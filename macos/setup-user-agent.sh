@@ -9,7 +9,7 @@ SOCKET_PATH="$HOME/Library/Application Support/meshfox/daemon.sock"
 LOG_DIR="$HOME/Library/Logs/Meshfox"
 PB=/usr/libexec/PlistBuddy
 
-if [ ! -x "$APP/Contents/MacOS/Meshfox" ]; then
+if [[ ! -x "$APP/Contents/MacOS/Meshfox" ]]; then
   echo "Meshfox is missing from /Applications" >&2
   exit 1
 fi
@@ -17,7 +17,7 @@ fi
 # Seed a private CLI once. Subsequent package installs leave it alone so
 # `meshfox check-updates` can advance it independently of the app bundle.
 LOCAL_BIN="$HOME/.local/bin/meshfox"
-if [ ! -e "$LOCAL_BIN" ] && [ ! -L "$LOCAL_BIN" ]; then
+if [[ ! -e "$LOCAL_BIN" ]] && [[ ! -L "$LOCAL_BIN" ]]; then
   mkdir -p "$(dirname "$LOCAL_BIN")"
   ditto "$APP/Contents/Resources/meshfox" "$LOCAL_BIN"
   chmod 755 "$LOCAL_BIN"

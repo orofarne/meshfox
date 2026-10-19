@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { selectNode, toolbarButton } from "./helpers";
+import { expectNever, nextFrames, selectNode, toolbarButton } from "./helpers";
 
 // Drives web/e2e/fixtures/body-conflict.canvas.md — what the node's body
 // editor does when the body is replaced by another client while it is open
@@ -98,7 +98,7 @@ test("unsaved edits are never written over a body changed elsewhere: Apply repor
   await replaceBodyElsewhere(page, "theirs");
   await expect(page.locator(".mesh-text-editor-note")).toContainText("changed elsewhere");
   await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
-  await page.waitForTimeout(1500);
+  await expectNever(1500, async () => (await serverBody(page)).text !== "theirs", "the draft was written over the other body");
   expect((await serverBody(page)).text).toBe("theirs");
   await expect(lines).toContainText("body a MINE");
 
@@ -175,7 +175,7 @@ test("'take theirs' drops the unsaved edits and shows the other body", async ({ 
   await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);
   await expect(lines).toContainText("theirs");
   await expect(lines).not.toContainText("MINE");
-  await page.waitForTimeout(1200);
+  await expectNever(1200, async () => (await serverBody(page)).text !== "theirs", "the dropped draft was written to the server");
   expect((await serverBody(page)).text).toBe("theirs");
 });
 
@@ -288,7 +288,7 @@ test("title and body remain local until Apply; Cancel discards subsequent change
   const title = page.locator(".mesh-text-editor-title-input");
   await title.fill("Local title");
   await title.blur();
-  await page.waitForTimeout(1000);
+  await expectNever(1000, async () => (await serverBody(page)).text !== "body a", "a local draft was written before Apply");
   expect((await serverBody(page)).text).toBe("body a");
   const initial = await (await page.request.get("/api/canvas")).json();
   expect(initial.nodes.find((n: { id: string }) => n.id === "a").title).not.toBe("Local title");
@@ -359,6 +359,8 @@ test("an older GET arriving after Apply cannot roll back the canvas or editor", 
   const held = new Promise<void>((resolve) => { release = resolve; });
   let arrived!: () => void;
   const pending = new Promise<void>((resolve) => { arrived = resolve; });
+  let delivered!: () => void;
+  const stale = new Promise<void>((resolve) => { delivered = resolve; });
   let first = true;
   await page.route("**/api/canvas", async (route) => {
     if (!first) { await route.continue(); return; }
@@ -367,6 +369,7 @@ test("an older GET arriving after Apply cannot roll back the canvas or editor", 
     arrived();
     await held;
     await route.fulfill({ response });
+    delivered();
   });
   // An unrelated operation starts a reload holding the old body of a.
   const changed = await page.request.patch("/api/nodes/root", { data: { title: `Other ${Date.now()}` } });
@@ -376,7 +379,8 @@ test("an older GET arriving after Apply cannot roll back the canvas or editor", 
   await page.getByRole("button", { name: "Apply", exact: true }).click();
   await expect(page.getByRole("button", { name: "Apply", exact: true })).toBeDisabled();
   release();
-  await page.waitForTimeout(500);
+  await stale;
+  await nextFrames(page);
   await expect(lines).toContainText("body a NEW");
   await expect(page.locator('.react-flow__node[data-id="a"] .mesh-node-body')).toContainText("body a NEW");
   await expect(page.locator(".mesh-text-editor-conflict")).toHaveCount(0);

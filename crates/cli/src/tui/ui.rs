@@ -1442,7 +1442,9 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_output(f: &mut Frame, area: Rect, app: &App) {
-    let title = if let Some(run) = &app.run {
+    let title = if !app.external_running.is_empty() {
+        " Output (running) ".to_string()
+    } else if let Some(run) = &app.run {
         if run.is_running() {
             " Output (running — K to kill) ".to_string()
         } else if run.killed {
@@ -1535,6 +1537,13 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         app.file_run
             .as_ref()
             .map(|run| super::ansi::lines(&run.lines.join("\n")))
+    };
+    let content = if app.external_console_lines.is_empty() {
+        content
+    } else {
+        let mut lines = content.unwrap_or_default();
+        lines.extend(super::ansi::lines(&app.external_console_lines.join("\n")));
+        Some(lines)
     };
     let text: Text = if let Some(lines) = content {
         // `output_scroll` counts lines back from the bottom (see its own

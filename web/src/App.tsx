@@ -291,6 +291,25 @@ function appendOutputLine(prev: LiveBlockState, event: { stream: "stdout" | "std
   };
 }
 
+/** Put a block's live state back to what it was before a speculative watch
+ * claimed it (`before`), or drop it if there was nothing — the `nds.map` body
+ * of `watchAutorunBlock`'s "nothing to watch" rollback, hoisted out so it
+ * doesn't nest six functions deep. */
+function restoreLiveBlock(
+  nds: Node<MeshNodeData>[],
+  nodeId: string,
+  blockName: string,
+  before: LiveBlockState | undefined,
+): Node<MeshNodeData>[] {
+  return nds.map((n) => {
+    if (n.id !== nodeId) return n;
+    const liveBlocks = { ...n.data.liveBlocks };
+    if (before) liveBlocks[blockName] = before;
+    else delete liveBlocks[blockName];
+    return { ...n, data: { ...n.data, liveBlocks } };
+  });
+}
+
 /** How many attempts, per streamed line, the console will keep around before
  * dropping the oldest — same order of magnitude as the server's own
  * per-run ring buffers (`crates/server/src/run_registry.rs`'s
@@ -1236,15 +1255,7 @@ export default function App() {
         if (!isCurrent() || sawDone) return;
         settleUnfinishedWatch(targetNodeId, blockName, false, () => {
           if (!isCurrent() || heardAnything) return;
-          setNodes((nds) =>
-            nds.map((n) => {
-              if (n.id !== targetNodeId) return n;
-              const liveBlocks = { ...n.data.liveBlocks };
-              if (before) liveBlocks[blockName] = before;
-              else delete liveBlocks[blockName];
-              return { ...n, data: { ...n.data, liveBlocks } };
-            }),
-          );
+          setNodes((nds) => restoreLiveBlock(nds, targetNodeId, blockName, before));
         });
       }).catch(() => {
         // The stream broke part-way: ask the server how the run really ended
@@ -1425,6 +1436,7 @@ export default function App() {
       // its Kill button knows what to cancel — the same `runId` covers the
       // whole chain (the server only ever runs one step of it at a time).
       let runId: string | undefined;
+      let activeStep: { nodeId: string; block: string } | undefined;
 
       // The server stops running a chain the moment one step fails (a
       // non-zero exit) or the run is killed (see crates/server/src/lib.rs's
@@ -1491,6 +1503,7 @@ export default function App() {
               ownRunIds.current.add(event.runId);
               break;
             case "step-start":
+              activeStep = { nodeId: event.nodeId, block: event.block };
               streamedKeys.add(`${event.nodeId}::${event.block}`);
               ownStreamedSteps.current.set(`${event.nodeId}::${event.block}`, Infinity);
               patchLiveBlock(event.nodeId, event.block, {
@@ -1545,6 +1558,7 @@ export default function App() {
               );
               break;
             case "step-end":
+              activeStep = undefined;
               patchLiveBlock(event.nodeId, event.block, {
                 status: "done",
                 exitCode: event.exitCode,
@@ -1553,14 +1567,27 @@ export default function App() {
               });
               break;
             case "killed":
+              activeStep = undefined;
               patchLiveBlock(event.nodeId, event.block, { status: "killed", runId: undefined });
               break;
             case "error":
+              // Preparation can fail after step-start without a step-end
+              // (for example while resolving artifact inputs). The error
+              // terminates that step even though no process exit code exists.
+              if (activeStep) {
+                patchLiveBlock(activeStep.nodeId, activeStep.block, {
+                  status: "done",
+                  exitCode: undefined,
+                  runId: undefined,
+                });
+                activeStep = undefined;
+              }
               setError(event.message);
               break;
             case "done":
               break;
             case "service-started":
+              activeStep = undefined;
               // Fixes this block's own live status as a static "started"
               // (see `LiveBlockState.status`/`LiveRunOutput`) instead of
               // leaving it stuck on "running" forever — a service step
@@ -2679,7 +2706,7 @@ export default function App() {
       const groups = new Map<string, string[]>();
       for (const e of derivedEdges) {
         if (!e.extra) continue;
-        const key = [e.source, e.target].sort().join("\u0000");
+        const key = [e.source, e.target].sort((a, b) => a.localeCompare(b)).join("\u0000");
         const group = groups.get(key);
         if (group) group.push(e.id);
         else groups.set(key, [e.id]);
@@ -2693,6 +2720,7 @@ export default function App() {
         for (const id of ids) parallelOffsets.set(id, PARALLEL_EDGE_OFFSET);
       }
     }
+    const showError = (error: unknown) => setError(String(error));
     setEdges((previousEdges) => {
       const selectedIds = new Set(previousEdges.filter((edge) => edge.selected).map((edge) => edge.id));
       return derivedEdges.map((e) => {
@@ -2759,7 +2787,7 @@ export default function App() {
                   ...(patch.via !== undefined ? { edgeVia: patch.via } : {}),
                   ...(patch.label !== undefined ? { edgeLabel: patch.label } : {}),
                   ...(patch.labelAt !== undefined ? { edgeLabelAt: patch.labelAt } : {}),
-                }).then(setCanvas).catch((error) => setError(String(error))),
+                }).then(setCanvas).catch(showError),
             },
           };
         }

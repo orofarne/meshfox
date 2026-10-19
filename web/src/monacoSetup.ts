@@ -115,7 +115,7 @@ export function ensureMonacoConfigured(): Promise<void> {
       import("@monaco-editor/react"),
       import("@shikijs/monaco"),
       getHighlighter(),
-    ]).then(async ([monaco, { loader }, { shikiToMonaco }, highlighter]) => {
+    ]).then(([monaco, { loader }, { shikiToMonaco }, highlighter]) => {
       (self as typeof self & { MonacoEnvironment: Monaco.Environment }).MonacoEnvironment = {
         getWorker() {
           return new EditorWorker();

@@ -2,7 +2,7 @@
 # Remove the machine-wide app/agent and Meshfox daemon state for local users.
 set -euo pipefail
 
-if [ "$(id -u)" -ne 0 ]; then
+if [[ "$(id -u)" -ne 0 ]]; then
   exec sudo /bin/bash "$0" "$@"
 fi
 
@@ -16,7 +16,7 @@ CLI="/Applications/Meshfox.app/Contents/Resources/meshfox"
 while IFS= read -r user; do
   uid="$(id -u "$user" 2>/dev/null)" || continue
   home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')"
-  [ -n "$home" ] && [ -d "$home" ] || continue
+  [[ -n "$home" ]] && [[ -d "$home" ]] || continue
   launchctl bootout "gui/$uid/$SETUP_LABEL" 2>/dev/null || true
   launchctl bootout "gui/$uid/$DAEMON_LABEL" 2>/dev/null || true
   rm -f "$home/Library/LaunchAgents/$DAEMON_LABEL.plist"
@@ -27,14 +27,14 @@ while IFS= read -r user; do
 
   # Only remove the user's CLI when this package originally created it.
   cli_marker="$home/.local/bin/.meshfox-pkg-cli"
-  if [ -f "$cli_marker" ]; then
+  if [[ -f "$cli_marker" ]]; then
     rm -f "$home/.local/bin/meshfox" "$cli_marker"
   fi
 
   # Remove only the daemon socket setting this package added.
   # Run as the file owner so an in-place edit does not make their config root-owned.
   config="$home/.meshfox/config.toml"
-  if [ -f "$config" ]; then
+  if [[ -f "$config" ]]; then
     sudo -u "$user" env MESHFOX_SOCKET_TO_REMOVE="$socket" /usr/bin/perl -i -ne \
       'if (/^\s*server_socket\s*=\s*["\x27]([^"\x27]*)["\x27]\s*# meshfox-pkg-socket\s*$/ && $1 eq $ENV{MESHFOX_SOCKET_TO_REMOVE}) { next } print' \
       "$config"
@@ -43,11 +43,11 @@ while IFS= read -r user; do
 done < <(dscl . -list /Users)
 
 rm -f "$SETUP_PLIST"
-if { [ -L "$CLI_LINK" ] && [ "$(readlink "$CLI_LINK")" = "$CLI" ]; } || \
-   { [ -f "$CLI_LINK" ] && [ ! -L "$CLI_LINK" ] && head -n 2 "$CLI_LINK" | grep -qx '# meshfox-pkg-wrapper-v1'; }; then
+if { [[ -L "$CLI_LINK" ]] && [[ "$(readlink "$CLI_LINK")" = "$CLI" ]]; } || \
+   { [[ -f "$CLI_LINK" ]] && [[ ! -L "$CLI_LINK" ]] && head -n 2 "$CLI_LINK" | grep -qx '# meshfox-pkg-wrapper-v1'; }; then
   rm -f "$CLI_LINK"
 fi
-if [ -d "$APP" ]; then
+if [[ -d "$APP" ]]; then
   /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u -f "$APP" 2>/dev/null || true
   rm -rf "$APP"
 fi

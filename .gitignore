@@ -36,6 +36,7 @@ __pycache__/
 # state, analogous to CMake's CMakeCache.txt, never something to commit.
 .meshfox/
 TODO.canvas.md
+SONAR.canvas.md
 ARTICLES.canvas.md
 /CLAUDE.md
 .mcp.json

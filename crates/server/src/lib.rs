@@ -2977,18 +2977,11 @@ async fn get_vars(
     State(state): State<Arc<AppState>>,
     Query(query): Query<VarsQuery>,
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
-    let raw = state.raw.lock().unwrap().clone();
-    let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
-    let path: Vec<_> = query.path.split(',').filter(|p| !p.is_empty()).collect();
-    let chain = prepare_run_plan(
-        &state,
-        &mut canvas,
-        &path,
-        &query.block,
-        !query.no_deps,
-        &effective_overrides(&state, &HashMap::new()),
-    )?
-    .chain;
+    // One run plan serves both the local fields and the cross-canvas calls:
+    // preparing it twice would read every lazy secret from the store twice
+    // (two keychain prompts for one form).
+    let (mut fields, canvas, chain) =
+        get_vars_with_plan(State(state.clone()), Query(query), &HashMap::new()).await?;
     let calls = canvas_call::plan(
         &state,
         &canvas,
@@ -2997,9 +2990,6 @@ async fn get_vars(
         &canvas_call::ancestry(),
     )
     .await?;
-    let mut fields = get_vars_local(State(state), Query(query), &HashMap::new())
-        .await?
-        .0;
     for (addr, call) in calls {
         for mut field in call.prepared.fields {
             field["name"] = serde_json::json!(format!(
@@ -3186,6 +3176,21 @@ async fn get_vars_local(
     Query(query): Query<VarsQuery>,
     submitted: &HashMap<String, String>,
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
+    Ok(Json(
+        get_vars_with_plan(State(state), Query(query), submitted)
+            .await?
+            .0,
+    ))
+}
+
+/// `get_vars_local`'s body, also handing back the canvas it prepared and the
+/// run chain of the plan, so a caller that needs them (cross-canvas calls)
+/// doesn't prepare a second plan.
+async fn get_vars_with_plan(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<VarsQuery>,
+    submitted: &HashMap<String, String>,
+) -> Result<(Vec<VarStatus>, Canvas, Vec<meshfox_core::BlockAddr>), ApiError> {
     let raw = state.raw.lock().unwrap().clone();
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
     // can address a node spliced in from an `include`, same as `run_block`
@@ -3205,6 +3210,7 @@ async fn get_vars_local(
         !query.no_deps,
         &overrides,
     )?;
+    let chain = plan.chain.clone();
     let needed: std::collections::HashSet<_> =
         plan.declarations.iter().map(|d| d.name.clone()).collect();
     overrides.extend(plan.resolved.values.clone());
@@ -3280,7 +3286,7 @@ async fn get_vars_local(
             var_status(materialized, &resolved, cache.secret_store_kind())
         })
         .collect();
-    Ok(Json(statuses))
+    Ok((statuses, canvas, chain))
 }
 
 /// Runs whichever `from=` source blocks are needed — transitively, via

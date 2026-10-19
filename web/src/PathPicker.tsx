@@ -191,7 +191,7 @@ export function PathPicker({ kind, mode = "open", ext = [], initialPath, title, 
                 if (listing) go(listing.path, e.target.checked, true);
               }}
             />
-            hidden
+            {" "}hidden
           </label>
           {kind === "file" && ext.length > 0 && (
             <label className="path-picker-toggle" title={`Only show .${ext.join(", .")} files`}>

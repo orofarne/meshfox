@@ -18,9 +18,10 @@
     left: {x:b.left,y:b.cy}, right: {x:b.right,y:b.cy},
     top: {x:b.cx,y:b.top}, bottom: {x:b.cx,y:b.bottom}
   })[side];
-  const choose = (a,b) => Math.abs(b.cx-a.cx) >= Math.abs(b.cy-a.cy)
-    ? (b.cx >= a.cx ? ['right','left'] : ['left','right'])
-    : (b.cy >= a.cy ? ['bottom','top'] : ['top','bottom']);
+  const choose = (a,b) => {
+    if (Math.abs(b.cx-a.cx) >= Math.abs(b.cy-a.cy)) return b.cx >= a.cx ? ['right','left'] : ['left','right'];
+    return b.cy >= a.cy ? ['bottom','top'] : ['top','bottom'];
+  };
   let overlay, labels;
   function draw() {
     if (overlay) overlay.remove();

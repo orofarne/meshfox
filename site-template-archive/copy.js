@@ -29,7 +29,7 @@
       document.body.appendChild(area);
       area.select();
       let ok = false;
-      try { ok = document.execCommand('copy'); } catch (_) {}
+      try { ok = document.execCommand('copy'); } catch (_) { /* unsupported: ok stays false */ }
       area.remove();
       return ok;
     }

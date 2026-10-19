@@ -31,7 +31,7 @@ module.exports = grammar({
     // <!-- meshfox:node id="x" -->   /   <!-- /meshfox:output -->
     marker: $ => seq('<!--', optional('/'), $.tag, repeat($.attribute), '-->'),
 
-    tag: _ => /meshfox:[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*/,
+    tag: _ => /meshfox:\w+(-\w+)*/,
 
     // A form fence body line: `field var=x label="X"`.
     field_line: $ => seq('field', repeat($.attribute)),
@@ -42,13 +42,13 @@ module.exports = grammar({
     ),
 
     // Any char but whitespace, `=` and `"` (spec: key-char).
-    key: _ => /([^\s="\-]|-[^\s="\-]|--+[^\s=">\-])+/,
+    key: _ => /([^\s="-]|-[^\s="-]|--+[^\s=">-])+/,
 
     value: $ => choice($.string, $.bare_value),
 
     string: _ => choice(/"[^"]*"/, /'[^']*'/),
 
-    bare_value: _ => /([^\s"'\-]|-[^\s\-])([^\s\-]|-[^\s\-]|--+[^\s>\-])*/,
+    bare_value: _ => /([^\s"'-]|-[^\s-])([^\s-]|-[^\s-]|--+[^\s>-])*/,
 
     // Prose after/between markers on one line:
     // `<!-- meshfox:comment -->Any text<!-- /meshfox:comment -->`.

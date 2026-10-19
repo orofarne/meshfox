@@ -1428,7 +1428,7 @@ a {
 .mesh-table-detail-value {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .mesh-table-hint {
   opacity: 0.5;
@@ -3384,7 +3384,7 @@ a {
   border-radius: 4px;
   font-size: 0.78rem;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* DeleteNodeDialog.tsx — reuses `.vars-modal`'s backdrop/card/hint/actions
@@ -3461,7 +3461,7 @@ a {
   overflow-y: auto;
   padding: 0.4rem 0.75rem;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .console-line-addr {

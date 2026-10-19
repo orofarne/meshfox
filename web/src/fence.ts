@@ -27,7 +27,7 @@ export function tokenize(s: string): string[] {
 }
 
 function unquote(v: string): string {
-  if (v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.endsWith(v[0])) {
+  if (v.length >= 2 && (v.startsWith('"') || v.startsWith("'")) && v.endsWith(v[0])) {
     return v.slice(1, -1);
   }
   return v;
@@ -82,16 +82,16 @@ export function selectedEnvNames(template: string, application: string): string 
   const start = application.indexOf("[");
   if (start < 0) return null;
   const values: Record<string, string> = {};
-  for (const match of application.slice(start + 1, -1).matchAll(/([A-Za-z_][A-Za-z0-9_]*)=("(?:\\.|[^"\\])*"|[^,\]]+)/g)) {
+  for (const match of application.slice(start + 1, -1).matchAll(/([A-Za-z_]\w*)=("(?:\\.|[^"\\])*"|[^,\]]+)/g)) {
     try { values[match[1]] = match[2].startsWith('"') ? JSON.parse(match[2]) : match[2]; }
     catch { return null; }
   }
   let missing = false;
-  const name = template.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, key: string) => {
+  const name = template.replace(/\$\{([A-Za-z_]\w*)\}/g, (_, key: string) => {
     if (!(key in values)) { missing = true; return ""; }
     return values[key];
   });
-  return missing || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? null : name;
+  return missing || !/^[A-Za-z_]\w*$/.test(name) ? null : name;
 }
 
 export interface CachedOutput {
@@ -129,8 +129,8 @@ export interface CachedOutput {
  * multiply JS numbers don't have natively. */
 function fnv1aHex(bytes: Uint8Array): string {
   let hash = 0x811c9dc5;
-  for (let i = 0; i < bytes.length; i++) {
-    hash ^= bytes[i];
+  for (const byte of bytes) {
+    hash ^= byte;
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
@@ -204,7 +204,7 @@ function precedingArguments(lines: string[], fenceLine: number): BlockArgument[]
   for (let i = fenceLine - 1; i >= 0; i--) {
     if (!lines[i].trim()) continue;
     if (/^(?: {4}|\t)/.test(lines[i])) break;
-    const marker = lines[i].trim().match(/^<!--\s*meshfox:arg\s+(.+?)\s*-->$/);
+    const marker = /^<!--\s*meshfox:arg\s+(.+?)\s*-->$/.exec(lines[i].trim());
     if (!marker) break;
     const attrs = attrsFromTokens(tokenize(marker[1]));
     args.unshift({ name: attrs.name, type: attrs.type ?? "string",

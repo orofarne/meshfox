@@ -366,6 +366,9 @@ export interface TagOps {
  * value, an end with no arrowhead), `500` (`labelAt`, the midpoint) or `[]`
  * (`via`). `tags` are a change to the edge's tags, like a node's.
  */
+/** A side an edge leaves/enters a node by; `"auto"` clears it back to routed. */
+export type EdgeSidePatch = "left" | "right" | "top" | "bottom" | "auto";
+
 export interface EdgePatch {
   from: string;
   label?: string;
@@ -374,8 +377,8 @@ export interface EdgePatch {
   style?: "solid" | "dashed" | "dotted" | "default";
   arrowStart?: "none" | "arrow" | "default";
   arrowEnd?: "none" | "arrow" | "default";
-  sourceSide?: "left" | "right" | "top" | "bottom" | "auto";
-  targetSide?: "left" | "right" | "top" | "bottom" | "auto";
+  sourceSide?: EdgeSidePatch;
+  targetSide?: EdgeSidePatch;
   via?: { x: number; y: number }[];
   tags?: TagOps;
 }
@@ -487,8 +490,8 @@ export interface NodePatch {
   edgeLabel?: string;
   /** Thousandths of the structural edge's rendered path length; 500 resets to midpoint. */
   edgeLabelAt?: number;
-  edgeSourceSide?: "left" | "right" | "top" | "bottom" | "auto";
-  edgeTargetSide?: "left" | "right" | "top" | "bottom" | "auto";
+  edgeSourceSide?: EdgeSidePatch;
+  edgeTargetSide?: EdgeSidePatch;
   edgeVia?: { x: number; y: number }[];
   /** Changes to the tags — omit to leave them untouched. Never a
    * replacement list, see `TagOps`. */

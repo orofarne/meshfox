@@ -19,15 +19,23 @@ set -euo pipefail
 bin="$1"
 shift
 
+# Reads only the signature header (`-dv`, ~30 ms even for a 200+ MB debug
+# binary): unsigned exits non-zero, a fresh link carries the linker's own
+# signature. `codesign --verify` would also hash every page of the file — ~0.7 s
+# per exec, paid by each of the ~40 e2e `webServer` runners and every test binary.
+# Every relink re-adds the linker signature, so a stale or half-written one
+# doesn't survive to here as a "clean" one.
 needs_sign() {
-  ! codesign --verify "$bin" 2>/dev/null || codesign -dv "$bin" 2>&1 | grep -q "linker-signed"
+  local info
+  info="$(codesign -dv "$bin" 2>&1)" || return 0
+  grep -q "linker-signed" <<<"$info"
 }
 
 if needs_sign; then
   lock="$bin.signlock"
   until mkdir "$lock" 2>/dev/null; do
     # A lock older than a minute belongs to a runner that died mid-sign.
-    if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
       rmdir "$lock" 2>/dev/null || true
     fi
     sleep 0.1

@@ -17,11 +17,11 @@ set -euo pipefail
 # this script) is a documented no-op error from git itself — `|| true`
 # swallows exactly that, nothing else (the actual fetch's own network/auth
 # failures still surface, since they happen before that exit).
-if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+if [[ "$(git rev-parse --is-shallow-repository)" = "true" ]]; then
     git fetch --unshallow || true
 fi
 
-curl -fsSL -o /tmp/meshfox.tar.gz "https://github.com/orofarne/meshfox/releases/latest/download/meshfox-x86_64-unknown-linux-gnu.tar.gz"
+curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/meshfox.tar.gz "https://github.com/orofarne/meshfox/releases/latest/download/meshfox-x86_64-unknown-linux-gnu.tar.gz"
 tar xzf /tmp/meshfox.tar.gz -C /tmp
 # examples/tables.canvas.md's `display="table"` nodes are rendered by the
 # DuckDB CLI (`meshfox static` fails the build without it), and two of them
@@ -29,7 +29,7 @@ tar xzf /tmp/meshfox.tar.gz -C /tmp
 # fetch duckdb and run the canvas's own generate/to-parquet blocks first.
 # Pinned: bump deliberately instead of breaking the deploy on a new release.
 DUCKDB_VERSION=v1.3.2
-curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
 python3 -m zipfile -e /tmp/duckdb.zip /tmp/duckdb-cli
 chmod +x /tmp/duckdb-cli/duckdb
 export PATH="/tmp/duckdb-cli:$PATH" # meshfox static and the to-parquet block both call plain `duckdb`

@@ -111,7 +111,7 @@
     for (const el of [dim, sheet]) el.getAnimations().forEach(a => a.cancel());
     document.documentElement.classList.remove('lamp-on');
     closing = false;
-    const back = opener && opener.isConnected ? opener : null;
+    const back = opener?.isConnected ? opener : null;
     current = null; opener = null;
     setHash(null);
     back?.focus({ preventScroll: true });

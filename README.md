@@ -1210,7 +1210,7 @@ cargo test --test tui_e2e -- --ignored --color=always
 ### Linux tests
 <!-- meshfox:node id="linux-tests" -->
 
-Linux-only code (the Secret Service backend behind `secret_store = "keychain"`, systemd socket activation of `meshfox serve`) is never compiled on a macOS host, so it is built and tested in a [lima](https://lima-vm.io) VM named `mfx` (Debian 13, 4 CPUs, 8 GiB — a 4 GiB VM gets the linker OOM-killed). `lima-prep` creates and starts it if needed and installs the toolchain, `gnome-keyring` (the real Secret Service the tests talk to) and `secret-tool`; it is idempotent. The repo is mounted into the VM read-only at the same path, so every block builds into `$HOME/target` inside the VM (with debug info off, for the linker's sake) and `Cargo.lock` has to be up to date on the host first.
+Linux-only code (the Secret Service backend behind `secret_store = "keychain"`, systemd socket activation of `meshfox serve`) is never compiled on a macOS host, so it is built and tested in a [lima](https://lima-vm.io) VM named `mfx` (Debian 13, 4 CPUs, 8 GiB — a 4 GiB VM gets the linker OOM-killed). `lima-prep` creates and starts it if needed and installs the toolchain, `gnome-keyring` (the real Secret Service the tests talk to) and `secret-tool`; it is idempotent. `secrets` and `systemd` depend on it with `lima-prep!`, so it runs whenever either of them does — a session-freshness skip of `lima-prep` alone would otherwise leave a VM that has since been stopped (reboot, `limactl stop`) stopped. The repo is mounted into the VM read-only at the same path, so every block builds into `$HOME/target` inside the VM (with debug info off, for the linker's sake) and `Cargo.lock` has to be up to date on the host first.
 
 ```sh name="lima-prep"
 if ! limactl list --format '{{.Name}}' | grep -qx mfx; then
@@ -1230,7 +1230,7 @@ limactl shell mfx -- bash -lc '
 
 `secrets` runs `crates/core/tests/secret_service_it.rs` and `crates/cli/tests/secret_cmd_linux.rs` against `gnome-keyring` in a throwaway session bus (`scripts/secret-service-it.sh`): the backend's round trips, `meshfox secret set/show/rm/list` through the real CLI, a `run` that reads the stored value, and the loud failure when no Secret Service is reachable. It never touches your own keyring.
 
-```sh name="secrets" deps="lima-prep"
+```sh name="secrets" deps="lima-prep!"
 limactl shell mfx -- bash -lc "
   set -e
   cd '$PWD'
@@ -1242,7 +1242,7 @@ limactl shell mfx -- bash -lc "
 
 `systemd` builds `meshfox`, installs `linux/systemd/meshfox.{socket,service}` for the VM user under a real `systemd --user` and checks socket activation end to end (`scripts/systemd-socket-activation-it.sh`): the service starts on the first connection, `stop` takes the workers down but leaves the socket, a clean `SIGTERM` doesn't restart it, and a worker the service spawned reads a secret from the keyring. The units are removed again afterwards.
 
-```sh name="systemd" deps="lima-prep"
+```sh name="systemd" deps="lima-prep!"
 limactl shell mfx -- bash -lc "
   set -e
   cd '$PWD'

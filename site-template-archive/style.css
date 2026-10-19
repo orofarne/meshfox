@@ -22,9 +22,8 @@ body { margin:0; color:var(--ink); background:#241f1b; font:15px/1.55 var(--seri
 a { color:#8e392f; }
 .archive-header { background:#e4d7bb; border-bottom:8px solid #1b1918; padding:.7rem clamp(1rem,4vw,4rem); display:flex; align-items:center; flex-wrap:wrap; gap:.5rem 1.4rem; box-shadow:0 6px 20px #0007; position:relative; z-index:3; }
 .archive-header h1 { font:400 clamp(1.5rem,3vw,2.7rem)/1 var(--display); margin:0; }
-.stamp,.archive-footer { font:700 .69rem/1.5 var(--mono); letter-spacing:.17em; }
-.stamp { font:400 .8rem/1.5 var(--display); }
-.stamp { margin-left:auto; color:#9b3a31; border:2px solid currentColor; padding:.25rem .55rem; transform:rotate(-3deg); }
+.archive-footer { font:700 .69rem/1.5 var(--mono); letter-spacing:.17em; }
+.stamp { font:400 .8rem/1.5 var(--display); letter-spacing:.17em; margin-left:auto; color:#9b3a31; border:2px solid currentColor; padding:.25rem .55rem; transform:rotate(-3deg); }
 .board-wrap { overflow:auto; min-height:70vh; padding:clamp(1rem,3vw,3rem); background-color:var(--board); background-image:radial-gradient(#9d806646 1px,transparent 1px),radial-gradient(#130e0c50 1px,transparent 1px),linear-gradient(135deg,#44372f,#312822); background-size:5px 5px,7px 7px,auto; }
 .tree { position:relative; min-width:100%; width:max-content; padding:1.5rem; }
 /* One column of siblings at every depth. The sibling column is always to

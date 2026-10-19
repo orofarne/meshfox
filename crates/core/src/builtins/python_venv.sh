@@ -32,8 +32,8 @@ esac
 venv_dir="${MESHFOX_VENV_DIR:-.venv}"
 mkdir -p "$venv_dir"
 venv_dir="$(cd "$venv_dir" && pwd)"
-[ -x "$venv_dir/bin/python3" ] || python3 -m venv "$venv_dir"
-if [ "${MESHFOX_BLOCK_LANG:-text}" = text ]; then
+[[ -x "$venv_dir/bin/python3" ]] || python3 -m venv "$venv_dir"
+if [[ "${MESHFOX_BLOCK_LANG:-text}" = text ]]; then
   "$venv_dir/bin/python3" -m pip install --disable-pip-version-check -r "$1"
 else
   project_dir="$(mktemp -d)"

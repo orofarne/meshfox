@@ -6,10 +6,10 @@
     let right=360, bottom=180;
     for (const row of board.querySelectorAll(':scope > .node-row.spatial-item')) {
       const card=row.querySelector(':scope > .node');
-      right=Math.max(right,parseFloat(row.style.left)+parseFloat(card.style.width)+28);
-      const top=parseFloat(row.style.top)+pinClearance;
+      right=Math.max(right,Number.parseFloat(row.style.left)+Number.parseFloat(card.style.width)+28);
+      const top=Number.parseFloat(row.style.top)+pinClearance;
       row.style.top=top+'px';
-      bottom=Math.max(bottom,top+parseFloat(card.style.height)+28);
+      bottom=Math.max(bottom,top+Number.parseFloat(card.style.height)+28);
     }
     board.style.width=right+'px';
     board.style.height=bottom+'px';
@@ -19,10 +19,10 @@
   function fitBodies() {
     for (const card of document.querySelectorAll('.node-row.authored-item > .node, .group-canvas > .node-row.spatial-item > .node')) {
       const body=card.querySelector(':scope > .node-body');
-      if (!body || !body.getClientRects().length) continue;
+      if (!body?.getClientRects().length) continue;
       const bottom=card.getBoundingClientRect().bottom;
       const top=body.getBoundingClientRect().top;
-      const padding=parseFloat(getComputedStyle(card).paddingBottom) || 0;
+      const padding=Number.parseFloat(getComputedStyle(card).paddingBottom) || 0;
       body.style.maxHeight=Math.max(0,bottom-top-padding)+'px';
     }
   }

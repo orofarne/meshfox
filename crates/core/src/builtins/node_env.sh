@@ -45,21 +45,21 @@ else
 fi
 stamp="$node_dir/.meshfox-input.sha256"
 
-if [ -d "$node_dir/node_modules" ] && [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$input_hash" ]; then
+if [[ -d "$node_dir/node_modules" ]] && [[ -f "$stamp" ]] && [[ "$(cat "$stamp")" = "$input_hash" ]]; then
   echo "node_modules up to date"
 else
-  if [ "${MESHFOX_BLOCK_LANG:-text}" = json ]; then
+  if [[ "${MESHFOX_BLOCK_LANG:-text}" = json ]]; then
     cp "$1" "$node_dir/package.json"
     (cd "$node_dir" && npm install --no-audit --no-fund)
   else
     specs=()
-    while IFS= read -r line || [ -n "$line" ]; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
       line="${line%%#*}"
       line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-      [ -n "$line" ] && specs+=("$line")
+      [[ -n "$line" ]] && specs+=("$line")
     done < "$1"
-    [ -f "$node_dir/package.json" ] || printf '{"private": true}\n' > "$node_dir/package.json"
-    if [ "${#specs[@]}" -gt 0 ]; then
+    [[ -f "$node_dir/package.json" ]] || printf '{"private": true}\n' > "$node_dir/package.json"
+    if [[ "${#specs[@]}" -gt 0 ]]; then
       (cd "$node_dir" && npm install --no-audit --no-fund --save "${specs[@]}")
     fi
   fi

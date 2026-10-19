@@ -23,7 +23,7 @@ async function installedVersionTag(exe: string): Promise<string | undefined> {
   // First line is "meshfox v1.2.3 (2026-08-15)" for a release build, or
   // "meshfox commit 4cd82d8bdac1 (2026-09-01)" (two words before the date)
   // for anything else — the capture group only matches the former shape.
-  const match = output.split("\n")[0]?.match(/^meshfox\s+(v\d[^\s(]*)\s+\(/);
+  const match = /^meshfox\s+(v\d[^\s(]*)\s+\(/.exec(output.split("\n")[0] ?? "");
   return match?.[1];
 }
 
@@ -50,7 +50,7 @@ function compareVersionTags(a: string, b: string): number {
     v
       .replace(/^v/, "")
       .split(".")
-      .map((n) => parseInt(n, 10) || 0);
+      .map((n) => Number.parseInt(n, 10) || 0);
   const [aParts, bParts] = [parse(a), parse(b)];
   for (let i = 0; i < Math.max(aParts.length, bParts.length); i++) {
     const diff = (aParts[i] ?? 0) - (bParts[i] ?? 0);

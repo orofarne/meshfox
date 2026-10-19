@@ -38,7 +38,7 @@ export function measureFitSizes(root: HTMLElement): Record<FitDirection, NodeSiz
   clone.querySelectorAll(".react-flow__handle, .react-flow__resize-control, .mesh-node-fit-preview").forEach(el => el.remove());
   Object.assign(clone.style, { width: "100%", maxHeight: "none" });
   const centered = clone.querySelector<HTMLElement>(".mesh-node-title-centered");
-  if (centered) { centered.style.removeProperty("font-size"); centered.removeAttribute("data-autofit"); }
+  if (centered) { centered.style.removeProperty("font-size"); delete centered.dataset.autofit; }
   host.append(clone);
   // Keep theme variables and font inherited from this view (also works inside
   // the group expansion panel). The host itself remains outside normal flow.

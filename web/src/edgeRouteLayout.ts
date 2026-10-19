@@ -239,7 +239,10 @@ function groupCollisionShifts(base: Node<MeshNodeData>[], framed: Node<MeshNodeD
   const movable = (n: Node<MeshNodeData>) => !!n.data.suggested && n.data.level > 1;
   const belongs = (id: string, ancestor: string): boolean => {
     let n = byId.get(id);
-    while (n) { if (n.id === ancestor) return true; n = n.parentId ? byId.get(n.parentId) : undefined; }
+    while (n) {
+      if (n.id === ancestor) return true;
+      n = n.parentId ? byId.get(n.parentId) : undefined;
+    }
     return false;
   };
   const gap = 25;

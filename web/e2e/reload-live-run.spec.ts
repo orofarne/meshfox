@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { clickFitViewAndWait, nextFrames } from "./helpers";
 
 // Drives web/e2e/fixtures/reload-live-run.canvas.md — a long-running
 // block's live output is purely client-side React state
@@ -23,6 +23,22 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await page.waitForSelector(".mesh-node");
   await clickFitViewAndWait(page);
+});
+
+test("a preparation error after step-start clears the running indicator", async ({ page }) => {
+  await page.routeWebSocket(/\/api\/run\?/, ws => {
+    ws.send(JSON.stringify({ type: "started", runId: "preparation-error" }));
+    ws.send(JSON.stringify({ type: "step-start", nodeId: "root", block: "long-task" }));
+    ws.send(JSON.stringify({ type: "error", message: "Cannot resolve artifact inputs" }));
+    ws.send(JSON.stringify({ type: "done", exitCode: 1 }));
+    ws.close();
+  });
+  const task = block(page, "root", "long-task");
+  await task.getByRole("button", { name: "run long-task" }).click();
+  await expect(page.getByText("Cannot resolve artifact inputs", { exact: true })).toBeVisible();
+  await expect(task.locator('[data-exit="fail"]')).toBeVisible();
+  await expect(task.getByRole("button", { name: "run long-task" })).toBeEnabled();
+  await expect(task.getByRole("button", { name: "running long-task…" })).toHaveCount(0);
 });
 
 test("reloading mid-run keeps the already-printed output and resumes the live tail", async ({
@@ -102,9 +118,11 @@ test("editing a node preserves completed output without a replay or height jump"
   await input.press('Enter');
   expect((await saved).ok()).toBe(true);
   await expect(title).toContainText(changedTitle);
-  // Span a full registry poll (3s), including the delayed replay that
-  // previously masked the temporary disappearance.
-  await page.waitForTimeout(3500);
+  // Span a full registry poll (every 3s), including the delayed replay that
+  // previously masked the temporary disappearance: wait for the next poll's
+  // response, then let what it triggers render.
+  await page.waitForResponse(response => response.url().endsWith('/api/runs'));
+  await nextFrames(page, 10);
   const observation = await page.evaluate(() => (window as unknown as {
     outputObservation: { finish: () => { height: number; samples: { missing: boolean; height: number }[] } };
   }).outputObservation.finish());

@@ -61,7 +61,7 @@ export function HistoryPanel({ entries: listed, cursor, onClose, onGoto }: Histo
   // shown. (`oldest.seq - 1` isn't a safe target instead: seqs have gaps
   // once a redo tail is dropped, so it may never be a cursor value.)
   // Marked current when nothing real is applied.
-  const oldest = listed[listed.length - 1];
+  const oldest = listed.at(-1);
   const wholeLogShown = listed.filter((e) => e.applied).length < HISTORY_FETCH_LIMIT;
   const entries: HistoryEntry[] =
     oldest && wholeLogShown

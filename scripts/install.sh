@@ -41,7 +41,8 @@ info() {
 }
 
 need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || err "'$1' is required but not found on PATH"
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || err "'$cmd' is required but not found on PATH"
 }
 
 usage() {

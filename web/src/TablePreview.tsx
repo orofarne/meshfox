@@ -295,11 +295,8 @@ export function FileTablePreview({ nodeId, target }: { nodeId: string; target?: 
       case "C":
         if ((e.ctrlKey || e.metaKey) && selected) {
           const value = getRow(selected.row)?.[selected.col];
-          try {
-            void navigator.clipboard.writeText(value ?? "");
-          } catch {
-            /* clipboard unavailable — nothing to do */
-          }
+          // Clipboard unavailable (or denied) — nothing to do.
+          navigator.clipboard?.writeText(value ?? "").catch(() => {});
         } else {
           handled = false;
         }

@@ -56,7 +56,7 @@ function readTopLevelString(filePath: string, key: string): string | undefined {
     if (!inTopLevel) {
       continue;
     }
-    const match = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.+)$/);
+    const match = /^([A-Za-z0-9_-]+)\s*=\s*(.+)$/.exec(line);
     if (!match || match[1] !== key) {
       continue;
     }

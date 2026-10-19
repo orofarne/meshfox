@@ -71,6 +71,36 @@ export function toolbarButton(page: Page, titleSubstring: string): Locator {
   return page.locator(`.mesh-node-toolbar button[title*="${titleSubstring}" i]`);
 }
 
+/** Asserts that something does NOT happen: polls `isBad` for `windowMs` and
+ * fails as soon as it holds. For a "nothing was written / nothing closed /
+ * nothing reconnected" check there is no event to wait for, so this replaces
+ * a blind `waitForTimeout` with an observation that also catches a change
+ * that lands and reverts inside the window, and fails fast on a regression. */
+export async function expectNever(
+  windowMs: number,
+  isBad: () => boolean | Promise<boolean>,
+  what: string,
+): Promise<void> {
+  const deadline = Date.now() + windowMs;
+  do {
+    if (await isBad()) throw new Error(`${what} (within ${windowMs}ms)`);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
+}
+
+/** Resolves after the page has painted `frames` more frames — lets a state
+ * update that is already on its way land before a "nothing changed" check. */
+export function nextFrames(page: Page, frames = 2): Promise<void> {
+  return page.evaluate(
+    (n) =>
+      new Promise<void>((resolve) => {
+        const step = (left: number) => (left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1)));
+        step(n);
+      }),
+    frames,
+  );
+}
+
 /** Puts the canvas file back to exactly `raw` through the whole-file
  * endpoint — a fixture reset at the end of a test that rewrote it. That
  * endpoint requires the ETag of the version being replaced (`If-Match`), so

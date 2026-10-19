@@ -4,6 +4,8 @@ import { edgeOpsBetween, tagOpsBetween, type NodePatch } from "./api";
 import { translitSlug } from "./slug";
 import { TagEditor } from "./TagEditor";
 
+type FoldChoice = "default" | "true" | "false";
+
 interface NodeSettingsProps {
   node: CanvasNode;
   /** Every other node in the document, for the "add incoming edge" picker
@@ -84,8 +86,8 @@ export function NodeSettings({ node, allNodes, onChange, onRenameId, onClearId, 
   // default, `meshfox:option name="unfold"`) is a real, distinct value from
   // "explicitly folded"/"explicitly expanded", and this control needs a way
   // to get back to it, not just toggle between the other two.
-  const initialFold: "default" | "true" | "false" = node.fold === undefined ? "default" : node.fold ? "true" : "false";
-  const [fold, setFold] = useState<"default" | "true" | "false">(initialFold);
+  const initialFold: FoldChoice = node.fold === undefined ? "default" : node.fold ? "true" : "false";
+  const [fold, setFold] = useState<FoldChoice>(initialFold);
 
   const otherNodes = allNodes.filter((n) => n.id !== node.id);
   const addable = otherNodes.filter((n) => !extraParents.some((e) => e.from === n.id));

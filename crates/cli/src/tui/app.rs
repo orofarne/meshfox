@@ -650,6 +650,8 @@ pub struct App {
     /// once that run's own `Done` arrives (`step_output` keeps the settled
     /// result, same as any other finished step).
     pub external_running: HashMap<BlockAddr, std::time::Instant>,
+    /// Transcript of active runs observed through passive subscriptions.
+    pub external_console_lines: Vec<String>,
     /// Whether the Output pane (the "console" — a running transcript of the
     /// most recent chain/file run, not scoped to one block) is collapsed to
     /// its 1-line title strip — see `ui::compute_layout`. Starts collapsed;
@@ -1241,6 +1243,7 @@ impl App {
             child_steps: HashMap::new(),
             displayed_invocations: HashMap::new(),
             external_running: HashMap::new(),
+            external_console_lines: Vec::new(),
             console_collapsed: true,
             console_last_activity: None,
             spinner_tick: 0,
@@ -5082,7 +5085,7 @@ impl App {
         duration_ms: Option<u64>,
     ) {
         let done = matches!(event, crate::worker_client::SubscribeEvent::Done { .. });
-        self.on_external_run_event(addr.clone(), event);
+        self.fold_external_run_event(addr.clone(), event, duration_ms.is_none());
         if let (true, Some(ms)) = (done, duration_ms) {
             if let Some(entry) = self.step_output.get_mut(&addr) {
                 entry.duration_ms = ms;
@@ -5116,17 +5119,51 @@ impl App {
     /// (this TUI never resolved this block's own attributes for a run it
     /// didn't start) — best-effort `false` if the block can't be found
     /// (already gone from a since-edited canvas, say).
+    #[cfg(test)]
     pub fn on_external_run_event(
         &mut self,
         addr: BlockAddr,
         event: crate::worker_client::SubscribeEvent,
     ) {
+        self.fold_external_run_event(addr, event, true);
+    }
+
+    fn fold_external_run_event(
+        &mut self,
+        addr: BlockAddr,
+        event: crate::worker_client::SubscribeEvent,
+        console: bool,
+    ) {
         use crate::worker_client::SubscribeEvent;
-        if self.run.as_ref().is_some_and(|r| r.chain.contains(&addr)) {
+        if self
+            .run
+            .as_ref()
+            .is_some_and(|r| r.is_running() && r.chain.contains(&addr))
+        {
             // A passive Line may have arrived before our StepStart. Even
             // when ignoring duplicate output, never retain its running badge.
             self.external_running.remove(&addr);
             return;
+        }
+        if console {
+            self.console_last_activity = Some(std::time::Instant::now());
+            match &event {
+                SubscribeEvent::Line { text, .. } => {
+                    if !self.external_running.contains_key(&addr) {
+                        self.external_console_lines
+                            .push(format!("==> {}/{}", addr.node_id, addr.block_name));
+                    }
+                    self.external_console_lines.push(text.clone());
+                }
+                SubscribeEvent::Done { exit_code } => {
+                    self.external_console_lines.push(format!(
+                        "==> {}/{} (exit {})",
+                        addr.node_id,
+                        addr.block_name,
+                        exit_code.unwrap_or(-1)
+                    ));
+                }
+            }
         }
         match event {
             SubscribeEvent::Line { stream, text } => {
@@ -5453,7 +5490,8 @@ impl App {
             return;
         }
         let running = self.run.as_ref().is_some_and(RunState::is_running)
-            || self.file_run.as_ref().is_some_and(|r| r.events.is_some());
+            || self.file_run.as_ref().is_some_and(|r| r.events.is_some())
+            || !self.external_running.is_empty();
         if running {
             return;
         }
@@ -7864,6 +7902,40 @@ mod tests {
         .await;
         assert!(document_text(&app).contains("second recording"));
         assert!(!app.step_output[&second].running);
+    }
+
+    #[tokio::test]
+    async fn external_console_replays_active_but_not_finished_runs() {
+        use crate::worker_client::SubscribeEvent;
+        let mut app =
+            app_with_blocks("external-console", "```sh name=build\necho build\n```\n").await;
+        let addr = BlockAddr::new("root", "build");
+        let line = |text: &str| SubscribeEvent::Line {
+            stream: meshfox_server::stream_exec::OutputStream::Stdout,
+            text: text.into(),
+        };
+        app.on_reconciled_run_event(addr.clone(), line("old output"), Some(123));
+        app.on_reconciled_run_event(
+            addr.clone(),
+            SubscribeEvent::Done { exit_code: Some(0) },
+            Some(123),
+        );
+        assert!(app.external_console_lines.is_empty());
+        assert_eq!(app.step_output[&addr].duration_ms, 123);
+        app.on_reconciled_run_event(addr.clone(), line("live backlog"), None);
+        app.on_external_run_event(addr.clone(), line("next line"));
+        app.on_external_run_event(addr.clone(), SubscribeEvent::Done { exit_code: Some(0) });
+        assert_eq!(
+            app.external_console_lines,
+            vec![
+                "==> root/build",
+                "live backlog",
+                "next line",
+                "==> root/build (exit 0)"
+            ]
+        );
+        assert!(app.step_output[&addr].text.contains("live backlog"));
+        assert!(!app.step_output[&addr].text.contains("old output"));
     }
 
     #[tokio::test]

@@ -87,7 +87,7 @@ function crossesStub(a: Point, b: Point, stub: Segment, join: Point): boolean {
 }
 
 class MinHeap {
-  private items: { state: number; cost: number }[] = [];
+  private readonly items: { state: number; cost: number }[] = [];
   get length() { return this.items.length; }
   push(item: { state: number; cost: number }) {
     const a = this.items;
@@ -124,7 +124,7 @@ function simplify(points: Point[]): Point[] {
   for (const point of points) {
     if (out.length && out.at(-1)!.x === point.x && out.at(-1)!.y === point.y) continue;
     while (out.length >= 2) {
-      const a = out[out.length - 2], b = out[out.length - 1];
+      const a = out.at(-2)!, b = out.at(-1)!;
       if ((a.x === b.x && b.x === point.x) || (a.y === b.y && b.y === point.y)) out.pop();
       else break;
     }
@@ -333,6 +333,7 @@ export function routeAroundNodes(
   if (found < 0) return undefined;
   const reversed: Point[] = [];
   for (let state = found; state >= 0; state = previous[state]) reversed.push(point(Math.floor(state / 3)));
-  const points = simplify([start, ...reversed.reverse(), end]);
+  reversed.reverse();
+  const points = simplify([start, ...reversed, end]);
   return draw(points);
 }

@@ -141,12 +141,11 @@ function ThemedImg({ src, ...props }: React.ImgHTMLAttributes<HTMLImageElement>)
     if (!src?.startsWith("data:image/svg+xml;base64,")) return src;
     // `dark` is only the cache key: the actual colors are read from the
     // page's CSS custom properties, which `index.css` swaps per theme.
-    void dark;
     return themeSvgDataUrl(src, readPageTheme());
   }, [src, dark]);
   // Relative URLs are served by this worker. Remote and inline images
   // keep their own caching semantics. Preserve query parameters and fragments.
-  return <img {...props} src={refreshImageUrl(themed, refresh, window.location.href)} />;
+  return <img {...props} alt={props.alt ?? ""} src={refreshImageUrl(themed, refresh, window.location.href)} />;
 }
 
 /**
@@ -752,7 +751,7 @@ function useAutoFitTitleFontSize(
       // never touched by anything but this hook, and always cleared
       // before being read, so it can't suffer the same corruption.
       measure.style.fontSize = "";
-      const defaultPx = parseFloat(getComputedStyle(measure).fontSize);
+      const defaultPx = Number.parseFloat(getComputedStyle(measure).fontSize);
       const fits = (px: number) => {
         measure.style.fontSize = `${px}px`;
         return measure.scrollHeight <= targetHeight + 0.5;
@@ -794,7 +793,7 @@ function useAutoFitTitleFontSize(
     // node's own `fixedSize` flag flipping) and fighting whatever the
     // newer instance already decided.
     let cancelled = false;
-    document.fonts.ready.then(() => {
+    void document.fonts.ready.then(() => {
       if (!cancelled) recompute();
     });
     return () => {
@@ -1428,7 +1427,7 @@ function HighlightedCode({ code, lang }: { code: string; lang: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    highlightToHtml(code, lang).then((h) => {
+    void highlightToHtml(code, lang).then((h) => {
       if (!cancelled) setHtml(h);
     });
     return () => {
@@ -1754,7 +1753,7 @@ function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeD
   };
 
   const templates = seg.envRefs.filter(ref => ref.varName.includes("${"));
-  const applications = Object.keys(data.liveBlocks).filter(name => name.startsWith(`${seg.name}[`)).sort();
+  const applications = Object.keys(data.liveBlocks).filter(name => name.startsWith(`${seg.name}[`)).sort((a, b) => a.localeCompare(b));
   if ((seg.args?.length ?? 0) + (seg.inputs?.length ?? 0) + (seg.outputs?.length ?? 0) + templates.length + exported.length + seg.deps.length + implicit.length === 0) return null;
   return (
     <div className="mesh-block-details nodrag">
@@ -2420,7 +2419,7 @@ function LinkPreviewCard({ target }: { target: string }) {
   useEffect(() => {
     let cancelled = false;
     setPreview("loading");
-    getLinkPreview(target).then((result) => {
+    void getLinkPreview(target).then((result) => {
       if (!cancelled) setPreview(result);
     });
     return () => {
@@ -2487,7 +2486,8 @@ export function NodeBodyPreview({ text }: { text: string }) {
           );
         }
         const highlightLang = seg.type === "constraint" ? "starlark" : seg.lang;
-        const lang = seg.type === "constraint" ? `starlark${seg.name ? ` · ${seg.name}` : ""}` : seg.lang;
+        const constraintSuffix = seg.name ? ` · ${seg.name}` : "";
+        const lang = seg.type === "constraint" ? `starlark${constraintSuffix}` : seg.lang;
         return (
           <div className="mesh-code-block" key={`${seg.type === "constraint" ? "constraint" : seg.name}-${i}`}>
             <div className="mesh-code-block-head">

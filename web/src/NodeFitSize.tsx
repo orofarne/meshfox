@@ -27,7 +27,7 @@ export function NodeFitSize({ nodeRef, onApply, onPreview }: {
     <button ref={trigger} type="button" className="mesh-node-icon-button nodrag" aria-label="Fit to content"
       title="Fit to content" aria-haspopup="menu" aria-expanded={!!sizes}
       onClick={() => { if (sizes) close(); else if (nodeRef.current) setSizes(measureFitSizes(nodeRef.current)); }}>⤢</button>
-    {sizes && <div className="mesh-node-fit-menu nokey" role="menu" aria-label="Fit to content"
+    {sizes && <div className="mesh-node-fit-menu nokey" role="menu" aria-label="Fit to content" tabIndex={-1}
       onKeyDown={event => {
         if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
         event.preventDefault();

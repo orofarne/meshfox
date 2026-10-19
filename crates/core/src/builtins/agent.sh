@@ -74,7 +74,7 @@ interpolate() {
   printf '%s' "$out$rest"
 }
 
-if [ -t 1 ]; then
+if [[ -t 1 ]]; then
   prompt="$(interpolate "$(cat "$1")")"
   case "$provider" in
     claude)

@@ -68,11 +68,11 @@ export function parseVarDecls(canvas: CanvasDoc): Map<string, ClientVarDecl> {
       }
       if (fence) {
         const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
-        if (close && close[1][0] === fence.marker && close[1].length >= fence.length) fence = null;
+        if (close && close[1].startsWith(fence.marker) && close[1].length >= fence.length) fence = null;
         continue;
       }
       const open = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-      if (open && (open[1][0] !== "`" || !open[2].includes("`"))) {
+      if (open && (!open[1].startsWith("`") || !open[2].includes("`"))) {
         fence = { marker: open[1][0], length: open[1].length };
         continue;
       }

@@ -22,6 +22,11 @@ function runState(run: RunHistoryEntry): "ok" | "fail" | "killed" {
   return run.outcome === "killed" ? "killed" : run.exitCode === 0 ? "ok" : "fail";
 }
 
+function runTitle(run: RunHistoryEntry): string {
+  const ended = run.endedAt ? `, ended ${run.endedAt}` : "";
+  return `started ${run.startedAt}${ended}`;
+}
+
 function runLabel(run: RunHistoryEntry): string {
   return run.outcome === "killed" ? "killed" : `exit ${run.exitCode ?? "?"}`;
 }
@@ -166,7 +171,7 @@ export function RunHistoryDialog({
                 data-stale={run.stale || undefined}
                 data-selected={selected === run.id || undefined}
                 onClick={() => setSelected(run.id)}
-                title={`started ${run.startedAt}${run.endedAt ? `, ended ${run.endedAt}` : ""}`}
+                title={runTitle(run)}
               >
                 {run.block !== blockName && <code className="run-history-application">{run.block}</code>}
                 <span className="run-history-time">{formatRunTime(run.startedAt)}</span>

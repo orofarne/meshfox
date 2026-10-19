@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { selectNode, toolbarButton } from "./helpers";
+import { nextFrames, selectNode, toolbarButton } from "./helpers";
 
 // Drives web/e2e/fixtures/image-paste.canvas.md (TODO.canvas.md: "Base64
 // image") — pasting an image into either of the two Monaco editors
@@ -138,9 +138,11 @@ test("a large paste asks for confirmation first, and declining inserts nothing",
   // at display time, not on paste).
   const bigBase64 = "A".repeat(1_400_000); // ~1.4MB of base64 text, over the 1MB soft-warn threshold
 
-  page.once("dialog", (dialog) => {
-    expect(dialog.message()).toContain("MB");
-    void dialog.dismiss();
+  const dismissed = new Promise<void>((resolve) => {
+    page.once("dialog", (dialog) => {
+      expect(dialog.message()).toContain("MB");
+      void dialog.dismiss().then(resolve);
+    });
   });
 
   const root = page.locator('.react-flow__node[data-id="root"]');
@@ -155,8 +157,9 @@ test("a large paste asks for confirmation first, and declining inserts nothing",
   const before = await source.textContent();
   await pasteImage(source, bigBase64);
 
-  // Give the confirm()/dismiss round-trip a beat, then confirm nothing
+  // Let the confirm()/dismiss round-trip finish, then confirm nothing
   // changed.
-  await page.waitForTimeout(200);
+  await dismissed;
+  await nextFrames(page);
   await expect(source).toHaveText(before ?? "");
 });

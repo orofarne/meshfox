@@ -15,7 +15,8 @@ const lines = ["id,name,amount,note"];
 for (let i = 1; i <= ROWS; i++) {
   // amount is a permutation of 1..ROWS, so sorting it has one right answer.
   const amount = ((i * 7919) % ROWS) + 1;
-  lines.push(`${i},name-${String(i).padStart(6, "0")},${amount},${i % 5 === 0 ? "" : `note ${i}`}`);
+  const note = i % 5 === 0 ? "" : `note ${i}`;
+  lines.push(`${i},name-${String(i).padStart(6, "0")},${amount},${note}`);
 }
 fs.writeFileSync(path.join(dir, "orders.csv"), lines.join("\n") + "\n");
 process.env.MESHFOX_SERVER_SOCKET = "";

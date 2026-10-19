@@ -37,7 +37,7 @@ const INDEX_FETCH_RETRY_DELAY_MS = 200;
 export class CanvasEditorProvider implements vscode.CustomReadonlyEditorProvider {
   constructor(private readonly coordinator: Coordinator) {}
 
-  async openCustomDocument(uri: vscode.Uri): Promise<vscode.CustomDocument> {
+  openCustomDocument(uri: vscode.Uri): vscode.CustomDocument {
     return { uri, dispose: () => {} };
   }
 

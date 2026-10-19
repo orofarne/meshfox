@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait, disableDefaultFold } from "./helpers";
+import { clickFitViewAndWait, disableDefaultFold, expectNever } from "./helpers";
 
 // Drives web/e2e/fixtures/deps.canvas.md through the real UI, in the
 // default read-only mode (never clicks "Edit"), so nothing here ever
@@ -174,14 +174,15 @@ test("console keeps a full grace period after silent completion and does not rep
   await expect(consolePanel).toHaveClass(/console-panel-open/);
   await expect(consolePanel).toContainText("console-producer-marker");
   await expect(target.locator('[data-exit="ok"]')).toBeVisible({ timeout: 15_000 });
-  await page.waitForTimeout(1500); // past the collapse polling tick
+  // Stays open past the collapse polling tick.
+  await expectNever(1500, async () => !(await consolePanel.getAttribute("class"))?.includes("console-panel-open"), "the console collapsed early");
   await expect(consolePanel).toHaveClass(/console-panel-open/);
 
   await target.locator("button.mesh-run-chain").click();
   await expect(consolePanel).toContainText("skipped, already fresh this session");
   await expect(consolePanel).not.toContainText("console-producer-marker");
   await expect(target.locator('[data-exit="ok"]')).toBeVisible({ timeout: 15_000 });
-  await page.waitForTimeout(1500);
+  await expectNever(1500, async () => !(await consolePanel.getAttribute("class"))?.includes("console-panel-open"), "the console collapsed early");
   await expect(consolePanel).toHaveClass(/console-panel-open/);
   await expect(consolePanel).not.toHaveClass(/console-panel-open/, { timeout: 12_000 });
 });

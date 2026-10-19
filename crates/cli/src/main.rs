@@ -11,6 +11,12 @@
 //! whole point of a canvas) — Edit only controls whether a `cache`d
 //! block's output actually gets written back into the file, or just shown.
 
+// macOS's ld64 warns on every link of this crate's debug binary (and of its
+// unit-test binary) that `__eh_frame` is over its 16 MB compact-unwind limit.
+// It only costs exception-handling speed in an unoptimized build, and cargo
+// replays it on every `cargo run` — ~40 times per e2e run, one per `webServer`.
+#![allow(linker_messages)]
+
 use clap::{Args, Parser, Subcommand};
 use meshfox_core::{mdcanvas, Canvas, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType};
 #[cfg(test)]

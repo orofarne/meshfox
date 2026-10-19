@@ -29,10 +29,11 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok:   $*"; }
 mf() { "$HOME/.local/bin/meshfox" "$@"; }
-active() { systemctl --user is-active "$1" 2>/dev/null || true; }
+active() { local unit="$1"; systemctl --user is-active "$unit" 2>/dev/null || true; }
 
 get_port() {
-  python3 - "$sock" "$1" <<'PY'
+  local name="$1"
+  python3 - "$sock" "$name" <<'PY'
 import json, socket, sys
 s = socket.socket(socket.AF_UNIX)
 s.settimeout(30)

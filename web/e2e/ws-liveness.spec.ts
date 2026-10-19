@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { expectNever } from "./helpers";
 
 // A browser WebSocket never shows a script ping frames and never times out on
 // silence: a worker that hangs with its socket open raises no event at all.
@@ -38,6 +39,6 @@ test("a quiet watch socket that keeps sending heartbeats is left alone", async (
   });
   await page.goto("/");
   await expect.poll(() => connections).toBe(1);
-  await page.waitForTimeout(6_000);
+  await expectNever(6_000, () => connections !== 1, "the heartbeating socket was re-established");
   expect(connections).toBe(1);
 });

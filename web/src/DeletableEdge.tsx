@@ -34,9 +34,9 @@ export interface DeletableEdgeData {
   label?: string;
   labelAt?: number;
   color?: string;
-  style?: ExtraEdgeDto["style"];
-  arrowStart?: ExtraEdgeDto["arrowStart"];
-  arrowEnd?: ExtraEdgeDto["arrowEnd"];
+  style?: Exclude<ExtraEdgeDto["style"], undefined>;
+  arrowStart?: Exclude<ExtraEdgeDto["arrowStart"], undefined>;
+  arrowEnd?: Exclude<ExtraEdgeDto["arrowEnd"], undefined>;
   tags?: string[];
   /** Every distinct tag already used anywhere in the document — offered as
    * suggestions by this edge's own `TagEditor` (see App.tsx's
@@ -60,8 +60,8 @@ export interface DeletableEdgeData {
   routedLabel?: { x: number; y: number };
   routeFailed?: boolean;
   via?: { x: number; y: number }[];
-  sourceSide?: ExtraEdgeDto["sourceSide"];
-  targetSide?: ExtraEdgeDto["targetSide"];
+  sourceSide?: Exclude<ExtraEdgeDto["sourceSide"], undefined>;
+  targetSide?: Exclude<ExtraEdgeDto["targetSide"], undefined>;
   /** Extra edge only: persists a full style patch. */
   onUpdate?: (patch: Partial<Omit<ExtraEdgeDto, "from">>) => void;
   onUpdateRoute?: (patch: { sourceSide?: "left" | "right" | "top" | "bottom" | "auto"; targetSide?: "left" | "right" | "top" | "bottom" | "auto"; via?: { x: number; y: number }[]; label?: string; labelAt?: number }) => void;
@@ -279,7 +279,7 @@ export function DeletableEdge({
       ["top", Math.hypot(clientY - box.top, clientX - clamp(clientX, box.left, box.right))],
       ["bottom", Math.hypot(clientY - box.bottom, clientX - clamp(clientX, box.left, box.right))],
     ];
-    return distances.sort((a, b) => a[1] - b[1])[0][0];
+    return distances.reduce((nearest, d) => (d[1] < nearest[1] ? d : nearest))[0];
   };
 
   const portAt = (nodeId: string, side: EdgeSide) => {

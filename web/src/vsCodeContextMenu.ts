@@ -149,7 +149,7 @@ export function attachVSCodeContextMenu(editor: MonacoNS.editor.IStandaloneCodeE
         shortcut: "⌘X",
         enabled: hasSelection,
         onClick: () => {
-          copySelection();
+          void copySelection();
           if (selection) {
             editor.executeEdits("vscode-context-menu-cut", [{ range: selection, text: "", forceMoveMarkers: true }]);
           }
@@ -161,7 +161,7 @@ export function attachVSCodeContextMenu(editor: MonacoNS.editor.IStandaloneCodeE
         shortcut: "⌘C",
         enabled: hasSelection,
         onClick: () => {
-          copySelection();
+          void copySelection();
           editor.focus();
         },
       },

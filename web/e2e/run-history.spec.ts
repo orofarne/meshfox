@@ -86,7 +86,7 @@ test("a tty block shows its last run's status and a history entry, with no store
   await expect(shell.locator(".mesh-node-failed-badge")).toHaveCount(0);
 
   await shell.getByRole("button", { name: "run shell" }).click();
-  await expect(page.locator(".mesh-tty-panel")).toContainText("exited (3)");
+  await expect(page.locator(".mesh-tty-panel")).toContainText("Failed · exit 3");
   await page.locator(".mesh-tty-head-actions button", { hasText: "✕" }).click();
   await expect(shell.locator(".mesh-node-failed-badge")).toBeVisible();
   // The outcome is also written under the block (a terminal session has no
@@ -119,7 +119,7 @@ test("a tty run made in another tab shows up here without a reload", async ({ pa
   await other.waitForSelector(".mesh-node");
   await clickFitViewAndWait(other);
   await node(other, "watched").getByRole("button", { name: "run watched" }).click();
-  await expect(other.locator(".mesh-tty-panel")).toContainText("exited (4)");
+  await expect(other.locator(".mesh-tty-panel")).toContainText("Failed · exit 4");
 
   await expect(node(page, "watched").locator(".mesh-node-failed-badge")).toBeVisible();
   await other.close();

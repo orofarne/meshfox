@@ -23,7 +23,7 @@ export function useMonacoReady(): boolean {
   const [ready, setReady] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    ensureMonacoConfigured().then(() => {
+    void ensureMonacoConfigured().then(() => {
       if (!cancelled) setReady(true);
     });
     return () => {
@@ -250,7 +250,10 @@ export function NodeTextEditor({
 
   const save = async (close: boolean) => {
     if (savingRef.current || conflictRef.current || !titleRef.current.trim()) return;
-    if (!dirtyNow()) { if (close) onClose(); return; }
+    if (!dirtyNow()) {
+      if (close) onClose();
+      return;
+    }
     const sent = { text: textRef.current, title: titleRef.current };
     savingRef.current = true;
     setSaving(true);

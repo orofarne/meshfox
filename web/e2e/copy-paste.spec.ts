@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { selectNode, toolbarButton } from "./helpers";
+import { expectNever, selectNode, toolbarButton } from "./helpers";
 
 // Drives web/e2e/fixtures/copy-paste.canvas.md (TODO.canvas.md: "VSCode:
 // вставка текста (Cmd+V и контекстное меню) в редактор ноды не работает") —
@@ -134,7 +134,7 @@ test("Monaco's own broken 'Paste' menu item never appears, on any browser", asyn
   const body = bodyEditor(page);
   await expect(body).toBeVisible();
   await body.locator(".view-lines").click({ button: "right" });
-  await page.waitForTimeout(200);
+  await expectNever(300, async () => (await page.getByRole("menuitem", { name: "Paste" }).count()) > 0, "a Paste menu item appeared");
   await expect(page.getByRole("menuitem", { name: "Paste" })).toHaveCount(0);
   await page.keyboard.press("Escape");
 });

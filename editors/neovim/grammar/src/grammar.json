@@ -84,7 +84,7 @@
     },
     "tag": {
       "type": "PATTERN",
-      "value": "meshfox:[A-Za-z0-9_]+(-[A-Za-z0-9_]+)*"
+      "value": "meshfox:\\w+(-\\w+)*"
     },
     "field_line": {
       "type": "SEQ",
@@ -142,7 +142,7 @@
     },
     "key": {
       "type": "PATTERN",
-      "value": "([^\\s=\"\\-]|-[^\\s=\"\\-]|--+[^\\s=\">\\-])+"
+      "value": "([^\\s=\"-]|-[^\\s=\"-]|--+[^\\s=\">-])+"
     },
     "value": {
       "type": "CHOICE",
@@ -172,7 +172,7 @@
     },
     "bare_value": {
       "type": "PATTERN",
-      "value": "([^\\s\"'\\-]|-[^\\s\\-])([^\\s\\-]|-[^\\s\\-]|--+[^\\s>\\-])*"
+      "value": "([^\\s\"'-]|-[^\\s-])([^\\s-]|-[^\\s-]|--+[^\\s>-])*"
     },
     "text": {
       "type": "CHOICE",

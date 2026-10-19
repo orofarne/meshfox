@@ -37,7 +37,7 @@ const fontBase64 = fs.readFileSync(fontPath).toString("base64");
 // share Fira Code's column width. Either one throws every character after
 // it out of alignment with the rows above/below. A fixed-width cell per
 // character can't drift regardless of which font/glyph lands inside it.
-const escapeHtml = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escapeHtml = (s) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 const rows = mascot
   .split("\n")
   .map((line) => {
