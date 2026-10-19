@@ -50,6 +50,8 @@ pub enum DepsError {
     ExpansionLimit(&'static str),
     #[error("service configuration: {0}")]
     ServiceConfig(String),
+    #[error("canvas call: {0}")]
+    CanvasCall(String),
     #[error("block arguments: {0}")]
     Arguments(String),
     #[error("artifact dependency: {0}")]
@@ -696,6 +698,18 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     node.id.clone(),
                     name.clone(),
                 ));
+            }
+            if block.lang == "meshfox" {
+                crate::canvas_call::CanvasCall::parse(&block.code)
+                    .map_err(DepsError::CanvasCall)?;
+                if block.interpreter.is_some()
+                    || block.tty
+                    || block.service
+                    || block.tangle()
+                    || !block.env.is_empty()
+                {
+                    return Err(DepsError::CanvasCall("meshfox blocks use their native executor; interpreter, tty, service, tangle and env are not allowed; use YAML set for child variables".into()));
+                }
             }
             if block.interpreter.as_deref() == Some("@service") {
                 crate::service::ServiceConfig::parse(&block.code)

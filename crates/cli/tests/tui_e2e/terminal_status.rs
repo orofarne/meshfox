@@ -92,3 +92,22 @@ fn terminal_status_clears_on_external_shutdown_signal() {
     assert!(session.wait_for_exit(Duration::from_secs(5)));
     session.wait_for_raw("status=;indicator=;status-color=", Duration::from_secs(2));
 }
+
+#[test]
+#[ignore = "pty-based e2e"]
+fn native_canvas_call_collects_child_input_and_reports_child_step() {
+    let (mut session, canvas) =
+        fixture("```meshfox name=build\ncanvas: child.md\nrun: work\n```\n");
+    let child = canvas.parent().unwrap().join("child.md");
+    std::fs::write(child, "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:var name=\"TOKEN\" type=\"string\" -->\n```bash name=work env=\"$TOKEN\"\nprintf '%s\\n' \"$TOKEN\"; sleep 0.5\n```\n").unwrap();
+    session.send_keys("r");
+    session.wait_for_raw("status=waiting: build;", Duration::from_secs(10));
+    session.send_keys("from-parent\r");
+    session.wait_for_raw(
+        "status=running: build → child.md: work;",
+        Duration::from_secs(10),
+    );
+    session.wait_for_raw("status=done: build;", Duration::from_secs(10));
+    session.send_keys("q");
+    assert!(session.wait_for_exit(Duration::from_secs(5)));
+}

@@ -3248,9 +3248,14 @@ async fn drain_worker_run_events(
                             // to hide.
                             run_output::banner(&format!("{block} (already run this session, skipped)"), "\n");
                         }
-                        worker_client::RunEvent::Output { stream, text, .. } => match stream {
-                            meshfox_server::stream_exec::OutputStream::Stdout => println!("{text}"),
-                            meshfox_server::stream_exec::OutputStream::Stderr => eprintln!("{text}"),
+                        worker_client::RunEvent::Output { stream, text, child, .. } => {
+                            if let Some(label) = child.as_ref().and_then(worker_client::child_step_label) {
+                                terminal_status::running(&format!("{name} → {label}"));
+                            }
+                            match stream {
+                                meshfox_server::stream_exec::OutputStream::Stdout => println!("{text}"),
+                                meshfox_server::stream_exec::OutputStream::Stderr => eprintln!("{text}"),
+                            }
                         },
                         worker_client::RunEvent::ServiceStarted { node_id, block, pid } => {
                             run_output::banner(&format!("{block} (service started, pid {pid})"), "\n");

@@ -35,6 +35,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tower_http::cors::CorsLayer;
 
+mod canvas_call;
 /// Sequenced broadcast log backing `/api/watch` — see its own module doc
 /// comment.
 mod canvas_events;
@@ -2751,7 +2752,7 @@ fn acquire_chain_locks(
     Ok(acquired)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequest {
     #[serde(default)]
@@ -2815,20 +2816,20 @@ struct RunRequest {
 /// not because it's resolved, but so the form the UI opens for it can
 /// still offer that default as a pre-filled suggestion instead of a blank
 /// field (see `meshfox_core::vars::resolve`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VarStatus {
     name: String,
     #[serde(rename = "type")]
-    var_type: &'static str,
+    var_type: String,
     prompt: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     choices: Vec<String>,
     /// `"open"`/`"save"` for a `type="file"` variable, absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
-    mode: Option<&'static str>,
+    mode: Option<String>,
     /// A `type="file"` variable's `ext=` filter hint (picker only).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ext: Vec<String>,
     secret: bool,
     resolved: bool,
@@ -2848,7 +2849,7 @@ struct VarStatus {
     /// (`"plaintext"` or `"keychain"`, from the `secret_store` setting) —
     /// the UI just labels its checkbox with it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    secret_store: Option<&'static str>,
+    secret_store: Option<String>,
     /// Why the secret store couldn't be read for this field (locked
     /// keychain, access denied, ...) — the field is asked for again, and
     /// the UI says why instead of leaving it a mystery.
@@ -2879,7 +2880,7 @@ fn secret_error_suffix(resolved: &meshfox_core::ResolvedVars) -> String {
 
 /// The web-facing shape of `meshfox_core::SharedOrigin` — see
 /// `VarStatus::inherited_from`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "camelCase")]
 enum VarOrigin {
     Project,
@@ -2935,6 +2936,87 @@ struct ArgumentsResponse {
 
 /// Argument answers never enter the document's variable cache.
 async fn prepare_arguments(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ArgumentsRequest>,
+) -> Result<Json<ArgumentsResponse>, ApiError> {
+    let no_deps = request.no_deps;
+    let mut response = prepare_arguments_local(State(Arc::clone(&state)), Json(request))
+        .await?
+        .0;
+    if let Some(block) = &response.prepared.block {
+        let raw = state.raw.lock().unwrap().clone();
+        let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+        let path: Vec<_> = response.path.iter().map(String::as_str).collect();
+        let chain = prepare_run_plan(
+            &state,
+            &mut canvas,
+            &path,
+            block,
+            !no_deps,
+            &effective_overrides(&state, &HashMap::new()),
+        )?
+        .chain;
+        let calls = canvas_call::plan(
+            &state,
+            &canvas,
+            &chain,
+            &HashMap::new(),
+            &canvas_call::ancestry(),
+        )
+        .await?;
+        for call in calls.values() {
+            response
+                .confirmation
+                .extend(call.prepared.confirmation.clone());
+        }
+    }
+    Ok(Json(response))
+}
+
+async fn get_vars(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<VarsQuery>,
+) -> Result<Json<Vec<VarStatus>>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let path: Vec<_> = query.path.split(',').filter(|p| !p.is_empty()).collect();
+    let chain = prepare_run_plan(
+        &state,
+        &mut canvas,
+        &path,
+        &query.block,
+        !query.no_deps,
+        &effective_overrides(&state, &HashMap::new()),
+    )?
+    .chain;
+    let calls = canvas_call::plan(
+        &state,
+        &canvas,
+        &chain,
+        &HashMap::new(),
+        &canvas_call::ancestry(),
+    )
+    .await?;
+    let mut fields = get_vars_local(State(state), Query(query), &HashMap::new())
+        .await?
+        .0;
+    for (addr, call) in calls {
+        for mut field in call.prepared.fields {
+            field["name"] = serde_json::json!(format!(
+                "{}{}",
+                canvas_call::prefix(&addr),
+                field["name"].as_str().unwrap_or_default()
+            ));
+            fields.push(
+                serde_json::from_value(field)
+                    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            );
+        }
+    }
+    Ok(Json(fields))
+}
+
+async fn prepare_arguments_local(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ArgumentsRequest>,
 ) -> Result<Json<ArgumentsResponse>, ApiError> {
@@ -3099,9 +3181,10 @@ async fn argument_choice_sources(
 /// need to ask" check) — see SPEC.md's "Variables". A block (and its
 /// `deps=` chain) that declares no `env=` at all yields an empty list, so
 /// the UI never prompts for anything it doesn't need.
-async fn get_vars(
+async fn get_vars_local(
     State(state): State<Arc<AppState>>,
     Query(query): Query<VarsQuery>,
+    submitted: &HashMap<String, String>,
 ) -> Result<Json<Vec<VarStatus>>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
@@ -3113,7 +3196,7 @@ async fn get_vars(
     } else {
         query.path.split(',').collect()
     };
-    let mut overrides = effective_overrides(&state, &HashMap::new());
+    let mut overrides = effective_overrides(&state, submitted);
     let plan = prepare_run_plan(
         &state,
         &mut canvas,
@@ -3330,16 +3413,16 @@ fn var_status(
     let secret_error = resolved.secret_errors.get(&d.name).cloned();
     VarStatus {
         name: d.name,
-        var_type: d.var_type.as_str(),
+        var_type: d.var_type.as_str().into(),
         prompt: d.prompt,
         choices: d.choices,
-        mode: d.file_mode.map(|m| m.as_str()),
+        mode: d.file_mode.map(|m| m.as_str().into()),
         ext: d.ext,
         secret: d.secret,
         resolved: is_resolved,
         value: if d.secret { None } else { value },
         inherited_from,
-        secret_store: d.secret.then(|| store.as_str()),
+        secret_store: d.secret.then(|| store.as_str().into()),
         secret_error,
         stored: None,
     }
@@ -3630,6 +3713,8 @@ enum RunEvent {
         block: String,
         stream: stream_exec::OutputStream,
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        child: Option<serde_json::Value>,
     },
     /// `/api/run/tty`'s WebSocket only: emitted right after `StepStart` for
     /// a `tty` step, instead of any `Output`. From here until the matching
@@ -4535,23 +4620,35 @@ async fn get_canvas_raw(
     State(state): State<Arc<AppState>>,
     Query(query): Query<SourceFileQuery>,
 ) -> Result<Response, ApiError> {
-    let text = match resolve_source_file(&state, query.include.as_deref())? {
-        SourceFile::Primary => state.raw.lock().unwrap().clone(),
-        SourceFile::Include { path, .. } => std::fs::read_to_string(&path).map_err(|e| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to read {}: {e}", path.display()),
-            )
-        })?,
+    let (text, read_only) = match resolve_source_file(&state, query.include.as_deref())? {
+        SourceFile::Primary => (state.raw.lock().unwrap().clone(), false),
+        SourceFile::Include { path } => {
+            let text = std::fs::read_to_string(&path).map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to read {}: {e}", path.display()),
+                )
+            })?;
+            let read_only = mdcanvas::is_canvas_path(&path) || mdcanvas::has_marker(&text);
+            (text, read_only)
+        }
     };
-    Ok((StatusCode::OK, [(header::ETAG, etag_for(&text))], text).into_response())
+    Ok((
+        StatusCode::OK,
+        [
+            ("etag", etag_for(&text)),
+            ("x-meshfox-read-only", read_only.to_string()),
+        ],
+        text,
+    )
+        .into_response())
 }
 
 /// Overwrites the whole document (or, with `?include=<nodeId>`, an include
 /// target's own file — see `get_canvas_raw`) with `body` — the Source-mode
 /// editor's Save button. Primary canvases receive the usual save-time output
-/// cleanup. A canvas-valued include goes to that file's own worker; a plain
-/// Markdown include is written verbatim. Invalid canvas text is rejected
+/// cleanup. Canvas-valued includes are read-only; plain Markdown includes
+/// are written verbatim. Invalid canvas text is rejected
 /// before saving, as with the other canvas mutation endpoints.
 ///
 /// **`If-Match` is required** and must be the `ETag` the file was read with:
@@ -4568,9 +4665,7 @@ async fn put_canvas_raw(
 ) -> Result<Response, ApiError> {
     let base_rev = if_match_rev(&headers)?;
     // Only the primary file is this process's own to serialise; an include
-    // target is written verbatim or handed to that file's own worker, and
-    // holding this lock across that HTTP round trip would stall every
-    // other mutation of this canvas for no benefit.
+    // target is written verbatim and has no canvas mutation history here.
     let _guard = if query.include.is_none() {
         Some(state.begin_mutation().await)
     } else {
@@ -4636,36 +4731,10 @@ async fn put_canvas_raw(
                 || mdcanvas::has_marker(&body)
                 || std::fs::read_to_string(&path).is_ok_and(|raw| mdcanvas::has_marker(&raw));
             if is_canvas {
-                let port = worker_port_for_include(&path).await.map_err(|e| {
-                    ApiError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("include worker: {e}"),
-                    )
-                })?;
-                // The CLI installs this at process startup, but library
-                // embedders and direct handler tests may not have done so.
-                // Keep an existing provider if the host chose one already.
-                let _ = rustls::crypto::ring::default_provider().install_default();
-                // That worker owns the file, so it does the check: the
-                // client's `If-Match` goes through as it came.
-                let response = reqwest::Client::new()
-                    .put(format!("http://127.0.0.1:{port}/api/canvas/raw"))
-                    .header(header::IF_MATCH.as_str(), format!("\"{base_rev}\""))
-                    .body(body)
-                    .send()
-                    .await
-                    .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let text = response.text().await.unwrap_or_default();
-                    return Err(ApiError(status, text));
-                }
-                response
-                    .headers()
-                    .get(header::ETAG.as_str())
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.trim_matches('"').to_string())
-                    .unwrap_or_default()
+                return Err(ApiError(
+                    StatusCode::FORBIDDEN,
+                    "included canvases are read-only; open the canvas separately to edit it".into(),
+                ));
             } else {
                 let current = std::fs::read_to_string(&path)
                     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4684,34 +4753,6 @@ async fn put_canvas_raw(
         [(header::ETAG, format!("\"{saved_rev}\""))],
     )
         .into_response())
-}
-
-async fn worker_port_for_include(path: &std::path::Path) -> io::Result<u16> {
-    let canonical = path.canonicalize()?;
-    let root = canonical
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    if let Some(socket) = meshfox_core::config::server_socket(root) {
-        return watcher_protocol::request_port(&socket, &canonical).await;
-    }
-    match worker_lock::try_acquire(&canonical)? {
-        worker_lock::Acquired::Other { port } => Ok(port),
-        worker_lock::Acquired::Us(guard) => {
-            let (ready_tx, ready_rx) = oneshot::channel();
-            tokio::spawn(serve_as_worker(
-                canonical,
-                0,
-                false,
-                None,
-                true,
-                guard,
-                Some(ready_tx),
-            ));
-            ready_rx
-                .await
-                .map_err(|_| io::Error::other("failed to start include worker"))
-        }
-    }
 }
 
 /// One entry of `PutCanvasRequest::layout_hints` — a node's current
@@ -6387,6 +6428,7 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
                                 block: id.clone(),
                                 stream,
                                 text,
+                                child: None,
                             }));
                         }
                         None => {
@@ -7277,6 +7319,9 @@ async fn run_block_impl_sized(
         &overrides,
     )?;
     let chain = plan.chain;
+    let native_calls =
+        canvas_call::plan(&state, &canvas, &chain, &req.vars, &canvas_call::ancestry()).await?;
+    canvas_call::admit(&native_calls, req.confirm)?;
     require_run_confirmation(&canvas, &chain, req.confirm)?;
     let persist = req.persist;
 
@@ -7598,7 +7643,7 @@ async fn run_block_impl_sized(
             let is_requested_target = Some(addr) == chain.last();
             let runtime_values = service_values(&state, &resolved_vars);
             let live_fingerprint = step_fingerprint(Some(&canvas), &decls, addr, &block, &runtime_values);
-            if (!is_requested_target || req.skip_fresh) && !block.always && !forced_reruns.contains(addr) {
+            if block.lang != "meshfox" && (!is_requested_target || req.skip_fresh) && !block.always && !forced_reruns.contains(addr) {
                 let already_fresh = state
                     .session_runs
                     .lock()
@@ -7865,6 +7910,22 @@ async fn run_block_impl_sized(
                 };
                 tty_exit_code
             } else {
+            let run_handle = if resolved_block.lang == "meshfox" {
+                let Some(call) = native_calls.get(addr) else {
+                    final_exit_code = 1;
+                    yield Ok(ndjson_line(&RunEvent::Error { message: "canvas call changed after preparation; retry the run".into() }));
+                    break;
+                };
+                let handle = if is_requested_target {
+                    target_reservation.clone().unwrap_or_else(|| run_registry::reserve(addr.node_id.clone(), addr.block_name.clone()))
+                } else { run_registry::reserve(addr.node_id.clone(), addr.block_name.clone()) };
+                let row = held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone()))
+                    .map(|id| (state.run_ledger.clone(), id));
+                if let Some((_, id)) = &row { stamp_run_fingerprint(&state, addr, *id); }
+                canvas_call::attach(&handle, call.clone(), req.confirm, req.persist, &req.save_secrets, row);
+                if is_requested_target { _reservation_guard.0 = None; }
+                handle
+            } else {
             let proc = match stream_exec::spawn_block(
                 &resolved_block,
                 &block_env,
@@ -7935,15 +7996,30 @@ async fn run_block_impl_sized(
                     lock_path_for_run,
                 ),
             };
+            run_handle
+            };
             state.runs_registry.lock().unwrap().insert(
                 (addr.node_id.clone(), addr.block_name.clone()),
                 Arc::clone(&run_handle),
             );
-            let (_backlog, mut run_rx) = run_handle.subscribe_from(0);
+            let (backlog, mut run_rx) = run_handle.subscribe_from(0);
+            let mut backlog = std::collections::VecDeque::from(backlog);
             let mut kill_requested = false;
             let exit_code = loop {
                 tokio::select! {
-                    event = run_rx.recv() => {
+                    event = async {
+                        if let Some(line) = backlog.pop_front() {
+                            return Ok(run_registry::RunEvent::Line(line));
+                        }
+                        // A very short native task can finish before this
+                        // subscriber exists. Drain retained/queued output first,
+                        // then synthesize the terminal event if it was missed.
+                        let outcome = run_handle.outcome();
+                        if outcome != run_registry::RunOutcome::Running && run_rx.is_empty() {
+                            return Ok(run_registry::RunEvent::Done(outcome));
+                        }
+                        run_rx.recv().await
+                    } => {
                         match event {
                             Ok(run_registry::RunEvent::Line(line)) => {
                                 full_output.push_str(&line.text);
@@ -7963,6 +8039,7 @@ async fn run_block_impl_sized(
                                     block: addr.block_name.clone(),
                                     stream: line.stream,
                                     text: line.text,
+                                    child: line.child,
                                 }));
                             }
                             Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Exited { exit_code })) => {
@@ -10742,6 +10819,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/api/link-preview", get(get_link_preview))
         .route("/api/run", get(run_block))
+        .route("/api/canvas-call/prepare", post(canvas_call::prepare))
+        .route("/api/canvas-call/run", post(canvas_call::run))
         .route("/api/run/force", get(force_run))
         .route("/api/form/fields", get(get_form_fields))
         .route("/api/form/submit", post(submit_form))
@@ -14762,14 +14841,7 @@ mod include_edit_tests {
     }
 
     #[tokio::test]
-    async fn source_mode_reads_and_writes_an_included_files_own_raw_text() {
-        // Writing a canvas-valued include goes through that file's own
-        // worker (`worker_port_for_include`), which honours a
-        // `server_socket` set in the developer's own `~/.meshfox/
-        // config.toml` — pointing this test at their real daemon instead of
-        // a worker of its own, and failing with a broken pipe whenever that
-        // daemon is running. An empty value switches the setting off.
-        std::env::set_var("MESHFOX_SERVER_SOCKET", "");
+    async fn source_mode_reads_but_cannot_write_an_included_canvas() {
         let base_path = write_base_and_child_canvas();
         let child_path = base_path.parent().unwrap().join("child.canvas.md");
         let base_before = std::fs::read_to_string(&base_path).unwrap();
@@ -14793,7 +14865,7 @@ mod include_edit_tests {
 
         let new_source =
             format!("{source}\n## Extra\n<!-- meshfox:node id=\"extra\" -->\n\nmore\n");
-        let status = put_canvas_raw(
+        let err = put_canvas_raw(
             State(state),
             Query(SourceFileQuery {
                 include: Some("child".to_string()),
@@ -14803,15 +14875,58 @@ mod include_edit_tests {
             new_source.clone(),
         )
         .await
-        .unwrap_or_else(|e| panic!("put failed: {}", e.1))
-        .status();
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        .err()
+        .expect("included canvas must be read-only");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
 
-        assert_eq!(std::fs::read_to_string(&child_path).unwrap(), new_source);
+        assert_eq!(std::fs::read_to_string(&child_path).unwrap(), source);
         // The primary document was never touched by any of this.
         assert_eq!(std::fs::read_to_string(&base_path).unwrap(), base_before);
 
         let _ = std::fs::remove_dir_all(base_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn source_mode_protects_marker_canvases_and_plain_markdown_conversion() {
+        for existing_canvas in [true, false] {
+            let base_path = write_base_and_child_canvas();
+            let dir = base_path.parent().unwrap();
+            let child_path = dir.join("child.md");
+            let source = if existing_canvas {
+                std::fs::read_to_string(dir.join("child.canvas.md")).unwrap()
+            } else {
+                "ordinary prose\n".to_string()
+            };
+            std::fs::write(&child_path, &source).unwrap();
+            let base = std::fs::read_to_string(&base_path)
+                .unwrap()
+                .replace("child.canvas.md", "child.md");
+            std::fs::write(&base_path, base).unwrap();
+            let state = build_state(base_path.clone(), false, None).await.unwrap();
+            let query = || {
+                Query(SourceFileQuery {
+                    include: Some("child".into()),
+                    merge: None,
+                })
+            };
+            let response = get_canvas_raw(State(state.clone()), query()).await.unwrap();
+            assert_eq!(
+                response.headers()["x-meshfox-read-only"],
+                existing_canvas.to_string()
+            );
+            let err = put_canvas_raw(
+                State(state),
+                query(),
+                if_match_for(&source),
+                "<!-- meshfox:canvas -->\n# Changed\n".into(),
+            )
+            .await
+            .err()
+            .expect("cannot edit or create a canvas via include");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(std::fs::read_to_string(&child_path).unwrap(), source);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]

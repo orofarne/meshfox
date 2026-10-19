@@ -976,6 +976,18 @@ so the example works before you pick a video of your own.
 
 [examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md)
 
+### Calling an application in another canvas
+<!-- meshfox:node id="calling-an-application-in-another-canvas" -->
+
+A native `meshfox` fence describes a child invocation as YAML: `canvas`, `run`, and optional `set`, `fresh`, `no-deps`, or `skip-fresh` fields. The caller prepares child input and confirmation before its own chain starts, streams the child's steps and output, and forwards cancellation to that specific child run. The child keeps its own worker, working directory, locks and history.
+
+[examples/canvas-call.canvas.md](./examples/canvas-call.canvas.md) contains a runnable parent, an embedded execution diagram, input, cancellation and failure examples. Its separate [child canvas](./examples/canvas-call-data/child.canvas.md) shows the other side of the call.
+
+#### Example
+<!-- meshfox:node id="example-12" type="file" -->
+
+[examples/canvas-call.canvas.md](./examples/canvas-call.canvas.md)
+
 ## Architecture
 <!-- meshfox:node id="architecture" -->
 

@@ -43,7 +43,7 @@ fn a_finished_markdown_block_renders_its_output_inline_under_the_block() {
     );
 }
 
-/// Mirrors scripts/screencast/README.md: an optional output_dir argument,
+/// Mirrors scripts/screencast/README.canvas.md: an optional output_dir argument,
 /// accepted unchanged in the run form, followed by streamed plain output.
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]

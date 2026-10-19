@@ -624,6 +624,7 @@ pub struct App {
     /// to splice a block's own live output right under it, the TUI
     /// equivalent of the web UI's `LiveRunOutput`.
     pub step_output: HashMap<BlockAddr, StepOutput>,
+    pub child_steps: HashMap<BlockAddr, String>,
     /// Latest invocation displayed beneath each source definition.
     displayed_invocations: HashMap<BlockAddr, BlockAddr>,
     /// Addresses currently running as part of a run this TUI session
@@ -1210,6 +1211,7 @@ impl App {
             run: None,
             file_run: None,
             step_output: HashMap::new(),
+            child_steps: HashMap::new(),
             displayed_invocations: HashMap::new(),
             external_running: HashMap::new(),
             console_collapsed: true,
@@ -3476,12 +3478,16 @@ impl App {
     /// (and `raw`/`canvas`, if the primary document was what got saved)
     /// afterward, same as any other on-disk change here, so the tree/
     /// document panes reflect the edit the moment the editor closes.
-    /// Canvas files, including canvas-valued include targets, save through
-    /// their own worker. Plain Markdown include targets remain file writes.
+    /// Canvas-valued include targets are read-only. Plain Markdown includes
+    /// save through the parent worker.
     async fn save_source_editor(&mut self) {
         let Some(se) = &self.source_editor else {
             return;
         };
+        if se.read_only {
+            self.status = "included canvas is read-only; open it separately to edit".into();
+            return;
+        }
         let mut text = se.editor.lines.to_string();
         let is_canvas = se.is_canvas
             || meshfox_core::mdcanvas::is_canvas_path(&se.path)
@@ -4687,6 +4693,7 @@ impl App {
             RunEvent::Started { .. } => {}
             RunEvent::StepStart { node_id, block } => {
                 let addr = BlockAddr::new(node_id, block);
+                self.child_steps.remove(&addr);
                 // The passive watch stream can deliver a line before this
                 // stream announces the step. Transfer ownership of its badge
                 // along with its output to the foreground run.
@@ -4745,7 +4752,15 @@ impl App {
                 block,
                 stream,
                 text,
+                child,
             } => {
+                if let Some(label) = child
+                    .as_ref()
+                    .and_then(crate::worker_client::child_step_label)
+                {
+                    self.child_steps
+                        .insert(BlockAddr::new(&node_id, &block), label);
+                }
                 run.lines.push(text.clone());
                 run.full_output.push_str(&text);
                 run.full_output.push('\n');
@@ -7660,6 +7675,7 @@ mod tests {
             block: second.block_name.clone(),
             stream: meshfox_server::stream_exec::OutputStream::Stdout,
             text: "second recording".into(),
+            child: None,
         }))
         .await;
         let text = document_text(&app);
@@ -7728,6 +7744,7 @@ mod tests {
                 block: "build".into(),
                 stream,
                 text: text.into(),
+                child: None,
             }))
             .await;
         }

@@ -11,6 +11,7 @@ pub mod attrs;
 pub mod body_rev;
 pub mod builtin_interpreter;
 pub mod canvas;
+pub mod canvas_call;
 pub mod comment;
 pub mod config;
 pub mod constraint;

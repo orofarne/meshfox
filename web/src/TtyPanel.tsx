@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { ImageAddon } from "@xterm/addon-image";
 import "@xterm/xterm/css/xterm.css";
 import { usePrefersDark } from "./NodeTextEditor";
 import { killRun, watchSilence } from "./api";
@@ -170,6 +171,7 @@ export function TtyPanel({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(container);
+    term.loadAddon(new ImageAddon());
     fit.fit();
     // Without this, xterm.js leaves its own hidden input textarea
     // unfocused until the user clicks into the terminal once — so the very

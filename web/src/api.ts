@@ -236,11 +236,11 @@ export async function fetchIncludes(): Promise<IncludeManifestEntry[]> {
  * `ETag`), which a later `saveCanvasSource` must name. Pass an
  * `IncludeManifestEntry`'s `nodeId` (from `fetchIncludes`) to read that
  * include's own target file instead. */
-export async function fetchCanvasSource(includeNodeId?: string): Promise<{ text: string; rev: string }> {
+export async function fetchCanvasSource(includeNodeId?: string): Promise<{ text: string; rev: string; readOnly: boolean }> {
   const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
   const res = await fetch(url);
   if (!res.ok) throw new Error(`GET /api/canvas/raw: ${res.status}`);
-  return { text: await res.text(), rev: res.headers.get("ETag") ?? "" };
+  return { text: await res.text(), rev: res.headers.get("ETag") ?? "", readOnly: res.headers.get("x-meshfox-read-only") === "true" };
 }
 
 /**
@@ -858,7 +858,7 @@ export type RunEvent =
    * this field existed; `App.tsx`'s `"output"` handling uses it only to
    * *additionally* accumulate `stdoutText`/`stderrText` on `LiveBlockState`
    * (`MeshNode.tsx`), for `output="markdown"` mode's live view. */
-  | { type: "output"; nodeId: string; block: string; stream: "stdout" | "stderr"; text: string }
+  | { type: "output"; nodeId: string; block: string; stream: "stdout" | "stderr"; text: string; child?: { canvas: string; port: number; event: unknown } }
   | { type: "step-end"; nodeId: string; block: string; exitCode: number; durationMs: number }
   | { type: "killed"; nodeId: string; block: string }
   | { type: "error"; message: string }

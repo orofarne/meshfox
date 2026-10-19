@@ -121,9 +121,14 @@ impl Snapshot {
                 .unwrap_or("preparing");
             if run.is_running() {
                 if let Some(addr) = run.current_addr() {
+                    let label = app
+                        .child_steps
+                        .get(addr)
+                        .map(|child| format!("{name} → {child}"))
+                        .unwrap_or_else(|| name.into());
                     snapshot
                         .active
-                        .insert(key(&addr.node_id, &addr.block_name), name.into());
+                        .insert(key(&addr.node_id, &addr.block_name), label);
                 } else {
                     snapshot.active.insert("foreground".into(), name.into());
                 }

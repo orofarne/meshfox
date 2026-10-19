@@ -83,6 +83,7 @@ pub struct SourceEditorState {
     /// structure to hold it to — see `meshfox_core::include`'s own module
     /// docs).
     pub is_canvas: bool,
+    pub read_only: bool,
     pub editor: EditorState,
     events: EditorEventHandler,
     /// Last-saved (or last-loaded) snapshot — the dirty check, and the
@@ -193,7 +194,11 @@ impl SourceEditorState {
         let mut editor = EditorState::new(Lines::from(raw.as_str()));
         editor.cursor = cursor;
         prime_viewport(&mut editor);
+        let read_only = path != primary_path
+            && (meshfox_core::mdcanvas::is_canvas_path(&path)
+                || meshfox_core::mdcanvas::has_marker(&raw));
         Ok(SourceEditorState {
+            read_only,
             primary_path,
             primary_raw,
             path,
@@ -310,6 +315,29 @@ impl SourceEditorState {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> SourceEditorOutcome {
+        if self.read_only && !self.file_picker_open {
+            if key.code == KeyCode::Esc {
+                return SourceEditorOutcome::Close;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+                self.file_picker_open = true;
+                self.file_picker_selected = self.current_file_index().map(|i| i + 1).unwrap_or(0);
+            } else if matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::Char('h' | 'j' | 'k' | 'l' | 'w' | 'b' | '0' | '$' | 'G')
+            ) {
+                self.events.on_key_event(key, &mut self.editor);
+            }
+            return SourceEditorOutcome::Stay;
+        }
         if self.diff.is_some() {
             return self.on_diff_key(key);
         }
@@ -480,6 +508,9 @@ impl SourceEditorState {
     /// Loads `raw` (`path`'s text) into the editor.
     pub fn finish_switch(&mut self, path: PathBuf, is_canvas: bool, raw: String) {
         self.editor = EditorState::new(Lines::from(raw.as_str()));
+        self.read_only = path != self.primary_path
+            && (meshfox_core::mdcanvas::is_canvas_path(&path)
+                || meshfox_core::mdcanvas::has_marker(&raw));
         self.original = raw;
         self.conflict_rev = None;
         self.path = path;
@@ -1033,6 +1064,34 @@ mod tests {
             raw.to_string(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn included_canvas_blocks_edit_keys_and_save_but_keeps_file_switching() {
+        let mut editor = open_editor("# Primary\n");
+        for (name, raw) in [
+            ("child.canvas.md", "# Child\n"),
+            ("child.md", "<!-- meshfox:canvas -->\n# Child\n"),
+        ] {
+            editor.finish_switch(PathBuf::from(name), false, raw.into());
+            assert!(editor.read_only);
+            for key in [
+                KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            ] {
+                assert!(matches!(editor.on_key(key), SourceEditorOutcome::Stay));
+                assert_eq!(editor.editor.lines.to_string(), raw);
+            }
+            editor.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            assert!(editor.file_picker_open);
+            editor.file_picker_open = false;
+        }
+        editor.finish_switch(PathBuf::from("notes.md"), false, "plain prose".into());
+        assert!(!editor.read_only);
+        editor.finish_switch(editor.primary_path.clone(), true, "# Primary\n".into());
+        assert!(!editor.read_only);
     }
 
     #[test]

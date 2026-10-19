@@ -153,6 +153,7 @@ Direct `dependencies` from `web/package.json` — these ship inside the built br
 | @monaco-editor/react | MIT |
 | @shikijs/monaco | MIT |
 | @xterm/addon-fit | MIT |
+| @xterm/addon-image | MIT |
 | @xterm/xterm | MIT |
 | @xyflow/react | MIT |
 | anser | MIT |

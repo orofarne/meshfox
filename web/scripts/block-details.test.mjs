@@ -99,3 +99,12 @@ test('tangle flag follows the core: bare or true enables it, false disables it',
     'root').filter(s => s.type === 'code');
   assert.deepEqual(blocks.map(b => b.tangle), [true, true, false, false]);
 });
+
+test('native meshfox calls have ordinary runnable controls and implicit defaults', () => {
+  const source = '```meshfox\ncanvas: ../README.md\nrun: install-from-source\n```\n';
+  const blocks = parseBody(source, 'build').filter(s => s.type === 'code');
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].lang, 'meshfox');
+  assert.equal(blocks[0].name, 'build');
+  assert.match(blocks[0].code, /canvas: ../);
+});

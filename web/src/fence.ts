@@ -372,7 +372,7 @@ function fenceIndentOk(line: string): boolean {
  * that just errors when clicked, since the server's own
  * `candidate_fences` never considered it a candidate to begin with. */
 function isSupportedLang(lang: string): boolean {
-  return lang === "bash" || lang === "sh" || lang === BUTTON_LANG || lang === FORM_LANG;
+  return lang === "bash" || lang === "sh" || lang === "meshfox" || lang === BUTTON_LANG || lang === FORM_LANG;
 }
 
 /** Mirrors `core::exec::BUTTON_LANG` — the fence "language" for a `button`

@@ -1947,6 +1947,8 @@ pub enum RunEvent {
         block: String,
         stream: OutputStream,
         text: String,
+        #[serde(default)]
+        child: Option<serde_json::Value>,
     },
     TtyStart {
         node_id: String,
@@ -2987,4 +2989,21 @@ mod tests {
             .unwrap();
         assert!(matches!(event, WatchEvent::Changed));
     }
+}
+
+/// Read a native child's current step from its event, never from output text.
+pub fn child_step_label(child: &serde_json::Value) -> Option<String> {
+    let event = &child["event"];
+    if let Some(label) = event.get("child").and_then(child_step_label) {
+        return Some(label);
+    }
+    if event["type"] != "step-start" {
+        return None;
+    }
+    let canvas = std::path::Path::new(child["canvas"].as_str()?);
+    Some(format!(
+        "{}: {}",
+        canvas.file_name()?.to_string_lossy(),
+        event["block"].as_str()?
+    ))
 }

@@ -2853,6 +2853,7 @@ fn render_source_editor(
     f.render_widget(view, chunks[1]);
 
     let footer = match &se.error {
+        _ if se.read_only => Line::from("Read-only canvas include · Ctrl-f switch file · Esc close · open separately to edit"),
         Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(FAIL))),
         None => Line::from(Span::styled(
             "Ctrl-s save · Ctrl-f switch file · Ctrl-n heading→node · Ctrl-p suggest params · Ctrl-g Unicode · \

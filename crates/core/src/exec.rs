@@ -274,7 +274,7 @@ fn uuid_like_suffix() -> String {
 /// sample, a `json` snippet, ...) from being mistaken for "the" runnable
 /// block in a node that has no real meshfox structure of its own.
 pub fn is_supported_lang(lang: &str) -> bool {
-    matches!(lang, "bash" | "sh" | BUTTON_LANG | FORM_LANG)
+    matches!(lang, "bash" | "sh" | "meshfox" | BUTTON_LANG | FORM_LANG)
 }
 
 /// The fence "language" for a `button` shortcut fence (see SPEC.md's

@@ -202,6 +202,7 @@ impl Highlighter {
     }
 
     fn highlight(&self, lang: &str, code: &str) -> Vec<Line<'static>> {
+        let lang = if lang == "meshfox" { "yaml" } else { lang };
         let syntax = self
             .syntax_set
             .find_syntax_by_token(lang)

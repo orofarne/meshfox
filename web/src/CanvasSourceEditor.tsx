@@ -78,13 +78,14 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   } | null>(null);
   const [showTheirs, setShowTheirs] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [readOnly, setReadOnly] = useState(true);
   const [saving, setSaving] = useState(false);
   const dark = usePrefersDark();
   const monacoReady = useMonacoReady();
   const detachRef = useRef<(() => void) | null>(null);
   useEffect(() => () => detachRef.current?.(), []);
   const handleMount: OnMount = (editor, monaco) => {
-    detachRef.current = attachMeshfoxEditorExtensions(editor, monaco);
+    if (!readOnly) detachRef.current = attachMeshfoxEditorExtensions(editor, monaco);
     editor.focus();
   };
 
@@ -96,16 +97,21 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
 
   useEffect(() => {
     setText(null);
+    setReadOnly(true);
     setError(null);
     setConflict(null);
     setShowTheirs(false);
+    let cancelled = false;
     fetchCanvasSource(selected === PRIMARY ? undefined : selected)
-      .then(({ text: t, rev: r }) => {
+      .then(({ text: t, rev: r, readOnly: ro }) => {
+        if (cancelled) return;
+        setReadOnly(ro);
         setText(t);
         setOriginal(t);
         setRev(r);
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => { if (!cancelled) setError(String(e)); });
+    return () => { cancelled = true; };
   }, [selected]);
 
   const dirty = text !== null && text !== original;
@@ -128,7 +134,7 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   };
 
   const handleSave = async (baseRev: string = rev) => {
-    if (text === null) return;
+    if (text === null || readOnly) return;
     setSaving(true);
     setError(null);
     try {
@@ -173,7 +179,7 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
   return (
     <div className="mesh-source-editor nokey">
       <div className="mesh-source-editor-toolbar">
-        <span className="mesh-source-editor-label">Editing raw Markdown source</span>
+        <span className="mesh-source-editor-label">{readOnly ? "Read-only canvas include — open it separately to edit" : "Editing raw Markdown source"}</span>
         {includes.length > 0 && (
           <select
             className="mesh-source-editor-file-select"
@@ -195,7 +201,7 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
           <button type="button" onClick={handleClose} disabled={saving}>
             Cancel
           </button>
-          <button type="button" onClick={() => handleSave()} disabled={saving || text === null || !dirty || !!conflict}>
+          <button type="button" onClick={() => handleSave()} disabled={readOnly || saving || text === null || !dirty || !!conflict}>
             {saving ? "Saving…" : "Save"}
           </button>
         </div>
@@ -239,9 +245,9 @@ export function CanvasSourceEditor({ initialInclude, onSaved, onClose, onDirtyCh
               language="markdown"
               theme={dark ? THEMES.dark : THEMES.light}
               value={text}
-              onChange={(v) => setText(v ?? "")}
+              onChange={(v) => { if (!readOnly) setText(v ?? ""); }}
               onMount={handleMount}
-              options={MONACO_OPTIONS}
+              options={{ ...MONACO_OPTIONS, readOnly }}
             />
           </Suspense>
         )}

@@ -44,6 +44,7 @@ pub struct SeqLine {
     pub seq: u64,
     pub stream: OutputStream,
     pub text: String,
+    pub child: Option<serde_json::Value>,
 }
 
 struct RingBuffer {
@@ -61,10 +62,20 @@ impl RingBuffer {
         }
     }
 
-    fn push(&mut self, stream: OutputStream, text: String) -> SeqLine {
+    fn push(
+        &mut self,
+        stream: OutputStream,
+        text: String,
+        child: Option<serde_json::Value>,
+    ) -> SeqLine {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let line = SeqLine { seq, stream, text };
+        let line = SeqLine {
+            seq,
+            stream,
+            text,
+            child,
+        };
         if self.lines.len() >= self.cap {
             self.lines.pop_front();
         }
@@ -132,6 +143,16 @@ pub struct RunHandle {
 }
 
 impl RunHandle {
+    pub(crate) fn publish_child(
+        &self,
+        stream: OutputStream,
+        text: String,
+        child: serde_json::Value,
+    ) {
+        let line = self.log.lock().unwrap().push(stream, text, Some(child));
+        let _ = self.tx.send(RunEvent::Line(line));
+    }
+
     pub fn run_id(&self) -> Option<i64> {
         *self.run_id.lock().unwrap()
     }
@@ -246,7 +267,7 @@ pub fn attach(
             tokio::select! {
                 line = proc.output_rx.recv() => match line {
                     Some((stream, text)) => {
-                        let seq_line = task_handle.log.lock().unwrap().push(stream, text);
+                        let seq_line = task_handle.log.lock().unwrap().push(stream, text, None);
                         // No subscribers is a normal, common case (nobody's
                         // watching this exact run right now) — not an
                         // error, nothing to do about it either way, since
@@ -443,4 +464,46 @@ mod tests {
         // panic on an already-consumed sender.
         assert!(!handle.kill());
     }
+}
+
+/// A native task has the same durable output, cancellation and ledger lifetime
+/// as a process. Only the driver differs; subscribers use the same handle.
+pub(crate) fn attach_native<F, Fut>(
+    handle: &Arc<RunHandle>,
+    ledger_row: Option<(crate::run_ledger::RunLedger, i64)>,
+    driver: F,
+) where
+    F: FnOnce(Arc<RunHandle>, oneshot::Receiver<()>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = RunOutcome> + Send + 'static,
+{
+    if handle.attached.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (tx, rx) = oneshot::channel();
+    *handle.kill_tx.lock().unwrap() = Some(tx);
+    *handle.run_id.lock().unwrap() = ledger_row.as_ref().map(|(_, id)| *id);
+    let handle = Arc::clone(handle);
+    tokio::spawn(async move {
+        let outcome = driver(Arc::clone(&handle), rx).await;
+        if let Some((ledger, id)) = ledger_row {
+            let finish = match outcome {
+                RunOutcome::Exited { exit_code } => {
+                    crate::run_ledger::FinishOutcome::Exited(exit_code)
+                }
+                _ => crate::run_ledger::FinishOutcome::Killed,
+            };
+            let _ = ledger.finish(id, finish);
+            let lines: Vec<_> = handle
+                .log
+                .lock()
+                .unwrap()
+                .since(0)
+                .into_iter()
+                .map(|l| (l.stream, l.text))
+                .collect();
+            let _ = ledger.save_output(id, &lines);
+        }
+        *handle.outcome.lock().unwrap() = outcome.clone();
+        let _ = handle.tx.send(RunEvent::Done(outcome));
+    });
 }

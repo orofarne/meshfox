@@ -118,6 +118,7 @@ async function ensureLanguageLoaded(hl: Highlighter, lang: string): Promise<bool
  * CSS (see index.css's `.mesh-shiki` rules) without re-rendering.
  */
 export async function highlightToHtml(code: string, lang: string): Promise<string> {
+  if (lang === "meshfox") lang = "yaml";
   const hl = await getHighlighter();
   const loaded = await ensureLanguageLoaded(hl, lang);
   return hl.codeToHtml(code, {

@@ -229,3 +229,18 @@ Healthy background services show `ready: N services` in iTerm2/title mode;
 starting/stopping/restarting services count as activity, and a crashed service
 or failed stop shows failure. Progress-only terminals withdraw the indicator
 when services are ready. TUI exit and handled shutdown signals clear status.
+
+### Native calls between canvases
+
+A `meshfox` fence is YAML with required `canvas` and `run`, optional `set`
+(string values), `fresh`, `no-deps` and `skip-fresh`. It uses a native server
+executor, not a shell wrapper or a nested CLI. Child document variables and
+confirmation gates are prepared before parent side effects. Child events carry
+optional `child: {canvas, port, event}` metadata; CLI/TUI terminal status reads
+this metadata to show the child step. Cancellation names the exact child run.
+
+See SPEC.md's "Calling another canvas" and `examples/canvas-call.canvas.md`
+for the runnable parent/child example with an embedded SVG architecture diagram.
+Required child application arguments must be bound in `run`. TTY relay is not
+supported; service-starting calls need an independently running child worker.
+The parent's YAML cannot auto-approve child confirmation gates.

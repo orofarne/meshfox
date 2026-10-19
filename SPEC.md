@@ -274,8 +274,10 @@ structure of its own: an include never parses that structure, never
 introduces a new addressable node, and never recurses into an `include`
 marker written inside the target's own text. The include node itself
 becomes `text`, its body marked as belonging to the target file rather
-than the including document — not editable per-node (open the target file
-directly, or Source mode's file picker, to change it).
+than the including document — not editable per-node. Source mode's file
+picker can edit ordinary Markdown targets. A target with a `.canvas.md`
+extension or a `meshfox:canvas` marker is read-only through the including
+canvas, including Source mode; open that canvas separately to edit it.
 
 A `file` node's `display="code"` is the read-only-preview counterpart for
 a target you want to *show* without folding its content into this node's
@@ -2745,3 +2747,65 @@ Supported values: `auto` (default), `iterm2`, `sixel`, `kitty`, `halfblocks`.
 capability detection. The client fetches the public setting from `/api/info`
 when no env override is present. Invalid protocol values are reported at TUI
 startup. Nested canvases inherit the existing terminal Picker.
+
+
+## Calling another canvas
+
+A native `meshfox` runnable fence invokes one application in another canvas.
+It uses the ordinary runnable-fence naming/default rules, `deps`, `inputs`,
+`outputs`, `cache`, and run controls in CLI, TUI and the web UI.
+
+````markdown
+```meshfox name="build"
+canvas: ../../README.md
+run: install-from-source
+set:
+  INSTALL_PATH: /usr/local/bin
+fresh: true
+```
+````
+
+The body is YAML with a strict schema. `canvas` and `run` are required nonempty
+strings. `canvas` resolves relative to the document containing the block,
+including inside an `include`. The target must be a canvas. `run` is one CLI
+application address (optional node path followed by an application), with shell-style
+quoting for address tokens, but no shell execution. Bind application arguments
+in this address, e.g. `run: 'build install[DEST=local]'`. Required arguments must
+be bound explicitly; missing child document variables are offered in the
+parent's normal pre-run form.
+
+Optional fields: `set` maps child document-variable names to literal strings;
+`fresh`, `no-deps`, and `skip-fresh` are booleans with the same meaning as the
+CLI options. `fresh` conflicts with the other two. Unknown/duplicate fields
+and a `confirm` field are errors. Values are literal: no shell expansion,
+`~` expansion, or implicit parent-variable/argument interpolation. Native
+fences cannot carry `env`, `interpreter`, `tty`, `service` or `tangle`.
+
+The target uses its existing worker, acquired through the coordinator or the
+normal per-canvas discovery lock. Without a coordinator, a quiet embedded
+child worker has the host process's lifetime. The child keeps its own working
+directory, variables, run locks, history and freshness records. Parent and child
+execution graphs are not merged. The parent invocation is always re-evaluated;
+its child's freshness options decide which child steps need execution. The
+parent may cache its latest displayed output but cannot skip checking the child
+solely because its YAML is unchanged.
+
+Child input, configuration errors and confirmation requirements are checked
+before parent execution begins. Form names are scoped as
+`@canvas[NODE:APPLICATION]/VARIABLE`; CLI `--set` can supply the same names.
+Confirmation is per invocation and flows from the parent's explicit approval;
+there is no automatic approval option in YAML. Recursive calls are checked
+for cycles and limited to 32 nesting levels. Child `tty` applications are
+rejected during preflight; run them directly in their own canvas.
+
+Output is streamed through the parent's ordinary retained run. Nested step
+banners show the child canvas and block; output events additionally carry
+optional `child: {canvas, port, event}` metadata. Child failure fails the parent
+step. Cancelling it signals the exact child run id and follows its terminal
+outcome, rather than killing the child worker or another run. Existing child
+services keep their ordinary worker ownership: cancellation does not stop all
+services in that canvas. When the child worker is embedded in the caller, calls starting services are
+rejected during preflight: open the target with `meshfox view` or use a
+coordinator first, so its services have an independent lifetime. Child service
+startup in an independent worker completes that chain step,
+without waiting for the background service's eventual exit.

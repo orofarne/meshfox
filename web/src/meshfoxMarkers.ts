@@ -120,7 +120,7 @@ function computeFenceAttrRanges(text: string): MarkerRange[] {
     const lang = m[1];
     const attrs = m[2];
     if (!attrs) continue;
-    if (lang !== "bash" && lang !== "sh" && !/\binterpreter=/.test(attrs)) continue;
+    if (lang !== "bash" && lang !== "sh" && lang !== "meshfox" && !/\binterpreter=/.test(attrs)) continue;
     out.push(...attrRanges(attrs, m.index + m[0].length - attrs.length));
   }
   return out;
