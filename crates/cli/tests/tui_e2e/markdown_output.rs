@@ -42,3 +42,50 @@ fn a_finished_markdown_block_renders_its_output_inline_under_the_block() {
         "the raw pipe-table syntax should have been rendered, not left as literal text:\n{screen}"
     );
 }
+
+/// Mirrors scripts/screencast/README.md: an optional output_dir argument,
+/// accepted unchanged in the run form, followed by streamed plain output.
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn parameterized_record_shows_running_status_and_output_beneath_its_source() {
+    let source = concat!(
+        "<!-- meshfox:canvas -->\n# Record screencast\n",
+        "<!-- meshfox:node id=\"record-screencast\" -->\n",
+        "<!-- meshfox:arg name=\"output_dir\" default=\"../../target/screencast\" -->\n",
+        "```bash name=\"record\"\n",
+        "printf 'record%s: %s\\n' ing \"$output_dir\"\nsleep 3\n",
+        "```\n",
+    );
+    let (canvas_path, dir) = fixtures::write_fixture(source);
+    let mut session = TuiSession::spawn(&canvas_path, dir, 40, 120);
+    session
+        .wait_for("Record screencast", Duration::from_secs(5))
+        .expect("initial render");
+    session.send_keys("r");
+    session
+        .wait_for("arguments for this application", Duration::from_secs(5))
+        .expect("argument form");
+    session.send_keys("\r");
+    // This header exists only in the Document pane, never in the console.
+    session
+        .wait_for("output: record ·", Duration::from_secs(10))
+        .expect("inline output frame");
+    session
+        .wait_for("live · running", Duration::from_secs(2))
+        .expect("block running status");
+    session
+        .wait_for("recording: ../../target/screencast", Duration::from_secs(2))
+        .expect("streamed output");
+    let screen = session.screen_text();
+    let frame = screen.find("output: record ·").unwrap();
+    assert!(
+        screen[frame..].contains("recording: ../../target/screencast"),
+        "stdout beneath source:\n{screen}"
+    );
+    session
+        .wait_for("live · done", Duration::from_secs(10))
+        .expect("block completion");
+    assert!(session
+        .screen_text()
+        .contains("recording: ../../target/screencast"));
+}

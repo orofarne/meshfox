@@ -308,6 +308,14 @@ pub struct RunState {
     pub finished: bool,
 }
 
+/// Runtime addresses include bound arguments; source fences use the definition name.
+fn definition_addr(addr: &BlockAddr) -> BlockAddr {
+    let name = meshfox_core::args::Application::parse(&addr.block_name)
+        .map(|app| app.definition)
+        .unwrap_or_else(|_| addr.block_name.clone());
+    BlockAddr::new(&addr.node_id, name)
+}
+
 impl RunState {
     /// Whether the event loop (`mod.rs::main_loop`) still has something to
     /// poll for this run.
@@ -616,6 +624,8 @@ pub struct App {
     /// to splice a block's own live output right under it, the TUI
     /// equivalent of the web UI's `LiveRunOutput`.
     pub step_output: HashMap<BlockAddr, StepOutput>,
+    /// Latest invocation displayed beneath each source definition.
+    displayed_invocations: HashMap<BlockAddr, BlockAddr>,
     /// Addresses currently running as part of a run this TUI session
     /// didn't itself start — another frontend's manual run, `force_run`,
     /// or a server-triggered `autorun`, discovered passively via
@@ -1200,6 +1210,7 @@ impl App {
             run: None,
             file_run: None,
             step_output: HashMap::new(),
+            displayed_invocations: HashMap::new(),
             external_running: HashMap::new(),
             console_collapsed: true,
             console_last_activity: None,
@@ -3684,7 +3695,12 @@ impl App {
             .step_output
             .iter()
             .filter(|(addr, _)| addr.node_id == node.id)
-            .map(|(addr, so)| (addr.block_name.clone(), so.clone()))
+            .filter(|(addr, _)| {
+                self.displayed_invocations
+                    .get(&definition_addr(addr))
+                    .is_none_or(|displayed| displayed == *addr)
+            })
+            .map(|(addr, so)| (definition_addr(addr).block_name, so.clone()))
             .collect();
 
         // `file` nodes with `display="code"` (see SPEC.md) show the
@@ -4675,6 +4691,8 @@ impl App {
                 // stream announces the step. Transfer ownership of its badge
                 // along with its output to the foreground run.
                 self.external_running.remove(&addr);
+                self.displayed_invocations
+                    .insert(definition_addr(&addr), addr.clone());
                 run.chain.push(addr.clone());
                 run.idx += 1;
                 run.stdout_only.clear();
@@ -4691,7 +4709,7 @@ impl App {
                     .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
                     .unwrap_or_default()
                     .into_iter()
-                    .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+                    .find(|b| b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
                     .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown"));
                 // A fresh, in-flight entry right away — mirrors
                 // `on_external_run_event`'s own `Line` handling, so a
@@ -4908,7 +4926,7 @@ impl App {
             .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
             .unwrap_or_default()
             .into_iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+            .find(|b| b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
             .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown"))
     }
 
@@ -4985,6 +5003,8 @@ impl App {
                 // stacked instead of only the current one.
                 if !self.external_running.contains_key(&addr) {
                     self.step_output.remove(&addr);
+                    self.displayed_invocations
+                        .insert(definition_addr(&addr), addr.clone());
                 }
                 self.external_running
                     .entry(addr.clone())
@@ -5014,6 +5034,10 @@ impl App {
             }
             SubscribeEvent::Done { exit_code } => {
                 let started = self.external_running.remove(&addr);
+                if !self.step_output.contains_key(&addr) {
+                    self.displayed_invocations
+                        .insert(definition_addr(&addr), addr.clone());
+                }
                 // A run that printed nothing never got an entry from a
                 // `Line` — make one, so its exit code still shows.
                 let output_markdown = self.block_output_markdown(&addr);
@@ -5374,6 +5398,8 @@ impl App {
             if same {
                 continue;
             }
+            self.displayed_invocations
+                .insert(definition_addr(addr), addr.clone());
             self.step_output.insert(
                 addr.clone(),
                 StepOutput {
@@ -5413,7 +5439,7 @@ impl App {
             .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
             .unwrap_or_default()
             .into_iter()
-            .any(|b| b.tty && b.name.as_deref() == Some(addr.block_name.as_str()))
+            .any(|b| b.tty && b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
     }
 
     /// Nodes whose blocks' latest current run failed or was killed, per the
@@ -7587,6 +7613,71 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn parameterized_invocations_show_live_output_under_the_definition() {
+        use crate::worker_client::{RunEvent, SubscribeEvent};
+        let mut app = app_with_blocks(
+            "parameterized-output",
+            "<!-- meshfox:arg name=output_dir default=../../target/screencast -->\n```sh name=record output=markdown\necho recording\n```\n",
+        ).await;
+        let definition = BlockAddr::new("root", "record");
+        let first = BlockAddr::new("root", "record[output_dir=../../target/screencast]");
+        let second = BlockAddr::new("root", "record[output_dir=/tmp/other-recording]");
+        app.on_external_run_event(
+            first.clone(),
+            SubscribeEvent::Line {
+                stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                text: "first recording".into(),
+            },
+        );
+        assert!(document_text(&app).contains("first recording"));
+        assert!(document_text(&app).contains("running"));
+        assert!(app.step_output[&first].output_markdown);
+        app.on_external_run_event(first.clone(), SubscribeEvent::Done { exit_code: Some(0) });
+        app.run = Some(RunState {
+            chain: Vec::new(),
+            idx: 0,
+            http_rx: None,
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        app.on_run_event(Some(RunEvent::StepStart {
+            node_id: "root".into(),
+            block: second.block_name.clone(),
+        }))
+        .await;
+        app.on_run_event(Some(RunEvent::Output {
+            node_id: "root".into(),
+            block: second.block_name.clone(),
+            stream: meshfox_server::stream_exec::OutputStream::Stdout,
+            text: "second recording".into(),
+        }))
+        .await;
+        let text = document_text(&app);
+        assert!(text.contains("second recording"), "{text}");
+        assert!(!text.contains("first recording"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        assert!(app.step_output[&second].output_markdown);
+        assert_eq!(app.displayed_invocations[&definition], second);
+        assert!(app.step_output.contains_key(&first));
+        app.on_run_event(Some(RunEvent::StepEnd {
+            node_id: "root".into(),
+            block: second.block_name.clone(),
+            exit_code: 0,
+            duration_ms: 100,
+        }))
+        .await;
+        assert!(document_text(&app).contains("second recording"));
+        assert!(!app.step_output[&second].running);
     }
 
     #[tokio::test]
