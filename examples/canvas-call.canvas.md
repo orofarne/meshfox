@@ -96,7 +96,7 @@ Inspect or run its applications directly to see their independent variable cache
 ## Sequence with a coordinator
 <!-- meshfox:node id="sequence-with-a-coordinator" -->
 
-![Sequence with a coordinator](./canvas-call-data/sequence-with-coordinator.svg)
+![Sequence with a coordinator](./canvas-call-data/sequence-with-coordinator.svg){width=100%}
 
 The parent asks the coordinator for the child worker's port. The coordinator reuses an existing worker or launches a separate worker process; the parent then talks directly to the child worker.
 
@@ -105,7 +105,7 @@ Time flows downward. Input and approval are collected before parent dependencies
 ## Sequence without a coordinator
 <!-- meshfox:node id="sequence-without-a-coordinator" -->
 
-![Sequence without a coordinator](./canvas-call-data/sequence-without-coordinator.svg)
+![Sequence without a coordinator](./canvas-call-data/sequence-without-coordinator.svg){width=100%}
 
 The parent checks the child's per-canvas worker lock. It reuses an existing worker, or starts an embedded child worker on a separate thread and Tokio runtime in the same process. The embedded worker shares the host's lifetime; child services require an independent worker.
 
