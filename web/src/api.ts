@@ -1136,20 +1136,6 @@ export async function fetchRunHistory(nodeId: string, block: string): Promise<Ru
 }
 
 /**
- * Runs a runnable `file` node's `interpreter target` (see
- * `CanvasNode.interpreter`) — the counterpart to `runBlockStream` for a node
- * that has no fenced code of its own, just a target file on disk. Streams
- * the same `RunEvent` shape (`nodeId`/`block` both set to `nodeId` itself,
- * same "the block shares its node's own id" convention a `text` node's sole
- * implicit block already uses), registered the same way in the server's
- * run registry — `killRun` works on it unchanged. No `withDeps`/`persist`:
- * a `file` node has no `deps=` chain or cache to opt into.
- */
-export async function runFileStream(nodeId: string, onEvent: (event: RunEvent) => void): Promise<void> {
-  await openEventSocket(wsUrl(`/api/nodes/${encodeURIComponent(nodeId)}/run`), onEvent);
-}
-
-/**
  * What `POST /api/nodes/:id/open` tells this page to do next (see
  * `open_node_file`'s `OpenAction` in `crates/server/src/lib.rs`).
  */

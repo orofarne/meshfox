@@ -376,12 +376,22 @@ pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
 /// strict — a stray mention of the marker in prose must never swallow the
 /// text after it.
 fn follows_file_node_body(markdown: &str, fence_ranges: &[Range<usize>], pos: usize) -> bool {
+    file_node_attrs_before(markdown, fence_ranges, pos).is_some()
+}
+
+/// The `meshfox:node` attributes of the file node whose body a region at
+/// `pos` would end — `Some` exactly when `follows_file_node_body` holds.
+fn file_node_attrs_before(
+    markdown: &str,
+    fence_ranges: &[Range<usize>],
+    pos: usize,
+) -> Option<std::collections::HashMap<String, String>> {
     const NODE_PREFIX: &str = "<!-- meshfox:node";
     let before = &markdown[..pos];
     let mut search_end = before.len();
     let comment_start = loop {
         let Some(start) = before[..search_end].rfind(NODE_PREFIX) else {
-            return false;
+            return None;
         };
         let at_line_start = start == 0 || before.as_bytes()[start - 1] == b'\n';
         let in_fence = fence_ranges
@@ -393,9 +403,7 @@ fn follows_file_node_body(markdown: &str, fence_ranges: &[Range<usize>], pos: us
         search_end = start;
     };
     let after_comment = &before[comment_start..];
-    let Some((comment_line, body)) = after_comment.split_once('\n') else {
-        return false;
-    };
+    let (comment_line, body) = after_comment.split_once('\n')?;
     let attrs = crate::attrs::parse_attrs(
         comment_line
             .trim()
@@ -406,21 +414,24 @@ fn follows_file_node_body(markdown: &str, fence_ranges: &[Range<usize>], pos: us
             .trim(),
     );
     if attrs.get("type").map(String::as_str) != Some("file") {
-        return false;
+        return None;
     }
     let body = body.trim_end();
-    let mut lines = body.lines().skip_while(|line| line.trim().is_empty());
-    let Some(link) = lines.next() else {
-        return false;
-    };
-    link.trim_start().starts_with('[')
+    // `meshfox:arg` lines sit above the link of a file node with arguments.
+    let mut lines = body.lines().skip_while(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with("<!-- meshfox:arg ")
+    });
+    let link = lines.next()?;
+    (link.trim_start().starts_with('[')
         && lines.all(|line| {
             let line = line.trim_start();
             !(line.starts_with('#')
                 || line.starts_with("```")
                 || line.starts_with("~~~")
                 || line.starts_with("<!--"))
-        })
+        }))
+    .then_some(attrs)
 }
 
 /// Remove complete cached-output regions whose preceding source fence no longer
@@ -430,13 +441,20 @@ fn follows_file_node_body(markdown: &str, fence_ranges: &[Range<usize>], pos: us
 pub fn strip_uncached_output(markdown: &str) -> String {
     let regions = output_byte_ranges(markdown);
     let fences = crate::fence::candidate_fences(markdown);
+    let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
     let mut result = markdown.to_string();
     for region in regions.iter().rev() {
-        let Some((_, _, attrs)) = fences
+        let attrs = match fences
             .iter()
             .find(|(fence, _, _)| fence.span.end + 1 == region.start)
-        else {
-            continue;
+        {
+            Some((_, _, attrs)) => attrs.clone(),
+            // No fence before it: the region of a runnable file node, whose
+            // `cache` flag is on its own `meshfox:node` line.
+            None => match file_node_attrs_before(markdown, &fence_ranges, region.start) {
+                Some(attrs) => attrs,
+                None => continue,
+            },
         };
         if !attrs.get("cache").is_some_and(|value| value != "false") {
             result.replace_range(region.clone(), "");
@@ -535,7 +553,7 @@ pub fn write_node_output(
     Some(format!("{keep}\n\n{}\n", rendered.trim_end_matches('\n')))
 }
 
-const START_PREFIX: &str = "<!-- meshfox:output ";
+pub(crate) const START_PREFIX: &str = "<!-- meshfox:output ";
 
 /// Where the cached-output region at the end of a runnable `file` node's
 /// body starts: its first line-leading start marker, provided the body

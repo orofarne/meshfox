@@ -103,3 +103,33 @@ test("confirmation traps focus and backdrop cancellation does not run a block", 
   await expect(target.locator(".mesh-node-quick-run-icon")).toBeFocused();
   expect(launches).toEqual([]);
 });
+
+test("a runnable file node gets the controls of a fence: run, chain, history and source", async ({ page }) => {
+  const target = node(page, "file-block");
+  const block = target.locator(".mesh-code-block");
+  await expect(block.locator(".mesh-code-block-head button", { hasText: "run file-block" })).toBeVisible();
+  await expect(block.locator("button.mesh-run-chain")).toHaveText("⛓ run chain: file-block");
+  await expect(block.locator('button[aria-label="Run history"]')).toBeVisible();
+  // Dependencies are listed like a fence's.
+  await expect(block).toContainText("dep-source/setup");
+
+  // Source is the file's content, folded until asked for.
+  await expect(block).not.toContainText("echo file-block-ran");
+  await block.locator(".mesh-code-source-toggle", { hasText: "‹/›" }).click();
+  await expect(block).toContainText("echo file-block-ran");
+
+  // Plain run: just the file, its output right under the block.
+  await block.locator(".mesh-code-block-head button", { hasText: "run file-block" }).click();
+  await expect(block).toContainText("file-block-ran");
+
+  // Chain run goes through the ordinary run path (deps first).
+  await block.locator("button.mesh-run-chain").click();
+  await expect(block).toContainText("file-block-ran");
+  await expect(page.locator(".error")).toHaveCount(0);
+
+  // Both runs are in the block's history.
+  await block.getByRole("button", { name: "Run history" }).click();
+  const history = page.getByRole("dialog", { name: /Run history/ });
+  await expect(history).toBeVisible();
+  await expect(history).toContainText("file-block");
+});

@@ -2212,57 +2212,6 @@ async fn run_stream_inner(
     Ok(rx)
 }
 
-/// `GET /api/nodes/:id/run` — the file-node counterpart to [`run_stream`]/
-/// [`run_stream_persisted`]: runs a runnable `file` node's own `interpreter
-/// target` and streams the exact same `RunEvent` vocabulary a fenced-block
-/// chain does (`crates/server/src/lib.rs`'s own `run_file_node` doc comment
-/// — `nodeId`/`block` both set to the node's own id, no `deps=`/`cache`/
-/// `env=`/`tty` concepts to worry about here, so no query params at all).
-/// Used by `crate::run_via_worker`'s own fallback for exactly the case a
-/// fenced-block chain's own `get_vars`/`run_stream_persisted` can't
-/// address: `path`+`name` naming a node whose body is just a link to an
-/// external target rather than a fenced block.
-pub async fn run_file_node_stream(
-    port: u16,
-    node_id: &str,
-) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
-    let mut url = reqwest::Url::parse(&format!("ws://127.0.0.1:{port}/api/nodes"))
-        .map_err(|e| e.to_string())?;
-    url.path_segments_mut()
-        .map_err(|_| "couldn't build the worker's node-run URL".to_string())?
-        .push(node_id)
-        .push("run");
-    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        loop {
-            let msg = match ws_next(&mut ws).await {
-                WsNext::Frame(msg) => msg,
-                WsNext::Closed => return,
-                WsNext::Silent => {
-                    let _ = tx.send(RunEvent::Error {
-                        message: worker_silent_message(),
-                    });
-                    return;
-                }
-            };
-            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_str::<RunEvent>(&text) else {
-                continue;
-            };
-            if tx.send(event).is_err() {
-                return;
-            }
-        }
-    });
-    Ok(rx)
-}
-
 /// `POST /api/kill` — cancels whatever's currently registered for this
 /// address (see `crates/server/src/lib.rs`'s own `KillRequest` doc
 /// comment: usable even by a caller that never itself started the run).
@@ -2285,19 +2234,6 @@ pub async fn kill_run(port: u16, node_id: &str, block: &str) -> Result<(), Strin
     let res = client()
         .post(format!("{}/api/kill", base_url(port)))
         .json(&serde_json::json!({ "nodeId": node_id, "block": block }))
-        .timeout(time_limit(CONTROL))
-        .send()
-        .await
-        .map_err(|e| describe(&e))?;
-    into_result(res).await
-}
-
-/// `POST /api/kill` by run id — how a `file` node's run (which has no
-/// block address in the run registry) is cancelled.
-pub async fn kill_run_id(port: u16, run_id: &str) -> Result<(), String> {
-    let res = client()
-        .post(format!("{}/api/kill", base_url(port)))
-        .json(&serde_json::json!({ "runId": run_id }))
         .timeout(time_limit(CONTROL))
         .send()
         .await

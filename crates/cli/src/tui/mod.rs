@@ -517,7 +517,6 @@ async fn main_loop(
         }
 
         let has_http_run = app.run.as_ref().is_some_and(|r| r.http_rx.is_some());
-        let has_file_proc = app.file_run.as_ref().is_some_and(|r| r.events.is_some());
         // Polls `GET /api/services` (`App::refresh_services`) on the same
         // ~3s cadence the web UI's own service panel already uses,
         // unconditionally whenever a worker is reachable — the whole point
@@ -553,11 +552,6 @@ async fn main_loop(
                 app.run.as_mut().unwrap().http_rx.as_mut().unwrap().recv().await
             }, if has_http_run => {
                 app.on_run_event(event).await;
-            }
-            line = async {
-                app.file_run.as_mut().unwrap().events.as_mut().unwrap().recv().await
-            }, if has_file_proc => {
-                app.on_file_run_event(line);
             }
             Some((content, display)) = reload_rx.recv() => {
                 app.on_external_change(content, display);

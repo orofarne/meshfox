@@ -183,9 +183,11 @@ manual path, not gated by it.
     making the node runnable: `interpreter target` (the target's path
     resolved relative to the canvas's own directory, confined to it — same
     boundary `display="code"` targets are resolved within).
-    Optional; omitted means the node isn't runnable this way. The web UI's
-    "▷ run" button (next to "expand", in a runnable node's title bar)
-    invokes this the same way it does a `text` node's default code block.
+    Optional; omitted means the node isn't runnable this way. See "Runnable
+    file nodes" below for everything a runnable node carries (dependencies,
+    caching, arguments, history). The web UI's "▷ run" button (next to
+    "expand", in a runnable node's title bar) runs its block the same way
+    it does a `text` node's default code block.
     A runnable code *fence* (see "Runnable code fences" below) can carry
     the same `interpreter=` attribute — this is that mechanism's origin.
 
@@ -393,6 +395,77 @@ See TEMPLATES.md for the markup a template can style.
   (comparisons use DuckDB's own typing of the value against the column;
   text ops are case-insensitive). A value the column can't hold is a `400`
   with DuckDB's message.
+
+## Runnable file nodes
+
+A `file` node with an `interpreter=` and a link target is runnable: the
+target file is run as `interpreter target`. The node carries one implicit
+block, named after the node's `id`, and otherwise behaves like a runnable
+fence — `deps=`, `env=`, `cache`, `confirm`, `lease`, `defer`, arguments, run
+history, `meshfox run`/`list`/`logs`, `run --detach`, and the same block
+controls in the web UI and the terminal viewer (run, run chain, history,
+source fold, dependencies, output). `meshfox run <node>` addresses it without
+a trailing block name. A worked example is
+`examples/runnable-files.canvas.md`.
+
+The script runs in the canvas's own directory (for a node spliced in from an
+`include`, that include's directory) — not the script's. The target is
+resolved relative to that directory and confined like a `display="code"`
+target (the canvas tree plus the directories of `dir`/`file` variables).
+
+**Block attributes** go on the node's own `meshfox:node` line, with the
+meaning they have in a fence's info string: `deps`, `inputs`, `outputs`,
+`env`, `cache`, `confirm`, `default`, `always`, `autorun`, `output`,
+`output-attrs`, `render`, `send`, `lease`, `defer`, `argv`. `name` is always
+the node's `id`, `interpreter` is the node's own attribute, and `fold` keeps
+its meaning as the node's fold state. They are accepted only on a file node
+with an `interpreter`; `meshfox validate` rejects them elsewhere. `tty`,
+`service`, `autoclose` and `tangle` are not supported on a file node — the
+script runs directly from its file — and are rejected too.
+
+**Editing.** `meshfox node block <node> <node>` (and the API behind it) edits
+a file node's block attributes where they live, on the `meshfox:node` line:
+`--cache`/`--no-cache`, `--always`, `--default`, `--deps`/`--clear-deps`,
+`--env`/`--clear-env`, `--interpreter`, `--lang`, leaving the link, caption
+and cached output alone. It refuses what has no meaning there: `--code-file` (the
+code is the target file), `--rename` (the block is named after the node),
+`--tty`/`--service`/`--autoclose`, and `--clear-interpreter` (use `node meta
+--interpreter ""`, which also drops the block attributes). Removing
+`cache` also drops the node's cached-output region on the next save, as it
+does for a fence. A drag, resize or any other `node meta` change keeps the
+block attributes.
+
+**Body.** The link line, an optional plain-prose caption (as for any `file`
+node), and — written by meshfox, never by hand — one cached-output region at
+the very end, exactly like the one a fence's `cache` writes
+(`<!-- meshfox:output name="<id>" hash="..." -->`, see "Cached output"). Any
+other block-level Markdown, or text after the region, makes the body invalid.
+The region is recognized only directly after the node's link/caption, the
+file-node counterpart of "directly after a fence".
+
+**Arguments.** `meshfox:arg` declarations (see "Block arguments and
+applications") sit immediately above the link line, with only blank lines in
+between — the link plays the part of the fence's opening line. Binding,
+types, defaults, `required`, applications (`extract[lang=hy]`) and manual
+forms are those of a fence. Values reach the script as environment
+variables, and — unless the node has `argv="false"` — as `--name=value`
+command-line flags after the script path, in declaration order, with
+canonical values (`python3 extract.py --lang=hy --pages=3`). Flags are passed
+to any block with an `interpreter=` (a fence's too); a plain `bash` fence has
+no script path to append them to and gets the environment only. `argv="false"`
+is for scripts that would reject unknown flags.
+
+**`cache` and arguments are exclusive** for every block, fence or file node:
+the cached output belongs to the block, not to one application of it, so a
+block with a `meshfox:arg` signature and `cache` is a validation error.
+
+**Freshness.** The block's fingerprint covers the target path and a digest of
+the file's content, so editing the script makes its cached output stale and
+its "already ran this session" record invalid, like editing a fence.
+
+**Display.** The block is drawn under the link and caption. Its source — the
+file's current content — starts folded unless the node has `display="code"`;
+`display="table"` has no effect on a runnable node.
 
 ## Runnable code fences
 

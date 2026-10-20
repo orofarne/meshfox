@@ -21,7 +21,6 @@ import {
   fetchReadOnly,
   saveLayout,
   runBlockStream,
-  runFileStream,
   openNodeFile,
   openNodeFileFolder,
   killRun,
@@ -278,7 +277,7 @@ function positionFor(
  * state — `text` (merged stdout+stderr, unchanged from before `stream`
  * existed on the wire) plus whichever of `stdoutText`/`stderrText` this
  * line's own `stream` says it belongs to (the other one carries over
- * untouched). Shared by `executeRun`/`executeFileRun`'s own `"output"`
+ * untouched). Shared by `executeRun`'s own `"output"`
  * handling below — see `LiveBlockState.stdoutText`'s own doc comment for
  * why the split exists at all (`output="markdown"` mode's live view). */
 function appendOutputLine(prev: LiveBlockState, event: { stream: "stdout" | "stderr"; text: string }): LiveBlockState {
@@ -1798,108 +1797,6 @@ export default function App() {
       });
   }, [canvas, adoptPlainRun, applyTtyRuns]);
 
-  // Runs a runnable `file` node's `interpreter target` (see
-  // `api.ts`'s `runFileStream`) — the file-node counterpart to
-  // `executeRun`. A `file` node has no `deps=`/`env=`/`cache` concept, so
-  // there's no vars-modal gate (`handleRun` routes straight here for one,
-  // skipping `fetchVars`/`executeRun` entirely) and no reload afterward
-  // (nothing on disk changes). `blockName` is always `nodeId` itself, same
-  // "the block shares its node's own id" convention a `text` node's sole
-  // implicit block already uses — see `RunEvent`'s `nodeId`/`block`.
-  const executeFileRun = useCallback(
-    async (nodeId: string) => {
-      patchLiveBlock(nodeId, nodeId, { status: "queued", text: "" });
-      let runId: string | undefined;
-      try {
-        await runFileStream(nodeId, (event: RunEvent) => {
-          switch (event.type) {
-            case "started":
-              runId = event.runId;
-              break;
-            case "step-start":
-              patchLiveBlock(event.nodeId, event.block, {
-                status: "running",
-                text: "",
-                stdoutText: undefined,
-                stderrText: undefined,
-                exitCode: undefined,
-                runId,
-                startedAt: Date.now(),
-                durationMs: undefined,
-              });
-              break;
-            case "step-skipped":
-              appendConsoleLine(event.nodeId, event.block, { stream: "stdout", text: "skipped, already fresh this session" });
-              // `event.output` is `SessionRun::output` (merged stdout+stderr
-              // only — the session-skip cache doesn't keep them split, see
-              // `crates/server/src/lib.rs`'s own `SessionRun`), and
-              // `MeshNode.tsx`'s `SkippedRunOutput` always renders `text`
-              // as plain text regardless, never Markdown — so there's
-              // nothing for `stdoutText`/`stderrText` to do here even for
-              // an `output="markdown"` block. Explicitly cleared anyway
-              // (not left whatever an earlier run on this same block
-              // happened to leave behind) so a *previous* run's split text
-              // can't leak
-              // into this skipped display.
-              patchLiveBlock(event.nodeId, event.block, {
-                status: "skipped",
-                text: event.output,
-                stdoutText: undefined,
-                stderrText: undefined,
-                exitCode: undefined,
-                runId: undefined,
-                startedAt: undefined,
-                durationMs: event.durationMs,
-              });
-              break;
-            case "output":
-              appendConsoleLine(event.nodeId, event.block, event);
-              setNodes((nds) =>
-                nds.map((n) => {
-                  if (n.id !== event.nodeId) return n;
-                  const prev = n.data.liveBlocks[event.block] ?? { status: "running", text: "" };
-                  return {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      liveBlocks: { ...n.data.liveBlocks, [event.block]: appendOutputLine(prev, event) },
-                    },
-                  };
-                }),
-              );
-              break;
-            case "step-end":
-              patchLiveBlock(event.nodeId, event.block, {
-                status: "done",
-                exitCode: event.exitCode,
-                runId: undefined,
-                durationMs: event.durationMs,
-              });
-              break;
-            case "killed":
-              patchLiveBlock(event.nodeId, event.block, { status: "killed", runId: undefined });
-              break;
-            case "error":
-              setError(event.message);
-              break;
-            case "done":
-              break;
-            case "service-started":
-            case "lock-conflict":
-              // A `file` node has no fenced code blocks at all (see this
-              // function's own doc comment), so `service` (a fence-only
-              // attribute) can never actually apply here — these only exist
-              // to keep this switch exhaustive over `RunEvent`.
-              break;
-          }
-        });
-      } catch (e) {
-        setError(String(e));
-      }
-    },
-    [patchLiveBlock, setNodes, appendConsoleLine],
-  );
-
   // Gate in front of `executeRun`: checks whether any declared
   // `meshfox:var` (see SPEC.md's "Variables") is still unresolved before
   // actually starting the run, and opens the modal to ask instead when
@@ -1907,16 +1804,10 @@ export default function App() {
   // Fetches fresh every click rather than caching canvas-load-time
   // status, since an earlier run (this tab or another) may have just
   // resolved something. A runnable `file` node (see `CanvasNode.interpreter`)
-  // routes straight to `executeFileRun` instead — it has no fenced block,
-  // `deps=` chain, or `env=` to check `GET /api/vars` for.
+  // goes the same way: its implicit block carries `deps=`/`env=`/arguments.
   const handleRun = useCallback(
     async (nodeId: string, blockName: string, withDeps: boolean) => {
       if (!canvas) return;
-      const node = canvas.nodes.find((n) => n.id === nodeId);
-      if (node?.type === "file" && node.interpreter) {
-        await executeFileRun(nodeId);
-        return;
-      }
       let path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
       let tty = false;
@@ -1949,7 +1840,7 @@ export default function App() {
         await executeRun(nodeId, blockName, withDeps);
       }
     },
-    [canvas, executeRun, executeFileRun],
+    [canvas, executeRun],
   );
 
   // `tty` counterpart to `handleRun`: same "check `GET /api/vars` first,
@@ -2630,6 +2521,8 @@ export default function App() {
             display: n.display,
             lang: n.lang,
             interpreter: n.interpreter,
+            blockAttrs: n.blockAttrs,
+            blockFingerprint: n.blockFingerprint,
             preview: n.preview,
             text: n.text,
             bodyRev: n.bodyRev,

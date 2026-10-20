@@ -79,3 +79,10 @@ echo confirm-consumer-ran
 ```bash tty confirm
 echo confirm-terminal-ran
 ```
+
+## File block
+<!-- meshfox:node id="file-block" type="file" interpreter="bash" deps="dep-source/setup" -->
+
+[file-block.sh](./file-block.sh)
+
+A runnable file: the same block controls a fence gets.

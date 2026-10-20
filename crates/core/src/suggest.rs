@@ -26,6 +26,15 @@ pub const FENCE_VALUE_ATTRS: &[&str] = &[
     "argv",
 ];
 
+/// The block attributes of a runnable `file` node (`mdcanvas::FILE_BLOCK_ATTRS`)
+/// that are plain on/off switches — written `cache="true"` on its
+/// `meshfox:node` line, there being no bare-flag form there.
+const FILE_BLOCK_FLAGS: &[&str] = &["cache", "always", "default", "autorun", "confirm"];
+
+/// Block attributes the parser accepts on a file node but `meshfox validate`
+/// rejects — never suggested.
+const FILE_BLOCK_UNSUPPORTED: &[&str] = &["tty", "service", "autoclose", "tangle"];
+
 pub const FENCE_FLAG_ATTRS: &[&str] = &[
     "cache",
     "tty",
@@ -178,7 +187,9 @@ pub fn finite_values(kind: AttrKind, name: &str) -> &'static [&'static str] {
         | (AttrKind::Edge, "sourceSide" | "targetSide") => &["left", "right", "top", "bottom"],
         (AttrKind::Edge, "style") => &["solid", "dashed", "dotted"],
         (AttrKind::Edge, "arrowStart" | "arrowEnd") => &["none", "arrow"],
-        (AttrKind::Fence, "output") => &["text", "markdown", "image"],
+        (AttrKind::Fence | AttrKind::Node, "output") => &["text", "markdown", "image"],
+        (AttrKind::Node, "argv") => &["false", "true"],
+        (AttrKind::Node, name) if FILE_BLOCK_FLAGS.contains(&name) => &["true", "false"],
         (AttrKind::Fence, "argv") => &["false", "true"],
         (AttrKind::Fence, "render") => crate::fence::RENDER_KINDS,
         (AttrKind::Fence, name) if FENCE_FLAG_ATTRS.contains(&name) => &["true", "false"],
@@ -262,6 +273,14 @@ pub fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
         AttrKind::Fence => (FENCE_VALUE_ATTRS, FENCE_FLAG_ATTRS),
     };
     let attrs = crate::attrs::parse_attrs(line);
+    // A node line offers a fence's attributes only once it is a file node,
+    // and never the ones a file node cannot take.
+    let block_attr_offered = |name: &str| {
+        kind != AttrKind::Node
+            || !crate::mdcanvas::FILE_BLOCK_ATTRS.contains(&name)
+            || (attrs.get("type").map(String::as_str) == Some("file")
+                && !FILE_BLOCK_UNSUPPORTED.contains(&name))
+    };
     let value_present = |name: &str| attrs.contains_key(name);
     let enabled = |name: &str| attrs.get(name).is_some_and(|v| v != "false");
     let flag_present = |name: &str| attrs.contains_key(name);
@@ -285,7 +304,7 @@ pub fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
     };
     value_attrs
         .iter()
-        .filter(|n| !value_present(n))
+        .filter(|n| !value_present(n) && block_attr_offered(n))
         .map(|&name| AttrCandidate {
             name,
             is_flag: false,

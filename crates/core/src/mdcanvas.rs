@@ -207,6 +207,13 @@ pub struct NodeMeta {
     /// default), `Some(true)`/`Some(false)` write an explicit
     /// `fold="true"`/`fold="false"`.
     pub fold: Option<bool>,
+    /// A runnable `file` node's block attributes (`FILE_BLOCK_ATTRS`) to
+    /// write: `Some` replaces whatever is on the line (`set_file_block_attrs`
+    /// is the writer), `None` keeps what is there — so a drag or a resize
+    /// never drops `deps=`/`cache`/... — either way only when the node
+    /// still has an `interpreter`: without one they mean nothing, and
+    /// clearing it clears them too.
+    pub block_attrs: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl NodeMeta {
@@ -237,6 +244,7 @@ impl NodeMeta {
             fold: node.fold,
             tags: node.tags.clone(),
             created_at: node.created_at.clone(),
+            block_attrs: None,
         }
     }
 }
@@ -593,6 +601,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 Default::default()
             },
             target_digest: None,
+            block_fingerprint: None,
         });
     }
 
@@ -761,7 +770,7 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     if let Some(l) = &node.lang {
         parts.push(format!("lang=\"{l}\""));
     }
-    if let Some(i) = &node.interpreter {
+    if let Some(i) = node.interpreter.as_ref().filter(|i| !i.trim().is_empty()) {
         parts.push(format!("interpreter=\"{i}\""));
     }
     for (key, value) in &node.block_attrs {
@@ -1108,15 +1117,28 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     if let Some(l) = &meta.lang {
         parts.push(format!("lang=\"{l}\""));
     }
-    if let Some(i) = &meta.interpreter {
+    // An empty interpreter is how a client says "clear it" (the web
+    // settings do too): it is never written out.
+    if let Some(i) = meta.interpreter.as_ref().filter(|i| !i.trim().is_empty()) {
         parts.push(format!("interpreter=\"{i}\""));
     }
     // Like `parent=`, `NodeMeta` has no field for a file node's block
     // attributes: carry over what is already on the line so a drag or a
     // resize never silently drops `deps=`/`cache`/... .
-    for key in FILE_BLOCK_ATTRS {
-        if let Some(value) = seg.node_attrs.get(*key) {
-            parts.push(format!("{key}=\"{value}\""));
+    if meta.interpreter.as_deref().is_some_and(|i| !i.trim().is_empty()) {
+        match &meta.block_attrs {
+            Some(attrs) => {
+                for (key, value) in attrs {
+                    parts.push(format!("{key}=\"{value}\""));
+                }
+            }
+            None => {
+                for key in FILE_BLOCK_ATTRS {
+                    if let Some(value) = seg.node_attrs.get(*key) {
+                        parts.push(format!("{key}=\"{value}\""));
+                    }
+                }
+            }
         }
     }
     if let Some(true) = meta.preview {
@@ -1207,6 +1229,110 @@ pub struct FenceAttrsPatch {
     pub code: Option<String>,
 }
 
+fn render_deps(deps: &[BlockRef]) -> String {
+    deps.iter()
+        .map(|d| {
+            let mut part = match &d.node_id {
+                Some(n) => format!("{n}/{}", d.block_name),
+                None => d.block_name.clone(),
+            };
+            if d.sync {
+                part.push('!');
+            }
+            part
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn render_env(env: &[EnvRef]) -> String {
+    env.iter()
+        .map(|e| {
+            if e.local_name == e.var_name {
+                format!("${}", e.var_name)
+            } else {
+                format!("{}=${}", e.local_name, e.var_name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl FenceAttrsPatch {
+    /// Why this patch cannot be applied to a runnable `file` node's block,
+    /// if it cannot: the block has no fence, so its code and name are not
+    /// the patch's to change, and the node's own attributes cannot take
+    /// what a file node does not support.
+    pub fn file_node_conflict(&self) -> Option<&'static str> {
+        if self.code.is_some() {
+            Some("a file node's code lives in its target file — edit that file")
+        } else if self.name.is_some() {
+            Some("a file node's block is named after the node — rename the node instead")
+        } else if matches!(self.interpreter, Some(None)) {
+            Some("a file node needs an interpreter to be runnable — drop it with `node meta --interpreter \"\"`, which also drops its block attributes")
+        } else if [self.tty, self.service, self.autoclose].contains(&Some(true)) {
+            Some("`tty`, `service` and `autoclose` aren't supported on a file node's block")
+        } else {
+            None
+        }
+    }
+}
+
+/// `set_fence_attrs` for a runnable `file` node's implicit block: its
+/// attributes live on the node's own `meshfox:node` line, so the patch
+/// edits those (`NodeMeta::block_attrs`) and leaves the body — link,
+/// caption, cached output — alone. `None` when `node_id` is not a runnable
+/// file node, or the patch cannot apply (`FenceAttrsPatch::file_node_conflict`).
+fn set_file_block_attrs(markdown: &str, node_id: &str, patch: &FenceAttrsPatch) -> Option<String> {
+    if patch.file_node_conflict().is_some() {
+        return None;
+    }
+    let canvas = parse(markdown).ok()?;
+    let node = canvas.node(node_id)?;
+    if !node.is_runnable_file() {
+        return None;
+    }
+    let mut attrs = node.block_attrs.clone();
+    let mut flag = |key: &str, value: Option<bool>| match value {
+        Some(true) => {
+            attrs.insert(key.to_string(), "true".to_string());
+        }
+        Some(false) => {
+            attrs.remove(key);
+        }
+        None => {}
+    };
+    flag("cache", patch.cache);
+    flag("always", patch.always);
+    flag("default", patch.default);
+    flag("tty", patch.tty);
+    flag("autoclose", patch.autoclose);
+    flag("service", patch.service);
+    if let Some(deps) = &patch.deps {
+        if deps.is_empty() {
+            attrs.remove("deps");
+        } else {
+            attrs.insert("deps".to_string(), render_deps(deps));
+        }
+    }
+    if let Some(env) = &patch.env {
+        if env.is_empty() {
+            attrs.remove("env");
+        } else {
+            attrs.insert("env".to_string(), render_env(env));
+        }
+    }
+    let mut meta = NodeMeta::from_node(node);
+    meta.block_attrs = Some(attrs);
+    if let Some(lang) = &patch.lang {
+        meta.lang = Some(lang.clone());
+    }
+    if let Some(Some(interpreter)) = &patch.interpreter {
+        meta.interpreter = Some(interpreter.clone());
+    }
+    set_node_meta(markdown, node_id, &meta)
+}
+
 /// Rewrites just one runnable fence's own info-string attributes (and,
 /// optionally, its code — see `FenceAttrsPatch::code`) inside node
 /// `node_id` — every other fence in the node, the rest of its body, and
@@ -1235,6 +1361,11 @@ pub fn set_fence_attrs(
     let idx = ids.iter().position(|id| id == node_id)?;
     let seg = &segments[idx];
     let body = &markdown[seg.body_span.clone()];
+
+    // A runnable `file` node's one implicit block has no fence to rewrite.
+    if block_name == node_id && seg.node_attrs.get("type").map(String::as_str) == Some("file") {
+        return set_file_block_attrs(markdown, node_id, patch);
+    }
 
     let blocks = scan_runnable_blocks(node_id, body);
     let block = blocks
@@ -1268,36 +1399,11 @@ pub fn set_fence_attrs(
     }
     let deps = patch.deps.clone().unwrap_or_else(|| block.deps.clone());
     if !deps.is_empty() {
-        let rendered = deps
-            .iter()
-            .map(|d| {
-                let mut part = match &d.node_id {
-                    Some(n) => format!("{n}/{}", d.block_name),
-                    None => d.block_name.clone(),
-                };
-                if d.sync {
-                    part.push('!');
-                }
-                part
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        parts.push(format!("deps=\"{rendered}\""));
+        parts.push(format!("deps=\"{}\"", render_deps(&deps)));
     }
     let env = patch.env.clone().unwrap_or_else(|| block.env.clone());
     if !env.is_empty() {
-        let rendered = env
-            .iter()
-            .map(|e| {
-                if e.local_name == e.var_name {
-                    format!("${}", e.var_name)
-                } else {
-                    format!("{}=${}", e.local_name, e.var_name)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        parts.push(format!("env=\"{rendered}\""));
+        parts.push(format!("env=\"{}\"", render_env(&env)));
     }
     if patch.cache.unwrap_or(block.cache) {
         parts.push("cache".to_string());
@@ -3974,6 +4080,7 @@ Reused from Tests as well.
             fold: None,
             tags: Vec::new(),
             created_at: None,
+            block_attrs: None,
         };
         let updated = set_node_meta(DOC, "tests", &meta).unwrap();
         let c = parse(&updated).unwrap();
@@ -5888,5 +5995,145 @@ Reused from Tests as well.
             crate::deps::validate(&canvas),
             Err(crate::deps::DepsError::FileNodeUnsupportedAttr(..))
         ));
+    }
+
+    #[test]
+    fn file_node_markdown_renders_like_a_fence_with_current_output() {
+        let canvas = parse(FILE_ARGS_DOC.replace(" interpreter=\"python3\"", " interpreter=\"python3\" deps=\"root\"").as_str()).unwrap();
+        let mut node = canvas.node("extract").unwrap().clone();
+        node.set_target_digest(b"print(1)");
+        node.block_fingerprint = Some(crate::fence::fingerprint(&crate::fence::target_block(&node)));
+        let md = crate::fence::file_node_markdown(&node, "print(1)").unwrap();
+        // The fence is found, named after the node, with its arguments and deps.
+        let blocks = crate::fence::scan_runnable_blocks("extract", &md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "print(1)");
+        assert_eq!(blocks[0].deps.len(), 1);
+        let signatures = crate::args::scan_signatures("extract", &md).unwrap();
+        assert_eq!(signatures[0].args.len(), 2);
+        assert!(md.contains("[extract](./extract.py)"));
+        assert!(md.contains("Pulls the tables."));
+
+        // Cached output whose hash is the node's current fingerprint reads as current.
+        let out = crate::output::ExecOutput { exit_code: 0, output: "x\n".into(), duration_ms: 1, stdout: "x\n".into(), stderr: String::new() };
+        let mut cached = canvas.node("extract").unwrap().clone();
+        cached.set_target_digest(b"print(1)");
+        cached.block_fingerprint = Some(crate::fence::fingerprint(&crate::fence::target_block(&cached)));
+        cached.text = crate::output::write_block_output(&cached, "extract", &out).unwrap();
+        let md = crate::fence::file_node_markdown(&cached, "print(1)").unwrap();
+        let block = &crate::fence::scan_code_blocks(&md)[0];
+        assert_eq!(
+            crate::output::cached_output_hash(&md, "extract"),
+            Some(crate::fence::fingerprint(block))
+        );
+        // ... and stays untouched (so stale) once the file changed.
+        cached.block_fingerprint = Some("deadbeef".into());
+        let stale = crate::fence::file_node_markdown(&cached, "print(2)").unwrap();
+        let block = &crate::fence::scan_code_blocks(&stale)[0];
+        assert_ne!(
+            crate::output::cached_output_hash(&stale, "extract"),
+            Some(crate::fence::fingerprint(block))
+        );
+    }
+
+    fn block_patch() -> FenceAttrsPatch {
+        FenceAttrsPatch::default()
+    }
+
+    #[test]
+    fn block_command_edits_a_file_nodes_attributes_on_its_node_line() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        assert!(canvas.node("seed").unwrap().block_attrs.contains_key("cache"));
+        let patch = FenceAttrsPatch {
+            cache: Some(false),
+            always: Some(true),
+            deps: Some(vec![]),
+            env: Some(crate::fence::parse_env_list("$TOKEN,LOCAL=$OTHER")),
+            ..block_patch()
+        };
+        let updated = set_fence_attrs(FILE_BLOCK_DOC, "seed", "seed", &patch).unwrap();
+        let attrs = parse(&updated).unwrap().node("seed").unwrap().block_attrs.clone();
+        assert_eq!(attrs.get("cache"), None);
+        assert_eq!(attrs.get("deps"), None);
+        assert_eq!(attrs.get("always").map(String::as_str), Some("true"));
+        assert_eq!(attrs.get("env").map(String::as_str), Some("$TOKEN,LOCAL=$OTHER"));
+        // The body (link and caption) is untouched.
+        assert!(updated.contains("[seed](./seed.sh)\n\nLoads the data."));
+        // A new interpreter replaces the node's own attribute.
+        let patch = FenceAttrsPatch { interpreter: Some(Some("sh -e".into())), ..block_patch() };
+        let updated = set_fence_attrs(FILE_BLOCK_DOC, "seed", "seed", &patch).unwrap();
+        assert_eq!(parse(&updated).unwrap().node("seed").unwrap().interpreter.as_deref(), Some("sh -e"));
+    }
+
+    #[test]
+    fn block_command_refuses_what_a_file_node_cannot_take() {
+        for patch in [
+            FenceAttrsPatch { code: Some("echo".into()), ..block_patch() },
+            FenceAttrsPatch { name: Some("other".into()), ..block_patch() },
+            FenceAttrsPatch { tty: Some(true), ..block_patch() },
+            FenceAttrsPatch { interpreter: Some(None), ..block_patch() },
+        ] {
+            assert!(patch.file_node_conflict().is_some());
+            assert!(set_fence_attrs(FILE_BLOCK_DOC, "seed", "seed", &patch).is_none());
+        }
+        // A fence is unaffected.
+        assert!(FenceAttrsPatch { code: Some("echo".into()), ..block_patch() }.file_node_conflict().is_some());
+    }
+
+    #[test]
+    fn clearing_a_file_nodes_interpreter_drops_its_block_attributes() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        for cleared in [None, Some(String::new())] {
+            let mut meta = NodeMeta::from_node(canvas.node("seed").unwrap());
+            meta.interpreter = cleared;
+            let updated = set_node_meta(FILE_BLOCK_DOC, "seed", &meta).unwrap();
+            let node = parse(&updated).unwrap().node("seed").unwrap().clone();
+            assert!(node.block_attrs.is_empty());
+            assert_eq!(node.interpreter, None);
+            assert!(unknown_node_edge_attr(&updated).is_none());
+        }
+    }
+
+    #[test]
+    fn removing_cache_from_a_file_node_drops_its_stale_output_region() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        let node = canvas.node("seed").unwrap();
+        let output = crate::output::ExecOutput {
+            exit_code: 0,
+            output: "hello\n".into(),
+            duration_ms: 5,
+            stdout: "hello\n".into(),
+            stderr: String::new(),
+        };
+        let body = crate::output::write_node_output(&node.text, &node.runnable_blocks()[0], &output).unwrap();
+        let cached = FILE_BLOCK_DOC.replace(&node.text, &body);
+        // Cached: the region survives a save.
+        assert_eq!(crate::output::strip_uncached_output(&cached), cached);
+        // `cache` removed: the save drops it and the node still parses.
+        let patch = FenceAttrsPatch { cache: Some(false), ..block_patch() };
+        let edited = set_fence_attrs(&cached, "seed", "seed", &patch).unwrap();
+        let stripped = crate::output::strip_uncached_output(&edited);
+        assert!(!stripped.contains("meshfox:output"));
+        let again = parse(&stripped).unwrap();
+        assert_eq!(again.node("seed").unwrap().caption.as_deref(), Some("Loads the data."));
+    }
+
+    #[test]
+    fn node_line_suggestions_offer_block_attributes_only_on_a_file_node() {
+        use crate::suggest::{attr_candidates, finite_values, AttrKind};
+        let names = |line: &str| -> Vec<&'static str> {
+            attr_candidates(AttrKind::Node, line).into_iter().map(|c| c.name).collect()
+        };
+        let text = names("<!-- meshfox:node id=\"a\" ");
+        assert!(!text.contains(&"cache") && !text.contains(&"deps"));
+        let file = names("<!-- meshfox:node id=\"a\" type=\"file\" ");
+        for wanted in ["cache", "deps", "env", "confirm", "argv", "lease", "defer", "output"] {
+            assert!(file.contains(&wanted), "{wanted} missing from {file:?}");
+        }
+        for unsupported in ["tty", "service", "autoclose", "tangle"] {
+            assert!(!file.contains(&unsupported), "{unsupported} offered");
+        }
+        assert_eq!(finite_values(AttrKind::Node, "cache"), ["true", "false"]);
+        assert_eq!(finite_values(AttrKind::Node, "argv"), ["false", "true"]);
     }
 }

@@ -705,6 +705,114 @@ pub fn target_block(node: &crate::canvas::Node) -> CodeBlock {
     )
 }
 
+/// A runnable `file` node's body as the Markdown a fence-based renderer
+/// expects: its link and caption, then — right under the `meshfox:arg`
+/// lines it carries — the fence the node stands in for (its block
+/// attributes and `interpreter` as the info string, `code` as the target's
+/// content), then its cached-output region. Lets a renderer that only knows
+/// fences (the TUI) draw the node's block exactly like a fence's, controls,
+/// dependencies, arguments and output included. The fence starts folded
+/// unless the node is `display="code"`.
+///
+/// The region's `hash=` was written from the node's fingerprint, which
+/// covers the target file rather than the code text the renderer sees; when
+/// it matches `node.block_fingerprint` it is rewritten to the fingerprint of
+/// the fence built here, so such output is shown as current — and left
+/// alone (stale) otherwise. `None` when the node is not a runnable file.
+pub fn file_node_markdown(node: &crate::canvas::Node, code: &str) -> Option<String> {
+    if !node.is_runnable_file() {
+        return None;
+    }
+    let mut prose = Vec::new();
+    let mut arg_lines = Vec::new();
+    let mut region = String::new();
+    let mut lines = node.text.lines();
+    for line in lines.by_ref() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(crate::output::START_PREFIX) {
+            region.push_str(line);
+            region.push('\n');
+            break;
+        }
+        if trimmed.starts_with("<!-- meshfox:arg ") {
+            arg_lines.push(trimmed.to_string());
+        } else {
+            prose.push(line);
+        }
+    }
+    for line in lines {
+        region.push_str(line);
+        region.push('\n');
+    }
+
+    let mut info = vec![format!("name={}", quote_info_value(&node.id))];
+    if let Some(interpreter) = &node.interpreter {
+        info.push(format!("interpreter={}", quote_info_value(interpreter)));
+    }
+    for (key, value) in &node.block_attrs {
+        info.push(format!("{key}={}", quote_info_value(value)));
+    }
+    if node.display != Some(crate::canvas::FileDisplay::Code) {
+        info.push("fold".to_string());
+    }
+    let lang = node
+        .lang
+        .clone()
+        .or_else(|| {
+            std::path::Path::new(node.target.as_deref()?)
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "text".to_string());
+    let longest_run = code
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let ticks = "`".repeat((longest_run + 1).max(3));
+
+    let mut out = prose.join("\n").trim_end().to_string();
+    out.push_str("\n\n");
+    for line in &arg_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("{ticks}{lang} {}\n{code}\n{ticks}\n", info.join(" ")));
+
+    if !region.is_empty() {
+        if let Some(block) = scan_code_blocks(&out).into_iter().next() {
+            let current = fingerprint(&block);
+            let first = region.lines().next().unwrap_or_default();
+            let hash = crate::attrs::parse_attrs(
+                first
+                    .trim()
+                    .trim_start_matches("<!--")
+                    .trim_end_matches("-->")
+                    .trim()
+                    .trim_start_matches("meshfox:output"),
+            )
+            .remove("hash");
+            if hash.is_some() && hash == node.block_fingerprint {
+                region = region.replacen(
+                    &format!("hash=\"{}\"", hash.unwrap()),
+                    &format!("hash=\"{current}\""),
+                    1,
+                );
+            }
+        }
+        out.push_str(&region);
+    }
+    Some(out)
+}
+
+fn quote_info_value(value: &str) -> String {
+    if value.contains('"') {
+        format!("'{value}'")
+    } else {
+        format!("\"{value}\"")
+    }
+}
+
 /// Byte range of the link line inside a `file` node's body — the line a
 /// `meshfox:arg` signature must immediately precede, standing in for a
 /// fence's opening line. Empty when there is none.

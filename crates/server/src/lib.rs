@@ -890,6 +890,7 @@ fn apply_node_state(raw: &str, target: &meshfox_core::Node) -> Option<String> {
     }
 
     let meta = NodeMeta {
+        block_attrs: None,
         x: target.x,
         y: target.y,
         width: target.width,
@@ -2246,7 +2247,7 @@ fn image_stamps(
     state: &AppState,
 ) -> std::collections::BTreeMap<PathBuf, Option<(std::time::SystemTime, u64)>> {
     let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+    let Ok(canvas) = resolved_canvas_structure(&raw, &state.canvas_path) else {
         return Default::default();
     };
     let root = canvas_root_dir(&state.canvas_path);
@@ -2285,7 +2286,7 @@ fn sweep_tangled_files(state: &AppState) {
         return;
     }
     let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+    let Ok(canvas) = resolved_canvas_structure(&raw, &state.canvas_path) else {
         return;
     };
     meshfox_core::tangle::sweep_canvas(&canvas, &state.canvas_path);
@@ -4399,12 +4400,19 @@ fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
 /// now. Shared by `canvas_response` and `get_include_asset` (the latter
 /// needs the resolved tree's `asset_base`s, not the JSON response itself).
 fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
-    let canvas = parse_or_error(raw)?;
-    let mut resolved = meshfox_core::include::resolve(&canvas, canvas_path)
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    let mut resolved = resolved_canvas_structure(raw, canvas_path)?;
     // A runnable file node's block fingerprint covers its target's content.
     resolved.hydrate_target_digests(canvas_path);
     Ok(resolved)
+}
+
+/// `resolved_canvas` without reading runnable file nodes' targets: for
+/// callers that only look at the document's structure and run on a timer
+/// (the file watcher), where hashing files twice a second would be waste.
+fn resolved_canvas_structure(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
+    let canvas = parse_or_error(raw)?;
+    meshfox_core::include::resolve(&canvas, canvas_path)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
 }
 
 #[derive(Debug, Serialize)]
@@ -5007,6 +5015,7 @@ async fn clear_layout(
     let canvas = parse_or_error(&raw)?;
     for node in &canvas.nodes {
         let meta = NodeMeta {
+        block_attrs: None,
             x: None,
             y: None,
             width: None,
@@ -5082,6 +5091,7 @@ async fn clear_node_layout(
         .node(&located.local_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     let meta = NodeMeta {
+        block_attrs: None,
         x: None,
         y: None,
         width: None,
@@ -5869,6 +5879,7 @@ async fn update_node(
             )
         };
         let meta = NodeMeta {
+        block_attrs: None,
             x: if req.clear_position {
                 req.x
             } else {
@@ -6098,6 +6109,11 @@ async fn update_block_attrs(
         interpreter,
         code: req.code.clone(),
     };
+    if node.is_runnable_file() {
+        if let Some(why) = patch.file_node_conflict() {
+            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, why.to_string()));
+        }
+    }
     let updated = mdcanvas::set_fence_attrs(&located.raw, &located.local_id, &block_name, &patch)
         .ok_or_else(not_found)?;
     parse_or_error(&updated)?;
@@ -6848,6 +6864,7 @@ async fn reparent_node(
             if let Some(new_node) = new_canvas.node(local_id) {
                 if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
                     let meta = NodeMeta {
+        block_attrs: None,
                         x: Some(local_x),
                         y: Some(local_y),
                         width: new_node.width,
@@ -8158,6 +8175,9 @@ async fn run_block_impl_sized(
             );
             let (backlog, mut run_rx) = run_handle.subscribe_from(0);
             let mut backlog = std::collections::VecDeque::from(backlog);
+            // `seq` of the first line not yet relayed: where a lagged
+            // subscription resumes from.
+            let mut next_seq: u64 = 0;
             let mut kill_requested = false;
             let exit_code = loop {
                 tokio::select! {
@@ -8176,6 +8196,7 @@ async fn run_block_impl_sized(
                     } => {
                         match event {
                             Ok(run_registry::RunEvent::Line(line)) => {
+                                next_seq = line.seq + 1;
                                 full_output.push_str(&line.text);
                                 full_output.push('\n');
                                 match line.stream {
@@ -8203,12 +8224,40 @@ async fn run_block_impl_sized(
                                 killed = true; killed_addr = Some(addr.clone());
                                 break -1;
                             }
+                            // This subscription fell more than the registry's
+                            // broadcast capacity behind the live tail — a
+                            // consumer slower than the process (a busy client,
+                            // a slow terminal) while it prints a lot. The
+                            // process is unaffected and the missed lines are
+                            // still in its ring buffer, so resume from the
+                            // first one not relayed (what `/api/run/subscribe`
+                            // does too) instead of reporting the step failed
+                            // while it is still running.
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                let (missed, fresh) = run_handle.subscribe_from(next_seq);
+                                run_rx = fresh;
+                                // The ring buffer is bounded too: a burst bigger
+                                // than it is gone for good. Say so rather than
+                                // letting the output look complete.
+                                let skipped = missed.first().map_or(0, |l| l.seq.saturating_sub(next_seq));
+                                if skipped > 0 {
+                                    yield Ok(ndjson_line(&RunEvent::Output {
+                                        node_id: addr.node_id.clone(),
+                                        block: addr.block_name.clone(),
+                                        stream: stream_exec::OutputStream::Stderr,
+                                        text: format!("[meshfox: {skipped} lines of output skipped — the process printed faster than they could be relayed]"),
+                                        child: None,
+                                    }));
+                                }
+                                backlog.extend(missed);
+                                continue;
+                            }
                             // `Done` never actually carries `Running` (see
-                            // `run_registry::track`'s own loop) and a
-                            // dropped/lagged channel only happens if this
-                            // subscription itself got badly behind — either
-                            // way there's nothing meaningful left to relay.
-                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Running)) | Err(_) => {
+                            // `run_registry::track`'s own loop), and a closed
+                            // channel means the drain task is gone: nothing
+                            // meaningful left to relay.
+                            Ok(run_registry::RunEvent::Done(run_registry::RunOutcome::Running))
+                            | Err(broadcast::error::RecvError::Closed) => {
                                 break -1;
                             }
                         }
@@ -16285,6 +16334,56 @@ mod run_file_tests {
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&target_path);
+    }
+
+    /// A consumer that reads slower than the process prints must not turn a
+    /// healthy run into a failed one: the step reports the process's own exit
+    /// code, and the end of its output still arrives (lines the bounded
+    /// buffers could not hold are announced, not silently dropped).
+    #[tokio::test]
+    async fn a_slow_output_consumer_does_not_fail_the_run() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"chatty\"\nseq 1 300000 | sed 's/^/a line of output that is long enough to fill buffers: /'\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/api/run?path=&block=chatty&noDeps=true"
+        ))
+        .await
+        .expect("connect");
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let mut delayed = false;
+        while let Some(msg) = ws.next().await {
+            match msg.expect("no ws error") {
+                WsMessage::Text(t) => {
+                    events.push(serde_json::from_str(&t).expect("valid RunEvent JSON"));
+                    if !delayed && events.iter().any(|e| e["type"] == "output") {
+                        // Let the process finish printing while nobody reads.
+                        delayed = true;
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                }
+                WsMessage::Close(_) => break,
+                _ => continue,
+            }
+        }
+        let step_end = events.iter().find(|e| e["type"] == "step-end").expect("step-end");
+        assert_eq!(step_end["exitCode"], 0, "the run is not a failure: {step_end}");
+        assert_eq!(events.last().unwrap()["type"], "done");
+        let texts: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "output")
+            .filter_map(|e| e["text"].as_str())
+            .collect();
+        assert!(
+            texts.last().is_some_and(|t| t.ends_with(": 300000")),
+            "the end of the output must arrive, got {:?}",
+            texts.last()
+        );
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     #[tokio::test]

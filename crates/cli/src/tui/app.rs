@@ -14,11 +14,11 @@ use meshfox_server::link_preview::{self, PreviewMeta};
 use super::image_render::DocumentImage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use meshfox_core::deps::BlockAddr;
-use meshfox_core::fence::{self, scan_runnable_blocks};
+use meshfox_core::fence;
 use meshfox_core::image_attrs::Background;
 use meshfox_core::mdcanvas;
 use meshfox_core::vars::{declared_vars, VarDecl, VarType};
-use meshfox_core::{Canvas, FileDisplay, Node, NodeType};
+use meshfox_core::{Canvas, FileDisplay, NodeType};
 use meshfox_server::stream_exec::OutputStream;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -382,30 +382,6 @@ pub struct StepOutput {
     pub running: bool,
 }
 
-/// A runnable `file` node's own single execution — no `deps=` chain, no
-/// `cache`, no `meshfox:var`, unlike a fenced block's `RunState`, since a
-/// `file` node has none of those; see `App::start_file_run`. Kept as its
-/// own separate state (rather than shoehorned into `RunState`, which is
-/// built entirely around a `BlockAddr` chain) for the same reason the web
-/// UI's `run_file_node` is its own endpoint, distinct from `run_block`.
-pub struct FileRunState {
-    /// Which row's running-spinner/failed-badge (`ui::render_tree`) this
-    /// execution belongs to — a `file` node has no `BlockAddr` of its own
-    /// to key off of (see this struct's own doc comment), so the node id
-    /// is tracked directly instead.
-    pub node_id: String,
-    /// The worker's event stream for this run (`None` once it ended).
-    pub events: Option<tokio::sync::mpsc::UnboundedReceiver<crate::worker_client::RunEvent>>,
-    /// The worker's id for the run, once `Started` arrived — what a kill names.
-    pub run_id: Option<String>,
-    pub lines: Vec<String>,
-    pub had_failure: bool,
-    /// Set once the process has exited — `run` stays around afterward
-    /// purely so its transcript keeps showing until the *next* run
-    /// starts, same convention `RunState::finished` uses.
-    pub finished: bool,
-}
-
 /// A `service` step's lock file (`.meshfox/services/...`) is already held
 /// by another live-or-stale process — parked here (mirrors
 /// `reset_session_confirm`'s "one thing at a time" precedence, see
@@ -630,9 +606,8 @@ pub struct App {
     pub run_confirmation: Option<RunConfirmation>,
     run_confirmation_approved: bool,
     pub run: Option<RunState>,
-    pub file_run: Option<FileRunState>,
     /// Live per-step output from the most recent run, kept around after
-    /// `RunState`/`FileRunState` moves past a step — see `StepOutput`'s own
+    /// `RunState` moves past a step — see `StepOutput`'s own
     /// doc comment. Consulted by `render_current_document`/`markdown::render`
     /// to splice a block's own live output right under it, the TUI
     /// equivalent of the web UI's `LiveRunOutput`.
@@ -655,7 +630,7 @@ pub struct App {
     /// Whether the Output pane (the "console" — a running transcript of the
     /// most recent chain/file run, not scoped to one block) is collapsed to
     /// its 1-line title strip — see `ui::compute_layout`. Starts collapsed;
-    /// `start_run`/`start_file_run` expand it, `mod.rs`'s periodic tick
+    /// `start_run` expands it, `mod.rs`'s periodic tick
     /// re-collapses it once nothing is running and `console_last_activity`
     /// is stale (see `App::console_is_active`/`console_tick`).
     pub console_collapsed: bool,
@@ -1238,7 +1213,6 @@ impl App {
             run_confirmation: None,
             run_confirmation_approved: false,
             run: None,
-            file_run: None,
             step_output: HashMap::new(),
             child_steps: HashMap::new(),
             displayed_invocations: HashMap::new(),
@@ -2130,8 +2104,7 @@ impl App {
         } else {
             format!("meshfox: form submitted — {count} autorun block(s) queued")
         };
-        let idle = self.run.as_ref().is_none_or(|r| r.finished)
-            && self.file_run.as_ref().is_none_or(|r| r.finished);
+        let idle = self.run.as_ref().is_none_or(|r| r.finished);
         if idle {
             if let Some(addr) = self.pending_autoruns.pop_front() {
                 self.start_run(addr.node_id, addr.block_name, true).await;
@@ -2573,9 +2546,7 @@ impl App {
                 node_id,
                 block_name,
             } => {
-                if self.run.as_ref().is_some_and(|r| !r.finished)
-                    || self.file_run.as_ref().is_some_and(|r| !r.finished)
-                {
+                if self.run.as_ref().is_some_and(|r| !r.finished) {
                     self.status = "a run is already in progress — press K to kill it first".into();
                     return;
                 }
@@ -3753,6 +3724,21 @@ impl App {
         self.doc_segments.clear();
         self.doc_click_regions.clear();
         self.doc_images.clear();
+        // A runnable `file` node is drawn as the fence it stands in for, so
+        // its target's content is needed — requested before `node` below
+        // borrows the canvas.
+        let runnable_file_id = self
+            .rows
+            .get(self.selected)
+            .map(|row| row.node_id.clone())
+            .filter(|id| {
+                self.display_canvas
+                    .node(id)
+                    .is_some_and(|node| node.is_runnable_file())
+            });
+        if let Some(id) = &runnable_file_id {
+            self.ensure_file_preview(id);
+        }
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -3867,7 +3853,19 @@ impl App {
         // (which for a `file` node is just the one Markdown link). The
         // fetch is in the background (`ensure_file_preview`); until it
         // lands the pane says so, and a refresh keeps the old content up.
-        if node.node_type == NodeType::File
+        // A runnable file node: its link, caption, block and cached output
+        // as fence Markdown (`fence::file_node_markdown`), so the ordinary
+        // renderer draws the block with all its controls. The target's
+        // content stays empty until the preview fetch above has landed.
+        let runnable_markdown = runnable_file_id.as_ref().and_then(|_| {
+            let content = match self.file_previews.get(&node.id).map(|p| &p.state) {
+                Some(FilePreviewState::Ready { content, .. }) => content.as_str(),
+                _ => "",
+            };
+            meshfox_core::fence::file_node_markdown(node, content)
+        });
+        if runnable_markdown.is_none()
+            && node.node_type == NodeType::File
             && matches!(node.display, Some(FileDisplay::Code | FileDisplay::Table))
         {
             let is_table = node.display == Some(FileDisplay::Table);
@@ -3949,7 +3947,7 @@ impl App {
         }
 
         let (segs, regions) = markdown::render_with_computed(
-            &node.text,
+            runnable_markdown.as_deref().unwrap_or(&node.text),
             &base_dir,
             &self.highlighter,
             &node.id,
@@ -4291,10 +4289,6 @@ impl App {
             self.status = "a run is already in progress — press K to kill it first".into();
             return;
         }
-        if self.file_run.as_ref().is_some_and(|r| !r.finished) {
-            self.status = "a run is already in progress — press K to kill it first".into();
-            return;
-        }
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -4312,28 +4306,18 @@ impl App {
             }
         }
 
-        // A runnable `file` node (`type="file" interpreter="..."`) has no
-        // fenced blocks at all — it's its own single, uncached, unchained
-        // action, same as the web UI's own "▷ run" on its title bar.
-        // Checked against `self.display_canvas` (already include-resolved,
-        // the same tree `row`/`node_id` came from) since a `file` node's
-        // own runnability has nothing to do with `deps=`/chain machinery.
-        if let Some(node) = self.display_canvas.node(&node_id) {
-            if node.is_runnable_file() {
-                self.start_file_run(node_id, node.clone()).await;
-                return;
-            }
-        }
-
         // Include-resolved (not just `Canvas::from_markdown`) so a block
         // living inside an `include` node's own dumped body is found here
         // too — same `self.display_canvas` the `file`-node check above
         // already trusts.
-        let Some(node_text) = self.display_canvas.node(&node_id).map(|n| n.text.clone()) else {
+        let Some(blocks) = self
+            .display_canvas
+            .node(&node_id)
+            .map(|n| n.runnable_blocks())
+        else {
             self.status = format!("node {node_id:?} not found");
             return;
         };
-        let blocks = scan_runnable_blocks(&node_id, &node_text);
         if blocks.is_empty() {
             self.status = "nothing runnable in this node".into();
             return;
@@ -5315,73 +5299,6 @@ impl App {
             .await;
     }
 
-    /// Runs a runnable `file` node (`type="file"` with both `target` and
-    /// `interpreter` set) as `interpreter target`, streaming output live —
-    /// the TUI counterpart to the web UI's own "▷ run" button on a `file`
-    /// node's title bar (`run_file_node` in `crates/server/src/lib.rs`),
-    /// previously the only way to run one at all.
-    async fn start_file_run(&mut self, node_id: String, _node: Node) {
-        let Some(port) = self.worker_port else {
-            self.status = "no worker for this canvas".into();
-            return;
-        };
-        match crate::worker_client::run_file_node_stream(port, &node_id).await {
-            Ok(events) => {
-                self.status.clear();
-                self.output_scroll = 0;
-                self.output_hscroll = 0;
-                self.file_run = Some(FileRunState {
-                    node_id: node_id.clone(),
-                    events: Some(events),
-                    run_id: None,
-                    lines: vec![format!("==> {node_id}")],
-                    had_failure: false,
-                    finished: false,
-                });
-                // A file run is always a single execution — never a
-                // multi-block chain — so it never auto-opens the console
-                // (see `resolved_chain_len`'s call sites for the chain-run
-                // equivalent of this rule).
-            }
-            Err(e) => {
-                self.status = format!("failed to run {node_id:?}: {e}");
-            }
-        }
-    }
-
-    /// One event from `file_run`'s worker stream (`None`: the stream ended).
-    /// Mirrors `on_run_event`, minus everything that only applies to a
-    /// fenced block (no `cache`, no `meshfox:var`, no chain to advance).
-    pub fn on_file_run_event(&mut self, event: Option<crate::worker_client::RunEvent>) {
-        use crate::worker_client::RunEvent;
-        let Some(run) = &mut self.file_run else {
-            return;
-        };
-        self.console_last_activity = Some(std::time::Instant::now());
-        let exit_code = match event {
-            Some(RunEvent::Started { run_id, .. }) => {
-                run.run_id = Some(run_id);
-                return;
-            }
-            Some(RunEvent::Output { text, .. }) => {
-                run.lines.push(text);
-                return;
-            }
-            Some(RunEvent::Done { exit_code }) => exit_code,
-            Some(RunEvent::Error { message }) => {
-                run.lines.push(message);
-                -1
-            }
-            Some(RunEvent::Killed { .. }) => -1,
-            Some(_) => return,
-            None => -1,
-        };
-        run.events = None;
-        run.lines.push(format!("(exit {exit_code})"));
-        run.had_failure = exit_code != 0;
-        run.finished = true;
-    }
-
     /// Called by `mod.rs` once `bridge_http_tty`'s relay loop returns —
     /// there's no `RunState`/chain `idx` to advance here at all: the
     /// *entire* chain (deps and interactive step alike) already ran
@@ -5514,7 +5431,6 @@ impl App {
     /// own ticks.
     pub fn spinner_active(&self) -> bool {
         self.run.as_ref().is_some_and(RunState::is_running)
-            || self.file_run.as_ref().is_some_and(|f| f.events.is_some())
             || !self.external_running.is_empty()
     }
 
@@ -5546,7 +5462,6 @@ impl App {
             return;
         }
         let running = self.run.as_ref().is_some_and(RunState::is_running)
-            || self.file_run.as_ref().is_some_and(|r| r.events.is_some())
             || !self.external_running.is_empty();
         if running {
             return;
@@ -6171,10 +6086,6 @@ impl App {
             self.status = format!("node {node_id:?} not found");
             return;
         };
-        if node.is_runnable_file() {
-            self.status = "a runnable file node keeps no run history".into();
-            return;
-        }
         let blocks: Vec<_> = node
             .runnable_blocks()
             .into_iter()
@@ -6439,12 +6350,6 @@ impl App {
                     self.status = "killing...".into();
                     let _ = crate::worker_client::kill_run(port, &node_id, &block).await;
                 }
-            }
-        }
-        if let (Some(run), Some(port)) = (&self.file_run, self.worker_port) {
-            if let (true, Some(run_id)) = (run.events.is_some(), run.run_id.clone()) {
-                let _ = crate::worker_client::kill_run_id(port, &run_id).await;
-                self.status = "killing...".into();
             }
         }
     }

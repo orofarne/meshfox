@@ -9,7 +9,6 @@ use std::time::Instant;
 enum Revision {
     Worker(u64),
     Local(Instant),
-    File(Option<String>),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Completion {
@@ -139,21 +138,6 @@ impl Snapshot {
                         label: name.into(),
                         failed: run.had_failure || run.killed,
                         revision: Revision::Local(run.step_started),
-                    },
-                );
-            }
-        }
-        if let Some(run) = &app.file_run {
-            let addr = format!("file/{}", run.node_id);
-            if run.events.is_some() {
-                snapshot.active.insert(addr, run.node_id.clone());
-            } else if run.finished {
-                snapshot.completed.insert(
-                    addr,
-                    Completion {
-                        label: run.node_id.clone(),
-                        failed: run.had_failure,
-                        revision: Revision::File(run.run_id.clone()),
                     },
                 );
             }

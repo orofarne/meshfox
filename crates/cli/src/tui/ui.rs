@@ -991,15 +991,7 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
             .and_then(super::app::RunState::current_addr)
             .map(|addr| addr.node_id.as_str()),
     );
-    if let Some(file_run) = app.file_run.as_ref().filter(|f| f.events.is_some()) {
-        running_nodes.insert(file_run.node_id.as_str());
-    }
-    let mut failed_nodes: std::collections::HashSet<&str> = app.failed_node_ids();
-    if let Some(file_run) = &app.file_run {
-        if file_run.had_failure {
-            failed_nodes.insert(file_run.node_id.as_str());
-        }
-    }
+    let failed_nodes: std::collections::HashSet<&str> = app.failed_node_ids();
 
     // A running/failed block also marks every non-root ancestor of its node
     // (same rule as the web UI's `runningAncestors`/`failedAncestors`), so a
@@ -1454,14 +1446,6 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         } else {
             " Output (done) ".to_string()
         }
-    } else if let Some(run) = &app.file_run {
-        if run.events.is_some() {
-            " Output (running — K to kill) ".to_string()
-        } else if run.had_failure {
-            " Output (failed) ".to_string()
-        } else {
-            " Output (done) ".to_string()
-        }
     } else {
         " Output ".to_string()
     };
@@ -1534,9 +1518,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         }
         Some(lines)
     } else {
-        app.file_run
-            .as_ref()
-            .map(|run| super::ansi::lines(&run.lines.join("\n")))
+        None
     };
     let content = if app.external_console_lines.is_empty() {
         content

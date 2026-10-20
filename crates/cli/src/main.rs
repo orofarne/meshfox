@@ -2854,60 +2854,9 @@ async fn run_via_worker(
         let (path, canonical, vars) = match prepared {
             Ok(result) => result,
             Err(chain_err) => {
-                match resolve_worker_file_node(port, canvas_path, &path, name).await {
-                    Some(node_id) => {
-                        if detach {
-                            eprintln!(
-                                "meshfox run: --detach requires a fenced block with chain history"
-                            );
-                            terminal_status::exit(1);
-                        }
-                        match worker_client::run_file_node_stream(port, &node_id).await {
-                            Ok(rx) => {
-                                match drain_worker_run_events(
-                                    rx,
-                                    port,
-                                    name,
-                                    &mut started_services,
-                                    &mut chain_ids,
-                                )
-                                .await
-                                {
-                                    DrainResult::Ok => {}
-                                    DrainResult::Failed => had_failure = true,
-                                    // Unreachable in practice — `run_file_node_impl`
-                                    // never takes a service lock (see
-                                    // `DrainResult::Conflict`'s own doc comment) —
-                                    // kept as a plain failure, not a retry, since
-                                    // there's no `force`-capable endpoint for a
-                                    // file node to retry through anyway.
-                                    DrainResult::Conflict {
-                                        block,
-                                        owner_pid,
-                                        owner_desc,
-                                        ..
-                                    } => {
-                                        eprintln!(
-                                        "error running {block:?}: already running elsewhere (pid {owner_pid}, \
-                                         started via {owner_desc})"
-                                    );
-                                        had_failure = true;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("error running {name:?}: {e} (worker on port {port})");
-                                had_failure = true;
-                            }
-                        }
-                        continue;
-                    }
-                    None => {
-                        let hint = worker_did_you_mean_hint(canvas_path, port, &path, name).await;
-                        eprintln!("meshfox run: {chain_err}{hint}");
-                        terminal_status::exit(1);
-                    }
-                }
+                let hint = worker_did_you_mean_hint(canvas_path, port, &path, name).await;
+                eprintln!("meshfox run: {chain_err}{hint}");
+                terminal_status::exit(1);
             }
         };
 
@@ -3167,38 +3116,8 @@ async fn run_via_worker(
     }
 }
 
-/// `run_async`'s own coordinator-routed path, checked only once
-/// `preflight_worker_vars` has already failed to resolve `path`+`name` as
-/// a fenced-block chain: fetches the worker's own raw canvas text (the
-/// same one `App::new`/`crate::worker_client::get_canvas_raw` already use
-/// for this purpose elsewhere) and resolves it *locally* — the one place
-/// this coordinator-routed path parses anything client-side at all, purely
-/// to answer "is this actually a runnable `file` node?" rather than to run
-/// anything itself. `None` for any failure along the way (unreachable
-/// worker, unparseable canvas, unresolvable path, or a real node that just
-/// isn't a runnable file) — the caller already has the original chain-
-/// resolution error to report in every one of those cases, so there's
-/// nothing more specific worth surfacing from here.
-async fn resolve_worker_file_node(
-    port: u16,
-    canvas_path: &Path,
-    path: &[String],
-    name: &str,
-) -> Option<String> {
-    let raw = worker_client::get_canvas_raw(port).await.ok()?;
-    let primary = Canvas::from_markdown(&raw).ok()?;
-    let canvas = meshfox_core::include::resolve(&primary, canvas_path).ok()?;
-    let full_path: Vec<&str> = path
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once(name))
-        .collect();
-    let node = canvas.resolve_path(&full_path).ok()?;
-    node.is_runnable_file().then(|| node.id.clone())
-}
-
 /// A "did you mean ...?" suffix for `chain_err`'s own message once *both*
-/// `preflight_worker_vars` and `resolve_worker_file_node` have given up on
+/// `preflight_worker_vars` has given up on
 /// `path`+`name` — computed by re-resolving it locally against the
 /// worker's own raw canvas purely for this diagnostic (the structured
 /// `TreeError` the in-process path used to match on never reaches this
@@ -4310,6 +4229,7 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
             if let Some(new_node) = new_canvas.node(node_id) {
                 if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
                     let meta = NodeMeta {
+        block_attrs: None,
                         x: Some(local_x),
                         y: Some(local_y),
                         width: new_node.width,
@@ -4711,6 +4631,12 @@ fn apply_node_block(
         interpreter,
         code: code.map(str::to_string),
     };
+    if let Some(why) = Canvas::from_markdown(raw)
+        .ok()
+        .and_then(|canvas| canvas.node(node_id).filter(|n| n.is_runnable_file()).and(patch.file_node_conflict()))
+    {
+        return Err(why.to_string());
+    }
     let updated = mdcanvas::set_fence_attrs(raw, node_id, block_name, &patch).ok_or_else(|| {
         format!("no runnable code block named {block_name:?} in node {node_id:?}")
     })?;
@@ -4987,6 +4913,7 @@ fn apply_node_meta(
     // value happens to be, same invariant the rejection above enforces on
     // the command-line side.
     let meta = NodeMeta {
+        block_attrs: None,
         x: if clear_position { None } else { x.or(node.x) },
         y: if clear_position { None } else { y.or(node.y) },
         width: if is_group || clear_position {

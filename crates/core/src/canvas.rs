@@ -429,6 +429,14 @@ pub struct Node {
     /// Never serialized: runtime state, not document content.
     #[serde(skip)]
     pub target_digest: Option<String>,
+    /// `file`-node only: the implicit block's current fingerprint
+    /// (`fence::fingerprint` of `Node::runnable_blocks`, including
+    /// `target_digest`), for clients that compare it with the `hash=` of
+    /// the cached output to flag it stale — they cannot recompute it, the
+    /// target's content is not part of the node. Set together with
+    /// `target_digest` by `Canvas::hydrate_target_digests`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_fingerprint: Option<String>,
 }
 
 impl Node {
@@ -488,6 +496,11 @@ impl Canvas {
     /// canvas may read simply gets no digest — running it reports the real
     /// error; this only makes cache/stale follow the file's content.
     pub fn hydrate_target_digests(&mut self, canvas_path: &std::path::Path) {
+        // Most canvases have none: do not even build the file access
+        // (it reads the variable cache and shared config) for those.
+        if !self.nodes.iter().any(Node::is_runnable_file) {
+            return;
+        }
         let access = crate::dirvars::FileAccess::for_canvas_path(self, canvas_path);
         let canvas_dir = canvas_path
             .parent()
@@ -505,6 +518,7 @@ impl Canvas {
                     node.set_target_digest(&content);
                 }
             }
+            node.block_fingerprint = Some(crate::fence::fingerprint(&crate::fence::target_block(node)));
         }
     }
 

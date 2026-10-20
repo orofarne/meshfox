@@ -96,6 +96,14 @@ export interface CanvasNode {
   /** file-node only: an executable (e.g. "python") to run against
    * `target`, making the node runnable — absent means it isn't. */
   interpreter?: string;
+  /** file-node only: the fence-style attributes (`deps`, `env`, `cache`, ...)
+   * authored on its `meshfox:node` line — they configure the node's one
+   * implicit runnable block, see `RunnableFileBlock`. */
+  blockAttrs?: Record<string, string>;
+  /** file-node only: that block's current fingerprint (it covers the target
+   * file's content, which the client cannot recompute) — compared with the
+   * cached output's `hash=` to flag it stale. */
+  blockFingerprint?: string;
   /** link-node only: whether to fetch and show an OpenGraph social preview
    * (title/description/image) below the link. Absent means off (the
    * default) — meshfox omits the default from the wire format, same as

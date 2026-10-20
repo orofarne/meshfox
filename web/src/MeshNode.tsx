@@ -432,8 +432,11 @@ export interface MeshNodeData {
   lang?: string;
   /** file-node only: an executable (e.g. "python") to run against
    * `target` — present makes the node runnable via the title bar's "▷ run"
-   * button (see `App.tsx`'s `executeFileRun`). */
+   * button (see `App.tsx`'s `handleRun`). */
   interpreter?: string;
+  /** file-node only: see `CanvasNode.blockAttrs` / `blockFingerprint`. */
+  blockAttrs?: Record<string, string>;
+  blockFingerprint?: string;
   /** link-node only: shows an OpenGraph social preview card (title/
    * description/image) below the link — see `LinkPreviewCard`. */
   preview?: boolean;
@@ -2666,14 +2669,167 @@ function FileLinkCaption({ caption }: { caption: string }) {
   );
 }
 
+/** Quotes an attribute value for a synthetic fence info string. */
+function quoteInfoValue(value: string): string {
+  return value.includes('"') ? `'${value}'` : `"${value}"`;
+}
+
+/**
+ * The `CodeSegment` a runnable `file` node stands in as: the node's own
+ * block attributes, `interpreter` and `meshfox:arg` lines are written out as
+ * the fence they would have been, the target's content is its code, and the
+ * cached-output region at the end of the body follows it — then the one
+ * ordinary parser (`parseBody`) builds the segment, so deps/args/output look
+ * exactly like a fence's. The one thing it cannot know is whether the cached
+ * output is stale: the block's fingerprint covers the file's content, which
+ * only the server hashes, so that comes from `blockFingerprint`.
+ */
+export function fileBlockSegment(
+  nodeId: string,
+  data: Pick<MeshNodeData, "text" | "interpreter" | "target" | "lang" | "display" | "blockAttrs" | "blockFingerprint">,
+  code: string,
+): CodeSegment | null {
+  if (!data.interpreter) return null;
+  const lines = data.text.split("\n");
+  const argLines: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("<!-- meshfox:arg ")) argLines.push(trimmed);
+    else if (trimmed.startsWith("[")) break;
+  }
+  const regionStart = lines.findIndex((line) => line.startsWith("<!-- meshfox:output "));
+  const region = regionStart >= 0 ? lines.slice(regionStart).join("\n") : "";
+  const attrs = [`name=${quoteInfoValue(nodeId)}`, `interpreter=${quoteInfoValue(data.interpreter)}`];
+  for (const [key, value] of Object.entries(data.blockAttrs ?? {})) attrs.push(`${key}=${quoteInfoValue(value)}`);
+  // The source starts folded unless the node asks to show the file
+  // (`display="code"`), like a fence with `fold`.
+  if (data.display !== "code") attrs.push("fold");
+  const lang = data.lang ?? extensionOf(data.target) ?? "text";
+  const longestRun = Math.max(0, ...(code.match(/`+/g) ?? []).map((run) => run.length));
+  const ticks = "`".repeat(Math.max(3, longestRun + 1));
+  const markdown = [...argLines, `${ticks}${lang} ${attrs.join(" ")}`, code, ticks, region].join("\n");
+  const seg = parseBody(markdown, nodeId).find((s): s is CodeSegment => s.type === "code");
+  if (!seg) return null;
+  if (seg.output) {
+    const hash = /hash="([^"]*)"/.exec(region.split("\n", 1)[0])?.[1];
+    seg.output = { ...seg.output, stale: hash === undefined || hash !== data.blockFingerprint };
+  }
+  return seg;
+}
+
+/** A runnable `file` node's block: `RunnableCodeBlock` over a segment built
+ * from the node (`fileBlockSegment`), its code being the target file's
+ * current content, re-read after every run/refresh. */
+function RunnableFileBlock({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
+  const refreshTick = useContext(FileRefreshContext);
+  const [source, setSource] = useState<{ content: string } | { error: string }>({ content: "" });
+  useEffect(() => {
+    let cancelled = false;
+    fetchNodeFileContent(nodeId)
+      .then(({ content }) => {
+        if (!cancelled) setSource({ content });
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setSource({ error: err instanceof Error ? err.message : String(err) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [nodeId, data.target, refreshTick]);
+  const code = "content" in source ? source.content : "";
+  const seg = useMemo(
+    () => fileBlockSegment(nodeId, data, code),
+    [nodeId, data.text, data.interpreter, data.target, data.lang, data.display, data.blockAttrs, data.blockFingerprint, code],
+  );
+  if (!seg) return null;
+  return (
+    <>
+      <RunnableCodeBlock seg={seg} data={data} nodeId={nodeId} />
+      {"error" in source && <p className="mesh-node-hint">source unavailable: {source.error}</p>}
+    </>
+  );
+}
+
+/** The target row of a `file`/`link` node: its link (opening the file / URL)
+ * plus, for a `file`, the download and show-in-folder buttons. */
+function FileTargetRow({ data }: { data: MeshNodeData }) {
+  const isFile = data.nodeType === "file";
+  return data.target ? (
+      <div className="mesh-node-target-row">
+        {/* A `file` node's own link now behaves exactly like the title
+         * bar's "↗ open" button (opens `target` in the OS's default
+         * application) instead of fetching the raw file — the download
+         * and folder icons right after it are what took over that old
+         * "click the link to get the file" behavior (and a new one,
+         * respectively), so the two are no longer conflated on the one
+         * link. A `link` node's own target is unaffected — it still
+         * just opens the URL, same as before.
+         *
+         * Deliberately a hrefless `<button>` for the `file` case, not
+         * an `<a href>` with a click handler that calls
+         * `preventDefault()` — the VS Code extension embeds this app
+         * in a webview, and VS Code's webview host intercepts *every*
+         * anchor click by inspecting its `href` directly (to hand
+         * `http(s)` targets off to the OS's real browser), completely
+         * independent of whatever this page's own JS does with the
+         * event; `preventDefault()` here never reaches it. With a real
+         * `href` still on the tag, that interception fired *in
+         * addition to* this handler's own `onOpenFile()` — one click
+         * opening two tabs (confirmed directly: VS Code's own native
+         * image-preview tab from `onOpenFile()`, plus a second raw
+         * browser tab straight at the file's server URL from VS
+         * Code's own interception). A `<button>` has no `href` at all
+         * for that interception to ever find. */}
+        {isFile ? (
+          <button type="button" className="mesh-node-open-link nodrag" onClick={data.onOpenFile}>
+            {data.target}
+          </button>
+        ) : (
+          <a href={resolveAssetHref(data.target, data.assetBase)} target="_blank" rel="noreferrer" className="nodrag">
+            {data.target}
+          </a>
+        )}
+        {isFile && (
+          <>
+            <a
+              href={resolveAssetHref(data.target, data.assetBase)}
+              download
+              className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+              title="Download this file"
+            >
+              <DownloadIcon />
+            </a>
+            <button
+              type="button"
+              className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+              onClick={data.onOpenFileFolder}
+              title="Show this file's containing folder"
+            >
+              <FolderIcon />
+            </button>
+          </>
+        )}
+      </div>
+    ) : (
+      <em>no target</em>
+    );
+}
+
 export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
   if (data.nodeType === "group") return null;
-  // A runnable file node's live run state is keyed under its own id in
-  // `liveBlocks` — same "the block shares its node's own id" convention a
-  // `text` node's sole implicit block already uses (see `App.tsx`'s
-  // `executeFileRun`). No cached copy to fall back to (unlike a fenced
-  // block's `seg.output`): a `file` node has no `cache` concept.
-  const fileRunLive = data.interpreter ? data.liveBlocks[nodeId] : undefined;
+  // A runnable file node is a block like a fence: its link and caption on
+  // top, then the same block (head controls, source, output) a fence gets.
+  if (data.nodeType === "file" && data.interpreter && data.target) {
+    return (
+      <>
+        <div className="mesh-node-body nopan">
+          <FileTargetRow data={data} />
+          {data.caption && <FileLinkCaption caption={data.caption} />}
+        </div>
+        <RunnableFileBlock data={data} nodeId={nodeId} />
+      </>
+    );
+  }
   if (data.nodeType === "file" && data.display === "code") {
     return (
       <>
@@ -2683,7 +2839,6 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
          * naturally reads as elaborating on the link above it). */}
         {data.caption && <div className="mesh-node-body nopan"><FileLinkCaption caption={data.caption} /></div>}
         <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />
-        {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </>
     );
   }
@@ -2692,78 +2847,17 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
       <>
         {data.caption && <div className="mesh-node-body mesh-table-caption nopan"><FileLinkCaption caption={data.caption} /></div>}
         <FileTablePreview nodeId={nodeId} target={data.target} />
-        {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </>
     );
   }
   if (data.nodeType === "file" || data.nodeType === "link") {
-    const isFile = data.nodeType === "file";
     return (
       <div className="mesh-node-body nopan">
-        {data.target ? (
-          <div className="mesh-node-target-row">
-            {/* A `file` node's own link now behaves exactly like the title
-             * bar's "↗ open" button (opens `target` in the OS's default
-             * application) instead of fetching the raw file — the download
-             * and folder icons right after it are what took over that old
-             * "click the link to get the file" behavior (and a new one,
-             * respectively), so the two are no longer conflated on the one
-             * link. A `link` node's own target is unaffected — it still
-             * just opens the URL, same as before.
-             *
-             * Deliberately a hrefless `<button>` for the `file` case, not
-             * an `<a href>` with a click handler that calls
-             * `preventDefault()` — the VS Code extension embeds this app
-             * in a webview, and VS Code's webview host intercepts *every*
-             * anchor click by inspecting its `href` directly (to hand
-             * `http(s)` targets off to the OS's real browser), completely
-             * independent of whatever this page's own JS does with the
-             * event; `preventDefault()` here never reaches it. With a real
-             * `href` still on the tag, that interception fired *in
-             * addition to* this handler's own `onOpenFile()` — one click
-             * opening two tabs (confirmed directly: VS Code's own native
-             * image-preview tab from `onOpenFile()`, plus a second raw
-             * browser tab straight at the file's server URL from VS
-             * Code's own interception). A `<button>` has no `href` at all
-             * for that interception to ever find. */}
-            {isFile ? (
-              <button type="button" className="mesh-node-open-link nodrag" onClick={data.onOpenFile}>
-                {data.target}
-              </button>
-            ) : (
-              <a href={resolveAssetHref(data.target, data.assetBase)} target="_blank" rel="noreferrer" className="nodrag">
-                {data.target}
-              </a>
-            )}
-            {isFile && (
-              <>
-                <a
-                  href={resolveAssetHref(data.target, data.assetBase)}
-                  download
-                  className="mesh-node-icon-button mesh-node-inline-icon nodrag"
-                  title="Download this file"
-                >
-                  <DownloadIcon />
-                </a>
-                <button
-                  type="button"
-                  className="mesh-node-icon-button mesh-node-inline-icon nodrag"
-                  onClick={data.onOpenFileFolder}
-                  title="Show this file's containing folder"
-                >
-                  <FolderIcon />
-                </button>
-              </>
-            )}
-          </div>
-        ) : (
-          <em>no target</em>
-        )}
+        <FileTargetRow data={data} />
         {data.nodeType === "link" && data.preview && data.target && (
           <LinkPreviewCard target={data.target} />
         )}
         {data.caption && <FileLinkCaption caption={data.caption} />}
-        {fileRunLive && <LiveRunOutput live={fileRunLive} />}
       </div>
     );
   }
@@ -2961,7 +3055,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // rule `core::fence::default_block` uses — see `defaultBlock`); for a
   // runnable `file` node (`interpreter` set), the node's own id, matching
   // the same "the block shares its node's own id" convention its live run
-  // state is keyed under (see `App.tsx`'s `executeFileRun`) — a file node
+  // state is keyed under (see `App.tsx`'s `handleRun`) — a file node
   // is never `tty` (that's only ever a fenced block's own attribute, see
   // `CodeSegment.tty`), so `quickRunIsTty` only checks `quickRunBlock`.
   // `null` when neither applies (nothing to quick-run) — the button just
