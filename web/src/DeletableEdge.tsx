@@ -279,7 +279,7 @@ export function DeletableEdge({
       ["top", Math.hypot(clientY - box.top, clientX - clamp(clientX, box.left, box.right))],
       ["bottom", Math.hypot(clientY - box.bottom, clientX - clamp(clientX, box.left, box.right))],
     ];
-    return distances.reduce((nearest, d) => (d[1] < nearest[1] ? d : nearest))[0];
+    return distances.reduce((nearest, d) => (d[1] < nearest[1] ? d : nearest), distances[0])[0];
   };
 
   const portAt = (nodeId: string, side: EdgeSide) => {

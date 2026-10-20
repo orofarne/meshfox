@@ -35,7 +35,7 @@ function newestMtime(dir: string): number {
 
 function linkerSignedOnly(): boolean {
   if (process.platform !== "darwin") return false;
-  const info = spawnSync("codesign", ["-dv", MESHFOX_BIN], { encoding: "utf8" });
+  const info = spawnSync("/usr/bin/codesign",["-dv", MESHFOX_BIN], { encoding: "utf8" });
   return info.status !== 0 || `${info.stdout}${info.stderr}`.includes("linker-signed");
 }
 

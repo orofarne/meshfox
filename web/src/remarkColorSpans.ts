@@ -27,63 +27,101 @@ function append(nodes: Node[], node: Node) {
   else nodes.push(node);
 }
 
-function visit(parent: Node, source: string) {
-  if (!parent.children || parent.type === "image" || parent.type === "imageReference") return;
-  for (const child of parent.children) visit(child, source);
-  if (!parent.children.some(node => node.type === "text" && node.value?.includes("["))) return;
+type Bracket = { delimiter: boolean; offset: number };
+const BRACKET_BY_CODE: Record<number, string> = { 91: "[", 93: "]" };
+
+// What a bracket-ish source spelling decodes to ("" for any other entity).
+function decodeSpelling(spelling: string): string {
+  if (spelling.startsWith("\\")) return spelling.slice(1);
+  if (spelling.startsWith("&#")) {
+    const hex = spelling[2].toLowerCase() === "x";
+    const code = Number.parseInt(spelling.slice(hex ? 3 : 2, -1), hex ? 16 : 10);
+    return BRACKET_BY_CODE[code] ?? "";
+  }
+  if (/^&(lbrack|lsqb);$/.test(spelling)) return "[";
+  if (/^&(rbrack|rsqb);$/.test(spelling)) return "]";
+  return spelling;
+}
+
+// Align bracket characters with their original spelling. Remark coalesces
+// entities and escapes into text; neither may introduce a delimiter.
+function bracketsIn(raw: string, start: number): Bracket[] {
+  const brackets: Bracket[] = [];
+  for (const match of raw.matchAll(/\\[\s\S]|&(?:#x[0-9a-f]+|#\d+|[a-z][a-z0-9]+);|[[\]]/gi)) {
+    const spelling = match[0];
+    const decoded = decodeSpelling(spelling);
+    if (decoded === "[" || decoded === "]") brackets.push({ delimiter: spelling === decoded, offset: start + match.index! });
+  }
+  return brackets;
+}
+
+function tokenize(children: Node[], source: string): Token[] {
   const tokens: Token[] = [];
-  for (const node of parent.children) {
+  for (const node of children) {
     if (node.type !== "text") { tokens.push({ node }); continue; }
     const start = node.position?.start.offset;
     const raw = start === undefined ? "" : source.slice(start, node.position?.end.offset);
-    // Align bracket characters with their original spelling. Remark coalesces
-    // entities and escapes into text; neither may introduce a delimiter.
-    const brackets: { delimiter: boolean; offset: number }[] = [];
-    for (const match of raw.matchAll(/\\[\s\S]|&(?:#x[0-9a-f]+|#[0-9]+|[a-z][a-z0-9]+);|[\[\]]/gi)) {
-      const spelling = match[0];
-      let decoded = spelling;
-      if (spelling.startsWith("\\")) decoded = spelling.slice(1);
-      else if (spelling.startsWith("&#")) {
-        const hex = spelling[2].toLowerCase() === "x";
-        const number = parseInt(spelling.slice(hex ? 3 : 2, -1), hex ? 16 : 10);
-        decoded = number === 91 ? "[" : number === 93 ? "]" : "";
-      } else if (/^&(lbrack|lsqb);$/.test(spelling)) decoded = "[";
-      else if (/^&(rbrack|rsqb);$/.test(spelling)) decoded = "]";
-      if (decoded === "[" || decoded === "]") brackets.push({ delimiter: spelling === decoded, offset: (start ?? 0) + match.index! });
-    }
+    const brackets = bracketsIn(raw, start ?? 0);
     for (const ch of node.value ?? "") {
       const bracket = ch === "[" || ch === "]" ? brackets.shift() : undefined;
       tokens.push({ node: text(ch), delimiter: bracket?.delimiter, sourceOffset: bracket?.offset });
     }
   }
+  return tokens;
+}
+
+// The `{...}` attributes right after the `]` at tokens[i], if the tokens'
+// own text spells them exactly as the source does.
+function colorAttrsAfter(tokens: Token[], i: number, source: string): { style: string; consumed: number } | null {
+  const sourceOffset = tokens[i].sourceOffset;
+  if (sourceOffset === undefined) return null;
+  const attrs = parseColors(source.slice(sourceOffset + 1));
+  if (!attrs) return null;
+  let tail = "";
+  for (let j = i + 1; j < tokens.length && tokens[j].node.type === "text"; j++) {
+    tail += tokens[j].node.value;
+    if (tail.endsWith("}")) break;
+  }
+  const spelled = source.slice(sourceOffset + 1, sourceOffset + 1 + attrs.consumed);
+  return tail.slice(0, attrs.consumed) === spelled ? attrs : null;
+}
+
+// An unmatched `[`: back to literal text, followed by what it enclosed.
+function appendUnclosed(frames: Node[][], content: Node[]) {
+  const top = frames.at(-1)!;
+  append(top, text("["));
+  for (const child of content) append(top, child);
+}
+
+function nestSpans(tokens: Token[], source: string): Node[] {
   const frames: Node[][] = [[]];
   for (let i = 0; i < tokens.length; i++) {
-    const { node, delimiter, sourceOffset } = tokens[i];
+    const { node, delimiter } = tokens[i];
     if (delimiter && node.value === "[") { frames.push([]); continue; }
     if (delimiter && node.value === "]" && frames.length > 1) {
       const content = frames.pop()!;
-      let tail = "";
-      for (let j = i + 1; j < tokens.length && tokens[j].node.type === "text"; j++) {
-        tail += tokens[j].node.value;
-        if (tail.endsWith("}")) break;
-      }
-      const attrs = sourceOffset === undefined ? null : parseColors(source.slice(sourceOffset + 1));
-      if (attrs && tail.slice(0, attrs.consumed) === source.slice(sourceOffset! + 1, sourceOffset! + 1 + attrs.consumed)) {
+      const attrs = colorAttrsAfter(tokens, i, source);
+      if (attrs) {
         append(frames.at(-1)!, { type: "colorSpan", children: content, data: { hName: "span", hProperties: { style: attrs.style } } });
         i += attrs.consumed;
         continue;
       }
-      append(frames.at(-1)!, text("["));
-      for (const child of content) append(frames.at(-1)!, child);
+      appendUnclosed(frames, content);
     }
     append(frames.at(-1)!, node);
   }
   while (frames.length > 1) {
     const content = frames.pop()!;
-    append(frames.at(-1)!, text("["));
-    for (const node of content) append(frames.at(-1)!, node);
+    appendUnclosed(frames, content);
   }
-  parent.children = frames[0];
+  return frames[0];
+}
+
+function visit(parent: Node, source: string) {
+  if (!parent.children || parent.type === "image" || parent.type === "imageReference") return;
+  for (const child of parent.children) visit(child, source);
+  if (!parent.children.some(node => node.type === "text" && node.value?.includes("["))) return;
+  parent.children = nestSpans(tokenize(parent.children, source), source);
 }
 
 export default function remarkColorSpans() {

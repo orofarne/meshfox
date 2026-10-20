@@ -2477,7 +2477,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
         if (seg.type === "markdown") {
           return (
             <ReactMarkdown
-              key={i}
+              key={`markdown-${i}`}
               remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
               components={markdownComponents}
               urlTransform={allowDataImageUrls}
@@ -2584,16 +2584,18 @@ function ConstraintFenceBlock({
   );
 }
 
-function RenderFenceBlock({ seg, result, assetBase }: {
+function RenderFenceBlock({ seg, result, assetBase }: Readonly<{
   seg: RenderSegment; result?: RenderResultDto; assetBase?: string;
-}) {
+}>) {
   const [expanded, setExpanded] = useState(false);
+  let status = "…";
+  if (result) status = result.error ? "✗" : "✓";
   return <div className="mesh-code-block mesh-render-block">
     <div className="mesh-code-block-head">
       <FoldToggle folded={!expanded} onToggle={() => setExpanded(e => !e)}
         foldedTitle="Show the Starlark source" unfoldedTitle="Hide the Starlark source" />
       <span className="mesh-code-lang">starlark · {seg.name ?? "render"}</span>
-      <span title={result?.error ?? undefined}>{result ? result.error ? "✗" : "✓" : "…"}</span>
+      <span title={result?.error ?? undefined}>{status}</span>
     </div>
     {expanded && <HighlightedCode code={seg.code} lang="starlark" />}
     {result?.error
@@ -2615,7 +2617,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
         if (seg.type === "markdown") {
           return (
             <ReactMarkdown
-              key={i}
+              key={`markdown-${i}`}
               remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
               components={components}
               urlTransform={allowDataImageUrls}
@@ -2721,7 +2723,7 @@ export function fileBlockSegment(
 /** A runnable `file` node's block: `RunnableCodeBlock` over a segment built
  * from the node (`fileBlockSegment`), its code being the target file's
  * current content, re-read after every run/refresh. */
-function RunnableFileBlock({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
+function RunnableFileBlock({ data, nodeId }: Readonly<{ data: MeshNodeData; nodeId: string }>) {
   const refreshTick = useContext(FileRefreshContext);
   const [source, setSource] = useState<{ content: string } | { error: string }>({ content: "" });
   useEffect(() => {

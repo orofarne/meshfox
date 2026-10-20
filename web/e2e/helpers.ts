@@ -82,10 +82,14 @@ export async function expectNever(
   what: string,
 ): Promise<void> {
   const deadline = Date.now() + windowMs;
-  do {
+  // Sequential on purpose: each poll must observe the state after the last
+  // pause, so the checks can't run concurrently.
+  const poll = async (): Promise<void> => {
     if (await isBad()) throw new Error(`${what} (within ${windowMs}ms)`);
     await new Promise((resolve) => setTimeout(resolve, 50));
-  } while (Date.now() < deadline);
+    if (Date.now() < deadline) return poll();
+  };
+  await poll();
 }
 
 /** Resolves after the page has painted `frames` more frames — lets a state

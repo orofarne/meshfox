@@ -413,8 +413,14 @@ function isRunnableCandidate(lang: string, attrs: Record<string, string>): boole
  * decide whether a node has exactly one unnamed fence (that node's
  * implicit block, if so — see `parseBody`'s `nodeId` param).
  */
-function fenceOpening(line: string): RegExpMatchArray | null {
-  return fenceIndentOk(line) ? line.trimStart().match(/^(`{3,}|~{3,})(.*)$/) : null;
+function fenceOpening(line: string): [string, string, string] | null {
+  if (!fenceIndentOk(line)) return null;
+  const value = line.trimStart();
+  const marker = value[0];
+  if (marker !== "`" && marker !== "~") return null;
+  let length = 1;
+  while (value[length] === marker) length++;
+  return length >= 3 ? [value, value.slice(0, length), value.slice(length)] : null;
 }
 function fenceClosing(line: string, delimiter: string): boolean {
   const value = line.trim();
@@ -447,7 +453,7 @@ function countUnnamedCandidateFences(markdown: string): number {
       if (!precededByOutputMarker) {
         const [lang, ...rest] = tokenize(info);
         const attrs = attrsFromTokens(rest);
-        if (opening[1][0] === "`" && isRunnableCandidate(lang, attrs) && attrs.name === undefined) count++;
+        if (opening[1].startsWith("`") && isRunnableCandidate(lang, attrs) && attrs.name === undefined) count++;
       }
     }
     i = j + 1;
@@ -585,7 +591,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       continue;
     }
 
-    if (opening[1][0] !== "`" || !isRunnableCandidate(lang, attrs) || (!attrs.name && !soloUnnamed)) {
+    if (!opening[1].startsWith("`") || !isRunnableCandidate(lang, attrs) || (!attrs.name && !soloUnnamed)) {
       // Either not a runnable candidate at all (unsupported language and
       // no `interpreter=` either — see `isRunnableCandidate`), or not a
       // runnable block and not this node's (one and only) implicitly-named
