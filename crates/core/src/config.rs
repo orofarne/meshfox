@@ -222,6 +222,26 @@ pub const DEFAULT_SESSION_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Default for [`session_max_runs_per_block`].
 pub const DEFAULT_SESSION_MAX_RUNS_PER_BLOCK: usize = 10;
 
+/// Number of complete chain transcripts retained independently of block history.
+pub fn session_max_chain_runs(root: &Path) -> usize {
+    session_limit(root, "max_chain_runs", 100).max(1)
+}
+/// Byte budget for output in one chain transcript, including effective output.
+pub fn session_max_chain_output_bytes(root: &Path) -> usize {
+    if session_max_output_bytes(root) == 0 {
+        return 0;
+    }
+    session_limit(root, "max_chain_output_bytes", 1024 * 1024)
+}
+fn session_limit(root: &Path, key: &str, fallback: usize) -> usize {
+    load(root)
+        .get("session")
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_integer())
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(fallback)
+}
+
 /// `[session] max_runs_per_block = N` in `.meshfox/config.toml` (same merge
 /// as every other setting) — how many finished runs of one block the core
 /// keeps in the session database before the oldest are rotated out, run row

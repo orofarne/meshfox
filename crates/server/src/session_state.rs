@@ -38,6 +38,7 @@ const SCHEMA_SQL: &str = "
 /// One `session_runs` row — the plain-data twin of `crate::SessionRun`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredRun {
+    pub run_id: Option<i64>,
     pub node_id: String,
     pub block: String,
     pub fingerprint: String,
@@ -64,6 +65,11 @@ impl SessionStore {
             .unwrap()
             .execute_batch(SCHEMA_SQL)
             .map_err(sqlite_err)?;
+        // Older freshness rows remain valid, but have no recoverable provenance.
+        let _ = conn
+            .lock()
+            .unwrap()
+            .execute("ALTER TABLE session_runs ADD COLUMN run_id INTEGER", []);
         Ok(SessionStore {
             conn,
             max_output_bytes,
@@ -90,12 +96,12 @@ impl SessionStore {
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO session_runs (node_id, block, fingerprint, produced_vars, output, duration_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                "INSERT INTO session_runs (node_id, block, fingerprint, produced_vars, output, duration_ms, run_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT (node_id, block) DO UPDATE SET fingerprint = excluded.fingerprint, \
                  produced_vars = excluded.produced_vars, output = excluded.output, \
-                 duration_ms = excluded.duration_ms",
-                params![run.node_id, run.block, run.fingerprint, vars, output, run.duration_ms as i64],
+                 duration_ms = excluded.duration_ms, run_id = excluded.run_id",
+                params![run.node_id, run.block, run.fingerprint, vars, output, run.duration_ms as i64, run.run_id],
             )
             .map_err(sqlite_err)?;
         Ok(())
@@ -104,7 +110,7 @@ impl SessionStore {
     pub fn load_runs(&self) -> io::Result<Vec<StoredRun>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT node_id, block, fingerprint, produced_vars, output, duration_ms FROM session_runs")
+            .prepare("SELECT node_id, block, fingerprint, produced_vars, output, duration_ms, run_id FROM session_runs")
             .map_err(sqlite_err)?;
         let rows = stmt
             .query_map([], |r| {
@@ -115,12 +121,13 @@ impl SessionStore {
                     r.get::<_, String>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, i64>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             })
             .map_err(sqlite_err)?;
         let mut runs = Vec::new();
         for row in rows {
-            let (node_id, block, fingerprint, vars, output, duration_ms) =
+            let (node_id, block, fingerprint, vars, output, duration_ms, run_id) =
                 row.map_err(sqlite_err)?;
             // A row whose JSON no longer parses is dropped rather than
             // failing startup — worst case that block just re-runs.
@@ -128,6 +135,7 @@ impl SessionStore {
                 continue;
             };
             runs.push(StoredRun {
+                run_id,
                 node_id,
                 block,
                 fingerprint,
@@ -193,6 +201,7 @@ mod tests {
 
     fn run(output: &str) -> StoredRun {
         StoredRun {
+            run_id: Some(7),
             node_id: "n".into(),
             block: "b".into(),
             fingerprint: "abc".into(),

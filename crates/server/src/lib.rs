@@ -49,6 +49,7 @@ pub mod link_preview;
 mod pty_exec;
 #[cfg(all(test, unix))]
 mod run_environment_tests;
+pub mod run_journal;
 /// Persistent audit log + startup reconciliation for every run/service/tty
 /// execution — see its own module doc comment. `pub` for the same
 /// test-seeding reason `session_db` is.
@@ -191,6 +192,7 @@ struct AppState {
     /// tty execution — see `run_ledger`'s own module doc comment. Shares
     /// its underlying connection with `undo_log` (see `session_db`).
     run_ledger: run_ledger::RunLedger,
+    run_journal: run_journal::RunJournal,
     /// Whether the process should exit on its own once every `/api/watch`
     /// connection has gone (see `TabGuard`) — off for e.g. the e2e test
     /// server, which cycles through pages with brief all-tabs-closed gaps
@@ -1516,6 +1518,7 @@ fn effective_overrides(
 /// `AppState::session_runs`.
 #[derive(Clone)]
 struct SessionRun {
+    run_id: Option<i64>,
     /// `meshfox_core::session_fingerprint` of the block *as it stood* (code/
     /// lang/interpreter/env=/deps=, same as `crate::output`'s cached-output
     /// staleness mechanism) *and* the resolved values of whatever variables
@@ -1682,6 +1685,7 @@ fn remember_session_run(
     run: SessionRun,
 ) {
     let stored = session_state::StoredRun {
+        run_id: run.run_id,
         node_id: addr.node_id.clone(),
         block: addr.block_name.clone(),
         fingerprint: run.fingerprint.clone(),
@@ -2818,6 +2822,8 @@ fn acquire_chain_locks(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRequest {
+    #[serde(default = "web_source")]
+    source: String,
     #[serde(default)]
     confirm: bool,
     /// Node-id path from the root's children down to the node that owns
@@ -3757,6 +3763,7 @@ enum RunEvent {
     /// `/api/run` path and `/api/run/tty`'s WebSocket — both are
     /// `run_block_impl`, so they consult the same `session_runs` map.
     StepSkipped {
+        source_run_id: Option<i64>,
         node_id: String,
         block: String,
         /// Whatever this step printed the last time it actually ran (see
@@ -3805,6 +3812,7 @@ enum RunEvent {
     /// "spawned", not "exited", so nothing here ever waits for an exit
     /// code. See SPEC.md's "Service blocks (experimental)".
     ServiceStarted {
+        reused: bool,
         node_id: String,
         block: String,
         pid: u32,
@@ -7119,6 +7127,8 @@ async fn clear_node_id(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunWsQuery {
+    #[serde(default = "web_source")]
+    source: String,
     #[serde(default)]
     confirm: bool,
     #[serde(default)]
@@ -7146,8 +7156,13 @@ struct RunWsQuery {
 /// support `#[serde(flatten)]` the way a JSON body's `ForceRunRequest` used
 /// to rely on, so `TtyRunQuery`'s own precedent — a flat, fully-duplicated
 /// struct — is what `ForceRunWsQuery` below follows instead).
+fn web_source() -> String {
+    "web".into()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_run_request(
+    source: &str,
     path: &str,
     block: String,
     no_deps: bool,
@@ -7180,6 +7195,7 @@ fn parse_run_request(
         })?
     };
     Ok(RunRequest {
+        source: source.to_string(),
         confirm,
         path,
         block,
@@ -7208,6 +7224,7 @@ async fn run_block(
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
         let result = match parse_run_request(
+            &query.source,
             &query.path,
             query.block,
             query.no_deps,
@@ -7235,6 +7252,8 @@ async fn run_block(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForceRunWsQuery {
+    #[serde(default = "web_source")]
+    source: String,
     #[serde(default)]
     confirm: bool,
     #[serde(default)]
@@ -7303,6 +7322,7 @@ async fn force_run(
         };
         let result: Result<Response, ApiError> = async {
             let req = parse_run_request(
+                &query.source,
                 &query.path,
                 query.block,
                 query.no_deps,
@@ -7536,6 +7556,26 @@ async fn run_block_impl_sized(
     // breaking the loop, say), so an already-waiting subscriber isn't left
     // hanging on a `Running` outcome forever.
     let run_id = uuid::Uuid::new_v4().to_string();
+    let recorder = state.run_journal.clone();
+    let journal_ledger = state.run_ledger.clone();
+    let journal_target = chain.last().expect("nonempty run plan");
+    let journal_id = match recorder.start(
+        &run_id,
+        &journal_target.node_id,
+        &journal_target.block_name,
+        &req.path,
+        &req.source,
+        serde_json::json!({"noDeps":req.no_deps,"fresh":req.fresh,"skipFresh":req.skip_fresh,"steps":chain.iter().map(|a|serde_json::json!({"nodeId":a.node_id,"block":a.block_name})).collect::<Vec<_>>()}),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            for (_, id) in held_locks {
+                let _ = state.run_ledger.discard_reservation(id);
+            }
+            return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+
     let inherited_scope = canvas_call::lease_scope();
     let scope_id = inherited_scope.clone().unwrap_or_else(|| run_id.clone());
     let lease_scope = state
@@ -7759,6 +7799,7 @@ async fn run_block_impl_sized(
                     }
                     resolved_vars.extend(session_run.produced_vars);
                     yield Ok(ndjson_line(&RunEvent::StepSkipped {
+                        source_run_id: session_run.run_id,
                         node_id: addr.node_id.clone(),
                         block: addr.block_name.clone(),
                         output: session_run.output,
@@ -7867,6 +7908,7 @@ async fn run_block_impl_sized(
                     // exactly this reason — its own lock, held since it was
                     // first spawned, is untouched by this request.
                     yield Ok(ndjson_line(&RunEvent::ServiceStarted {
+                        reused: true,
                         node_id: addr.node_id.clone(),
                         block: addr.block_name.clone(),
                         pid,
@@ -7920,6 +7962,7 @@ async fn run_block_impl_sized(
                                 break;
                             }
                             yield Ok(ndjson_line(&RunEvent::ServiceStarted {
+                                reused: false,
                                 node_id: addr.node_id.clone(),
                                 block: addr.block_name.clone(),
                                 pid,
@@ -8315,7 +8358,7 @@ async fn run_block_impl_sized(
                     &state,
                     addr,
                     &decls,
-                    SessionRun { fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
+                    SessionRun { run_id: artifact_run_id, fingerprint: live_fingerprint, produced_vars, output: full_output, duration_ms },
                 );
             }
 
@@ -8382,7 +8425,12 @@ async fn run_block_impl_sized(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(Body::from_stream(detach_from_client(stream)))
+        .body(Body::from_stream(detach_from_client(run_journal::record(
+            recorder,
+            journal_id,
+            journal_ledger,
+            stream,
+        ))))
         .unwrap())
 }
 
@@ -8468,6 +8516,7 @@ async fn trigger_autorun(state: Arc<AppState>, addr: meshfox_core::BlockAddr) {
         return;
     };
     let build_req = move || RunRequest {
+        source: "autorun".into(),
         confirm: false,
         path: path.clone(),
         block: addr.block_name.clone(),
@@ -8878,6 +8927,8 @@ fn find_tty_block(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TtyRunQuery {
+    #[serde(default = "web_source")]
+    source: String,
     #[serde(default)]
     confirm: bool,
     #[serde(default)]
@@ -8956,6 +9007,7 @@ async fn run_block_tty(
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let req = parse_run_request(
+        &query.source,
         &query.path,
         query.block,
         query.no_deps,
@@ -10858,6 +10910,7 @@ async fn build_state_with(
             (
                 (r.node_id, r.block),
                 SessionRun {
+                    run_id: r.run_id,
                     fingerprint: r.fingerprint,
                     produced_vars: r.produced_vars,
                     output: r.output,
@@ -10867,6 +10920,11 @@ async fn build_state_with(
         })
         .collect();
     let session_vars = session_store.load_vars()?;
+    let run_journal = run_journal::RunJournal::new(
+        Arc::clone(&session_conn),
+        meshfox_core::config::session_max_chain_output_bytes(&config_root),
+        meshfox_core::config::session_max_chain_runs(&config_root),
+    )?;
     let run_ledger = run_ledger::RunLedger::from_connection(session_conn)?
         .with_max_output_bytes(max_output_bytes)
         .with_max_runs_per_block(meshfox_core::config::session_max_runs_per_block(
@@ -10914,6 +10972,7 @@ async fn build_state_with(
         canvas_events: canvas_events::CanvasEventLog::new(),
         undo_log,
         run_ledger,
+        run_journal,
         auto_exit,
         link_preview_cache: link_preview::PreviewCache::new(),
         session_runs: Mutex::new(session_runs),
@@ -10946,6 +11005,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/undo", post(api_undo))
         .route("/api/redo", post(api_redo))
         .route("/api/history", get(api_history))
+        .route("/api/logs", get(run_journal::api))
         .route("/api/history/goto", post(api_history_goto))
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))

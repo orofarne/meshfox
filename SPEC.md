@@ -1541,6 +1541,46 @@ for non-interactive startup.
 See [examples/services.canvas.md](examples/services.canvas.md) for foreground
 and Docker Compose examples and a self-contained Compose fixture.
 
+## Invocation transcripts (`meshfox logs`)
+
+The worker records each admitted fenced-block invocation and its dependency
+chain in the per-canvas session database. The transcript is independent of the
+per-block run ledger: it preserves ordered step starts, stdout/stderr, freshness
+skips, service startup/reuse, step outcomes, errors and the chain outcome. Steps
+not reached are marked explicitly. CLI, TUI, web, autorun and native canvas calls
+use this same journal; each requested CLI target is an invocation. No submitted
+variable values are stored as invocation metadata. TTY bytes and background
+service output after readiness are outside the transcript.
+
+`meshfox logs` selects the latest chain. A block address selects its latest
+participation; `--chain` selects invocations by their requested target and shows
+the whole chain. `--list` lists matching invocations; `--id N` selects a chain,
+and `--block PATH BLOCK` narrows that ID to one block. `--json` emits NDJSON.
+The default view shows skips without old output. `--effective` additionally
+shows a snapshot of the exact source execution's output used by a skipped
+step, with the source block-run ID and time. Missing source output is explicit;
+a more recent execution is never substituted. Snapshots already recorded in a
+chain survive per-block history rotation and subsequent document edits.
+
+`--follow` replays and tails only the selected invocation, using sequence
+cursors, and ends when it completes. Ctrl-C detaches without cancellation.
+`meshfox console` instead remains attached across invocations. All history
+access goes through the worker API, including when a worker must be started
+just to read saved logs. Reading a failed invocation returns exit 0; missing
+history or a read failure returns nonzero. Pre-existing per-block history is
+not reconstructed into invocation transcripts retroactively.
+
+`[session] max_chain_runs` (default 100, minimum 1) retains completed transcripts
+independently of `max_runs_per_block`. `max_chain_output_bytes` (default 1 MiB)
+bounds output per invocation, including effective output, while preserving
+metadata and marking truncation. The recorded prefix is retained. Zero disables
+storing output; `max_output_bytes = 0` also disables transcript output. A worker
+restart marks unfinished invocations `interrupted` and retains their recorded
+prefix. Output commits in batches of up to 64 events or 50 ms; step and terminal
+boundaries flush preceding output immediately. Storage errors mark a transcript
+incomplete without stopping execution. Session reset preserves transcripts. On a read-only canvas the journal
+lives in memory for the worker's lifetime, like the rest of the session DB.
+
 ## Read-only canvases
 
 A canvas whose file, or the directory its `.meshfox/` state would live

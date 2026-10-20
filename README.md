@@ -672,6 +672,25 @@ meshfox pdf: wrote /tmp/meshfox-pdf-demo.pdf
 ```
 <!-- /meshfox:output -->
 
+### Saved logs (`logs`)
+<!-- meshfox:node id="saved-logs-logs" -->
+
+`meshfox logs` reads the latest saved chain transcript. Add a block address to see only its latest participation, or `--chain` to show the whole invocation requested for that target:
+
+```text
+meshfox project.canvas.md logs
+meshfox project.canvas.md logs build
+meshfox project.canvas.md logs build --chain
+meshfox project.canvas.md logs --list
+meshfox project.canvas.md logs --id 42 --effective
+meshfox project.canvas.md logs --id 42 --block tests smoke
+meshfox project.canvas.md logs build --chain --follow
+```
+
+The default transcript shows what happened in that invocation, including skips and steps not reached. `--effective` expands the exact earlier block output used by a skipped step, labelled with its original run ID and time; later runs cannot change it. `--follow` replays and follows just the selected invocation until it ends. Ctrl-C detaches without stopping it. Use `meshfox console` to observe successive runs and ongoing service logs instead.
+
+`--json` emits NDJSON. History is read through the worker API and survives worker restarts; transcripts start with the version that introduced `logs`. TTY terminal bytes are not recorded. `[session] max_chain_runs` (default 100) and `max_chain_output_bytes` (default 1 MiB) bound retention independently of per-block history. See SPEC.md's "Invocation transcripts" for provenance, truncation and storage behavior.
+
 ## How-to
 <!-- meshfox:node id="how-to" -->
 

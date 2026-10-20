@@ -255,6 +255,68 @@ run identity, so reconnecting cannot splice another invocation's output into
 the original stream. Workers without persisted run identities cannot resume
 that stream safely.
 
+### Saved block and chain logs
+
+```sh
+meshfox logs                                  # latest chain in the discovered .canvas.md
+meshfox project.canvas.md logs                # explicit canvas (also --canvas PATH)
+meshfox logs build                            # latest participation of block build
+meshfox logs tests smoke --chain              # latest chain requested for tests::smoke
+meshfox logs --list                           # list chain runs, newest first
+meshfox logs build --list                     # invocations involving this block
+meshfox logs build --chain --list             # invocations requested for this target
+meshfox logs --id 42                          # an immutable chain transcript
+meshfox logs --id 42 --block tests smoke      # only this block inside chain #42
+meshfox logs --id 42 --effective              # expand outputs used by skipped steps
+meshfox logs build --chain --follow           # replay and follow this invocation only
+meshfox logs --id 42 --json                   # NDJSON: run header, events, final status
+```
+
+With a block address, `logs` selects its latest participation in an admitted
+invocation, whether it ran directly, as a dependency, or was skipped. `--chain`
+selects by the requested target and shows the entire invocation; without an
+address the latest chain is selected. A CLI `run a,b` submits one chain per
+target and therefore records separate invocation IDs. `--id` always names a
+chain, including when `--block` narrows its transcript. Historical block
+selection remains available after the block is edited or removed.
+
+The default view records what happened in that invocation: output, stderr
+labels, step results, freshness skips, service startup/reuse, errors, and steps
+not reached. It does not substitute old output for a skipped step.
+`--effective` expands an immutable snapshot of the exact successful block run
+used by each freshness skip, labelled with its original block-run ID and time.
+A later rerun cannot change it. If that source's output was already unavailable
+when the skip was recorded, the transcript says so; it never substitutes a
+newer run. Chain transcripts are independent of per-block history rotation.
+
+`--follow` first replays the selected transcript, then follows that same ID
+until completion, cancellation or interruption. A finished run returns at once.
+It never follows a subsequent invocation; use `console` for that. Ctrl-C only
+detaches. Sequence cursors prevent duplicate output across reconnects, including
+worker port changes. The command accesses history through the worker API and
+can start a worker to read it after the previous one exited; it executes no
+blocks. Reading a failed run is a successful `logs` command (exit 0); missing
+history and read errors are nonzero.
+
+The worker records admitted chains for CLI, TUI, web, autorun and native canvas
+calls in its existing session database. Existing block-history rows are not
+retroactively reconstructed as chains; invocation transcripts begin with this
+version. TTY terminal bytes and a service's ongoing log after readiness are
+not part of a chain transcript (see `console` for service logs). Read-only
+canvases retain transcripts only for their worker's lifetime.
+
+`[session] max_chain_runs` defaults to 100 completed invocation transcripts,
+independent of `max_runs_per_block`. `[session] max_chain_output_bytes` defaults
+to 1048576 bytes of output per transcript, including effective output. It keeps
+the recorded prefix and always retains step/completion metadata; truncation is
+explicit. `max_chain_output_bytes = 0` disables storing transcript output;
+`max_output_bytes = 0` disables it too. No request variable values are saved as
+invocation metadata. A worker restart marks unfinished transcripts `interrupted`
+and preserves their recorded prefix. Output is committed in batches of up to 64
+events or 50 ms; control events flush the preceding output immediately. A storage
+failure marks the transcript incomplete without stopping execution. Normal session reset invalidates freshness
+but does not erase these historical transcripts.
+
 ### Native calls between canvases
 
 A `meshfox` fence is YAML with required `canvas` and `run`, optional `set`

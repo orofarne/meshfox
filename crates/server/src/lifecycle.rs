@@ -225,6 +225,7 @@ mod tests {
     }
     fn request(block: &str) -> RunRequest {
         RunRequest {
+            source: "cleanup".into(),
             path: vec![],
             block: block.into(),
             no_deps: false,

@@ -2164,6 +2164,7 @@ async fn run_stream_inner(
         ("fresh", fresh.to_string()),
         ("skipFresh", skip_fresh.to_string()),
         ("persist", persist.to_string()),
+        ("source", if persist { "cli" } else { "tui" }.into()),
         ("vars", vars_json),
         ("saveSecrets", secrets_json),
     ];
@@ -3127,4 +3128,45 @@ mod subscription_resume_tests {
         assert_eq!(cursor.load(std::sync::atomic::Ordering::Relaxed), 9);
         server.await.unwrap();
     }
+}
+
+/// Read failure classified for follow: expired/missing IDs are terminal.
+#[derive(Debug)]
+pub struct LogsError {
+    pub message: String,
+    pub retryable: bool,
+}
+impl std::fmt::Display for LogsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+/// Worker-owned persistent chain history; clients never open the session DB.
+pub async fn logs(
+    port: u16,
+    params: &[(String, String)],
+) -> Result<meshfox_server::run_journal::Page, LogsError> {
+    let fail = |message: String| LogsError {
+        message,
+        retryable: true,
+    };
+    let url = reqwest::Url::parse_with_params(&format!("{}/api/logs", base_url(port)), params)
+        .map_err(|e| fail(e.to_string()))?;
+    let response = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| fail(describe(&e)))?;
+    if !response.status().is_success() {
+        let retryable = response.status().is_server_error();
+        return Err(LogsError {
+            message: response
+                .text()
+                .await
+                .unwrap_or_else(|_| "could not read logs".into()),
+            retryable,
+        });
+    }
+    response.json().await.map_err(|e| fail(e.to_string()))
 }

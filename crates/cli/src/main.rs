@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 mod console_cmd;
 mod coordinator;
 mod cores_cmd;
+mod logs_cmd;
 mod lsp;
 mod mcp;
 mod pdf;
@@ -117,6 +118,35 @@ enum SessionOp {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Read a block's or chain's saved transcript. Follow never starts another run.
+    Logs {
+        /// Block address as in run; omit to select the latest chain.
+        #[arg(num_args = 0.., conflicts_with = "id")]
+        args: Vec<String>,
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        /// Show the whole chain requested for this target.
+        #[arg(long)]
+        chain: bool,
+        /// Select a particular chain run.
+        #[arg(long)]
+        id: Option<i64>,
+        /// Select one block inside the chain named by --id.
+        #[arg(long, num_args = 1.., requires = "id", conflicts_with = "chain")]
+        block: Vec<String>,
+        /// Include the original output used by skipped steps.
+        #[arg(long)]
+        effective: bool,
+        /// Replay then follow only this invocation until it ends; Ctrl-C detaches.
+        #[arg(long, conflicts_with = "list")]
+        follow: bool,
+        /// List matching invocations, newest first.
+        #[arg(long, conflicts_with = "id")]
+        list: bool,
+        /// Print newline-delimited JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Observe an already running core; Ctrl-C detaches without stopping tasks.
     Console {
         #[command(flatten)]
@@ -1136,7 +1166,7 @@ fn splice_leading_canvas(mut args: Vec<String>) -> Vec<String> {
         // free-form node-path/block-name list with nothing else to anchor
         // a bare path against, and `node <op>`'s positional slot is two
         // segments in (`node add`, `node rm`, ...), not on `node` itself.
-        Some("run") => {
+        Some("run" | "logs") => {
             args.insert(2, "--canvas".to_string());
             args.insert(3, canvas);
         }
@@ -1295,6 +1325,38 @@ fn main() {
     };
 
     match command {
+        Command::Logs {
+            args,
+            canvas,
+            chain,
+            id,
+            block,
+            effective,
+            follow,
+            list,
+            json,
+        } => {
+            let path = canvas.unwrap_or_else(|| {
+                console_cmd::discover().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                })
+            });
+            let options = logs_cmd::Options {
+                selector: if block.is_empty() { args } else { block },
+                chain,
+                id,
+                effective,
+                follow,
+                list,
+                json,
+            };
+            let runtime = tokio::runtime::Runtime::new().expect("async runtime");
+            if let Err(error) = runtime.block_on(logs_cmd::run(path, options)) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Command::Console {
             canvas,
             terminal_status,

@@ -429,6 +429,7 @@ pub(super) fn attach(
         .collect();
     run_registry::attach_native(handle, row, move |handle, mut kill| async move {
         let request = RunRequest {
+            source: "canvas".into(),
             path: call.prepared.path.clone(),
             block: call.prepared.block.clone().unwrap(),
             confirm,
