@@ -102,6 +102,8 @@ Document-scoped config values a canvas wants from whoever runs it — declared o
 
 A ` ```starlark constraint ` fence is a sandboxed Starlark contract living right in a node's own Markdown body — a way to assert invariants a canvas should hold (e.g. "every node tagged `table` has exactly one `file` child"), checked by `meshfox check` rather than only by convention. See SPEC.md's "Constraint fences" (linked above, under "File format") for the full reference. The worked example below actually runs — `meshfox check examples/constraints.canvas.md` from the repo root — and shows the newest piece: a constraint reading a `file`-type node's own already-declared target (`.content()`/`.json()`/`.yaml()`/`.toml()`/`.csv()`), the same mechanism `LICENSE.canvas.md` below uses for real, to keep this project's own dependency tables honest.
 
+`starlark render` uses the same document API to generate Markdown, such as a live table of node counts by tag. Its source starts collapsed in WebUI and TUI; the result updates with document changes and is never written back to the source file. `md.table()`, `md.text()`, `md.link()`, `md.code()` and `md.raw()` return typed `MarkdownFragment` values so builders can compose markup without escaping it twice. See SPEC.md's "Computed Starlark views" and the tag-summary block in the example below.
+
 ### Worked example
 <!-- meshfox:node id="constraints-example" type="file" -->
 
@@ -1016,6 +1018,20 @@ A native `meshfox` fence describes a child invocation as YAML: `canvas`, `run`, 
 
 [examples/canvas-call.canvas.md](./examples/canvas-call.canvas.md)
 
+### Computing a Markdown table from document tags
+<!-- meshfox:node id="computing-a-markdown-table-from-document-tags" -->
+
+Use a `starlark render` fence to turn the document tree into a live Markdown view, without launching an external interpreter. The **Computed tag summary** node in [examples/constraints.canvas.md](./examples/constraints.canvas.md#computed-tag-summary) counts nodes by tag and prints a table with `md.table()`.
+
+Open the example in WebUI or TUI: the table appears below the collapsed source and updates when tags or nodes change. `md` builders return typed `MarkdownFragment` values, so links and future formatting helpers can compose inside tables without double escaping.
+
+Static-site and PDF exports include the computed table as a snapshot of the document at export time. The exported site does not run Starlark in the browser; regenerate the export to update its results. The live document's source, cached-output regions and history never store the generated output.
+
+#### Example
+<!-- meshfox:node id="example-13" type="file" -->
+
+[examples/constraints.canvas.md](./examples/constraints.canvas.md)
+
 ## Architecture
 <!-- meshfox:node id="architecture" -->
 
@@ -1181,6 +1197,14 @@ For interactive debugging instead of a one-shot run, use `npm run test:e2e:ui` (
 
 `playwright.config.ts`'s `webServer` starts `meshfox view` itself — no server needs to be already running, and no separate build step either: `test:e2e` runs a `pretest:e2e` hook that builds `web/dist`, builds the `meshfox` binary once (`cargo build -p meshfox-cli`) and, on macOS, signs it once (`scripts/run-signed.sh --sign-only`). The ~40 servers then run `target/debug/meshfox view …` directly; going through `cargo run` for each meant a workspace freshness check apiece (~3 s, serialized on the build lock) and a signing check before the first test, even for a single spec. If the binary is missing, older than the Rust sources or only linker-signed (a bare `npx playwright test` after an edit), `e2e/meshfox-bin.ts` falls back to `cargo run`, which rebuilds and signs as needed; set `MESHFOX_E2E_CARGO_RUN=1` to force that. Debug builds of `meshfox-server` read `web/dist` fresh off disk on every request (`rust-embed`'s `debug-embed` feature, which would force compile-time embedding even in a debug build, isn't enabled — see its `Cargo.toml`, and `build.rs` only watches `web/dist` for release builds), so a frontend-only change just needs `npm run build` again, not a Rust rebuild, between test runs.
 
+Computed Starlark views have a focused real-worker/browser suite in `web/e2e/starlark-render.spec.ts`: rendered tables and links, collapsed/expanded source, script errors, and cross-node refresh after tag changes and node deletion. It uses a generated scratch canvas and checks that computed output does not change the source body revision.
+
+```sh name="starlark-render"
+export FORCE_COLOR=1
+cd web
+npm run test:starlark-render
+```
+
 ### VS Code end-to-end tests
 <!-- meshfox:node id="vs-code-end-to-end-tests" -->
 
@@ -1215,6 +1239,13 @@ At most six `meshfox tui` sessions are alive at once, whatever `--test-threads` 
 ```sh name="tui-e2e-run"
 export CARGO_TERM_COLOR=always
 cargo test --test tui_e2e -- --ignored --color=always
+```
+
+`starlark_render.rs` covers computed tables, initially collapsed source, keyboard and mouse source toggles, script diagnostics, and automatic refresh after another CLI client changes tags or deletes a node through the worker. It also checks that viewing never writes output to the canvas. Run this focused PTY scenario with:
+
+```sh name="starlark-render"
+export CARGO_TERM_COLOR=always
+cargo test -p meshfox-cli --test tui_e2e starlark_render -- --ignored --test-threads=1
 ```
 
 ### Linux tests

@@ -42,6 +42,7 @@ mod run_history;
 mod search;
 mod services;
 mod source_conflict;
+mod starlark_render;
 mod table_view;
 
 mod terminal_status;

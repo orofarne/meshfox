@@ -152,3 +152,20 @@ else:
 
 [manifest.toml](constraints-data/manifest.toml)
 
+## Computed tag summary
+<!-- meshfox:node id="computed-tag-summary" -->
+
+A computed view uses the same sandbox and document API as constraints. Open this document in WebUI or TUI to see the table; expand the block header to inspect its source. Results are computed for display and never written into this file.
+
+```starlark render name="tag-counts" output="markdown"
+counts = {}
+for n in [doc] + doc.descendants():
+    for tag in n.tags:
+        counts[tag] = counts.get(tag, 0) + 1
+
+print(md.table(
+    headers=["Tag", "Nodes"],
+    rows=[[tag, counts[tag]] for tag in sorted(counts)],
+))
+```
+

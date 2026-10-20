@@ -21,6 +21,7 @@ import {
   type BodySegment,
   type CodeSegment,
   type ConstraintSegment,
+  type RenderSegment,
 } from "./fence";
 import { parseBlockRef, blockDomId } from "./deps";
 import { exportsForBlock, implicitDepsForBlock, interpreterVarRefsNaive, type ClientVarDecl } from "./vars";
@@ -38,7 +39,7 @@ import {
   type FormFieldStatus,
   type SaveTextOutcome,
 } from "./api";
-import type { ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
+import type { RenderResultDto, ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
 
 import { resolveAssetHref } from "./assetHref";
 
@@ -414,6 +415,7 @@ export interface MeshNodeData {
    * constraint fences (nothing to roll up into the title-bar badge below),
    * not "0 constraints, 0 passing". */
   constraintResults?: ConstraintStatusDto[];
+  renderResults?: RenderResultDto[];
   /** Every `service` block belonging to this node (matched by `nodeId`,
    * folded in client-side from a separately-polled `GET /api/services` —
    * see `App.tsx`'s own service-polling effect), for the title-bar
@@ -2493,9 +2495,9 @@ export function NodeBodyPreview({ text }: { text: string }) {
             </div>
           );
         }
-        const highlightLang = seg.type === "constraint" ? "starlark" : seg.lang;
+        const highlightLang = seg.type !== "code" ? "starlark" : seg.lang;
         const constraintSuffix = seg.name ? ` · ${seg.name}` : "";
-        const lang = seg.type === "constraint" ? `starlark${constraintSuffix}` : seg.lang;
+        const lang = seg.type !== "code" ? `starlark${constraintSuffix}` : seg.lang;
         return (
           <div className="mesh-code-block" key={`${seg.type === "constraint" ? "constraint" : seg.name}-${i}`}>
             <div className="mesh-code-block-head">
@@ -2578,12 +2580,31 @@ function ConstraintFenceBlock({
   );
 }
 
+function RenderFenceBlock({ seg, result, assetBase }: {
+  seg: RenderSegment; result?: RenderResultDto; assetBase?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return <div className="mesh-code-block mesh-render-block">
+    <div className="mesh-code-block-head">
+      <FoldToggle folded={!expanded} onToggle={() => setExpanded(e => !e)}
+        foldedTitle="Show the Starlark source" unfoldedTitle="Hide the Starlark source" />
+      <span className="mesh-code-lang">starlark · {seg.name ?? "render"}</span>
+      <span title={result?.error ?? undefined}>{result ? result.error ? "✗" : "✓" : "…"}</span>
+    </div>
+    {expanded && <HighlightedCode code={seg.code} lang="starlark" />}
+    {result?.error
+      ? <div className="mesh-code-output" data-exit="fail"><pre><code>{result.error}</code></pre></div>
+      : result && <MarkdownOutput text={result.markdown} assetBase={assetBase} />}
+  </div>;
+}
+
 function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
   const segments = parseBody(data.text, nodeId);
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   const components = useMemo(() => makeMarkdownComponents(data.assetBase), [data.assetBase]);
 
   let constraintIdx = 0;
+  let renderIdx = 0;
   return (
     <div className="mesh-node-body nopan" ref={wheelRef}>
       {segments.map((seg, i) => {
@@ -2598,6 +2619,10 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
               {seg.content}
             </ReactMarkdown>
           );
+        }
+        if (seg.type === "render") {
+          return <RenderFenceBlock key={`render-${i}`} seg={seg}
+            result={data.renderResults?.[renderIdx++]} assetBase={data.assetBase} />;
         }
         if (seg.type === "constraint") {
           // Matched to `data.constraintResults` purely by position — both

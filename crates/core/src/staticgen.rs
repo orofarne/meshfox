@@ -478,6 +478,7 @@ pub fn build_document_for_static_export(
         created_at: None,
         updated_at: None,
         constraint_results: Vec::new(),
+        render_results: Vec::new(),
         effective_color: None,
         body_rev: None,
         asset_base: None,
@@ -623,15 +624,69 @@ fn build_node_view(
         let first_link_override = (node.node_type == NodeType::File && ctx.copy_files)
             .then_some(target.as_deref())
             .flatten();
-        let text = replace_button_fences(&node.text, canvas, node);
-        let html_body = render_markdown(
+        let blocks = crate::fence::scan_render_blocks(&node.text);
+        let mut html_body = String::new();
+        let mut cursor = 0;
+        for (block, result) in blocks.iter().zip(&node.render_results) {
+            let text = replace_button_fences(&node.text[cursor..block.span.start], canvas, node);
+            html_body.push_str(&render_markdown(
+                &text,
+                &base_dir,
+                node.asset_base.as_deref(),
+                ctx,
+                assets,
+                first_link_override,
+            ));
+            html_body
+                .push_str("<section class=\"mesh-render-block\"><details><summary>starlark · ");
+            html_body.push_str(&escape_html_text(block.name.as_deref().unwrap_or("render")));
+            html_body.push_str(if result.error.is_some() {
+                " · ✗"
+            } else {
+                " · ✓"
+            });
+            html_body.push_str("</summary>");
+            let code = format!(
+                "{}starlark\n{}\n{}\n",
+                "`".repeat(crate::output::safe_fence_len(&block.code)),
+                block.code,
+                "`".repeat(crate::output::safe_fence_len(&block.code))
+            );
+            html_body.push_str(&render_markdown(
+                &code,
+                &base_dir,
+                node.asset_base.as_deref(),
+                ctx,
+                assets,
+                None,
+            ));
+            html_body.push_str("</details>");
+            if let Some(error) = &result.error {
+                html_body.push_str("<pre class=\"mesh-render-error\">");
+                html_body.push_str(&escape_html_text(error));
+                html_body.push_str("</pre>");
+            } else {
+                html_body.push_str(&render_markdown(
+                    &result.markdown,
+                    &base_dir,
+                    node.asset_base.as_deref(),
+                    ctx,
+                    assets,
+                    None,
+                ));
+            }
+            html_body.push_str("</section>");
+            cursor = block.span.end;
+        }
+        let text = replace_button_fences(&node.text[cursor..], canvas, node);
+        html_body.push_str(&render_markdown(
             &text,
             &base_dir,
             node.asset_base.as_deref(),
             ctx,
             assets,
             first_link_override,
-        );
+        ));
         (html_body, target)
     };
     // `canvas.resolve_absolute_position` is exactly `(node.x, node.y)` for
@@ -1907,6 +1962,21 @@ mod tests {
 
     fn canvas(md: &str) -> Canvas {
         parse(md).unwrap()
+    }
+
+    #[test]
+    fn computed_starlark_export_has_collapsible_source_and_a_real_table() {
+        let mut c = canvas("# Root\n```starlark render name=\"counts\"\nprint(md.table(headers=[\"Tag\", \"Count\"], rows=[[md.link(\"todo\", \"https://example.com\"), 2]]))\n```\n");
+        crate::starlark_render::annotate(&mut c, None, &crate::FileAccess::none());
+        let site = build_site(&c);
+        let html = &site.root.html_body;
+        assert!(
+            html.contains("<details><summary>starlark · counts · ✓</summary>"),
+            "{html}"
+        );
+        assert!(html.contains("<table>"), "{html}");
+        assert!(html.contains("href=\"https://example.com\""), "{html}");
+        assert!(!html.contains("<details open"));
     }
 
     /// `build` with no real `canvas_dir` (nothing to resolve images/

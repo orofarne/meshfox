@@ -522,7 +522,11 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
             (f, lang, attrs)
         })
         .filter(|(_, lang, attrs)| {
-            crate::exec::is_supported_lang(lang) || attrs.contains_key("interpreter")
+            !(lang == "starlark"
+                && ["render", "constraint"]
+                    .iter()
+                    .any(|key| attrs.get(*key).is_some_and(|v| v != "false")))
+                && (crate::exec::is_supported_lang(lang) || attrs.contains_key("interpreter"))
         })
         .collect()
 }
@@ -755,13 +759,62 @@ pub fn scan_constraint_blocks(markdown: &str) -> Vec<ConstraintBlock> {
                 .get("constraint")
                 .map(|v| v != "false")
                 .unwrap_or(false);
-            if !is_constraint {
+            if !is_constraint || attrs.get("render").is_some_and(|v| v != "false") {
                 return None;
             }
             Some(ConstraintBlock {
                 name: attrs.get("name").cloned(),
                 code: f.code.clone(),
                 span: f.span.clone(),
+            })
+        })
+        .collect()
+}
+
+/// A computed Starlark view, separate from runnable shell fences.
+#[derive(Debug, Clone)]
+pub struct RenderBlock {
+    pub name: Option<String>,
+    pub code: String,
+    pub span: Range<usize>,
+    pub error: Option<String>,
+}
+
+pub fn scan_render_blocks(markdown: &str) -> Vec<RenderBlock> {
+    let output_ranges = crate::output::output_byte_ranges(markdown);
+    scan_raw_fences(markdown)
+        .into_iter()
+        .filter_map(|f| {
+            if in_output_region(&output_ranges, f.span.start) {
+                return None;
+            }
+            let (lang, attrs) = parse_info_string(&f.info);
+            if lang != "starlark" || !attrs.get("render").is_some_and(|v| v != "false") {
+                return None;
+            }
+            let error = if attrs.get("constraint").is_some_and(|v| v != "false") {
+                Some("starlark render and constraint are mutually exclusive".to_owned())
+            } else if attrs.get("output").is_some_and(|v| v != "markdown") {
+                Some("starlark render only supports output=\"markdown\"".to_owned())
+            } else if attrs
+                .get("render")
+                .is_some_and(|v| v != "true" && !v.is_empty())
+            {
+                Some("starlark render is a bare flag".to_owned())
+            } else if let Some(key) = attrs
+                .keys()
+                .filter(|key| !["render", "constraint", "name", "output"].contains(&key.as_str()))
+                .min()
+            {
+                Some(format!("unsupported starlark render attribute: {key}"))
+            } else {
+                None
+            };
+            Some(RenderBlock {
+                name: attrs.get("name").cloned(),
+                code: f.code,
+                span: f.span,
+                error,
             })
         })
         .collect()

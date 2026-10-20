@@ -52,7 +52,7 @@ use std::path::Path;
 /// Bazel BUILD file) — too restrictive for a short predicate script that's
 /// really just "loop over some nodes and call `fail`". Everything else
 /// about `Standard` (no type annotations, no f-strings, ...) stays as-is.
-fn dialect() -> Dialect {
+pub(crate) fn dialect() -> Dialect {
     Dialect {
         enable_top_level_stmt: true,
         ..Dialect::Standard
@@ -128,7 +128,7 @@ const MAX_HEAP_BYTES: usize = 64 * 1024 * 1024;
 /// `fail` builtin through `Evaluator::extra` (see the crate-level "Collect
 /// Starlark values" pattern this mirrors).
 #[derive(Debug, Default, ProvidesStaticType)]
-struct Violations(RefCell<Vec<String>>);
+pub(crate) struct Violations(RefCell<Vec<String>>);
 
 impl Violations {
     fn push(&self, msg: String) {
@@ -234,26 +234,19 @@ fn evaluate_one(
     let title = node.title.clone();
     let label = label_for(&node_id, block.name.as_deref(), index, total_in_node);
 
-    let source = format!(
-        "{prelude}self = doc.node({})\n{}\n",
-        star_str(&node_id),
-        block.code
-    );
+    let prelude = format!("{prelude}self = doc.node({})\n", star_str(&node_id));
     let violations = Violations::default();
 
     let outcome: Result<(), String> = Module::with_temp_heap(|module| {
-        let ast = AstModule::parse(&format!("{label}.star"), source, &dialect())
-            .map_err(|e| e.to_string())?;
-        let mut eval = Evaluator::new(&module);
-        eval.set_max_callstack_size(MAX_CALLSTACK)
-            .map_err(|e| e.to_string())?;
-        eval.set_max_heap_size(MAX_HEAP_BYTES)
-            .map_err(|e| e.to_string())?;
-        eval.set_max_tick_count(MAX_TICKS)
-            .map_err(|e| e.to_string())?;
-        eval.extra = Some(&violations);
-        eval.eval_module(ast, globals).map_err(|e| e.to_string())?;
-        Ok(())
+        run_module(
+            &module,
+            &prelude,
+            &block.code,
+            &label,
+            globals,
+            Some(&violations),
+            None,
+        )
     });
 
     let mut messages = violations.0.into_inner();
@@ -271,6 +264,39 @@ fn evaluate_one(
     }
 }
 
+/// Shared bounded evaluator for constraints and computed Markdown.
+pub(crate) fn run_module<'v, 'a>(
+    module: &'a Module<'v>,
+    prelude: &str,
+    source: &str,
+    label: &str,
+    globals: &Globals,
+    violations: Option<&'a Violations>,
+    printer: Option<&'a dyn starlark::PrintHandler>,
+) -> Result<(), String> {
+    let ast = AstModule::parse(&format!("{label}.star"), source.to_owned(), &dialect())
+        .map_err(|e| e.to_string())?;
+    let mut eval = Evaluator::new(module);
+    eval.set_max_callstack_size(MAX_CALLSTACK)
+        .map_err(|e| e.to_string())?;
+    eval.set_max_heap_size(MAX_HEAP_BYTES)
+        .map_err(|e| e.to_string())?;
+    eval.set_max_tick_count(MAX_TICKS)
+        .map_err(|e| e.to_string())?;
+    if let Some(violations) = violations {
+        eval.extra = Some(violations);
+    }
+    if let Some(printer) = printer {
+        eval.set_print_handler(printer);
+    }
+    let setup = AstModule::parse("document.star", prelude.to_owned(), &dialect())
+        .map_err(|e| e.to_string())?;
+    eval.eval_module(setup, globals)
+        .map_err(|e| e.to_string())?;
+    eval.eval_module(ast, globals).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Starlark source defining `doc` — the document's root node — and every
 /// other node in `canvas` as a read-only struct reachable from it via
 /// `.children()`/`.descendants()`. There's no separate "document" type:
@@ -280,7 +306,7 @@ fn evaluate_one(
 /// calls), so a script can never see a stale document. `base_dir` is only
 /// used here, to resolve each `file`-type node's target once up front —
 /// see `file_data_literals`.
-fn build_prelude(
+pub(crate) fn build_prelude(
     canvas: &Canvas,
     base_dir: Option<&Path>,
     access: &crate::dirvars::FileAccess,

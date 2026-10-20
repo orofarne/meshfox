@@ -121,6 +121,7 @@ export interface CanvasNode {
    * node's own body, in document order — see `ConstraintStatusDto`. Absent
    * or empty means this node has no constraint fences. */
   constraintResults?: ConstraintStatusDto[];
+  renderResults?: RenderResultDto[];
   /** Absolute directory a relative asset reference (an `![](...)` image, or
    * a plain link) in `text` should resolve against, when it's not the
    * canvas file's own directory — set when this node's body was spliced in
@@ -241,3 +242,5 @@ export interface FsListing {
   entries: FsEntry[];
   truncated: boolean;
 }
+
+export interface RenderResultDto { label: string; markdown: string; error: string | null; }

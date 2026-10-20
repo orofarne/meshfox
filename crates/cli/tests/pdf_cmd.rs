@@ -361,3 +361,68 @@ fn a_table_without_duckdb_fails_the_pdf() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Exercise CLI -> worker evaluation -> static view -> Chromium -> PDF.
+/// The expected marker is assembled at runtime, so seeing source code in
+/// the PDF cannot accidentally satisfy the output assertion.
+#[test]
+fn starlark_render_output_is_present_in_every_pdf_mode() {
+    if !system_browser_available() {
+        eprintln!("skipping: no system Chrome/Chromium/Edge found");
+        return;
+    }
+    let dir = unique_dir("starlark-render");
+    let canvas_path = dir.join("doc.canvas.md");
+    let source = concat!(
+        "<!-- meshfox:canvas -->\n# Tag summary\n<!-- meshfox:node id=\"root\" -->\n",
+        "```starlark render name=\"counts\"\n",
+        "source_only = \"SOURCE_ONLY_SHOULD_STAY_HIDDEN\"\n",
+        "marker = \"COMPUTED\" + \"PDFRESULT=\" + str(len(doc.nodes_with_tag(\"todo\")))\n",
+        "print(md.table(headers=[\"Tag\", \"Count\"], rows=[[\"todo\", marker]]))\n",
+        "```\n",
+        "## First\n<!-- meshfox:node id=\"first\" tags=\"todo\" -->\nFirst task.\n",
+        "## Second\n<!-- meshfox:node id=\"second\" tags=\"todo\" -->\nSecond task.\n",
+    );
+    assert!(!source.contains("COMPUTEDPDFRESULT=2"));
+    write_file(&canvas_path, source);
+    for mode in [Some("document"), Some("canvas"), None] {
+        let label = mode.unwrap_or("combined");
+        let out_path = dir.join(format!("{label}.pdf"));
+        let mut cmd = meshfox();
+        cmd.env("MESHFOX_SERVER_SOCKET", "")
+            .arg("pdf")
+            .arg(&canvas_path)
+            .arg("--out")
+            .arg(&out_path);
+        if let Some(mode) = mode {
+            cmd.arg("--mode").arg(mode);
+        }
+        let output = cmd.output().expect("run PDF export");
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pdf = lopdf::Document::load(&out_path).expect("valid PDF");
+        let pages: Vec<_> = pdf.get_pages().keys().copied().collect();
+        let text = pdf.extract_text(&pages).expect("extract PDF text");
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("COMPUTEDPDFRESULT=2"),
+            "{label} PDF is missing evaluated output:\n{text}"
+        );
+        assert!(
+            !compact.contains("SOURCE_ONLY_SHOULD_STAY_HIDDEN"),
+            "{label} PDF unexpectedly prints collapsed source:\n{text}"
+        );
+        if mode.is_none() {
+            assert_eq!(
+                compact.matches("COMPUTEDPDFRESULT=2").count(),
+                2,
+                "combined PDF must include output on both canvas and document pages:\n{text}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), source);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

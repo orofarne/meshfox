@@ -714,21 +714,20 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .collect();
     for node in &canvas.nodes {
         for block in node.runnable_blocks() {
-            let mut refs: Vec<(String, &'static str)> =
-                static_block_env_names(node, &block)?
-                    .into_iter()
-                    .map(|name| (name, "env"))
-                    .chain(
-                        interpreter_refs(&block)
-                            .into_iter()
-                            .map(|n| (n, "interpreter")),
-                    )
-                    .chain(
-                        crate::args::dependency_refs(&block)
-                            .into_iter()
-                            .map(|n| (n, "deps")),
-                    )
-                    .collect();
+            let mut refs: Vec<(String, &'static str)> = static_block_env_names(node, &block)?
+                .into_iter()
+                .map(|name| (name, "env"))
+                .chain(
+                    interpreter_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "interpreter")),
+                )
+                .chain(
+                    crate::args::dependency_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "deps")),
+                )
+                .collect();
             // A `form` fence's own `field var=` is just as much a
             // reference to a declared variable as `env=`/`interpreter=`
             // are — same node-subtree scoping rule applies. An invalid
@@ -809,21 +808,20 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
     let declared: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).collect();
     for node in &canvas.nodes {
         for block in node.runnable_blocks() {
-            let refs: Vec<(String, &'static str)> =
-                static_block_env_names(node, &block)?
-                    .into_iter()
-                    .map(|name| (name, "env"))
-                    .chain(
-                        interpreter_refs(&block)
-                            .into_iter()
-                            .map(|n| (n, "interpreter")),
-                    )
-                    .chain(
-                        crate::args::dependency_refs(&block)
-                            .into_iter()
-                            .map(|n| (n, "deps")),
-                    )
-                    .collect();
+            let refs: Vec<(String, &'static str)> = static_block_env_names(node, &block)?
+                .into_iter()
+                .map(|name| (name, "env"))
+                .chain(
+                    interpreter_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "interpreter")),
+                )
+                .chain(
+                    crate::args::dependency_refs(&block)
+                        .into_iter()
+                        .map(|n| (n, "deps")),
+                )
+                .collect();
             let argument_names: std::collections::HashSet<_> =
                 crate::args::scan_node_signatures(node)
                     .unwrap_or_default()

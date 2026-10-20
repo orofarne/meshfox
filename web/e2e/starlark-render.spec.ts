@@ -1,0 +1,33 @@
+import { test, expect } from "@playwright/test";
+import { clickFitViewAndWait, disableDefaultFold } from "./helpers";
+
+test("computed Markdown stays live across remote edits and deletions", async ({ page }, testInfo) => {
+  await disableDefaultFold(page, "root");
+  await page.goto("/");
+  await page.waitForSelector(".mesh-node");
+  await clickFitViewAndWait(page);
+  const block = page.locator('.mesh-render-block').filter({ has: page.locator('.mesh-code-lang').filter({ hasText: 'tag-counts' }) });
+  await expect(block.locator('table')).toBeVisible();
+  await expect(block.locator('tbody tr')).toHaveCount(2);
+  await expect(block.getByRole('link', {name: 'todo', exact: true})).toHaveAttribute('href', 'https://example.com/todo');
+  await expect(block.locator('pre')).toHaveCount(0);
+  await expect(block.getByRole('button', {name: /^run/})).toHaveCount(0);
+  await block.getByTitle('Show the Starlark source', {exact: true}).click();
+  await expect(block.locator('pre')).toContainText('counts = {}');
+  await expect(block.locator('table')).toBeVisible();
+  await block.getByTitle('Hide the Starlark source', {exact: true}).click();
+  await block.screenshot({path: testInfo.outputPath('tag-summary.png')});
+  const broken = page.locator('.mesh-render-block').filter({ has: page.locator('.mesh-code-lang').filter({hasText: 'broken'}) });
+  await expect(broken).toContainText('undefined_name');
+  await expect(broken.locator('[data-exit="fail"]')).toBeVisible();
+  const before = await (await page.request.get('/api/canvas')).json();
+  const change = await page.request.patch('/api/nodes/task', {data: { tags: { add: ['done'], remove: ['todo', 'task'] } }});
+  expect(change.ok()).toBeTruthy();
+  await expect(block.locator('tbody tr')).toHaveCount(1);
+  await expect(block.getByRole('link', {name: 'done', exact: true})).toBeVisible();
+  const after = await (await page.request.get('/api/canvas')).json();
+  expect(after.nodes.find((n: {id: string}) => n.id === 'root').bodyRev).toBe(before.nodes.find((n: {id: string}) => n.id === 'root').bodyRev);
+  const remove = await page.request.delete('/api/nodes/task');
+  expect(remove.ok()).toBeTruthy();
+  await expect(block.locator('tbody tr')).toHaveCount(0);
+});

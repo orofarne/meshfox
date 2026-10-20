@@ -2621,6 +2621,7 @@ export default function App() {
             target: n.target,
             caption: n.caption,
             constraintResults: n.constraintResults,
+            renderResults: n.renderResults,
             // Populated by the dedicated `services`-patch effect right
             // after this (deliberately not read here — this whole effect
             // only depends on `[canvas]`, see its own closing comment; a

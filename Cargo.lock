@@ -3467,6 +3467,7 @@ dependencies = [
 name = "meshfox-core"
 version = "0.1.0"
 dependencies = [
+ "allocative",
  "anyhow",
  "blake3",
  "csv",

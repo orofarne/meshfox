@@ -1794,7 +1794,8 @@ impl App {
     /// what would have caught that at authoring time, not this.
     fn try_build_inline_form(&self, node_id: &str, block_name: &str) -> Option<InlineFormState> {
         let node = self.display_canvas.node(node_id)?;
-        let block = node.runnable_blocks()
+        let block = node
+            .runnable_blocks()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(block_name))?;
         if !meshfox_core::is_form(&block.lang) {
@@ -1860,7 +1861,8 @@ impl App {
         let Some(node) = self.display_canvas.node(&node_id) else {
             return;
         };
-        let form_blocks: Vec<String> = node.runnable_blocks()
+        let form_blocks: Vec<String> = node
+            .runnable_blocks()
             .into_iter()
             .filter(|b| meshfox_core::is_form(&b.lang))
             .filter_map(|b| b.name)
@@ -2428,6 +2430,26 @@ impl App {
         })
     }
 
+    pub(super) fn render_block_label(&self, addr: &BlockAddr) -> Option<String> {
+        let index = addr
+            .block_name
+            .strip_prefix("@render:")?
+            .parse::<usize>()
+            .ok()?;
+        let result = self
+            .display_canvas
+            .node(&addr.node_id)?
+            .render_results
+            .get(index)?;
+        Some(
+            result
+                .label
+                .strip_prefix(&format!("{}/", addr.node_id))
+                .unwrap_or(&result.label)
+                .to_owned(),
+        )
+    }
+
     fn select_adjacent_block(&mut self, direction: i32) {
         let Some(row) = self.rows.get(self.selected) else {
             return;
@@ -2435,10 +2457,20 @@ impl App {
         let Some(node) = self.display_canvas.node(&row.node_id) else {
             return;
         };
-        let blocks: Vec<_> = node.runnable_blocks()
+        let mut positions: Vec<_> = node
+            .runnable_blocks()
             .into_iter()
-            .filter_map(|b| b.name)
+            .filter_map(|b| b.name.map(|name| (b.span.start, name)))
             .collect();
+        positions.extend(
+            meshfox_core::fence::scan_render_blocks(&node.text)
+                .into_iter()
+                .take(node.render_results.len())
+                .enumerate()
+                .map(|(i, b)| (b.span.start, format!("@render:{i}"))),
+        );
+        positions.sort_by_key(|(start, _)| *start);
+        let blocks: Vec<_> = positions.into_iter().map(|(_, name)| name).collect();
         if blocks.is_empty() {
             return;
         }
@@ -2461,7 +2493,24 @@ impl App {
         let Some(node) = self.display_canvas.node(&addr.node_id) else {
             return;
         };
-        let Some(block) = node.runnable_blocks()
+        if let Some(index) = addr
+            .block_name
+            .strip_prefix("@render:")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if index < node.render_results.len()
+                && matches!(action, BlockAction::ToggleSource | BlockAction::ToggleBlock)
+            {
+                self.selected_block = Some(addr.clone());
+                self.set_focus(Focus::Document);
+                let view = self.block_views.entry(addr).or_default();
+                view.source_expanded = Some(!view.source_expanded.unwrap_or(false));
+                self.render_current_document();
+            }
+            return;
+        }
+        let Some(block) = node
+            .runnable_blocks()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(&addr.block_name))
         else {
@@ -3712,9 +3761,15 @@ impl App {
         };
         if self.selected_block.as_ref().is_some_and(|addr| {
             addr.node_id != node.id
-                || !node.runnable_blocks()
-                    .iter()
-                    .any(|b| b.name.as_deref() == Some(&addr.block_name))
+                || !(addr
+                    .block_name
+                    .strip_prefix("@render:")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .is_some_and(|i| i < node.render_results.len())
+                    || node
+                        .runnable_blocks()
+                        .iter()
+                        .any(|b| b.name.as_deref() == Some(&addr.block_name)))
         }) {
             self.selected_block = None;
         }
@@ -3893,7 +3948,7 @@ impl App {
             }
         }
 
-        let (segs, regions) = markdown::render_with_blocks(
+        let (segs, regions) = markdown::render_with_computed(
             &node.text,
             &base_dir,
             &self.highlighter,
@@ -3906,6 +3961,7 @@ impl App {
             selected_block,
             self.focus == Focus::Document,
             true,
+            &node.render_results,
         );
         let offset = self.doc_segments.len();
         self.doc_segments.extend(segs);
@@ -6119,7 +6175,8 @@ impl App {
             self.status = "a runnable file node keeps no run history".into();
             return;
         }
-        let blocks: Vec<_> = node.runnable_blocks()
+        let blocks: Vec<_> = node
+            .runnable_blocks()
             .into_iter()
             .filter(|b| {
                 !b.service && !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang)

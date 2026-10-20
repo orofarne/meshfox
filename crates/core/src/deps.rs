@@ -46,6 +46,8 @@ impl BlockAddr {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DepsError {
+    #[error("Starlark render in node {0:?}: {1}")]
+    StarlarkRender(String, String),
     #[error("application graph exceeds its limit ({0})")]
     ExpansionLimit(&'static str),
     #[error("service configuration: {0}")]
@@ -191,7 +193,8 @@ fn find_block_with_values(
         .node(&addr.node_id)
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone()))?;
     let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
-    if !node.runnable_blocks()
+    if !node
+        .runnable_blocks()
         .iter()
         .any(|b| b.name.as_deref() == Some(app.definition.as_str()))
     {
@@ -265,12 +268,13 @@ fn validate_application_ref(
     let node = canvas
         .node(&addr.node_id)
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), app.definition.clone()))?;
-    let block = node.runnable_blocks()
+    let block = node
+        .runnable_blocks()
         .into_iter()
         .find(|block| block.name.as_deref() == Some(&app.definition))
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), app.definition.clone()))?;
-    let signatures = crate::args::scan_node_signatures(node)
-        .map_err(|e| DepsError::Arguments(e.to_string()))?;
+    let signatures =
+        crate::args::scan_node_signatures(node).map_err(|e| DepsError::Arguments(e.to_string()))?;
     let args = signatures
         .iter()
         .find(|sig| sig.block.span == block.span)
@@ -761,6 +765,11 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
     crate::artifacts::validate(canvas)?;
     let decls = crate::vars::declared_vars(canvas)?;
     for node in &canvas.nodes {
+        for block in crate::fence::scan_render_blocks(&node.text) {
+            if let Some(error) = block.error {
+                return Err(DepsError::StarlarkRender(node.id.clone(), error));
+            }
+        }
         let blocks = node.runnable_blocks();
         if let Err(names) = crate::fence::default_block(&node.id, &blocks) {
             return Err(DepsError::MultipleDefaults(node.id.clone(), names));

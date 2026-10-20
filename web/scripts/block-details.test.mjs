@@ -123,3 +123,19 @@ test('lease stays distinct from deps while participating in dependency planning'
     }
   }
 });
+
+test('Starlark computed views are separate from executable blocks and constraints', () => {
+  const source = '```starlark render name="counts" output="markdown"\nprint(1)\n```\n```starlark constraint\npass\n```\n```starlark\nprint(2)\n```';
+  const segments = parseBody(source, 'root');
+  assert.equal(segments.filter(s => s.type === 'render').length, 1);
+  assert.equal(segments.filter(s => s.type === 'constraint').length, 1);
+  assert.equal(segments.filter(s => s.type === 'code').length, 0);
+  assert.equal(segments.find(s => s.type === 'render').name, 'counts');
+  assert.ok(segments.find(s => s.type === 'markdown').content.includes('print(2)'));
+});
+
+test('Starlark views respect fence boundaries and leave nested examples inert', () => {
+  const source = '~~~~markdown\n```starlark render\nprint("inert")\n```\n~~~~\n~~~~starlark render name="real"\nprint(1)\n~~~~~\n````starlark render\nprint(2)\n````';
+  const segments = parseBody(source, 'root');
+  assert.deepEqual(segments.filter(s => s.type === 'render').map(s => s.code), ['print(1)', 'print(2)']);
+});

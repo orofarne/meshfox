@@ -110,7 +110,8 @@ pub fn document_attr_context(text: &str, row: usize) -> Option<AttrKind> {
                 let info = trimmed[len..].trim();
                 let language = info.split_whitespace().next().unwrap_or("");
                 let attrs = crate::attrs::parse_attrs(info);
-                if matches!(language, "bash" | "sh" | "button") || attrs.contains_key("interpreter")
+                if matches!(language, "bash" | "sh" | "button" | "starlark")
+                    || attrs.contains_key("interpreter")
                 {
                     Some(AttrKind::Fence)
                 } else {
@@ -222,6 +223,39 @@ pub fn detect_attr_context(line: &str) -> Option<AttrKind> {
 
 /// Exclude parsed attribute keys and flags that conflict with the current block.
 pub fn attr_candidates(kind: AttrKind, line: &str) -> Vec<AttrCandidate> {
+    if kind == AttrKind::Fence
+        && line
+            .trim_start()
+            .trim_start_matches(['`', '~'])
+            .trim_start()
+            .starts_with("starlark ")
+    {
+        let attrs = crate::attrs::parse_attrs(line);
+        let mut result = vec![];
+        if !attrs.contains_key("name") {
+            result.push(AttrCandidate {
+                name: "name",
+                is_flag: false,
+            });
+        }
+        if !attrs.contains_key("constraint") && !attrs.contains_key("render") {
+            result.push(AttrCandidate {
+                name: "constraint",
+                is_flag: true,
+            });
+            result.push(AttrCandidate {
+                name: "render",
+                is_flag: true,
+            });
+        }
+        if attrs.get("render").is_some_and(|v| v != "false") && !attrs.contains_key("output") {
+            result.push(AttrCandidate {
+                name: "output",
+                is_flag: false,
+            });
+        }
+        return result;
+    }
     let (value_attrs, flag_attrs): (&[&str], &[&str]) = match kind {
         AttrKind::Node => (NODE_ATTRS, &[]),
         AttrKind::Edge => (EDGE_ATTRS, &[]),
@@ -659,7 +693,18 @@ fn complete_value(
             .map(|v| (v.clone(), Some(detail.to_string())))
             .collect()
     };
-    let finite = finite_values(kind, name);
+    let starlark_render = chars
+        .iter()
+        .collect::<String>()
+        .trim_start()
+        .trim_start_matches(['`', '~'])
+        .trim_start()
+        .starts_with("starlark ");
+    let finite = if starlark_render && (kind, name) == (AttrKind::Fence, "output") {
+        &["markdown"][..]
+    } else {
+        finite_values(kind, name)
+    };
     let values: Vec<(String, Option<String>)> = if !finite.is_empty() {
         finite.iter().map(|v| (v.to_string(), None)).collect()
     } else {
@@ -931,5 +976,37 @@ mod tests {
         assert_eq!(labels(&c), ["interpreter"]);
         // A ``` line inside another fence is content, not an opener.
         assert!(at("````md\n```python name=\"a\" |\n```\n````\n").is_none());
+    }
+}
+
+#[cfg(test)]
+mod starlark_render_tests {
+    use super::*;
+    #[test]
+    fn starlark_has_its_own_fence_vocabulary() {
+        let candidates = attr_candidates(AttrKind::Fence, "```starlark ");
+        assert!(candidates.iter().any(|c| c.name == "render" && c.is_flag));
+        assert!(candidates
+            .iter()
+            .any(|c| c.name == "constraint" && c.is_flag));
+        assert!(!candidates.iter().any(|c| c.name == "interpreter"));
+        let candidates = attr_candidates(AttrKind::Fence, "```starlark render ");
+        assert!(candidates.iter().any(|c| c.name == "output"));
+        assert!(!candidates.iter().any(|c| c.name == "constraint"));
+        let line = "```starlark render output=\"\"";
+        let output = complete(line, 0, line.chars().count() - 1).unwrap();
+        assert_eq!(
+            output
+                .items
+                .iter()
+                .map(|i| i.label.as_str())
+                .collect::<Vec<_>>(),
+            ["markdown"]
+        );
+        assert!(complete("```starlark ", 0, 12)
+            .unwrap()
+            .items
+            .iter()
+            .any(|c| c.label == "render"));
     }
 }

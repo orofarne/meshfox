@@ -26,6 +26,7 @@ pub mod fsbrowse;
 pub mod image_attrs;
 pub mod include;
 pub mod locate;
+mod markdown_fragment;
 pub mod mdcanvas;
 pub mod merge;
 pub mod options;
@@ -38,6 +39,7 @@ pub mod secret_store;
 pub mod service;
 pub mod service_lock;
 pub mod shared_env;
+pub mod starlark_render;
 pub mod staticgen;
 pub mod subsup;
 pub mod suggest;
@@ -301,8 +303,7 @@ pub fn autorun_blocks_for_changed_vars(
             let Some(name) = &block.name else { continue };
             let bound;
             let block = if block.env.iter().any(|env| env.var_name.contains("${")) {
-                let Ok(selected) =
-                    args::bind_node_block(node, name, &canvas.artifact_values)
+                let Ok(selected) = args::bind_node_block(node, name, &canvas.artifact_values)
                 else {
                     continue;
                 };

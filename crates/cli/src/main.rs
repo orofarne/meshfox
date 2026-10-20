@@ -2773,10 +2773,8 @@ fn chain_contains_tty(
             let Some(node) = canvas.node(&addr.node_id) else {
                 continue;
             };
-            if meshfox_core::args::bind_node_block(node, &addr.block_name,
-                &HashMap::new(),
-            )
-            .is_ok_and(|b| b.tty)
+            if meshfox_core::args::bind_node_block(node, &addr.block_name, &HashMap::new())
+                .is_ok_and(|b| b.tty)
             {
                 return true;
             }
@@ -4649,7 +4647,8 @@ fn apply_node_block(
     let node = canvas
         .node(node_id)
         .ok_or_else(|| format!("no node {node_id:?}"))?;
-    if !node.runnable_blocks()
+    if !node
+        .runnable_blocks()
         .iter()
         .any(|b| b.name.as_deref() == Some(block_name))
     {

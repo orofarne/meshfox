@@ -85,7 +85,7 @@ pub fn format_duration_ms(duration_ms: u64) -> String {
 /// shorter than 3. `body` is a command's captured output, so it can contain
 /// literally anything — including a run of backticks as long as (or longer
 /// than) a fixed ` ```` ` would be.
-fn safe_fence_len(body: &str) -> usize {
+pub(crate) fn safe_fence_len(body: &str) -> usize {
     let mut longest_run = 0;
     let mut run = 0;
     for c in body.chars() {
@@ -384,7 +384,9 @@ fn follows_file_node_body(markdown: &str, fence_ranges: &[Range<usize>], pos: us
             return false;
         };
         let at_line_start = start == 0 || before.as_bytes()[start - 1] == b'\n';
-        let in_fence = fence_ranges.iter().any(|r| r.start <= start && start < r.end);
+        let in_fence = fence_ranges
+            .iter()
+            .any(|r| r.start <= start && start < r.end);
         if at_line_start && !in_fence {
             break start;
         }
@@ -496,7 +498,11 @@ pub fn write_block_output(
 
 /// The rendered cached-output region for `block` (`output=` picks the
 /// shape), stamped with `block`'s own fingerprint.
-fn render_for_block(block_name: &str, block: &crate::fence::CodeBlock, output: &ExecOutput) -> String {
+fn render_for_block(
+    block_name: &str,
+    block: &crate::fence::CodeBlock,
+    output: &ExecOutput,
+) -> String {
     let hash = fingerprint(block);
     match block.attrs.get("output").map(String::as_str) {
         Some("markdown") => render_output_block_markdown(block_name, output, &hash),

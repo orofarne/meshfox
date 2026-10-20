@@ -379,6 +379,18 @@ impl AppState {
         let old_raw = self.raw.lock().unwrap().clone();
         self.write_raw(raw)?;
         record_undo(self, &old_raw, raw, &event, undo_as);
+        // A structural edit (including deletion/reordering) can affect a
+        // view anywhere in the document. Keep the precise history event,
+        // but tell clients to fetch all freshly computed presentation data.
+        let event = if resolved_canvas(raw, &self.canvas_path).is_ok_and(|c| {
+            c.nodes
+                .iter()
+                .any(|n| !meshfox_core::fence::scan_render_blocks(&n.text).is_empty())
+        }) {
+            ServerEvent::Changed
+        } else {
+            event
+        };
         self.canvas_events.push(event);
         broadcast_undo_state(self);
         Ok(())
@@ -404,8 +416,9 @@ fn broadcast_undo_state(state: &AppState) {
 /// the document each time it is served (a constraint's result, a colour
 /// derived from a tag, the body's revision, where an included file lives),
 /// not stored in it — never part of what a step changed.
-const DERIVED_NODE_FIELDS: [&str; 5] = [
+const DERIVED_NODE_FIELDS: [&str; 6] = [
     "constraintResults",
+    "renderResults",
     "effectiveColor",
     "bodyRev",
     "assetBase",
@@ -2729,10 +2742,9 @@ fn steps_needing_a_lock(
         let Some(node) = canvas.node(&addr.node_id) else {
             continue;
         };
-        let Some(block) = meshfox_core::args::bind_node_block(node, &addr.block_name,
-            &HashMap::new(),
-        )
-        .ok() else {
+        let Some(block) =
+            meshfox_core::args::bind_node_block(node, &addr.block_name, &HashMap::new()).ok()
+        else {
             continue;
         };
         let kind = if block.service {
@@ -3090,7 +3102,8 @@ async fn prepare_arguments_local(
     let mut block_name = request.block.clone();
     let app = meshfox_core::args::Application::parse(&block_name)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    if !node.runnable_blocks()
+    if !node
+        .runnable_blocks()
         .iter()
         .any(|block| block.name.as_deref() == Some(app.definition.as_str()))
         && app.bindings.is_empty()
@@ -3105,14 +3118,8 @@ async fn prepare_arguments_local(
             }
         }
     }
-    let choice_sources = argument_choice_sources(
-        &state,
-        &canvas,
-        node,
-        &block_name,
-        &request.args,
-    )
-    .await;
+    let choice_sources =
+        argument_choice_sources(&state, &canvas, node, &block_name, &request.args).await;
     let mut argument_values = canvas.artifact_values.clone();
     argument_values.extend(choice_sources.clone());
     let prepared = meshfox_core::args::prepare_node_arguments(
@@ -3425,7 +3432,8 @@ async fn run_from_source_for_status(
 ) -> Option<HashMap<String, String>> {
     let node = canvas.node(&addr.node_id)?;
     let cwd = node.cwd(canvas_root_dir(canvas_path));
-    let block = node.runnable_blocks()
+    let block = node
+        .runnable_blocks()
         .into_iter()
         .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))?;
     if !stream_exec::supports(&block) {
@@ -4428,8 +4436,12 @@ impl AppState {
     fn canvas_snapshot(&self) -> Result<Json<VersionedCanvas>, ApiError> {
         let raw = self.raw.lock().unwrap();
         let Json(canvas) = canvas_response(&raw, &self.canvas_path)?;
-        let fingerprint = serde_json::to_string(&canvas)
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Retain only a digest, rather than a second full copy of the
+        // response (which can include large, transient computed views).
+        let fingerprint = meshfox_core::body_rev(
+            &serde_json::to_string(&canvas)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        );
         let mut version = self.snapshot_version.lock().unwrap();
         if version.1 != fingerprint {
             version.0 += 1;
@@ -4457,6 +4469,11 @@ fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canv
     // reads for a document whose constraints reach into `file` nodes.
     let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
     meshfox_core::constraint::annotate_status_with_access(
+        &mut canvas,
+        Some(canvas_root_dir(canvas_path)),
+        &access,
+    );
+    meshfox_core::starlark_render::annotate(
         &mut canvas,
         Some(canvas_root_dir(canvas_path)),
         &access,
@@ -6058,7 +6075,8 @@ async fn update_block_attrs(
 
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas.node(&located.local_id).ok_or_else(not_found)?;
-    if !node.runnable_blocks()
+    if !node
+        .runnable_blocks()
         .iter()
         .any(|b| b.name.as_deref() == Some(block_name.as_str()))
     {
@@ -7356,10 +7374,8 @@ async fn run_block_impl_sized(
     if detach
         && chain.iter().chain(cleanups.iter()).any(|addr| {
             canvas.node(&addr.node_id).is_some_and(|node| {
-                meshfox_core::args::bind_node_block(node, &addr.block_name,
-                    &HashMap::new(),
-                )
-                .is_ok_and(|block| block.tty)
+                meshfox_core::args::bind_node_block(node, &addr.block_name, &HashMap::new())
+                    .is_ok_and(|block| block.tty)
             })
         })
     {
@@ -8658,7 +8674,8 @@ async fn get_form_fields(
             format!("no node {:?}", query.node_id),
         )
     })?;
-    let block = node.runnable_blocks()
+    let block = node
+        .runnable_blocks()
         .into_iter()
         .find(|b| b.name.as_deref() == Some(query.block.as_str()))
         .ok_or_else(|| {
@@ -8761,7 +8778,8 @@ async fn submit_form(
     let node = canvas
         .node(&req.node_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
-    let block = node.runnable_blocks()
+    let block = node
+        .runnable_blocks()
         .into_iter()
         .find(|b| b.name.as_deref() == Some(req.block.as_str()))
         .ok_or_else(|| {
@@ -8870,10 +8888,8 @@ fn find_tty_block(
             canvas
                 .node(&addr.node_id)
                 .and_then(|node| {
-                    meshfox_core::args::bind_node_block(node, &addr.block_name,
-                        &HashMap::new(),
-                    )
-                    .ok()
+                    meshfox_core::args::bind_node_block(node, &addr.block_name, &HashMap::new())
+                        .ok()
                 })
                 .is_some_and(|b| b.tty)
         })
@@ -11520,6 +11536,50 @@ mod node_op_broadcast_tests {
         ));
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn computed_starlark_views_are_ephemeral_and_invalidate_other_nodes() {
+        let raw = "# Root\n<!-- meshfox:node id=\"root\" -->\n```starlark render\nprint(md.table(headers=[\"Count\"], rows=[[len(doc.nodes_with_tag(\"todo\"))]]))\n```\n## Task\n<!-- meshfox:node id=\"task\" tags=\"todo\" -->\n";
+        let path = write_test_canvas(raw);
+        let canvas = canvas_response(raw, &path).unwrap().0;
+        assert!(canvas.node("root").unwrap().render_results[0]
+            .markdown
+            .contains("| 1 |"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        let changed = raw.replace("tags=\"todo\"", "tags=\"done\"");
+        let updated = canvas_response(&changed, &path).unwrap().0;
+        assert!(updated.node("root").unwrap().render_results[0]
+            .markdown
+            .contains("| 0 |"));
+        assert_eq!(
+            canvas.node("root").unwrap().body_rev,
+            updated.node("root").unwrap().body_rev
+        );
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let (_, mut rx, _) = state.canvas_events.subscribe_from(u64::MAX);
+        state
+            .save_with_event(&changed, node_upserted_event(&changed, &path, "task"))
+            .unwrap();
+        assert!(matches!(recv_event(&mut rx), ServerEvent::Changed));
+        assert!(matches!(
+            recv_event(&mut rx),
+            ServerEvent::UndoStateChanged { .. }
+        ));
+        assert!(!node_fields(updated.node("root").unwrap()).contains_key("renderResults"));
+        // Deleting a tagged node must invalidate a view elsewhere too.
+        let without_task = mdcanvas::delete_node(&changed, "task").unwrap();
+        state
+            .save_with_event(
+                &without_task,
+                ServerEvent::NodeRemoved {
+                    node_id: "task".into(),
+                    keep_children: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(recv_event(&mut rx), ServerEvent::Changed));
+        std::fs::remove_file(path).unwrap();
     }
 
     const TWO_SIBLINGS: &str = concat!(
@@ -16154,7 +16214,13 @@ mod run_file_tests {
         let steps: Vec<_> = events
             .iter()
             .filter(|e| e["type"] == "step-start")
-            .map(|e| format!("{}/{}", e["nodeId"].as_str().unwrap(), e["block"].as_str().unwrap()))
+            .map(|e| {
+                format!(
+                    "{}/{}",
+                    e["nodeId"].as_str().unwrap(),
+                    e["block"].as_str().unwrap()
+                )
+            })
             .collect();
         assert_eq!(steps, ["setup/prep", "seed/seed"], "events: {events:?}");
         assert_eq!(events.last().unwrap()["type"], "done", "events: {events:?}");
@@ -16169,12 +16235,22 @@ mod run_file_tests {
         let canvas = meshfox_core::Canvas::from_markdown(&written).unwrap();
         let node = canvas.node("seed").unwrap();
         assert_eq!(node.caption.as_deref(), Some("Loads the data."));
-        assert_eq!(node.target.as_deref(), Some(format!("./{script_name}").as_str()));
+        assert_eq!(
+            node.target.as_deref(),
+            Some(format!("./{script_name}").as_str())
+        );
 
         // A second run replaces the region instead of stacking another.
-        let _ = run_ws_events(addr, "/api/run?path=seed&block=seed&persist=true&noDeps=true").await;
+        let _ = run_ws_events(
+            addr,
+            "/api/run?path=seed&block=seed&persist=true&noDeps=true",
+        )
+        .await;
         let again = std::fs::read_to_string(&canvas_path).unwrap();
-        assert_eq!(again.matches("<!-- meshfox:output name=\"seed\"").count(), 1);
+        assert_eq!(
+            again.matches("<!-- meshfox:output name=\"seed\"").count(),
+            1
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&target_path);

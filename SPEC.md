@@ -1285,6 +1285,70 @@ validate`: `validate` asks whether the file *parses* as a well-formed
 canvas; `check` asks whether the document, once parsed, actually satisfies
 whatever rules its own constraint fences declare.
 
+## Computed Starlark views
+
+A `starlark render` fence computes a Markdown view of the document using the
+same read-only `doc`/`self` API and bounded interpreter as a constraint:
+
+    ```starlark render name="tag-counts" output="markdown"
+    counts = {}
+    for n in [doc] + doc.descendants():
+        for tag in n.tags:
+            counts[tag] = counts.get(tag, 0) + 1
+    print(md.table(
+        headers=["Tag", "Nodes"],
+        rows=[[tag, counts[tag]] for tag in sorted(counts)],
+    ))
+    ```
+
+`render` is an explicit presence flag, `name` is optional, and `output` may
+only be `"markdown"` (the default). `constraint` and `render` are mutually
+exclusive. Shell execution attributes (`interpreter`, `cache`, `deps`, etc.)
+are not accepted on a computed view. A plain `starlark` fence stays inert.
+Computed views are not runnable blocks or dependency targets, and do not
+contribute to `meshfox check`'s constraint status.
+
+The worker evaluates views on its current authored document snapshot and
+sends `renderResults` alongside each node in its response. These are temporary
+presentation data: they never change the node's `text` or body revision,
+are never written to the source or cached-output regions, and are not input
+to subsequent evaluations. Changes anywhere in a document with computed views
+cause clients to fetch the complete updated snapshot. Static/PDF export uses
+the worker's computed results as well.
+
+WebUI and TUI show a compact `starlark · name` header, a success/error mark,
+and the generated Markdown underneath. Source starts collapsed; click the
+header toggle to expand it. In TUI, `[`/`]` select a block and `c` or Enter
+toggle its source. There is no Run button. Errors replace the result with a
+diagnostic, independent of constraint violations. Static export uses a
+collapsible `<details>` source section and the rendered result. Generated
+fences are always content, never new executable blocks.
+
+`print()` appends Markdown lines. Each block gets a fresh module and the
+constraint runtime's tick, heap and stack limits, plus a 1 MiB output limit.
+A failing block discards its partial output. Diagnostics refer to lines of
+the authored script, rather than the document API's generated prelude.
+
+The built-in `md` namespace returns native `MarkdownFragment` values:
+
+| Function | Result |
+| --- | --- |
+| `md.text(value)` | Escaped literal text. |
+| `md.raw(text)` | Explicit, authored Markdown without escaping. |
+| `md.link(label, url)` | A link with an escaped label and encoded URL delimiters. |
+| `md.code(text, lang="")` | A fenced code block with a safe delimiter length. |
+| `md.table(headers, rows)` | A GFM table from lists; every row must match the nonempty header width. |
+
+Builders distinguish ordinary strings/numbers (data to escape) from fragments
+(already-constructed markup). Inline fragments can be placed in links and
+table cells without escaping their markup again; table insertion still protects
+pipe separators. Plain cell line breaks become spaces. Block fragments such as
+tables and fenced code cannot be inserted into inline positions. `print(fragment)`
+emits its Markdown; `str(fragment)` explicitly loses the type information, so
+passing that string to another builder treats it as literal text. Fragment size
+is limited to 1 MiB. No color syntax is introduced here; future helpers can
+return the same fragment type.
+
 ## Interactive (`tty`) blocks
 
 A `tty` block (see its flag above) hands its process the real terminal
@@ -2646,6 +2710,7 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
                      | 'autorun' | 'render' | 'output' | 'send' | 'fold'
                      | 'inputs' | 'outputs' | 'lease' | 'defer'
     constraint-attr ::= 'constraint' | 'name'
+    starlark-render-attr ::= 'render' | 'name' | 'output'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its
 own `interpreter=` attribute set (see "Runnable code fences") — `button`

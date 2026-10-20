@@ -1584,7 +1584,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     );
     if app.focus == Focus::Document {
         hint = if let Some(addr) = &app.selected_block {
-            if app.is_button_block(addr) {
+            if let Some(label) = app.render_block_label(addr) {
+                format!("render: {label} · [/] select · Enter/c source · Esc clear · j/k scroll · tab focus")
+            } else if app.is_button_block(addr) {
                 format!("button: {} · Enter/r run chain · R run without deps · [/] select · Esc clear · tab focus", addr.block_name)
             } else {
                 format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · tab focus", addr.block_name)

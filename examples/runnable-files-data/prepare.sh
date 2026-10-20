@@ -1,0 +1,1 @@
+echo "preparing the workspace"

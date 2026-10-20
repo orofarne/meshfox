@@ -404,6 +404,54 @@ pub fn render_with_blocks(
     focused: bool,
     runnable_controls: bool,
 ) -> (Vec<Segment>, Vec<ClickRegion>) {
+    render_with_computed(
+        md,
+        base_dir,
+        hl,
+        node_id,
+        decls,
+        form_values,
+        form_focus,
+        live_output,
+        block_views,
+        selected_block,
+        focused,
+        runnable_controls,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_computed(
+    md: &str,
+    base_dir: &Path,
+    hl: &Highlighter,
+    node_id: &str,
+    decls: &[meshfox_core::vars::VarDecl],
+    form_values: &std::collections::HashMap<String, String>,
+    // `Some((block_name, selected_index))` while this node's own inline
+    // form is actively `editing` (see `App::active_inline_form`'s own doc
+    // comment) — lets the form-lang branch of `TagEnd::CodeBlock` draw a
+    // visible focus indicator (reversed row, blinking `_` text cursor) on
+    // whichever field/Send row is currently selected, the same convention
+    // `render_var_form` (`ui.rs`) already uses for the unrelated "configure
+    // variables" modal. `None` whenever this form is merely open (not
+    // `editing`) or this isn't the node it belongs to — no focus to show.
+    form_focus: Option<(&str, usize)>,
+    // Live output from the most recent run, for whichever of this node's own
+    // blocks it covers — keyed by block name (already scoped to this
+    // `node_id` by the caller, see `App::render_current_document`). The TUI
+    // equivalent of the web UI's `LiveRunOutput`: shown right under a
+    // runnable fence in `TagEnd::CodeBlock`, same spot an on-disk cached
+    // `OutputRegion` would occupy, but sourced from `App::step_output`
+    // instead of the document's own text — this never touches `md` at all.
+    live_output: &std::collections::HashMap<String, super::app::StepOutput>,
+    block_views: &std::collections::HashMap<String, BlockView>,
+    selected_block: Option<&str>,
+    focused: bool,
+    runnable_controls: bool,
+    render_results: &[meshfox_core::starlark_render::RenderResult],
+) -> (Vec<Segment>, Vec<ClickRegion>) {
     // Pre-scanned once so `Tag::CodeBlock`'s own handling (`start`) can
     // resolve a fence's *real* run name — including the implicit "sole
     // unnamed fence in this node" rule (`fence::scan_runnable_blocks`'s own
@@ -420,6 +468,10 @@ pub fn render_with_blocks(
         form_focus,
         live_output,
     );
+    renderer.computed = meshfox_core::fence::scan_render_blocks(md)
+        .into_iter()
+        .zip(render_results.iter().cloned())
+        .collect();
     renderer.block_views = block_views.clone();
     renderer.selected_block = selected_block.map(str::to_owned);
     renderer.focused = focused;
@@ -541,6 +593,11 @@ enum Inline {
 }
 
 struct Renderer<'a> {
+    computed: Vec<(
+        meshfox_core::fence::RenderBlock,
+        meshfox_core::starlark_render::RenderResult,
+    )>,
+    code_render: Option<usize>,
     block_views: std::collections::HashMap<String, BlockView>,
     selected_block: Option<String>,
     focused: bool,
@@ -703,6 +760,8 @@ impl<'a> Renderer<'a> {
         live_output: &'a std::collections::HashMap<String, super::app::StepOutput>,
     ) -> Self {
         Renderer {
+            computed: Vec::new(),
+            code_render: None,
             block_views: Default::default(),
             selected_block: None,
             focused: false,
@@ -1351,6 +1410,10 @@ impl<'a> Renderer<'a> {
             }
             Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
+                self.code_render = self
+                    .computed
+                    .iter()
+                    .position(|(b, _)| b.span.contains(&span_start));
                 self.code_send = None;
                 let mut tangle = false;
                 let (lang, name, interpreter, deps, lease, env) = match kind {
@@ -1604,6 +1667,85 @@ impl<'a> Renderer<'a> {
                     .filter(|_| self.runnable_controls);
                 let details = std::mem::take(&mut self.code_details);
                 let code = std::mem::take(&mut self.code_buf);
+                if let Some(index) = self.code_render.take() {
+                    let result = self.computed[index].1.clone();
+                    let key = format!("@render:{index}");
+                    let expanded = self
+                        .block_views
+                        .get(&key)
+                        .and_then(|v| v.source_expanded)
+                        .unwrap_or(false);
+                    let header = format!(
+                        "{} starlark · {}  {}",
+                        if expanded { "▾" } else { "▸" },
+                        name.as_deref().unwrap_or("render"),
+                        if result.error.is_some() { "✗" } else { "✓" }
+                    );
+                    self.push_segment(Segment::Text(vec![Line::from(Span::styled(
+                        header,
+                        if self.selected_block.as_deref() == Some(&key) && self.focused {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default().fg(Color::Cyan)
+                        },
+                    ))]));
+                    self.click_regions.push(ClickRegion {
+                        segment_index: self.segments.len() - 1,
+                        line_index: 0,
+                        col_start: 0,
+                        col_end: u16::MAX,
+                        target: ClickTarget::Block {
+                            node_id: self.node_id.to_owned(),
+                            block_name: key,
+                            action: BlockAction::ToggleSource,
+                        },
+                    });
+                    if expanded {
+                        let lines = self.hl.highlight_file(
+                            Some("starlark"),
+                            Path::new("render.star"),
+                            &code,
+                        );
+                        self.push_segment(Segment::Text(lines));
+                    }
+                    if let Some(error) = result.error {
+                        self.push_segment(Segment::Text(
+                            error
+                                .lines()
+                                .map(|l| {
+                                    Line::from(Span::styled(
+                                        l.to_owned(),
+                                        Style::default().fg(Color::Red),
+                                    ))
+                                })
+                                .collect(),
+                        ));
+                    } else {
+                        let (segments, clicks) = render_with_blocks(
+                            &result.markdown,
+                            self.base_dir,
+                            self.hl,
+                            self.node_id,
+                            &[],
+                            &Default::default(),
+                            None,
+                            &Default::default(),
+                            &Default::default(),
+                            None,
+                            false,
+                            false,
+                        );
+                        let offset = self.segments.len();
+                        self.segments.extend(segments);
+                        self.click_regions.extend(clicks.into_iter().map(|mut c| {
+                            c.segment_index += offset;
+                            c
+                        }));
+                    }
+                    return;
+                }
                 if lang == meshfox_core::FORM_LANG {
                     // Same non-executing, no-frame family as `button`
                     // (below) — a form has no real code to
@@ -2113,6 +2255,83 @@ impl<'a> Renderer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computed_starlark_table_and_source_toggle() {
+        let md = "```starlark render name=\"counts\"\nprint(42)\n```\n";
+        let results = [meshfox_core::starlark_render::RenderResult { label: "root/counts".into(), markdown: "| Tag | Count |\n| --- | --- |\n| todo | 2 |\n\n```bash name=\"evil\"\necho SHOULD_NOT_RUN\n```".into(), error: None }];
+        let hl = Highlighter::new();
+        let render = |views: &std::collections::HashMap<String, BlockView>| {
+            render_with_computed(
+                md,
+                Path::new("."),
+                &hl,
+                "root",
+                &[],
+                &Default::default(),
+                None,
+                &Default::default(),
+                views,
+                None,
+                false,
+                true,
+                &results,
+            )
+        };
+        let (segments, clicks) = render(&Default::default());
+        assert!(segments.iter().any(|s| matches!(s, Segment::Table { .. })));
+        let text = text_segments(segments)
+            .into_iter()
+            .filter_map(|s| {
+                if let Segment::Text(l) = s {
+                    Some(l)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .map(|l| line_text(&l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("print(42)"));
+        assert_eq!(
+            clicks
+                .iter()
+                .filter(|c| matches!(
+                    &c.target,
+                    ClickTarget::Block {
+                        action: BlockAction::ToggleSource,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(!clicks
+            .iter()
+            .any(|c| matches!(&c.target, ClickTarget::RunBlock { .. })));
+        let (expanded, _) = render(&std::collections::HashMap::from([(
+            "@render:0".into(),
+            BlockView {
+                collapsed: false,
+                source_expanded: Some(true),
+            },
+        )]));
+        let text = text_segments(expanded)
+            .into_iter()
+            .filter_map(|s| {
+                if let Segment::Text(l) = s {
+                    Some(l)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .map(|l| line_text(&l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("print(42)"));
+    }
 
     // Existing rendering assertions inspect styled lines; resolve semantic
     // tables through the production layout stage before those assertions.

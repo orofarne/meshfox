@@ -548,8 +548,7 @@ fn bind_in(
                 app.definition
             )
         })?;
-    let signatures =
-        scan_signatures_for(node_id, markdown, blocks).map_err(|e| e.to_string())?;
+    let signatures = scan_signatures_for(node_id, markdown, blocks).map_err(|e| e.to_string())?;
     let signature = signatures.iter().find(|s| s.block.span == block.span);
     let args = signature.map(|s| s.args.as_slice()).unwrap_or_default();
     static_env_names(&block, args)?;
@@ -688,8 +687,8 @@ fn prepare_in(
                 app.definition
             )
         })?;
-    let signatures = scan_signatures_for(node_id, markdown, blocks.clone())
-        .map_err(|e| e.to_string())?;
+    let signatures =
+        scan_signatures_for(node_id, markdown, blocks.clone()).map_err(|e| e.to_string())?;
     let args = signatures
         .iter()
         .find(|s| s.block.span == block.span)

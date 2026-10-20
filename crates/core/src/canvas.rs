@@ -372,6 +372,9 @@ pub struct Node {
     /// node's constraints (or it has none), not that they passed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_results: Vec<crate::constraint::ConstraintStatus>,
+    /// Computed views, evaluated from authored text by the worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub render_results: Vec<crate::starlark_render::RenderResult>,
     /// This node's own `color`, or, when unset, whatever
     /// `crate::tag_colors::effective_color` derives from its tags against
     /// the document's declared `meshfox:tag-color` defaults — display

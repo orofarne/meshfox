@@ -20,6 +20,8 @@ It grew by exactly 1 more once `meshfox-core` gained a line-based three-way merg
 
 The TUI Unicode palette adds `unicode_names2` 3.1.0 ((MIT OR Apache-2.0) AND Unicode-DFS-2016), with `unicode_names2_generator` (MIT OR Apache-2.0) used at build time. Unicode data attribution is covered by the crate's bundled Unicode license. The macOS normal-edge shipped dependency count was refreshed to 627 using Cargo metadata; no new copyleft obligations were found.
 
+Computed Starlark views add a direct use of `allocative` (Apache-2.0) in `meshfox-core` for heap accounting of the native `MarkdownFragment` value. It was already a normal dependency of `starlark`, so this adds no packages to the shipped dependency graph. Refreshed with `cargo metadata --filter-platform aarch64-apple-darwin`: 629 normal-edge third-party crates, with no additional copyleft requirement beyond the exceptions above.
+
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
 
@@ -32,6 +34,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 
 | Crate | License |
 |---|---|
+| allocative | Apache-2.0 |
 | anyhow | MIT OR Apache-2.0 |
 | async-stream | MIT |
 | axum | MIT |

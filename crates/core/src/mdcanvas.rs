@@ -465,11 +465,9 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                     match regions.as_slice() {
                         [] => body.clone(),
                         [region] if markdown[region.end..seg.body_span.end].trim().is_empty() => {
-                            crate::comment::strip(
-                                &raw_body[..region.start - seg.body_span.start],
-                            )
-                            .trim()
-                            .to_string()
+                            crate::comment::strip(&raw_body[..region.start - seg.body_span.start])
+                                .trim()
+                                .to_string()
                         }
                         _ => return Err(invalid()),
                     }
@@ -577,6 +575,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             created_at,
             updated_at,
             constraint_results: Vec::new(),
+            render_results: Vec::new(),
             effective_color: None,
             body_rev: None,
             asset_base: None,
@@ -5707,7 +5706,10 @@ Reused from Tests as well.
     fn runnable_file_node_gets_one_implicit_block_from_node_attrs() {
         let canvas = parse(FILE_BLOCK_DOC).unwrap();
         let node = canvas.node("seed").unwrap();
-        assert_eq!(node.block_attrs.get("cache").map(String::as_str), Some("true"));
+        assert_eq!(
+            node.block_attrs.get("cache").map(String::as_str),
+            Some("true")
+        );
         let blocks = node.runnable_blocks();
         assert_eq!(blocks.len(), 1);
         let block = &blocks[0];
@@ -5754,7 +5756,9 @@ Reused from Tests as well.
             Some(crate::fence::fingerprint(&again.runnable_blocks()[0]))
         );
         // Re-running replaces the region instead of stacking a second one.
-        let rewritten = crate::output::write_node_output(&again.text, &again.runnable_blocks()[0], &output).unwrap();
+        let rewritten =
+            crate::output::write_node_output(&again.text, &again.runnable_blocks()[0], &output)
+                .unwrap();
         assert_eq!(rewritten.matches("<!-- meshfox:output ").count(), 1);
     }
 
@@ -5769,7 +5773,9 @@ Reused from Tests as well.
             stdout: "x\n".into(),
             stderr: String::new(),
         };
-        let body = crate::output::write_node_output(&node.text, &node.runnable_blocks()[0], &output).unwrap();
+        let body =
+            crate::output::write_node_output(&node.text, &node.runnable_blocks()[0], &output)
+                .unwrap();
         let doc = FILE_BLOCK_DOC.replace(&node.text, &format!("{body}\ntrailing prose\n"));
         assert!(matches!(parse(&doc), Err(ParseError::InvalidLinkBody(..))));
     }
@@ -5781,7 +5787,10 @@ Reused from Tests as well.
         meta.x = Some(10.0);
         let moved = set_node_meta(FILE_BLOCK_DOC, "seed", &meta).unwrap();
         let again = parse(&moved).unwrap();
-        assert_eq!(again.node("seed").unwrap().block_attrs, canvas.node("seed").unwrap().block_attrs);
+        assert_eq!(
+            again.node("seed").unwrap().block_attrs,
+            canvas.node("seed").unwrap().block_attrs
+        );
         assert_eq!(again.node("seed").unwrap().x, Some(10.0));
     }
 
@@ -5811,7 +5820,8 @@ Reused from Tests as well.
         let canvas = parse(FILE_ARGS_DOC).unwrap();
         let node = canvas.node("extract").unwrap();
         let block =
-            crate::args::bind_node_block(node, "extract[pages=03,lang=hy]", &Default::default()).unwrap();
+            crate::args::bind_node_block(node, "extract[pages=03,lang=hy]", &Default::default())
+                .unwrap();
         assert_eq!(block.name.as_deref(), Some("extract[lang=hy,pages=3]"));
         assert_eq!(block.argv, ["--lang=hy", "--pages=3"]);
         assert_eq!(block.arguments["lang"], "hy");
@@ -5823,16 +5833,27 @@ Reused from Tests as well.
 
     #[test]
     fn argv_false_leaves_the_environment_only() {
-        let doc = FILE_ARGS_DOC.replace("interpreter=\"python3\"", "interpreter=\"python3\" argv=\"false\"");
+        let doc = FILE_ARGS_DOC.replace(
+            "interpreter=\"python3\"",
+            "interpreter=\"python3\" argv=\"false\"",
+        );
         let canvas = parse(&doc).unwrap();
-        let block = crate::args::bind_node_block(canvas.node("extract").unwrap(), "extract[lang=hy]", &Default::default()).unwrap();
+        let block = crate::args::bind_node_block(
+            canvas.node("extract").unwrap(),
+            "extract[lang=hy]",
+            &Default::default(),
+        )
+        .unwrap();
         assert!(block.argv.is_empty());
         assert_eq!(block.arguments["lang"], "hy");
     }
 
     #[test]
     fn a_block_with_arguments_cannot_be_cached() {
-        let doc = FILE_ARGS_DOC.replace("interpreter=\"python3\"", "interpreter=\"python3\" cache=\"true\"");
+        let doc = FILE_ARGS_DOC.replace(
+            "interpreter=\"python3\"",
+            "interpreter=\"python3\" cache=\"true\"",
+        );
         let canvas = parse(&doc).unwrap();
         let err = crate::args::validate(&canvas).unwrap_err().to_string();
         assert!(err.contains("cannot use `cache`"), "{err}");
@@ -5843,7 +5864,10 @@ Reused from Tests as well.
 
     #[test]
     fn file_node_arguments_must_sit_immediately_above_the_link() {
-        let doc = FILE_ARGS_DOC.replace("[extract](./extract.py)", "Some prose.\n\n[extract](./extract.py)");
+        let doc = FILE_ARGS_DOC.replace(
+            "[extract](./extract.py)",
+            "Some prose.\n\n[extract](./extract.py)",
+        );
         // Prose between the signature and the link is not a link body.
         assert!(parse(&doc).is_err());
         // A non-runnable file node has no signature to declare.

@@ -330,7 +330,12 @@ export interface ConstraintSegment {
   code: string;
 }
 
-export type BodySegment = MarkdownSegment | CodeSegment | ConstraintSegment;
+export interface RenderSegment {
+  type: "render";
+  name?: string;
+  code: string;
+}
+export type BodySegment = MarkdownSegment | CodeSegment | ConstraintSegment | RenderSegment;
 
 const OUTPUT_END_MARKER = "<!-- /meshfox:output -->";
 
@@ -396,6 +401,7 @@ export const FORM_LANG = "form";
  * one explicitly — mirrors `core::fence::candidate_fences`'s own
  * `is_supported_lang(lang) || attrs.contains_key("interpreter")` gate. */
 function isRunnableCandidate(lang: string, attrs: Record<string, string>): boolean {
+  if (lang === "starlark" && ["render", "constraint"].some(key => attrs[key] !== undefined && attrs[key] !== "false")) return false;
   return isSupportedLang(lang) || attrs.interpreter !== undefined;
 }
 
@@ -407,21 +413,29 @@ function isRunnableCandidate(lang: string, attrs: Record<string, string>): boole
  * decide whether a node has exactly one unnamed fence (that node's
  * implicit block, if so — see `parseBody`'s `nodeId` param).
  */
+function fenceOpening(line: string): RegExpMatchArray | null {
+  return fenceIndentOk(line) ? line.trimStart().match(/^(`{3,}|~{3,})(.*)$/) : null;
+}
+function fenceClosing(line: string, delimiter: string): boolean {
+  const value = line.trim();
+  return fenceIndentOk(line) && value.length >= delimiter.length && [...value].every(c => c === delimiter[0]);
+}
+
 function countUnnamedCandidateFences(markdown: string): number {
   const lines = markdown.split("\n");
   let count = 0;
   let i = 0;
   while (i < lines.length) {
-    if (!fenceIndentOk(lines[i]) || !lines[i].trimStart().startsWith("```")) {
+    const opening = fenceOpening(lines[i]);
+    if (!opening) {
       i++;
       continue;
     }
-    const trimmed = lines[i].trimStart();
-    const info = trimmed.slice(3).trim();
+    const info = opening[2].trim();
     let j = i + 1;
     let closed = false;
     while (j < lines.length) {
-      if (lines[j].trim() === "```") {
+      if (fenceClosing(lines[j], opening[1])) {
         closed = true;
         break;
       }
@@ -433,7 +447,7 @@ function countUnnamedCandidateFences(markdown: string): number {
       if (!precededByOutputMarker) {
         const [lang, ...rest] = tokenize(info);
         const attrs = attrsFromTokens(rest);
-        if (isRunnableCandidate(lang, attrs) && attrs.name === undefined) count++;
+        if (opening[1][0] === "`" && isRunnableCandidate(lang, attrs) && attrs.name === undefined) count++;
       }
     }
     i = j + 1;
@@ -522,21 +536,20 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
 
   let i = 0;
   while (i < lines.length) {
-    if (!fenceIndentOk(lines[i]) || !lines[i].trimStart().startsWith("```")) {
+    const opening = fenceOpening(lines[i]);
+    if (!opening) {
       if (!isBookkeepingCommentLine(lines[i])) {
         mdBuffer.push(lines[i]);
       }
       i++;
       continue;
     }
-    const trimmed = lines[i].trimStart();
-
-    const info = trimmed.slice(3).trim();
+    const info = opening[2].trim();
     let j = i + 1;
     const codeLines: string[] = [];
     let closed = false;
     while (j < lines.length) {
-      if (lines[j].trim() === "```") {
+      if (fenceClosing(lines[j], opening[1])) {
         closed = true;
         break;
       }
@@ -553,6 +566,13 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const [lang, ...rest] = tokenize(info);
     const attrs = attrsFromTokens(rest);
 
+    if (lang === "starlark" && attrs.render !== undefined && attrs.render !== "false") {
+      flushMarkdown();
+      segments.push({ type: "render", name: attrs.name, code: codeLines.join("\n") });
+      i = j + 1;
+      continue;
+    }
+
     if (lang === "starlark" && attrs.constraint !== undefined && attrs.constraint !== "false") {
       // Mirrors `core::fence::scan_constraint_blocks` — a bare `constraint`
       // flag opts a starlark fence in, same as a runnable fence opts in
@@ -565,7 +585,7 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
       continue;
     }
 
-    if (!isRunnableCandidate(lang, attrs) || (!attrs.name && !soloUnnamed)) {
+    if (opening[1][0] !== "`" || !isRunnableCandidate(lang, attrs) || (!attrs.name && !soloUnnamed)) {
       // Either not a runnable candidate at all (unsupported language and
       // no `interpreter=` either — see `isRunnableCandidate`), or not a
       // runnable block and not this node's (one and only) implicitly-named

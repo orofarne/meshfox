@@ -18,6 +18,7 @@
     "test:block-details": "node --test scripts/block-details.test.mjs",
     "test:confirmation": "npm run build && playwright test --config=confirmation.playwright.config.ts",
     "test:table": "npm run build && playwright test --config=table.playwright.config.ts",
+    "test:starlark-render": "npm run build && playwright test --config=starlark-render.playwright.config.ts",
     "test:arguments": "npm run build && playwright test --config=arguments.playwright.config.ts",
     "test:meshfox-grammar": "node --test scripts/meshfox-grammar.test.mjs",
     "test:routing": "node --test scripts/edge-routing.test.mjs",

@@ -390,21 +390,20 @@ fn infer_producer(
                     // and canonicalization for explicit and inferred applications.
                     let address =
                         crate::args::canonical_name(&producer.definition.block_name, bindings);
-                    let bound =
-                        match crate::args::bind_node_block(node, &address, values) {
-                            Ok(bound) => bound,
-                            Err(message) => {
-                                rejected.get_or_insert_with(|| {
-                                    format!(
-                                        "invalid inferred argument for {}/{} from {}: {message}",
-                                        producer.definition.node_id,
-                                        producer.definition.block_name,
-                                        path.display()
-                                    )
-                                });
-                                return Ok(());
-                            }
-                        };
+                    let bound = match crate::args::bind_node_block(node, &address, values) {
+                        Ok(bound) => bound,
+                        Err(message) => {
+                            rejected.get_or_insert_with(|| {
+                                format!(
+                                    "invalid inferred argument for {}/{} from {}: {message}",
+                                    producer.definition.node_id,
+                                    producer.definition.block_name,
+                                    path.display()
+                                )
+                            });
+                            return Ok(());
+                        }
+                    };
                     let addr = BlockAddr::new(&node.id, bound.name.as_deref().unwrap());
                     // Canonical int values, cwd normalization and all other outputs
                     // must describe the actual requested file, not a transformed alias.
@@ -450,10 +449,8 @@ fn producers(
             continue;
         }
         let node = canvas.node(&producer.definition.node_id).unwrap();
-        let block = crate::args::bind_node_block(node, &producer.definition.block_name,
-            values,
-        )
-        .map_err(crate::DepsError::Arguments)?;
+        let block = crate::args::bind_node_block(node, &producer.definition.block_name, values)
+            .map_err(crate::DepsError::Arguments)?;
         let addr = BlockAddr::new(&node.id, block.name.as_deref().unwrap());
         for path in paths(canvas, &addr, &block, "outputs", values, false)? {
             if let Some(other) = result.insert(path.clone(), addr.clone()) {
@@ -492,13 +489,12 @@ pub fn producer_deps(
             }
             for mut producer in node.runnable_blocks() {
                 producer.attrs.remove("inputs");
-                let local: std::collections::HashSet<_> =
-                    crate::args::scan_node_signatures(node)
-                        .map_err(|e| crate::DepsError::Arguments(e.to_string()))?
-                        .into_iter()
-                        .filter(|sig| sig.block.span == producer.span)
-                        .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
-                        .collect();
+                let local: std::collections::HashSet<_> = crate::args::scan_node_signatures(node)
+                    .map_err(|e| crate::DepsError::Arguments(e.to_string()))?
+                    .into_iter()
+                    .filter(|sig| sig.block.span == producer.span)
+                    .flat_map(|sig| sig.args.into_iter().map(|arg| arg.name))
+                    .collect();
                 let names: Vec<_> = var_refs(&producer)
                     .into_iter()
                     .filter(|name| !local.contains(name))

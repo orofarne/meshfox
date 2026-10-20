@@ -59,7 +59,8 @@ pub fn prepare_run(
                     })?;
                     let app = crate::args::Application::parse(&addr.block_name)
                         .map_err(DepsError::Arguments)?;
-                    let raw_block = node.runnable_blocks()
+                    let raw_block = node
+                        .runnable_blocks()
                         .into_iter()
                         .find(|b| b.name.as_deref() == Some(&app.definition))
                         .ok_or_else(|| {
@@ -177,7 +178,8 @@ fn potential_secrets(
         };
         let app =
             crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
-        let Some(raw) = node.runnable_blocks()
+        let Some(raw) = node
+            .runnable_blocks()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(&app.definition))
         else {
@@ -244,7 +246,8 @@ fn potential_secrets(
                     continue;
                 }
                 candidates.extend(
-                    producer_node.runnable_blocks()
+                    producer_node
+                        .runnable_blocks()
                         .into_iter()
                         .filter(|b| b.attrs.contains_key("outputs"))
                         .map(|b| BlockAddr::new(&producer_node.id, b.name.unwrap())),
