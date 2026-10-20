@@ -126,6 +126,10 @@ fn configured_coordinator_is_only_asked_to_list_existing_cores() {
         connection.is_some()
     });
     let (mut stream, _) = connection.unwrap();
+    // A socket accepted from a non-blocking listener is non-blocking too on
+    // macOS/BSD (Linux resets it), which would turn the read below into an
+    // immediate `WouldBlock` instead of waiting for the console's request.
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
