@@ -82,3 +82,60 @@ if not vim.g.meshfox_no_mappings then
     end,
   })
 end
+
+-- Color span attribute tails are plain text in tree-sitter-markdown's inline
+-- grammar. Highlight their narrow syntax with extmarks, retaining Markdown's
+-- existing tree (including bold, links, and code) rather than replacing it.
+local color_ns = vim.api.nvim_create_namespace('meshfox.color-spans')
+local function highlight_color_spans(buf)
+  if not vim.api.nvim_buf_is_valid(buf) or not vim.bo[buf].filetype:match('^markdown') then return end
+  vim.api.nvim_buf_clear_namespace(buf, color_ns, 0, -1)
+  local function mark(row, first, last, group)
+    vim.api.nvim_buf_set_extmark(buf, color_ns, row, first, {
+      end_row = row, end_col = last, hl_group = group, priority = 125,
+    })
+  end
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    local cursor = 1
+    while true do
+      local first, last, attrs = line:find('%]%{([^}\r\n]*)%}', cursor)
+      if not first then break end
+      cursor = last + 1
+      local ok, node = pcall(vim.treesitter.get_node, { bufnr = buf, pos = { row - 1, first - 1 }, ignore_injections = false })
+      local code = false
+      while ok and node do
+        if node:type() == 'code_span' or node:type() == 'fenced_code_block' or node:type() == 'indented_code_block' then code = true; break end
+        node = node:parent()
+      end
+      local seen, captures, pos = {}, {}, 1
+      local valid = not code
+      while pos <= #attrs do
+        local _, whitespace_end = attrs:find('^%s*', pos)
+        pos = (whitespace_end or pos - 1) + 1
+        if pos > #attrs then break end
+        local a, b, key, quote, value = attrs:find('^([%w-]+)=(["\']?)(#%x+)%2', pos)
+        if not a or (key ~= 'color' and key ~= 'background-color') or seen[key]
+            or (#value ~= 4 and #value ~= 7) or (b < #attrs and not attrs:sub(b + 1, b + 1):match('%s')) then
+          valid = false; break
+        end
+        seen[key] = true
+        table.insert(captures, { a, b, key })
+        pos = b + 1
+      end
+      if valid and #captures > 0 then
+        -- attrs starts at the zero-based column first + 1, after `]{`.
+        mark(row - 1, first, first + 1, '@punctuation.bracket')
+        mark(row - 1, last - 1, last, '@punctuation.bracket')
+        for _, c in ipairs(captures) do
+          local start = first + c[1]
+          mark(row - 1, start, start + #c[3], '@property')
+          mark(row - 1, start + #c[3], start + #c[3] + 1, '@operator')
+          mark(row - 1, start + #c[3] + 1, first + c[2] + 1, '@string')
+        end
+      end
+    end
+  end
+end
+vim.api.nvim_create_autocmd({ 'FileType', 'BufEnter', 'TextChanged', 'TextChangedI' }, {
+  callback = function(ev) highlight_color_spans(ev.buf) end,
+})

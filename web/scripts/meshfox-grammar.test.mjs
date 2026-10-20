@@ -51,3 +51,23 @@ for (const [label, path, language] of grammars) {
     }
   });
 }
+
+for (const [label, path, language] of grammars) {
+  test(`${label}: inline color attribute names and hex values have scopes`, async () => {
+    const grammar = JSON.parse(await readFile(new URL(path, import.meta.url), "utf8"));
+    if (label === "VS Code") {
+      grammar.name = "meshfox-vscode-marker";
+      grammar.injectTo = ["text.html.markdown"];
+    }
+    const highlighter = await createHighlighter({ langs: ["markdown", grammar], themes: ["github-light"] });
+    try {
+      const tokens = highlighter.codeToTokens('[**Text**]{color="#e06c75" background-color="#fff3b0"}', {
+        lang: language, theme: "github-light", includeExplanation: true,
+      }).tokens.flat().flatMap(t => t.explanation ?? []);
+      for (const key of ["color", "background-color"]) {
+        assert.ok(tokens.some(t => t.content === key && t.scopes.some(s => s.scopeName === "entity.other.attribute-name.meshfox")), key);
+      }
+      assert.ok(tokens.some(t => t.content.includes("#e06c75") && t.scopes.some(s => s.scopeName === "constant.other.color.rgb-value.meshfox")));
+    } finally { highlighter.dispose(); }
+  });
+}

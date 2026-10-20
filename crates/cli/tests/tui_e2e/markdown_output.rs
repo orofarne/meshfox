@@ -89,3 +89,68 @@ fn parameterized_record_shows_running_status_and_output_beneath_its_source() {
         .screen_text()
         .contains("recording: ../../target/screencast"));
 }
+
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn color_spans_paint_terminal_cells_and_restore_nested_colors() {
+    let source = concat!(
+        "<!-- meshfox:canvas -->\n# Colors\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "[ColorOuter **ColorBold** [ColorInner]{color=\"#abc\"} ColorTail]{color=\"#e06c75\" background-color=\"#fff3b0\"} PlainAfter\n\n",
+        "[BackgroundOnly]{background-color=#abc}\n\n",
+        "| Table |\n| --- |\n| [ColorCell]{color=#e06c75 background-color=#fff3b0} |\n\n",
+        "`[LiteralCode]{color=#fff}`\n\n",
+        "```starlark render name=\"colors\" output=\"markdown\"\n",
+        "print(md.background_color(md.color('StarlarkColor', '#e06c75'), '#fff3b0'))\n```\n",
+    );
+    let (canvas_path, dir) = fixtures::write_fixture(source);
+    let session = TuiSession::spawn(&canvas_path, dir, 50, 140);
+    session
+        .wait_for("StarlarkColor", Duration::from_secs(10))
+        .expect("rendered colors");
+    for word in [
+        "ColorOuter",
+        "ColorBold",
+        "ColorTail",
+        "ColorCell",
+        "StarlarkColor",
+    ] {
+        let (r, c) = session
+            .find(word)
+            .unwrap_or_else(|| panic!("missing {word}: {}", session.screen_text()));
+        assert_eq!(
+            session.fgcolor_at(r, c),
+            Some(vt100::Color::Rgb(224, 108, 117)),
+            "foreground {word} at {r},{c}: {}",
+            session.screen_text()
+        );
+        assert_eq!(
+            session.bgcolor_at(r, c),
+            Some(vt100::Color::Rgb(255, 243, 176)),
+            "background {word}"
+        );
+    }
+    let (r, c) = session.find("ColorInner").unwrap();
+    assert_eq!(
+        session.fgcolor_at(r, c),
+        Some(vt100::Color::Rgb(170, 187, 204))
+    );
+    assert_eq!(
+        session.bgcolor_at(r, c),
+        Some(vt100::Color::Rgb(255, 243, 176))
+    );
+    let (r, c) = session.find("BackgroundOnly").unwrap();
+    assert_eq!(
+        session.bgcolor_at(r, c),
+        Some(vt100::Color::Rgb(170, 187, 204))
+    );
+    let (r, c) = session.find("PlainAfter").unwrap();
+    assert_ne!(
+        session.fgcolor_at(r, c),
+        Some(vt100::Color::Rgb(224, 108, 117))
+    );
+    assert_ne!(
+        session.bgcolor_at(r, c),
+        Some(vt100::Color::Rgb(255, 243, 176))
+    );
+    assert!(session.screen_text().contains("[LiteralCode]{color=#fff}"));
+}

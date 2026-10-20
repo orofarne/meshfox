@@ -12,6 +12,7 @@ pub mod body_rev;
 pub mod builtin_interpreter;
 pub mod canvas;
 pub mod canvas_call;
+pub mod color_spans;
 pub mod comment;
 pub mod config;
 pub mod constraint;

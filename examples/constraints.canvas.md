@@ -165,7 +165,13 @@ for n in [doc] + doc.descendants():
 
 print(md.table(
     headers=["Tag", "Nodes"],
-    rows=[[tag, counts[tag]] for tag in sorted(counts)],
+    rows=[[md.color(tag, "#61afef"), md.background_color(counts[tag], "#fff3b0")] for tag in sorted(counts)],
 ))
+```
+
+`md.color(value, "#rgb")` colors text; `md.background_color(value, "#rrggbb")` colors its background. Both accept escaped text or an inline fragment and can be nested:
+
+```starlark render name="colored-summary" output="markdown"
+print(md.background_color(md.color("Colored summary", "#e06c75"), "#fff3b0"))
 ```
 

@@ -74,6 +74,18 @@ fn fragment(markdown: String, block: bool) -> anyhow::Result<MarkdownFragment> {
     Ok(MarkdownFragment { markdown, block })
 }
 
+fn colored(value: Value<'_>, key: &str, color: &str) -> anyhow::Result<MarkdownFragment> {
+    let Some(crate::image_attrs::Background::Rgb(r, g, b)) =
+        crate::image_attrs::Background::parse(color)
+    else {
+        anyhow::bail!("expected a hex color (#rgb or #rrggbb)");
+    };
+    fragment(
+        format!("[{}]{{{key}=\"#{r:02x}{g:02x}{b:02x}\"}}", inline(value)?),
+        false,
+    )
+}
+
 #[starlark::starlark_module]
 pub fn markdown_globals(builder: &mut GlobalsBuilder) {
     fn text(value: Value<'_>) -> anyhow::Result<MarkdownFragment> {
@@ -103,6 +115,14 @@ pub fn markdown_globals(builder: &mut GlobalsBuilder) {
             .replace('\n', "%0A")
             .replace('\r', "%0D");
         fragment(format!("[{}](<{}>)", inline(label)?, url), false)
+    }
+    /// Set a foreground color on escaped text or an existing inline fragment.
+    fn color(value: Value<'_>, color: &str) -> anyhow::Result<MarkdownFragment> {
+        colored(value, "color", color)
+    }
+    /// Set a background color; nests with md.color and other inline fragments.
+    fn background_color(value: Value<'_>, color: &str) -> anyhow::Result<MarkdownFragment> {
+        colored(value, "background-color", color)
     }
     fn code(text: &str, #[starlark(default = "")] lang: &str) -> anyhow::Result<MarkdownFragment> {
         anyhow::ensure!(!lang.contains(['\n', '\r', '`']), "invalid code language");

@@ -143,6 +143,9 @@ impl TuiSession {
         // `.meshfox/config.toml` of its own, so pointing `HOME` there too
         // gets both "no global config" and "no local config" for free.
         cmd.env("HOME", &fixture_dir);
+        // The test terminal supports SGR colors. Do not let a CI/agent shell's
+        // NO_COLOR disable the cell colors these PTY tests need to observe.
+        cmd.env("NO_COLOR", "");
 
         let child = pair.slave.spawn_command(cmd).expect("spawn meshfox tui");
         // Only needed to spawn the child (which inherits it as its
@@ -404,6 +407,15 @@ impl TuiSession {
     /// actually landed on the pane a click targeted, where a text-only
     /// assertion can't tell (the text is the same either way — only its
     /// color changes).
+    pub fn bgcolor_at(&self, row: u16, col: u16) -> Option<vt100::Color> {
+        self.parser
+            .lock()
+            .unwrap()
+            .screen()
+            .cell(row, col)
+            .map(|c| c.bgcolor())
+    }
+
     pub fn fgcolor_at(&self, row: u16, col: u16) -> Option<vt100::Color> {
         self.parser
             .lock()

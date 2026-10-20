@@ -1123,9 +1123,16 @@ fn render_markdown(
     // legitimate `Event::Html` for spliced `<img>` attrs and `<sub>`/
     // `<sup>` (`subsup_events`) — filtering the final `events` list
     // instead would strip those too.
-    let raw: Vec<Event> = Parser::new_ext(&stripped, options)
-        .filter(|e| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
-        .collect();
+    let raw: Vec<Event> = crate::color_spans::events(
+        &stripped,
+        Parser::new_ext(&stripped, options)
+            .into_offset_iter()
+            .filter(|(e, _)| !matches!(e, Event::Html(_) | Event::InlineHtml(_)))
+            .collect(),
+    )
+    .into_iter()
+    .map(|(e, _)| e.into_html())
+    .collect();
     let mut events: Vec<Event> = Vec::with_capacity(raw.len());
     let mut in_code = false;
     let mut i = 0;
@@ -1963,6 +1970,14 @@ mod tests {
 
     fn canvas(md: &str) -> Canvas {
         parse(md).unwrap()
+    }
+
+    #[test]
+    fn inline_color_spans_export_with_nested_markdown() {
+        let c = canvas("# Root\n[Outer **bold** [inner]{color='#abc'} tail]{color=\"#e06c75\" background-color=\"#fff3b0\"} plain\n");
+        let site = build_site(&c);
+        let html = &site.root.html_body;
+        assert!(html.contains("<span style=\"color:#e06c75;background-color:#fff3b0;\">Outer <strong>bold</strong> <span style=\"color:#aabbcc;\">inner</span> tail</span> plain"), "{html}");
     }
 
     #[test]

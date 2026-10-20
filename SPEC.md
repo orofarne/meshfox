@@ -1408,6 +1408,8 @@ The built-in `md` namespace returns native `MarkdownFragment` values:
 | --- | --- |
 | `md.text(value)` | Escaped literal text. |
 | `md.raw(text)` | Explicit, authored Markdown without escaping. |
+| `md.color(value, color)` | Inline foreground color, `#rgb` or `#rrggbb`. |
+| `md.background_color(value, color)` | Inline background color; nests with `md.color`. |
 | `md.link(label, url)` | A link with an escaped label and encoded URL delimiters. |
 | `md.code(text, lang="")` | A fenced code block with a safe delimiter length. |
 | `md.table(headers, rows)` | A GFM table from lists; every row must match the nonempty header width. |
@@ -3133,3 +3135,33 @@ rejected during preflight: open the target with `meshfox view` or use a
 coordinator first, so its services have an independent lifetime. Child service
 startup in an independent worker completes that chain step,
 without waiting for the background service's eventual exit.
+
+### Inline color spans
+
+Pandoc-shaped bracketed spans attach colors to inline Markdown:
+
+```markdown
+[Colored **text**]{color="#e06c75"}
+[Highlighted text]{background-color="#fff3b0"}
+[Both]{color="#123" background-color="#fff3b0"}
+[Outer [inner]{color="#abc"} tail]{color="#e06c75"}
+```
+
+The attribute list must immediately follow `]`. Only `color` and
+`background-color` are accepted, once each, with `#rgb` or `#rrggbb`
+(case insensitive). Values may be bare, single quoted, or double quoted.
+Unknown attributes, duplicates, empty lists and invalid colors leave the
+span syntax literal. Named colors and arbitrary CSS are not supported.
+
+Content supports inline Markdown, links and nested spans. Inner colors
+override the corresponding outer color and restore it when closed.
+Spans stay within a paragraph, heading, or table cell. Code, images, HTML,
+and escaped opening brackets do not introduce color spans. WebUI, static
+HTML/PDF export and TUI support the same syntax; terminal color fidelity
+depends on terminal capabilities.
+
+Starlark builders escape string content and accept existing inline fragments:
+`md.color(value, "#e06c75")` and
+`md.background_color(value, "#fff3b0")`. They return composable inline
+`MarkdownFragment` values, reject block fragments and invalid colors, and
+normalize colors to six hex digits.

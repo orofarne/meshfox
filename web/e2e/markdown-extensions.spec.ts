@@ -98,3 +98,26 @@ test("a 4-space-indented fence example is not treated as a runnable block", asyn
   await expect(body).toContainText("not-really-runnable");
   await expect(body).toContainText("echo hi");
 });
+
+test("color spans paint text and background, nest, and preserve inline Markdown", async ({ page }) => {
+  const body = page.locator('.react-flow__node[data-id="root"] .mesh-node-body');
+  const outer = body.locator('span[style]').filter({ hasText: "ColorBold" }).first();
+  await expect(outer).toHaveCSS("color", "rgb(224, 108, 117)");
+  await expect(outer).toHaveCSS("background-color", "rgb(255, 243, 176)");
+  await expect(outer.locator("strong")).toHaveText("strong");
+  await expect(outer.locator("span")).toHaveCSS("color", "rgb(170, 187, 204)");
+  await expect(body.getByText("BackgroundOnly", { exact: true })).toHaveCSS("background-color", "rgb(170, 187, 204)");
+  await expect(body.locator("td span")).toHaveCSS("color", "rgb(224, 108, 117)");
+  await expect(body.locator("td span")).toHaveCSS("background-color", "rgb(255, 243, 176)");
+  await expect(body.locator("a", { hasText: "example" })).toHaveAttribute("href", "https://example.com");
+  await expect(body.locator("code", { hasText: "LiteralCode" })).toHaveText('[LiteralCode]{color="#fff"}');
+  await expect(body).toContainText('[EscapedColor]{color="#fff"}');
+  await expect(body).toContainText('[InvalidColor]{color="red"}');
+  await expect(body).toContainText("ColorTail PlainAfter");
+});
+
+test("Starlark color builders paint computed Markdown output", async ({ page }) => {
+  const text = page.locator('.mesh-node-body span[style]').filter({ hasText: /^StarlarkColor$/ });
+  await expect(text.locator('span')).toHaveCSS('color', 'rgb(224, 108, 117)');
+  await expect(text.first()).toHaveCSS('background-color', 'rgb(255, 243, 176)');
+});

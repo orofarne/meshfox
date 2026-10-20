@@ -1,6 +1,7 @@
 <!-- meshfox:canvas -->
 # Markdown Extensions Fixture
 <!-- meshfox:node id="root" -->
+
 <!-- meshfox:option name="unfold" -->
 
 Fixture canvas for the Playwright suite covering three of meshfox's own
@@ -30,3 +31,19 @@ documentation rather than a real runnable block:
     ```bash name="not-really-runnable"
     echo hi
     ```
+
+[ColorBold **strong** [ColorInner]{color="#abc"} ColorTail]{color="#e06c75" background-color="#fff3b0"} PlainAfter
+
+[BackgroundOnly]{background-color="#abc"}
+
+`[LiteralCode]{color="#fff"}` and \[EscapedColor]{color="#fff"} and [InvalidColor]{color="red"}.
+
+[ColorLink [example](https://example.com)]{color="#123456"}
+
+| Color table |
+| --- |
+| [ColorCell]{color="#e06c75" background-color="#fff3b0"} |
+
+```starlark render name="colors" output="markdown"
+print(md.background_color(md.color("StarlarkColor", "#e06c75"), "#fff3b0"))
+```

@@ -103,6 +103,21 @@ mod tests {
         c.nodes[0].render_results.remove(0)
     }
     #[test]
+    fn colored_fragments_validate_and_compose() {
+        let result = render(
+            "print(md.background_color(md.color(md.raw('**Alert**'), '#e06c75'), '#fff3b0'))",
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result
+            .markdown
+            .contains("[[**Alert**]{color=\"#e06c75\"}]{background-color=\"#fff3b0\"}"));
+        assert!(render("print(md.color('text', 'red'))").error.is_some());
+        assert!(render("print(md.color(md.code('block'), '#fff'))")
+            .error
+            .is_some());
+    }
+
+    #[test]
     fn typed_fragments_compose_without_double_escaping() {
         let result = render(
             r#"print(type(md.text("hello")))

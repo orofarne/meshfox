@@ -3439,7 +3439,7 @@ dependencies = [
  "meshfox-server",
  "open",
  "portable-pty",
- "pulldown-cmark 0.13.4",
+ "pulldown-cmark",
  "ratatui",
  "ratatui-image",
  "reqwest",
@@ -3473,7 +3473,7 @@ dependencies = [
  "csv",
  "globset",
  "libc",
- "pulldown-cmark 0.12.2",
+ "pulldown-cmark",
  "rusqlite",
  "secret-service",
  "security-framework",
@@ -4399,19 +4399,6 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
-]
-
-[[package]]
-name = "pulldown-cmark"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
-dependencies = [
- "bitflags 2.13.1",
- "getopts",
- "memchr",
- "pulldown-cmark-escape",
- "unicase",
 ]
 
 [[package]]

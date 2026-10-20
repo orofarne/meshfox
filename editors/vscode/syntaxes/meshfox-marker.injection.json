@@ -2,9 +2,41 @@
   "scopeName": "meshfox.marker.injection",
   "injectionSelector": "L:text.html.markdown",
   "patterns": [
+    { "include": "#meshfox-color-attrs" },
     { "include": "#meshfox-marker" }
   ],
   "repository": {
+    "meshfox-color-attrs": {
+      "name": "meta.color-span.meshfox",
+      "begin": "(?<=\\])\\{(?=(?:color|background-color)=)",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.attributes.begin.meshfox"
+        }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.attributes.end.meshfox"
+        }
+      },
+      "patterns": [
+        {
+          "match": "(color|background-color)(=)(\"#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\"|\\x27#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\\x27|#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\\b)",
+          "captures": {
+            "1": {
+              "name": "entity.other.attribute-name.meshfox"
+            },
+            "2": {
+              "name": "punctuation.separator.key-value.meshfox"
+            },
+            "3": {
+              "name": "constant.other.color.rgb-value.meshfox"
+            }
+          }
+        }
+      ]
+    },
     "meshfox-marker": {
       "begin": "(<!--)\\s*(/?meshfox:[\\w-]+)",
       "beginCaptures": {

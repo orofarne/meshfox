@@ -110,8 +110,9 @@ The injection itself is attached to the `markdown` *language*, not to the filety
 | `grammar/` | the tree-sitter grammar (`grammar.js`, generated `src/`, corpus tests) |
 | `queries/meshfox/highlights.scm` | highlights for the injected language |
 | `queries/markdown{,_inline}/injections.scm` | `;; extends` the bundled ones |
-| `plugin/meshfox.lua` | filetype detection, registration of the language server, the `<leader>mn` mapping |
+| `plugin/meshfox.lua` | filetype detection, registration of the language server, the `<leader>mn` mapping, and color-span attribute highlighting |
 | `parser/` | the built parsers (`meshfox.so`, optionally `starlark.so`); git-ignored, made by the `build` blocks in "Install" |
+| `test/colors.lua` | color-span attribute highlight checks, including inline-code exclusion |
 | `test/check.lua` | the headless pass over the repo's canvases that this document's `test` block runs |
 
 The language server itself is not in this directory: it is the `meshfox lsp` subcommand (`crates/cli/src/lsp/`), built on `meshfox_core::suggest` (`crates/core/src/suggest.rs`), which the TUI's source editor shares for `Ctrl-p`.
@@ -128,6 +129,7 @@ Corpus tests for the grammar (`grammar/test/corpus/`), then a headless Neovim pa
 ```sh name="test" deps="install/build" default
 set -eu
 (cd grammar && tree-sitter test)
+nvim --headless -u NONE -i NONE -l test/colors.lua
 repo=$(git rev-parse --show-toplevel)
 # shellcheck disable=SC2046
 nvim --headless -u NONE -l test/check.lua \
@@ -135,7 +137,7 @@ nvim --headless -u NONE -l test/check.lua \
   $(find "$repo" -name '*.canvas.md' -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/.git/*')
 ```
 
-This covers highlighting only (and only parse errors, not colours — see the gotchas below). The language server is tested from the Rust side: `cargo test -p meshfox-core suggest`, `cargo test -p meshfox-cli --bin meshfox lsp::` and `cargo test -p meshfox-cli --test lsp_cmd` (the real binary over stdio).
+The dedicated color-span check asserts attribute highlight ranges, short hex colors, and exclusion of inline code and invalid values. The general tree-sitter pass checks parse errors only (see the gotchas below). The language server is tested from the Rust side: `cargo test -p meshfox-core suggest`, `cargo test -p meshfox-cli --bin meshfox lsp::` and `cargo test -p meshfox-cli --test lsp_cmd` (the real binary over stdio).
 
 ## Query-authoring gotchas
 <!-- meshfox:node id="query-authoring-gotchas" -->

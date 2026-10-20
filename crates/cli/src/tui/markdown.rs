@@ -577,14 +577,30 @@ pub fn render_with_computed(
     // `into_offset_iter` (not the plain `Parser` iterator `event` alone
     // would give) so `start` can resolve a code fence's click target by
     // where it actually sits in `md`, the same reasoning as above.
-    for (event, range) in Parser::new_ext(md, options).into_offset_iter() {
-        renderer.event(event, range.start);
+    for (event, range) in meshfox_core::color_spans::events(
+        md,
+        Parser::new_ext(md, options).into_offset_iter().collect(),
+    ) {
+        match event {
+            meshfox_core::color_spans::SpanEvent::Markdown(event) => {
+                renderer.event(event, range.start)
+            }
+            meshfox_core::color_spans::SpanEvent::Start(colors) => {
+                renderer.inline_stack.push(Inline::Colors(colors))
+            }
+            meshfox_core::color_spans::SpanEvent::End => {
+                if matches!(renderer.inline_stack.last(), Some(Inline::Colors(_))) {
+                    renderer.inline_stack.pop();
+                }
+            }
+        }
     }
     renderer.finish()
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Inline {
+    Colors(meshfox_core::color_spans::Colors),
     Emphasis,
     Strong,
     Strikethrough,
@@ -848,6 +864,15 @@ impl<'a> Renderer<'a> {
         let mut style = Style::default();
         for m in &self.inline_stack {
             style = match m {
+                Inline::Colors(colors) => {
+                    if let Some((r, g, b)) = colors.color {
+                        style = style.fg(Color::Rgb(r, g, b));
+                    }
+                    if let Some((r, g, b)) = colors.background {
+                        style = style.bg(Color::Rgb(r, g, b));
+                    }
+                    style
+                }
                 Inline::Emphasis => style.add_modifier(Modifier::ITALIC),
                 Inline::Strong => style.add_modifier(Modifier::BOLD),
                 Inline::Strikethrough => style.add_modifier(Modifier::CROSSED_OUT),
@@ -1642,7 +1667,7 @@ impl<'a> Renderer<'a> {
                     self.current = self
                         .current
                         .drain(..)
-                        .map(|s| Span::styled(s.content, style))
+                        .map(|s| Span::styled(s.content, style.patch(s.style)))
                         .collect();
                 }
                 self.flush_paragraph();
@@ -2368,6 +2393,34 @@ mod tests {
     ) -> (Vec<Segment>, Vec<ClickRegion>) {
         let (segments, clicks) = super::render(md, base, hl, node, decls, values, focus, live);
         (text_segments(segments), clicks)
+    }
+
+    #[test]
+    fn heading_color_spans_keep_explicit_colors_and_heading_weight() {
+        let hl = Highlighter::new();
+        let (segments, _) = render(
+            "## [Colored heading]{color=\"#e06c75\" background-color=\"#fff3b0\"}\n",
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let span = segments
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Text(lines) => Some(lines),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "Colored heading")
+            .unwrap();
+        assert_eq!(span.style.fg, Some(Color::Rgb(224, 108, 117)));
+        assert_eq!(span.style.bg, Some(Color::Rgb(255, 243, 176)));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     // TODO.canvas.md: "TUI: инлайн live-вывод для output=\"markdown\" блоков

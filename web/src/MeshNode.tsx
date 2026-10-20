@@ -1,3 +1,4 @@
+import remarkColorSpans from "./remarkColorSpans";
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, useUpdateNodeInternals, type NodeProps } from "@xyflow/react";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
@@ -2139,7 +2140,7 @@ function MarkdownOutput({
         </pre>
       )}
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+        remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
         components={components}
         urlTransform={allowDataImageUrls}
       >
@@ -2477,7 +2478,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
           return (
             <ReactMarkdown
               key={i}
-              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
               components={markdownComponents}
               urlTransform={allowDataImageUrls}
             >
@@ -2615,7 +2616,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
           return (
             <ReactMarkdown
               key={i}
-              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
               components={components}
               urlTransform={allowDataImageUrls}
             >
@@ -2660,7 +2661,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
 function FileLinkCaption({ caption }: { caption: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkImageAttrs, remarkSubSup, remarkGfmAlerts]}
+      remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
       components={markdownComponents}
       urlTransform={allowDataImageUrls}
     >
