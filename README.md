@@ -691,6 +691,8 @@ The default transcript shows what happened in that invocation, including skips a
 
 `--json` emits NDJSON. History is read through the worker API and survives worker restarts; transcripts start with the version that introduced `logs`. TTY terminal bytes are not recorded. `[session] max_chain_runs` (default 100) and `max_chain_output_bytes` (default 1 MiB) bound retention independently of per-block history. See SPEC.md's "Invocation transcripts" for provenance, truncation and storage behavior.
 
+`meshfox project.canvas.md run -d build` (or `--detach`) requires a configured, reachable coordinator (`server_socket`); it never falls back to a standalone core or starts a background watcher. It resolves inputs and confirmations, waits for the worker to accept the chain, prints its numeric ID, and returns. Exit code 0 means accepted; inspect the final outcome with `meshfox project.canvas.md logs --id 42 --follow`, or watch the canvas with `console`. Services keep running according to their normal lifecycle; run-scoped leases and deferred cleanup still finish in the worker. TTY chains (including TTY cleanup) and runnable file nodes are rejected. For a comma-separated block list, each target is admitted independently and prints one ID; they may execute concurrently, and a later admission error does not cancel an earlier accepted chain.
+
 ## How-to
 <!-- meshfox:node id="how-to" -->
 

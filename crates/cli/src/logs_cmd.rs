@@ -1,12 +1,8 @@
 //! Snapshot and follow views of worker-owned, immutable invocation history.
-use crate::{coordinator, worker_client};
+use crate::{coordinator, run_output, worker_client};
 use meshfox_server::run_journal::{Event, Summary};
 use serde_json::{json, Value};
-use std::{
-    io::{IsTerminal, Write},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{io::Write, path::PathBuf, time::Duration};
 
 pub struct Options {
     pub selector: Vec<String>,
@@ -75,8 +71,12 @@ async fn read(path: PathBuf, options: Options) -> Result<(), String> {
                     println!("{}", json!({"type":"run","run":run}));
                 } else {
                     println!(
-                        "#{}\t{}\t{}\t{}::{}\t{}",
-                        run.id, run.started_at, run.status, run.node_id, run.block, run.source
+                        "{}\t{}\t{}\t{}\t{}",
+                        style(format!("#{}", run.id), "1;36"),
+                        style(&run.started_at, "2"),
+                        status(&run.status),
+                        style(format!("{}::{}", run.node_id, run.block), "1"),
+                        style(&run.source, "2")
                     );
                 }
             }
@@ -107,21 +107,36 @@ async fn read(path: PathBuf, options: Options) -> Result<(), String> {
         if !page.more && (!options.follow || summary.status != "running") {
             if !options.json {
                 if !options.selector.is_empty() && !saw_step {
-                    println!("Block was not started in this invocation.");
+                    println!(
+                        "{}",
+                        style("Block was not started in this invocation.", "2")
+                    );
                 }
                 if summary.incomplete {
-                    println!("[transcript incomplete: some events could not be saved]");
+                    println!(
+                        "{}",
+                        style(
+                            "[transcript incomplete: some events could not be saved]",
+                            "33"
+                        )
+                    );
                 }
                 if summary.truncated {
-                    println!("[output truncated by the transcript byte limit]");
+                    println!(
+                        "{}",
+                        style("[output truncated by the transcript byte limit]", "33")
+                    );
                 }
                 if summary.output_disabled {
-                    println!("[storing output was disabled for this invocation]");
+                    println!(
+                        "{}",
+                        style("[storing output was disabled for this invocation]", "33")
+                    );
                 }
                 println!(
-                    "\nRun #{} · {}{}",
-                    summary.id,
-                    summary.status,
+                    "\n{} · {}{}",
+                    style(format!("Run #{}", summary.id), "1;36"),
+                    status(&summary.status),
                     summary
                         .exit_code
                         .map_or(String::new(), |code| format!(" · exit {code}"))
@@ -143,19 +158,41 @@ fn print_summary(run: &Summary, json_output: bool) {
         return;
     }
     println!(
-        "Run #{} · {}::{} · {}\n{} · {}",
-        run.id, run.node_id, run.block, run.source, run.started_at, run.status
+        "{} · {} · {}\n{} · {}",
+        style(format!("Run #{}", run.id), "1;36"),
+        style(format!("{}::{}", run.node_id, run.block), "1"),
+        style(&run.source, "2"),
+        style(&run.started_at, "2"),
+        status(&run.status),
     );
 }
-fn banner(text: &str) {
-    let color = std::io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-    if color {
-        println!("\n\x1b[1;36m==> {text}\x1b[0m");
+
+fn style(text: impl AsRef<str>, sgr: &str) -> String {
+    let text = text.as_ref();
+    if run_output::color_enabled() {
+        format!("\x1b[{sgr}m{text}\x1b[0m")
     } else {
-        println!("\n==> {text}");
+        text.to_string()
     }
 }
+
+fn status(text: &str) -> String {
+    style(
+        text,
+        match text {
+            "running" => "1;33",
+            "succeeded" => "1;32",
+            "failed" | "killed" => "1;31",
+            "interrupted" => "1;33",
+            _ => "2",
+        },
+    )
+}
+
+fn banner(text: &str) {
+    run_output::banner(text, "\n");
+}
+
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
 }
@@ -166,31 +203,43 @@ fn print_event(item: &Event, effective: bool) {
         "step-start" => banner(&addr),
         "step-not-started" => {
             banner(&addr);
-            println!("not started: {}", string(event, "reason"));
+            println!(
+                "{}",
+                style(format!("not started: {}", string(event, "reason")), "2")
+            );
         }
         "output" => {
             let text = string(event, "text");
             if event["stream"] == "stderr" {
-                println!("[stderr] {text}");
+                println!("{} {text}", style("[stderr]", "31"));
             } else {
                 println!("{text}");
             }
         }
         "step-skipped" => {
             banner(&addr);
-            println!("skipped: {}", string(event, "reason"));
+            println!(
+                "{}",
+                style(format!("skipped: {}", string(event, "reason")), "2")
+            );
             if effective {
                 let source = &event["effective"];
                 if let Some(id) = source["runId"].as_i64() {
-                    println!("using block run #{id} · {}", string(source, "startedAt"));
+                    println!(
+                        "{}",
+                        style(
+                            format!("using block run #{id} · {}", string(source, "startedAt")),
+                            "2"
+                        )
+                    );
                 }
                 if source["available"] == true {
                     if let Some(lines) = source["lines"].as_array() {
                         for line in lines {
                             let prefix = if line["stream"] == "stderr" {
-                                "    [stderr] "
+                                format!("    {} ", style("[stderr]", "31"))
                             } else {
-                                "    "
+                                "    ".into()
                             };
                             for text in string(line, "text").lines() {
                                 println!("{prefix}{text}");
@@ -199,38 +248,59 @@ fn print_event(item: &Event, effective: bool) {
                     }
                     if let Some(code) = source["exitCode"].as_i64() {
                         println!(
-                            "    (exit {code} · {})",
-                            meshfox_core::format_duration_ms(
-                                source["durationMs"].as_u64().unwrap_or(0)
+                            "{}",
+                            style(
+                                format!(
+                                    "    (exit {code} · {})",
+                                    meshfox_core::format_duration_ms(
+                                        source["durationMs"].as_u64().unwrap_or(0)
+                                    )
+                                ),
+                                if code == 0 { "32" } else { "31" }
                             )
                         );
                     }
                 } else {
-                    println!("    [original output unavailable]");
+                    println!("{}", style("    [original output unavailable]", "33"));
                 }
                 if event["truncated"] == true {
-                    println!("    [effective output truncated]");
+                    println!("{}", style("    [effective output truncated]", "33"));
                 }
             }
         }
-        "step-end" => println!(
-            "(exit {} · {})",
-            event["exitCode"],
-            meshfox_core::format_duration_ms(event["durationMs"].as_u64().unwrap_or(0))
+        "step-end" => run_output::step_end(
+            event["exitCode"].as_i64().unwrap_or(1) as i32,
+            event["durationMs"].as_u64().unwrap_or(0),
+            "\n",
         ),
         "service-started" => println!(
-            "{addr}: service {} (pid {})",
-            if event["reused"] == true {
-                "reused"
-            } else {
-                "ready"
-            },
-            event["pid"]
+            "{}",
+            style(
+                format!(
+                    "{addr}: service {} (pid {})",
+                    if event["reused"] == true {
+                        "reused"
+                    } else {
+                        "ready"
+                    },
+                    event["pid"]
+                ),
+                "32"
+            )
         ),
         "tty-start" => println!("{addr}: TTY session (terminal output is not recorded)"),
-        "error" => println!("error: {}", string(event, "message")),
-        "lock-conflict" => println!("{addr}: locked by {}", string(event, "ownerDesc")),
-        "killed" => println!("{addr}: killed"),
+        "error" => println!(
+            "{}",
+            style(format!("error: {}", string(event, "message")), "1;31")
+        ),
+        "lock-conflict" => println!(
+            "{}",
+            style(
+                format!("{addr}: locked by {}", string(event, "ownerDesc")),
+                "33"
+            )
+        ),
+        "killed" => println!("{}", style(format!("{addr}: killed"), "1;31")),
         _ => {}
     }
 }

@@ -3749,6 +3749,8 @@ enum RunEvent {
     /// Always first. `runId` is what `/api/kill` takes to cancel this run.
     Started {
         run_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain_id: Option<i64>,
     },
     StepStart {
         node_id: String,
@@ -6479,7 +6481,7 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
 
     let stream = async_stream::stream! {
         let _guard = RunGuard { state: Arc::clone(&state), run_id: run_id.clone() };
-        yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone() }));
+        yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone(), chain_id: None }));
         yield Ok(ndjson_line(&RunEvent::StepStart { node_id: id.clone(), block: id.clone() }));
         let step_started = std::time::Instant::now();
 
@@ -7127,6 +7129,8 @@ async fn clear_node_id(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RunWsQuery {
+    #[serde(default)]
+    detach: bool,
     #[serde(default = "web_source")]
     source: String,
     #[serde(default)]
@@ -7235,7 +7239,15 @@ async fn run_block(
             &query.vars,
             &query.save_secrets,
         ) {
-            Ok(req) => run_block_impl(state, req).await,
+            Ok(req) => {
+                run_block_impl_sized(
+                    state,
+                    req,
+                    (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS),
+                    query.detach,
+                )
+                .await
+            }
             Err(e) => Err(e),
         };
         pump_run_response_into_ws(socket, result).await;
@@ -7375,7 +7387,7 @@ fn require_run_confirmation(
 }
 
 async fn run_block_impl(state: Arc<AppState>, req: RunRequest) -> Result<Response, ApiError> {
-    run_block_impl_sized(state, req, (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS)).await
+    run_block_impl_sized(state, req, (DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS), false).await
 }
 
 /// `run_block_impl` with an explicit initial pty size for any `tty` step in
@@ -7389,6 +7401,7 @@ async fn run_block_impl_sized(
     state: Arc<AppState>,
     req: RunRequest,
     tty_size: (u16, u16),
+    detach: bool,
 ) -> Result<Response, ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
@@ -7411,6 +7424,24 @@ async fn run_block_impl_sized(
     let cleanups = meshfox_core::deps::cleanup_blocks(&canvas, &chain)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     require_run_confirmation(&canvas, &cleanups, req.confirm)?;
+    if detach
+        && chain.iter().chain(cleanups.iter()).any(|addr| {
+            canvas.node(&addr.node_id).is_some_and(|node| {
+                meshfox_core::args::bind_block(
+                    &node.id,
+                    &node.text,
+                    &addr.block_name,
+                    &HashMap::new(),
+                )
+                .is_ok_and(|block| block.tty)
+            })
+        })
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "--detach does not support TTY chains".into(),
+        ));
+    }
     let mut call_chain = chain.clone();
     call_chain.extend(cleanups.clone());
     let native_calls = canvas_call::plan(
@@ -7642,7 +7673,7 @@ async fn run_block_impl_sized(
         // block's own step ever being reached below.
         let mut _reservation_guard = ResolveReservationOnDrop(target_reservation.clone());
 
-        yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone() }));
+        yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone(), chain_id: Some(journal_id) }));
 
         let mut final_exit_code = 0;
         let mut killed = false;
@@ -9046,7 +9077,7 @@ async fn run_block_tty(
         .await?;
     }
 
-    let response = run_block_impl_sized(Arc::clone(&state), req, (cols, rows)).await?;
+    let response = run_block_impl_sized(Arc::clone(&state), req, (cols, rows), false).await?;
     if response.status() != StatusCode::OK {
         return Ok(response);
     }

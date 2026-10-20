@@ -168,6 +168,9 @@ enum Command {
     /// instead of after it (`meshfox examples/hello.canvas.md run tests
     /// smoke-test smoke`), or with `--canvas`, to name one explicitly.
     Run {
+        /// Return the accepted chain ID without waiting for completion. TTY is unsupported.
+        #[arg(short = 'd', long)]
+        detach: bool,
         /// Terminal run indicator (also configurable via MESHFOX_TERMINAL_STATUS).
         /// Auto supports iTerm2, Ghostty, Contour and Windows Terminal.
         #[arg(long, value_enum, default_value = terminal_status::default_mode())]
@@ -1374,6 +1377,7 @@ fn main() {
             }
         }
         Command::Run {
+            detach,
             terminal_status,
             confirm,
             args,
@@ -1408,6 +1412,7 @@ fn main() {
                 set,
                 confirm,
                 terminal_status,
+                detach,
             )
         }
         Command::Configure { canvas } => {
@@ -2532,6 +2537,7 @@ fn run(
     set: Vec<(String, String)>,
     confirm: bool,
     status_mode: terminal_status::Mode,
+    detach: bool,
 ) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
@@ -2539,7 +2545,17 @@ fn run(
     });
     runtime.block_on(async {
         terminal_status::start(status_mode);
-        run_async(canvas_path, args, no_deps, fresh, skip_fresh, set, confirm).await;
+        run_async(
+            canvas_path,
+            args,
+            no_deps,
+            fresh,
+            skip_fresh,
+            set,
+            confirm,
+            detach,
+        )
+        .await;
         terminal_status::finish(0);
     });
 }
@@ -2605,17 +2621,21 @@ async fn run_async(
     skip_fresh: bool,
     set: Vec<(String, String)>,
     confirm: bool,
+    detach: bool,
 ) {
     let block_arg = args.pop().expect("clap requires at least one arg");
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     let block_names = meshfox_core::args::split_list(&block_arg);
 
-    let port = coordinator::get_or_spawn(canvas_path)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
-            terminal_status::exit(1);
-        });
+    let worker = if detach {
+        coordinator::get_or_spawn_detached(canvas_path).await
+    } else {
+        coordinator::get_or_spawn(canvas_path).await
+    };
+    let port = worker.unwrap_or_else(|e| {
+        eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
+        terminal_status::exit(1);
+    });
     let initial_raw = worker_client::get_canvas_raw(port)
         .await
         .unwrap_or_else(|e| {
@@ -2691,6 +2711,7 @@ async fn run_async(
                         skip_fresh,
                         confirm,
                         overrides,
+                        detach,
                     )
                     .await;
                 }
@@ -2711,6 +2732,7 @@ async fn run_async(
                 skip_fresh,
                 confirm,
                 overrides,
+                detach,
             )
             .await;
         }
@@ -2799,6 +2821,7 @@ async fn run_via_worker(
     skip_fresh: bool,
     confirm: bool,
     mut overrides: HashMap<String, String>,
+    detach: bool,
 ) {
     let run_started = std::time::Instant::now();
     let path: Vec<String> = path.iter().map(|s| s.to_string()).collect();
@@ -2809,6 +2832,7 @@ async fn run_via_worker(
     // together once every requested name has been dispatched (see the
     // "stay attached" loop after this one).
     let mut started_services: Vec<(String, String)> = Vec::new();
+    let mut chain_ids = Vec::new();
 
     for name in block_names {
         terminal_status::running(name);
@@ -2837,10 +2861,22 @@ async fn run_via_worker(
             Err(chain_err) => {
                 match resolve_worker_file_node(port, canvas_path, &path, name).await {
                     Some(node_id) => {
+                        if detach {
+                            eprintln!(
+                                "meshfox run: --detach requires a fenced block with chain history"
+                            );
+                            terminal_status::exit(1);
+                        }
                         match worker_client::run_file_node_stream(port, &node_id).await {
                             Ok(rx) => {
-                                match drain_worker_run_events(rx, port, name, &mut started_services)
-                                    .await
+                                match drain_worker_run_events(
+                                    rx,
+                                    port,
+                                    name,
+                                    &mut started_services,
+                                    &mut chain_ids,
+                                )
+                                .await
                                 {
                                     DrainResult::Ok => {}
                                     DrainResult::Failed => had_failure = true,
@@ -2907,8 +2943,20 @@ async fn run_via_worker(
         if let Ok(raw) = worker_client::get_canvas_raw(port).await {
             let path_str: Vec<&str> = path.iter().map(String::as_str).collect();
             if chain_contains_tty(canvas_path, &raw, &path_str, &[name], no_deps) {
+                if detach {
+                    eprintln!("meshfox run: --detach does not support TTY chains");
+                    terminal_status::exit(1);
+                }
                 if !run_worker_tty(
-                    port, &path, name, no_deps, fresh, skip_fresh, vars, approved,
+                    port,
+                    &path,
+                    name,
+                    no_deps,
+                    fresh,
+                    skip_fresh,
+                    vars,
+                    approved,
+                    &mut chain_ids,
                 )
                 .await
                 {
@@ -2925,7 +2973,7 @@ async fn run_via_worker(
         // var cache, so replaying the same values here is exactly as cheap
         // and correct as the first attempt was.
         let vars_for_retry = vars.clone();
-        let rx = match worker_client::run_stream_persisted(
+        let mut rx = match worker_client::run_stream_persisted(
             port,
             &path,
             name,
@@ -2936,6 +2984,7 @@ async fn run_via_worker(
             std::collections::HashSet::new(),
             None,
             approved,
+            detach,
         )
         .await
         {
@@ -2946,7 +2995,21 @@ async fn run_via_worker(
                 continue;
             }
         };
-        match drain_worker_run_events(rx, port, name, &mut started_services).await {
+        if detach {
+            match rx.recv().await {
+                Some(worker_client::RunEvent::Started {
+                    chain_id: Some(id), ..
+                }) => {
+                    println!("{id}");
+                }
+                event => {
+                    eprintln!("meshfox run: launch was not accepted: {event:?}");
+                    had_failure = true;
+                }
+            }
+            continue;
+        }
+        match drain_worker_run_events(rx, port, name, &mut started_services, &mut chain_ids).await {
             DrainResult::Ok => {}
             DrainResult::Failed => had_failure = true,
             DrainResult::Conflict {
@@ -2969,6 +3032,7 @@ async fn run_via_worker(
                     &owner_desc,
                     &mut started_services,
                     approved,
+                    &mut chain_ids,
                 )
                 .await
                 {
@@ -2978,13 +3042,28 @@ async fn run_via_worker(
         }
     }
 
+    if detach {
+        terminal_status::exit(if had_failure { 1 } else { 0 });
+    }
+
     // Wall-clock for the whole invocation (preflight, prompts and
     // confirmations included), printed before attaching to any service —
     // which runs until Ctrl-C and isn't part of "how long did this take".
     run_output::banner(
         &format!(
-            "total: {}",
-            meshfox_core::format_duration_ms(run_started.elapsed().as_millis() as u64)
+            "total: {}{}",
+            meshfox_core::format_duration_ms(run_started.elapsed().as_millis() as u64),
+            match chain_ids.as_slice() {
+                [] => String::new(),
+                [id] => format!(" · run #{id}"),
+                ids => format!(
+                    " · runs {}",
+                    ids.iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
         ),
         "\n",
     );
@@ -3185,6 +3264,7 @@ async fn run_worker_tty(
     skip_fresh: bool,
     vars: HashMap<String, String>,
     approved: bool,
+    chain_ids: &mut Vec<i64>,
 ) -> bool {
     if !prompt::stdin_is_tty() || !std::io::stdout().is_terminal() {
         eprintln!(
@@ -3251,7 +3331,11 @@ async fn run_worker_tty(
         }
     };
     let _ = crossterm::terminal::enable_raw_mode();
-    let exit_code = crate::tui::bridge_http_tty(&mut socket).await;
+    let mut chain_id = None;
+    let exit_code = crate::tui::bridge_http_tty_with_chain_id(&mut socket, &mut chain_id).await;
+    if let Some(id) = chain_id {
+        chain_ids.push(id);
+    }
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = futures_util::SinkExt::close(&mut socket).await;
     exit_code.exit_code() == 0
@@ -3338,6 +3422,7 @@ async fn drain_worker_run_events(
     port: u16,
     name: &str,
     started_services: &mut Vec<(String, String)>,
+    chain_ids: &mut Vec<i64>,
 ) -> DrainResult {
     let mut had_failure = false;
     {
@@ -3361,7 +3446,9 @@ async fn drain_worker_run_events(
                         break;
                     };
                     match event {
-                        worker_client::RunEvent::Started { .. } => {}
+                        worker_client::RunEvent::Started { chain_id, .. } => {
+                            if let Some(id) = chain_id { chain_ids.push(id); }
+                        }
                         worker_client::RunEvent::StepStart { node_id, block } => {
                             terminal_status::running(&block);
                             run_output::banner(&block, "\n");
@@ -3523,6 +3610,7 @@ async fn retry_after_lock_conflict(
     owner_desc: &str,
     started_services: &mut Vec<(String, String)>,
     approved: bool,
+    chain_ids: &mut Vec<i64>,
 ) -> bool {
     if !confirm_kill_and_retry(&conflict_block, owner_pid, owner_desc) {
         return false;
@@ -3538,6 +3626,7 @@ async fn retry_after_lock_conflict(
         std::collections::HashSet::new(),
         Some((conflict_node_id, conflict_block)),
         approved,
+        false,
     )
     .await
     {
@@ -3547,7 +3636,7 @@ async fn retry_after_lock_conflict(
             return false;
         }
     };
-    match drain_worker_run_events(rx, port, name, started_services).await {
+    match drain_worker_run_events(rx, port, name, started_services, chain_ids).await {
         DrainResult::Ok => true,
         DrainResult::Failed => false,
         DrainResult::Conflict {

@@ -1051,6 +1051,7 @@ impl CanvasCtx {
             std::collections::HashSet::new(),
             None,
             params.confirm,
+            false,
         )
         .await
         .map_err(|e| ErrorData::internal_error(format!("couldn't start the run: {e}"), None))?;

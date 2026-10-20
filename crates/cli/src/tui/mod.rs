@@ -1022,6 +1022,14 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
 /// equivalent of — it's never in an alt screen to begin with, just needs
 /// its own raw-mode enable/disable around this call).
 pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
+    bridge_http_tty_with_chain_id(socket, &mut None).await
+}
+
+/// CLI runs retain the journal identity for their final elapsed-time summary.
+pub(crate) async fn bridge_http_tty_with_chain_id(
+    socket: &mut crate::worker_client::TtySocket,
+    chain_id: &mut Option<i64>,
+) -> TtyEnd {
     use tokio_tungstenite::tungstenite::Message;
 
     // Pre-tty phase: a `tty`-touching chain can (and typically does) run
@@ -1047,6 +1055,9 @@ pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket
                 else {
                     continue;
                 };
+                if let crate::worker_client::RunEvent::Started { chain_id: id, .. } = &event {
+                    *chain_id = *id;
+                }
                 match print_tty_transcript_event(event) {
                     TtyPreludeOutcome::Continue => {}
                     TtyPreludeOutcome::EnterPty => break,

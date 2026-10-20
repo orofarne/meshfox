@@ -1979,6 +1979,8 @@ pub async fn submit_form(
 pub enum RunEvent {
     Started {
         run_id: String,
+        #[serde(default)]
+        chain_id: Option<i64>,
     },
     StepStart {
         node_id: String,
@@ -2095,6 +2097,7 @@ pub async fn run_stream(
         save_secrets,
         force,
         confirm,
+        false,
     )
     .await
 }
@@ -2118,6 +2121,7 @@ pub async fn run_stream_persisted(
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
     confirm: bool,
+    detach: bool,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
     run_stream_inner(
         port,
@@ -2131,6 +2135,7 @@ pub async fn run_stream_persisted(
         save_secrets,
         force,
         confirm,
+        detach,
     )
     .await
 }
@@ -2148,6 +2153,7 @@ async fn run_stream_inner(
     save_secrets: HashSet<String>,
     force: Option<(String, String)>,
     confirm: bool,
+    detach: bool,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<RunEvent>, String> {
     let vars_json = serde_json::to_string(&vars).map_err(|e| e.to_string())?;
     let secrets_json = serde_json::to_string(&save_secrets).map_err(|e| e.to_string())?;
@@ -2161,6 +2167,7 @@ async fn run_stream_inner(
         ("block", block.to_string()),
         ("noDeps", no_deps.to_string()),
         ("confirm", confirm.to_string()),
+        ("detach", detach.to_string()),
         ("fresh", fresh.to_string()),
         ("skipFresh", skip_fresh.to_string()),
         ("persist", persist.to_string()),

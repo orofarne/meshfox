@@ -121,6 +121,16 @@ pub async fn get_or_spawn(canvas_path: &Path) -> io::Result<u16> {
     }
 }
 
+/// Detached execution requires a configured external coordinator to own the core.
+/// An existing standalone core is insufficient: never fall back to local discovery.
+pub async fn get_or_spawn_detached(canvas_path: &Path) -> io::Result<u16> {
+    let root = crate::canvas_root_dir(canvas_path);
+    let socket = meshfox_core::config::server_socket(root).ok_or_else(|| {
+        io::Error::other("--detach requires a configured coordinator (server_socket)")
+    })?;
+    watcher_protocol::request_port(&socket, &canvas_path.canonicalize()?).await
+}
+
 /// Hands `canvas_path` off to the `server_socket`-configured coordinator
 /// instead of `view` becoming its own watcher — the replacement for the
 /// now-removed `meshfox open` command, folded into `view`'s own top-level

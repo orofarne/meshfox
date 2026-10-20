@@ -5303,7 +5303,7 @@ impl App {
         };
         self.console_last_activity = Some(std::time::Instant::now());
         let exit_code = match event {
-            Some(RunEvent::Started { run_id }) => {
+            Some(RunEvent::Started { run_id, .. }) => {
                 run.run_id = Some(run_id);
                 return;
             }

@@ -2,7 +2,7 @@
 
 use std::io::IsTerminal;
 
-fn color_enabled() -> bool {
+pub(crate) fn color_enabled() -> bool {
     std::io::stdout().is_terminal()
         && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
         && std::env::var_os("TERM").is_none_or(|value| value != "dumb")
