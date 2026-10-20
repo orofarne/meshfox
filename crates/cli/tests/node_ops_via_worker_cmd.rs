@@ -833,3 +833,72 @@ fn node_block_routes_through_a_running_worker() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--file -` means stdin for `node body`/`node append`, same sentinel
+/// `node add --body-file -` already took — it used to be read as a file
+/// literally named `-`.
+#[test]
+fn node_body_and_append_read_stdin_for_a_dash_file() {
+    use std::io::Write;
+
+    let dir = unique_dir();
+    let canvas_path = dir.join("dash.canvas.md");
+    std::fs::write(
+        &canvas_path,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Dash\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" -->\n\nbefore\n",
+        ),
+    )
+    .unwrap();
+
+    let with_stdin = |args: &[&str], input: &str| {
+        let mut child = meshfox()
+            .args(args)
+            .arg("--canvas")
+            .arg(&canvas_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let shown = meshfox()
+        .args(["node", "show", "--canvas"])
+        .arg(&canvas_path)
+        .arg("child")
+        .output()
+        .unwrap();
+    let rev = String::from_utf8_lossy(&shown.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("body-rev: "))
+        .expect("node show prints body-rev")
+        .to_string();
+
+    with_stdin(
+        &["node", "body", "child", "--base-rev", &rev, "--file", "-"],
+        "replaced\n",
+    );
+    with_stdin(&["node", "append", "child", "--file", "-"], "tail\n");
+
+    let after = std::fs::read_to_string(&canvas_path).unwrap();
+    assert!(after.contains("replaced"), "after: {after}");
+    assert!(after.contains("tail"), "after: {after}");
+    assert!(!after.contains("before"), "after: {after}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

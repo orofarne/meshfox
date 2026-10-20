@@ -60,6 +60,7 @@ pub(crate) fn dialect() -> Dialect {
 }
 use serde::{Deserialize, Serialize};
 use starlark::values::none::NoneType;
+use starlark::values::Value;
 use std::cell::RefCell;
 use std::fmt::Write as _;
 
@@ -150,9 +151,32 @@ fn constraint_globals(builder: &mut GlobalsBuilder) {
     }
 }
 
+/// Builtins the Starlark standard library lacks but a document script
+/// reaches for as soon as it counts or totals things — shared by constraint
+/// and render fences so both dialects agree.
+#[starlark::starlark_module]
+pub(crate) fn sequence_globals(builder: &mut GlobalsBuilder) {
+    /// `sum(items, start=0)`: adds up the items of an iterable (ints, floats,
+    /// or anything else `+` accepts, such as lists or strings when `start` is
+    /// of that type); `start` is returned for an empty iterable.
+    fn sum<'v>(
+        items: Value<'v>,
+        start: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let heap = eval.heap();
+        let mut total = start.unwrap_or_else(|| heap.alloc(0));
+        for item in items.iterate(heap)? {
+            total = total.add(item, heap)?;
+        }
+        Ok(total)
+    }
+}
+
 fn globals() -> Globals {
     GlobalsBuilder::extended_by(&[LibraryExtension::StructType])
         .with(constraint_globals)
+        .with(sequence_globals)
         .build()
 }
 
@@ -581,6 +605,17 @@ mod tests {
             results[0].messages,
             vec!["first".to_string(), "second".to_string()]
         );
+    }
+
+    #[test]
+    fn sum_is_available_to_constraints() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Check\n<!-- meshfox:node id=\"check\" -->\n\n\
+             ```starlark constraint\nif sum([1, 2, 3]) != 6 or sum([], 4) != 4:\n    fail(\"sum is wrong\")\n```\n",
+        );
+        let results = evaluate(&c, None);
+        assert!(results[0].ok, "{:?}", results[0].messages);
     }
 
     #[test]

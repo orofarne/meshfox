@@ -120,3 +120,125 @@ fn check_reports_a_broken_include_target_instead_of_silently_ignoring_it() {
         "expected a non-zero exit for a broken include target"
     );
 }
+
+const RENDER_CANVAS: &str = concat!(
+    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+    "```starlark render name=\"total\"\nprint(\"total:\", sum([1, 2, 3]))\n```\n\n",
+    "## Child\n<!-- meshfox:node id=\"child\" -->\n\n",
+    "```starlark render name=\"broken\"\nprint(no_such_name)\n```\n",
+);
+
+#[test]
+fn check_fails_on_a_render_block_that_raises_an_error() {
+    let dir = unique_dir("render-fail");
+    let canvas = dir.join("doc.canvas.md");
+    write_file(&canvas, RENDER_CANVAS);
+
+    let output = meshfox().arg("check").arg(&canvas).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "a broken render block must fail the check"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ok   render root/total"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("FAIL render child/broken"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("no_such_name"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("1/2 render blocks failed"),
+        "stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_counts_working_render_blocks_and_passes() {
+    let dir = unique_dir("render-ok");
+    let canvas = dir.join("doc.canvas.md");
+    write_file(
+        &canvas,
+        concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```starlark render\nprint(\"hi\")\n```\n\n",
+            "```starlark constraint\npass\n```\n",
+        ),
+    );
+
+    let output = meshfox().arg("check").arg(&canvas).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ok (1 constraint, 1 render block)"),
+        "stdout: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn render_prints_the_computed_markdown_and_narrows_by_node_and_name() {
+    let dir = unique_dir("render-print");
+    let canvas = dir.join("doc.canvas.md");
+    write_file(&canvas, RENDER_CANVAS);
+
+    // One selected block: just its Markdown, nothing else.
+    let output = meshfox()
+        .arg("render")
+        .arg(&canvas)
+        .args(["--name", "total"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "total: 6\n");
+
+    let output = meshfox()
+        .arg("render")
+        .arg(&canvas)
+        .args(["--node", "root"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "total: 6\n");
+
+    // Everything: each block labelled; the failing one reports on stderr
+    // and makes the exit status non-zero, without hiding the good one.
+    let output = meshfox().arg("render").arg(&canvas).output().unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("<!-- render: root/total -->\ntotal: 6\n"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("child/broken"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Nothing matches.
+    let output = meshfox()
+        .arg("render")
+        .arg(&canvas)
+        .args(["--node", "nope"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no starlark render block"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

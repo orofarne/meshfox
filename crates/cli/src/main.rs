@@ -474,6 +474,24 @@ enum Command {
         #[command(flatten)]
         canvas: CanvasOpt,
     },
+    /// Prints the Markdown each ` ```starlark render ` fence computes — the
+    /// view the web UI and TUI show under its `starlark · name` header — so a
+    /// computed view can be read and verified from a terminal or a script.
+    /// Evaluates against the include-resolved document, same as `check`
+    /// (which also fails on a render block that errors). With several blocks
+    /// selected each is preceded by a `<!-- render: node/name -->` line. A
+    /// block that fails prints its diagnostic to stderr; exits non-zero if
+    /// any selected block failed or none matched.
+    Render {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+        /// Only the render blocks of this node.
+        #[arg(long)]
+        node: Option<String>,
+        /// Only render blocks with this `name=`.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Reverts the most recent still-undoable edit to the canvas — any
     /// node/edge/reorder change, from any client (web UI, TUI, another CLI
     /// invocation, MCP). Routes through the running worker for this
@@ -887,7 +905,8 @@ enum NodeCommand {
         #[arg(long)]
         canvas: Option<PathBuf>,
         node_id: String,
-        /// Read the new body from this file instead of stdin.
+        /// Read the new body from this file instead of stdin (`-` also
+        /// means stdin, same as `node add --body-file -`).
         #[arg(long)]
         file: Option<PathBuf>,
         /// The `body-rev` `meshfox node show` printed when you read the
@@ -918,7 +937,8 @@ enum NodeCommand {
         #[arg(long)]
         canvas: Option<PathBuf>,
         node_id: String,
-        /// Read the text to append from this file instead of stdin.
+        /// Read the text to append from this file instead of stdin (`-`
+        /// also means stdin).
         #[arg(long)]
         file: Option<PathBuf>,
     },
@@ -1588,6 +1608,10 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             check(&canvas_path)
         }
+        Command::Render { canvas, node, name } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            render_cmd(&canvas_path, node.as_deref(), name.as_deref())
+        }
         Command::Undo { canvas } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             undo_cmd(&canvas_path)
@@ -2183,36 +2207,103 @@ fn validate(canvas_path: &Path) {
 /// `base_dir`, so a constraint's `.content()`/`.json()`/`.yaml()`/
 /// `.toml()`/`.csv()` on a `file`-type node can actually resolve that
 /// node's target (see `meshfox_core::constraint`).
+/// One `starlark render` fence's outcome, with the node it lives in.
+struct RenderOutcome {
+    node_id: String,
+    title: String,
+    result: meshfox_core::starlark_render::RenderResult,
+}
+
+/// What `meshfox check` found: every constraint fence's verdict plus the
+/// outcome of every computed-view (`starlark render`) fence, so a render
+/// block that raises an error fails the check instead of being noticed only
+/// in the UI.
+struct CheckReport {
+    constraints: Vec<meshfox_core::ConstraintResult>,
+    renders: Vec<RenderOutcome>,
+}
+
+impl CheckReport {
+    fn failed_constraints(&self) -> usize {
+        self.constraints.iter().filter(|r| !r.ok).count()
+    }
+
+    fn failed_renders(&self) -> usize {
+        self.renders
+            .iter()
+            .filter(|r| r.result.error.is_some())
+            .count()
+    }
+
+    fn ok(&self) -> bool {
+        self.failed_constraints() == 0 && self.failed_renders() == 0
+    }
+}
+
 /// Pure logic behind `meshfox check`: resolves includes, then evaluates
-/// every constraint fence. `Err` only for a parse/include failure (same
-/// class `validate_canvas` fails on) — an empty or partially-failing
-/// result list is not an error, same as `find_node_ids` returning an
-/// empty match list rather than erroring: the caller (CLI `check` below,
-/// or the MCP `check` tool) decides what to do with per-constraint
-/// failures.
-fn check_canvas(
-    raw: &str,
-    canvas_path: &Path,
-) -> Result<Vec<meshfox_core::ConstraintResult>, String> {
-    let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
-    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
-    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
-    let mut results = Vec::new();
-    results.extend(meshfox_core::constraint::evaluate_with_access(
+/// every constraint fence and every `starlark render` fence. `Err` only for
+/// a parse/include failure (same class `validate_canvas` fails on) — an
+/// empty or partially-failing report is not an error, same as
+/// `find_node_ids` returning an empty match list rather than erroring: the
+/// caller (CLI `check` below, or the MCP `check` tool) decides what to do
+/// with per-fence failures.
+fn check_canvas(raw: &str, canvas_path: &Path) -> Result<CheckReport, String> {
+    let (mut canvas, access) = resolved_for_evaluation(raw, canvas_path)?;
+    let constraints = meshfox_core::constraint::evaluate_with_access(
         &canvas,
         Some(canvas_root_dir(canvas_path)),
         &access,
-    ));
-    Ok(results)
+    );
+    let renders = render_outcomes(&mut canvas, canvas_path, &access);
+    Ok(CheckReport {
+        constraints,
+        renders,
+    })
+}
+
+/// Parses `raw` and resolves its includes, the tree every Starlark fence is
+/// evaluated against, plus the file access its `file`-node reads go through.
+fn resolved_for_evaluation(
+    raw: &str,
+    canvas_path: &Path,
+) -> Result<(Canvas, meshfox_core::FileAccess), String> {
+    let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
+    let canvas = meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
+    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
+    Ok((canvas, access))
+}
+
+/// Evaluates every `starlark render` fence of `canvas`, in document order.
+fn render_outcomes(
+    canvas: &mut Canvas,
+    canvas_path: &Path,
+    access: &meshfox_core::FileAccess,
+) -> Vec<RenderOutcome> {
+    meshfox_core::starlark_render::annotate(canvas, Some(canvas_root_dir(canvas_path)), access);
+    canvas
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.render_results.iter().map(|result| RenderOutcome {
+                node_id: node.id.clone(),
+                title: node.title.clone(),
+                result: result.clone(),
+            })
+        })
+        .collect()
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
 
 fn check(canvas_path: &Path) {
     let raw = read_raw_or_exit(canvas_path);
-    let results = check_canvas(&raw, canvas_path).unwrap_or_else(|e| {
+    let report = check_canvas(&raw, canvas_path).unwrap_or_else(|e| {
         eprintln!("meshfox check: {}: {e}", canvas_path.display());
         std::process::exit(1);
     });
-    if results.is_empty() {
+    if report.constraints.is_empty() && report.renders.is_empty() {
         println!(
             "meshfox check: {} ok (no constraints)",
             canvas_path.display()
@@ -2220,7 +2311,7 @@ fn check(canvas_path: &Path) {
         return;
     }
 
-    for r in &results {
+    for r in &report.constraints {
         if r.ok {
             println!("meshfox check: ok   {} {:?}", r.label, r.title);
         } else {
@@ -2230,22 +2321,100 @@ fn check(canvas_path: &Path) {
             }
         }
     }
+    for r in &report.renders {
+        match &r.result.error {
+            None => println!(
+                "meshfox check: ok   render {} {:?}",
+                r.result.label, r.title
+            ),
+            Some(error) => {
+                eprintln!(
+                    "meshfox check: FAIL render {} {:?}",
+                    r.result.label, r.title
+                );
+                eprintln!("meshfox check:         {error}");
+            }
+        }
+    }
 
-    let n = results.len();
-    let failed = results.iter().filter(|r| !r.ok).count();
-    if failed > 0 {
+    let n = report.constraints.len();
+    let m = report.renders.len();
+    let (failed, failed_renders) = (report.failed_constraints(), report.failed_renders());
+    if !report.ok() {
+        let mut parts = Vec::new();
+        if failed > 0 {
+            parts.push(format!("{failed}/{}", plural(n, "constraint")) + " failed");
+        }
+        if failed_renders > 0 {
+            parts.push(format!("{failed_renders}/{}", plural(m, "render block")) + " failed");
+        }
         eprintln!(
-            "meshfox check: {}: {failed}/{n} constraint{} failed",
+            "meshfox check: {}: {}",
             canvas_path.display(),
-            if n == 1 { "" } else { "s" }
+            parts.join(", ")
         );
         std::process::exit(1);
     }
+    let mut counted = Vec::new();
+    if n > 0 {
+        counted.push(plural(n, "constraint"));
+    }
+    if m > 0 {
+        counted.push(plural(m, "render block"));
+    }
     println!(
-        "meshfox check: {} ok ({n} constraint{})",
+        "meshfox check: {} ok ({})",
         canvas_path.display(),
-        if n == 1 { "" } else { "s" }
+        counted.join(", ")
     );
+}
+
+/// `meshfox render`: prints the Markdown every `starlark render` fence
+/// computes — what the web UI and TUI show under its header — so a computed
+/// view can be read and verified without a UI. `node`/`name` narrow it to one
+/// node's blocks / one block name. A block that errors prints its diagnostic
+/// to stderr, and the exit status is non-zero if any selected block failed
+/// or none matched.
+fn render_cmd(canvas_path: &Path, node: Option<&str>, name: Option<&str>) {
+    let raw = read_raw_or_exit(canvas_path);
+    let outcomes = resolved_for_evaluation(&raw, canvas_path)
+        .map(|(mut canvas, access)| render_outcomes(&mut canvas, canvas_path, &access))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox render: {}: {e}", canvas_path.display());
+            std::process::exit(1);
+        });
+    let selected: Vec<&RenderOutcome> = outcomes
+        .iter()
+        .filter(|o| node.is_none_or(|id| o.node_id == id))
+        .filter(|o| name.is_none_or(|n| o.result.label.ends_with(&format!("/{n}"))))
+        .collect();
+    if selected.is_empty() {
+        eprintln!(
+            "meshfox render: {}: no starlark render block{}{} ({} in the document)",
+            canvas_path.display(),
+            node.map(|id| format!(" in node {id:?}"))
+                .unwrap_or_default(),
+            name.map(|n| format!(" named {n:?}")).unwrap_or_default(),
+            outcomes.len(),
+        );
+        std::process::exit(1);
+    }
+    let mut failed = false;
+    for outcome in &selected {
+        if selected.len() > 1 {
+            println!("<!-- render: {} -->", outcome.result.label);
+        }
+        match &outcome.result.error {
+            None => print!("{}", outcome.result.markdown),
+            Some(error) => {
+                failed = true;
+                eprintln!("meshfox render: {}: {error}", outcome.result.label);
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
 }
 
 fn create(canvas_path: &Path) {
@@ -4094,10 +4263,10 @@ fn node_add(
 
 /// Reads `--body-file`'s value: `path` itself, unless it's the literal `-`
 /// (the same "read stdin instead" sentinel `git`/`tar` use), in which case
-/// stdin. Distinct from `node body`'s own `--file`, which already treats
-/// *omitting* the flag entirely as "read stdin" — `node add`'s
-/// `--body-file` can't reuse that trick, since omitting it here has to
-/// mean "no body at all" instead.
+/// stdin. `node add`'s `--body-file` can't treat *omitting* the flag as
+/// "read stdin" the way `node body`/`node append` do, since omitting it
+/// there has to mean "no body at all" — see [`read_text_source_or_exit`]
+/// for the variant where omission means stdin.
 fn read_body_source_or_exit(path: &Path) -> String {
     if path == Path::new("-") {
         use std::io::Read;
@@ -4114,6 +4283,16 @@ fn read_body_source_or_exit(path: &Path) -> String {
             eprintln!("failed to read {}: {e}", path.display());
             std::process::exit(1);
         })
+    }
+}
+
+/// Reads `node body`'s/`node append`'s `--file`: stdin when the flag is
+/// omitted *or* is the literal `-` (so every `--file`/`--body-file` flag
+/// accepts the same `-` sentinel), the file otherwise.
+fn read_text_source_or_exit(file: Option<&Path>) -> String {
+    match file {
+        Some(path) => read_body_source_or_exit(path),
+        None => read_body_source_or_exit(Path::new("-")),
     }
 }
 
@@ -4375,23 +4554,7 @@ fn node_body(
     base_rev: &str,
     merge: bool,
 ) {
-    let new_body = match &file {
-        Some(path) => std::fs::read_to_string(path).unwrap_or_else(|e| {
-            eprintln!("failed to read {}: {e}", path.display());
-            std::process::exit(1);
-        }),
-        None => {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to read stdin: {e}");
-                    std::process::exit(1);
-                });
-            buf
-        }
-    };
+    let new_body = read_text_source_or_exit(file.as_deref());
 
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
@@ -4428,23 +4591,7 @@ fn apply_node_body(raw: &str, node_id: &str, new_body: &str) -> Result<String, S
 }
 
 fn node_append(canvas_path: &Path, node_id: &str, file: Option<PathBuf>) {
-    let addition = match file {
-        Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!("failed to read {}: {e}", path.display());
-            std::process::exit(1);
-        }),
-        None => {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to read stdin: {e}");
-                    std::process::exit(1);
-                });
-            buf
-        }
-    };
+    let addition = read_text_source_or_exit(file.as_deref());
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
         std::process::exit(1);

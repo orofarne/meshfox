@@ -4801,7 +4801,15 @@ async fn get_canvas_raw(
     Query(query): Query<SourceFileQuery>,
 ) -> Result<Response, ApiError> {
     let (text, read_only) = match resolve_source_file(&state, query.include.as_deref())? {
-        SourceFile::Primary => (state.raw.lock().unwrap().clone(), false),
+        SourceFile::Primary => {
+            // Adopt an edit made behind the worker's back first, like every
+            // mutation does (`begin_mutation`): the watcher only notices one
+            // up to a poll later, and a client that just changed the file
+            // and reads it back through the worker (`meshfox check`, an MCP
+            // read) must not be handed the previous text.
+            let _read = state.begin_mutation().await;
+            (state.raw.lock().unwrap().clone(), false)
+        }
         SourceFile::Include { path } => {
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 ApiError(
@@ -12909,6 +12917,28 @@ mod node_op_broadcast_tests {
         assert_eq!(err.0, StatusCode::PRECONDITION_FAILED);
         assert!(err.1.contains("edited outside"), "{}", err.1);
         assert_eq!(std::fs::read_to_string(&canvas_path).unwrap(), external);
+
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A client that edits the file and reads it back through the worker at
+    /// once (`meshfox check` right after an editor save) gets the new text,
+    /// not whatever the worker cached before its watcher's next poll.
+    #[tokio::test]
+    async fn reading_the_raw_canvas_sees_an_external_edit_the_watcher_has_not_noticed() {
+        let canvas_path = write_test_canvas(TWO_SIBLINGS);
+        let state = build_state(canvas_path.clone(), false, None).await.unwrap();
+
+        let external = TWO_SIBLINGS.replace("body b", "body b, edited outside");
+        std::fs::write(&canvas_path, &external).unwrap();
+
+        let response = get_canvas_raw(State(state.clone()), raw_query())
+            .await
+            .expect("raw read");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), external);
 
         let _ = std::fs::remove_file(&canvas_path);
     }

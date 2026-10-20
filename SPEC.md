@@ -1279,6 +1279,9 @@ The script sees:
 - **`doc`** — the document's root node.
 - **`self`** — the node whose body this fence lives in, so a script can
   find its place in the tree without hardcoding its own id.
+- **`sum(items, start=0)`** — the one builtin added on top of Starlark's own
+  (which has no `sum`): adds up an iterable's items, `start` for an empty one.
+  `render` fences have it too.
 - On every node (both of the above, and any node reached through them):
   - **`.id`**, **`.title`**, **`.type`** (a string, e.g. `"file"`),
     **`.parent`** (a string, or `None` for the root), **`.tags`** (a list
@@ -1379,7 +1382,12 @@ only be `"markdown"` (the default). `constraint` and `render` are mutually
 exclusive. Shell execution attributes (`interpreter`, `cache`, `deps`, etc.)
 are not accepted on a computed view. A plain `starlark` fence stays inert.
 Computed views are not runnable blocks or dependency targets, and do not
-contribute to `meshfox check`'s constraint status.
+contribute to a node's constraint status. `meshfox check` (and the MCP `check`
+tool) nevertheless evaluates every render fence and fails on one that raises an
+error, and `meshfox render [--node ID] [--name NAME]` prints the computed
+Markdown of the selected blocks (each preceded by a `<!-- render: node/name -->`
+line when several are selected; a failing block's diagnostic goes to stderr and
+the exit status is non-zero).
 
 The worker evaluates views on its current authored document snapshot and
 sends `renderResults` alongside each node in its response. These are temporary

@@ -27,7 +27,7 @@
 //! out). A canvas id is that file's path relative to the root; opening an
 //! already-open file just returns the same id.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,6 +124,121 @@ pub async fn run() -> Result<(), String> {
 
 fn invalid_params(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
+}
+
+/// Collects the argument names a tool's input schema accepts into `names`
+/// (`properties`, looking through `$ref`/`allOf`/`anyOf`/`oneOf`, since a
+/// `#[serde(flatten)]` field's properties land wherever `schemars` puts
+/// them). Returns `true` when the schema is open — it allows extra
+/// properties, or is too deep or odd to read — and nothing can be called
+/// unknown.
+fn collect_argument_names(
+    schema: &serde_json::Value,
+    root: &serde_json::Value,
+    names: &mut BTreeSet<String>,
+    depth: usize,
+) -> bool {
+    use serde_json::Value;
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    if depth > 8 {
+        return true;
+    }
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        names.extend(properties.keys().cloned());
+    }
+    match object.get("additionalProperties") {
+        None | Some(Value::Bool(false)) => {}
+        Some(_) => return true,
+    }
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        let target = reference
+            .strip_prefix("#/")
+            .and_then(|path| path.split('/').try_fold(root, |node, key| node.get(key)));
+        match target {
+            Some(target) => {
+                if collect_argument_names(target, root, names, depth + 1) {
+                    return true;
+                }
+            }
+            None => return true,
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf"] {
+        for branch in object
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if collect_argument_names(branch, root, names, depth + 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Edit distance between two names, for the "did you mean" hint.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (diagonal + usize::from(ca != *cb))
+                .min(above + 1)
+                .min(row[j] + 1);
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// Strict argument check: serde silently drops unknown fields (and cannot
+/// refuse them next to `#[serde(flatten)]`), so a misspelled parameter such
+/// as `add_tag` for `add_tags` used to run the tool with that argument
+/// missing. Rejecting it up front means nothing runs on a call that wasn't
+/// understood.
+fn reject_unknown_arguments(
+    tool: &rmcp::model::Tool,
+    arguments: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<(), ErrorData> {
+    let Some(arguments) = arguments else {
+        return Ok(());
+    };
+    let root = serde_json::Value::Object((*tool.input_schema).clone());
+    let mut accepted = BTreeSet::new();
+    if collect_argument_names(&root, &root, &mut accepted, 0) {
+        return Ok(());
+    }
+    let unknown: Vec<String> = arguments
+        .keys()
+        .filter(|key| !accepted.contains(key.as_str()))
+        .map(|key| {
+            match accepted
+                .iter()
+                .map(|name| (edit_distance(key, name), name))
+                .filter(|(distance, _)| *distance <= 2)
+                .min()
+            {
+                Some((_, name)) => format!("\"{key}\" (did you mean \"{name}\"?)"),
+                None => format!("\"{key}\""),
+            }
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(invalid_params(format!(
+        "{}: unknown parameter {}; nothing was done. Accepted parameters: {}",
+        tool.name,
+        unknown.join(", "),
+        accepted.into_iter().collect::<Vec<_>>().join(", "),
+    )))
 }
 
 // =======================================================================
@@ -296,6 +411,13 @@ struct NodeIdParams {
     /// callers only want the structural metadata.
     #[serde(default)]
     include_body: bool,
+    /// With `include_body`, cut each body to its first this-many characters
+    /// and add `body_truncated` (how many characters were left out) to that
+    /// node's result. The `body_rev` is still the revision of the *whole*
+    /// body, but a truncated `body` must not be sent back through
+    /// `node_body`. Omitted: whole bodies.
+    #[serde(default)]
+    body_limit: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
@@ -620,6 +742,13 @@ struct NodeFindParams {
     /// without `show`, since a bare id list has no metadata to attach it to.
     #[serde(default)]
     include_body: bool,
+    /// With `include_body`, cut each body to its first this-many characters
+    /// and add `body_truncated` (how many characters were left out) to that
+    /// node's result. The `body_rev` is still the revision of the *whole*
+    /// body, but a truncated `body` must not be sent back through
+    /// `node_body`. Omitted: whole bodies.
+    #[serde(default)]
+    body_limit: Option<usize>,
     /// Case-insensitive substring match against each node's title or body
     /// text. A match's own result carries a short `excerpt` of the
     /// matching line, so a caller doesn't need a separate `node_show` just
@@ -776,6 +905,7 @@ impl CanvasCtx {
             &canvas,
             node,
             params.include_body,
+            params.body_limit,
         )))
     }
 
@@ -814,6 +944,13 @@ impl CanvasCtx {
         }
         if !params.remove_tags.is_empty() {
             meta_fields.remove_tag = Some(params.remove_tags.join(","));
+        }
+        if !meta_fields.is_set() && !params.clear_position {
+            return Err(invalid_params(
+                "node_meta: nothing to change — pass at least one of x, y, width, height, color, \
+                 type, display, lang, interpreter, preview, fold, createdAt, add_tags, \
+                 remove_tags or clear_position",
+            ));
         }
         let mut update =
             crate::node_update_from_fields(&meta_fields, None).map_err(invalid_params)?;
@@ -1258,14 +1395,27 @@ impl CanvasCtx {
         })))
     }
 
-    /// Runs every embedded `starlark constraint` fence's Starlark contract against the document (implies validate first, over the fully include-resolved tree) and reports pass/fail per fence. Unlike validate, one constraint failing isn't a tool error — it comes back as structured data (ok: false, with that fence's own fail() messages) so a caller can inspect what's wrong without try/catch. A parse/include failure (the document doesn't even reach a checkable state) is still a tool error, same as validate's.
+    /// Runs every embedded `starlark constraint` fence's Starlark contract against the document (implies validate first, over the fully include-resolved tree) and reports pass/fail per fence. Also evaluates every `starlark render` fence and lists them under `renders` (`ok: false` with the Starlark `error` for a block that fails, which makes the overall `ok` false too). Unlike validate, one constraint failing isn't a tool error — it comes back as structured data (ok: false, with that fence's own fail() messages) so a caller can inspect what's wrong without try/catch. A parse/include failure (the document doesn't even reach a checkable state) is still a tool error, same as validate's.
     async fn check(&self, _params: CheckParams) -> Result<CallToolResult, ErrorData> {
         let raw = self.read_raw().await?;
-        let results = crate::check_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
-        let ok = results.iter().all(|r| r.ok);
+        let report = crate::check_canvas(&raw, &self.canvas_path).map_err(invalid_params)?;
+        let renders: Vec<serde_json::Value> = report
+            .renders
+            .iter()
+            .map(|r| {
+                json!({
+                    "node_id": r.node_id,
+                    "title": r.title,
+                    "label": r.result.label,
+                    "ok": r.result.error.is_none(),
+                    "error": r.result.error,
+                })
+            })
+            .collect();
         Ok(CallToolResult::structured(json!({
-            "ok": ok,
-            "results": results,
+            "ok": report.ok(),
+            "results": report.constraints,
+            "renders": renders,
         })))
     }
 
@@ -1301,7 +1451,7 @@ impl CanvasCtx {
             let nodes: Vec<serde_json::Value> = ids
                 .iter()
                 .filter_map(|id| canvas.node(id))
-                .map(|n| node_json(&canvas, n, params.include_body))
+                .map(|n| node_json(&canvas, n, params.include_body, params.body_limit))
                 .collect();
             result["nodes"] = json!(nodes);
         }
@@ -1309,7 +1459,24 @@ impl CanvasCtx {
     }
 }
 
-fn node_json(canvas: &Canvas, node: &meshfox_core::Node, include_body: bool) -> serde_json::Value {
+/// `text`'s first `limit` characters and how many characters that left out
+/// (`limit: None` keeps all of it).
+fn truncate_body(text: &str, limit: Option<usize>) -> (&str, usize) {
+    let Some(limit) = limit else {
+        return (text, 0);
+    };
+    match text.char_indices().nth(limit) {
+        Some((cut, _)) => (&text[..cut], text[cut..].chars().count()),
+        None => (text, 0),
+    }
+}
+
+fn node_json(
+    canvas: &Canvas,
+    node: &meshfox_core::Node,
+    include_body: bool,
+    body_limit: Option<usize>,
+) -> serde_json::Value {
     let children: Vec<&str> = canvas
         .children(&node.id)
         .iter()
@@ -1339,7 +1506,11 @@ fn node_json(canvas: &Canvas, node: &meshfox_core::Node, include_body: bool) -> 
         "updatedAt": node.updated_at,
     });
     if include_body {
-        result["body"] = json!(node.text);
+        let (body, omitted) = truncate_body(&node.text, body_limit);
+        result["body"] = json!(body);
+        if omitted > 0 {
+            result["body_truncated"] = json!(omitted);
+        }
     }
     result
 }
@@ -2286,6 +2457,18 @@ fn secret_visible_under(scope: &str, root: &std::path::Path) -> bool {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MeshfoxMcpRoot {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        if let Some(tool) = self.tool_router.get(&request.name) {
+            reject_unknown_arguments(tool, request.arguments.as_ref())?;
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Multi-canvas meshfox MCP server. Every canvas-scoped tool requires a canvas_id from \
@@ -2386,11 +2569,99 @@ mod tests {
         let canvas = Canvas::from_markdown(markdown).unwrap();
         let node = canvas.node("child").unwrap();
 
-        let without_body = node_json(&canvas, node, false);
+        let without_body = node_json(&canvas, node, false, None);
         assert!(without_body.get("body").is_none());
 
-        let with_body = node_json(&canvas, node, true);
+        let with_body = node_json(&canvas, node, true, None);
         assert_eq!(with_body["body"], "some node text");
+        assert!(with_body.get("body_truncated").is_none());
+    }
+
+    #[test]
+    fn node_json_cuts_a_long_body_at_body_limit_on_a_char_boundary() {
+        let markdown = "<!-- meshfox:canvas -->\n# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nпривет, мир\n";
+        let canvas = Canvas::from_markdown(markdown).unwrap();
+        let node = canvas.node("child").unwrap();
+
+        let cut = node_json(&canvas, node, true, Some(6));
+        assert_eq!(cut["body"], "привет");
+        assert_eq!(cut["body_truncated"], 5);
+        // The revision still names the whole body, so it stays a valid base_rev.
+        assert_eq!(
+            cut["body_rev"],
+            node_json(&canvas, node, false, None)["body_rev"]
+        );
+
+        let fits = node_json(&canvas, node, true, Some(100));
+        assert_eq!(fits["body"], "привет, мир");
+        assert!(fits.get("body_truncated").is_none());
+    }
+
+    #[test]
+    fn every_tool_schema_is_readable_enough_for_strict_argument_checks() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        let tools = server.tool_router.list_all();
+        assert!(tools.len() > 20, "{} tools", tools.len());
+        for tool in tools {
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let mut names = std::collections::BTreeSet::new();
+            let open = super::collect_argument_names(&schema, &schema, &mut names, 0);
+            assert!(
+                !open,
+                "{}'s schema reads as open, so unknown arguments would pass: {schema}",
+                tool.name
+            );
+            // The root tools that aren't scoped to one canvas.
+            if !["canvas_open", "canvas_list", "secret_list"].contains(&&*tool.name) {
+                assert!(
+                    names.contains("canvas_id"),
+                    "{}: names {names:?}",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_arguments_get_a_closest_name_hint_and_known_ones_pass() {
+        let (_base, root) = fixture();
+        let server = MeshfoxMcpRoot::new(root);
+        let tool = server.tool_router.get("node_meta").unwrap();
+        let args = |value: serde_json::Value| value.as_object().unwrap().clone();
+
+        assert!(super::reject_unknown_arguments(
+            tool,
+            Some(&args(serde_json::json!({
+                "canvas_id": "a", "node_id": "n", "x": 1.0, "add_tags": ["t"], "createdAt": "z"
+            })))
+        )
+        .is_ok());
+        let error = super::reject_unknown_arguments(
+            tool,
+            Some(&args(
+                serde_json::json!({ "canvas_id": "a", "node_id": "n", "add_tag": "t" }),
+            )),
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("did you mean \"add_tags\""),
+            "{}",
+            error.message
+        );
+        let error = super::reject_unknown_arguments(
+            tool,
+            Some(&args(
+                serde_json::json!({ "canvas_id": "a", "zzzzzzzz": 1 }),
+            )),
+        )
+        .unwrap_err();
+        assert!(!error.message.contains("did you mean"), "{}", error.message);
+        assert!(
+            error.message.contains("Accepted parameters"),
+            "{}",
+            error.message
+        );
     }
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);

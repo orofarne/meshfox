@@ -34,7 +34,7 @@ Map your intent to a subcommand instead:
 - Change a node's stable id (updates every reference: `parent=`, `meshfox:edge
   from=`, best-effort `deps=`) → `meshfox node set-id <id> <new-id>`
 - Replace a node's body → `meshfox node body <id> --base-rev <rev> --file
-  <path>` (or pipe to stdin). `--base-rev` is required: the `body-rev:` line
+  <path>` (or pipe to stdin; `--file -` is stdin too). `--base-rev` is required: the `body-rev:` line
   `meshfox node show <id>` prints. If the body changed since you read it
   (another tab, an agent, an editor), nothing is written and the error gives
   the current body and revision — merge, then retry with that revision. Add
@@ -48,7 +48,7 @@ Map your intent to a subcommand instead:
   in the history is the ordinary refusal. Just adding to it? `node append`
   needs no revision.
 - Append to a node's existing body, without reading it back first → `meshfox
-  node append <id> --file <path>` (or pipe to stdin)
+  node append <id> --file <path>` (or pipe to stdin; `--file -` is stdin too)
 - Set position/size/style/tags (`x`/`y`/`w`/`h`/`color`/`type`/`display`/
   `lang`/`interpreter`/`tags`) → `meshfox node meta <id> [flags...]` — same
   flags `node add` above also accepts. `color` is either a literal hex
@@ -92,6 +92,9 @@ the file parses; `check` asks whether the document actually satisfies its
 own declared rules. A structural edit that leaves the file well-formed can
 still break a constraint (e.g. deleting a table's only `file` child) —
 `check` is what catches that, `validate` won't.
+`check` also evaluates every ` ```starlark render ` fence and fails on one that
+raises an error; `meshfox render <file> [--node ID] [--name NAME]` prints what
+those blocks compute, to read or verify a computed view without a UI.
 
 ## Running non-interactively
 

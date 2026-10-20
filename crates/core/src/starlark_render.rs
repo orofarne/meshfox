@@ -44,7 +44,7 @@ pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &FileAcces
     let mut globals =
         GlobalsBuilder::extended_by(&[LibraryExtension::StructType, LibraryExtension::Print]);
     globals.namespace("md", crate::markdown_fragment::markdown_globals);
-    let globals = globals.build();
+    let globals = globals.with(crate::constraint::sequence_globals).build();
     for node in &mut canvas.nodes {
         node.render_results = crate::fence::scan_render_blocks(&node.text)
             .into_iter()
@@ -101,6 +101,14 @@ mod tests {
         let mut c = canvas(code);
         annotate(&mut c, None, &FileAccess::none());
         c.nodes[0].render_results.remove(0)
+    }
+    #[test]
+    fn sum_adds_numbers_and_honors_start() {
+        let result =
+            render("print(sum([1, 2, 3]), sum([0.5, 0.25]), sum([], 7), sum([[1], [2]], []))");
+        assert_eq!(result.error, None);
+        assert_eq!(result.markdown.trim(), "6 0.75 7 [1, 2]");
+        assert!(render("print(sum(['a']))").error.is_some());
     }
     #[test]
     fn colored_fragments_validate_and_compose() {
