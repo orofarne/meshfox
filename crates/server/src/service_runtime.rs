@@ -1,5 +1,5 @@
 //! Async lifecycle owner. No registry mutex is held while running user commands.
-use super::{descendant_pids, RingBuffer, ServiceStatus};
+use super::{descendant_pids, tree_refresh, RingBuffer, ServiceStatus};
 use crate::{
     run_ledger::{FinishOutcome, RunLedger},
     stream_exec::{self, OutputStream, SpawnedProcess},
@@ -19,6 +19,17 @@ use tokio::sync::watch;
 
 type Log = Arc<Mutex<RingBuffer>>;
 const TICK: Duration = Duration::from_millis(50);
+/// How often a running process's descendants are looked for: often while it
+/// is young — when a service forks, daemonizes and has its parent exit, which
+/// reparents the child out of reach — and ever less once it has been running
+/// a while. Each look walks the machine's whole process table, so a service
+/// that runs for days must not pay the young rate for all of them; at stop
+/// its process group is signalled whatever the scans found.
+const SCAN_YOUNG: Duration = Duration::from_millis(250);
+const SCAN_SETTLING: Duration = Duration::from_secs(1);
+const SCAN_SETTLED: Duration = Duration::from_secs(5);
+const SCAN_YOUNG_FOR: Duration = Duration::from_secs(10);
+const SCAN_SETTLING_FOR: Duration = Duration::from_secs(60);
 const DEFAULT_STOP: Duration = Duration::from_secs(30);
 static NEXT_EPOCH: AtomicI64 = AtomicI64::new(-1);
 
@@ -29,6 +40,7 @@ struct Process {
     stopping: bool,
     cleaned: bool,
     track_descendants: bool,
+    started: Instant,
     scanned: Instant,
     exit: Option<i32>,
 }
@@ -41,6 +53,7 @@ impl Process {
             stopping: false,
             cleaned: false,
             track_descendants: true,
+            started: Instant::now(),
             scanned: Instant::now() - Duration::from_secs(1),
             exit: None,
         }
@@ -52,7 +65,7 @@ impl Process {
         if self.exit.is_some() {
             return Ok(self.exit);
         }
-        if self.scanned.elapsed() >= Duration::from_millis(250) {
+        if self.scanned.elapsed() >= self.scan_interval() {
             self.scan();
             self.scanned = Instant::now();
         }
@@ -65,6 +78,16 @@ impl Process {
         }
         Ok(self.exit)
     }
+    fn scan_interval(&self) -> Duration {
+        let age = self.started.elapsed();
+        if age < SCAN_YOUNG_FOR {
+            SCAN_YOUNG
+        } else if age < SCAN_SETTLING_FOR {
+            SCAN_SETTLING
+        } else {
+            SCAN_SETTLED
+        }
+    }
     fn scan(&mut self) {
         // A reaped leader PID may have been reused since startup.
         if self.exit.is_some() {
@@ -75,7 +98,11 @@ impl Process {
             return;
         }
         let mut sys = sysinfo::System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&descendants), true);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&descendants),
+            true,
+            tree_refresh(),
+        );
         for pid in descendants {
             if let Some(process) = sys.process(pid) {
                 self.descendants.entry(pid).or_insert(process.start_time());
@@ -88,7 +115,11 @@ impl Process {
             return pids;
         }
         let mut sys = sysinfo::System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&pids),
+            true,
+            tree_refresh(),
+        );
         pids.into_iter()
             .filter(|pid| {
                 sys.process(*pid).is_some_and(|p| {

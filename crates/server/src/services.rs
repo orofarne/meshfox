@@ -60,6 +60,19 @@ pub enum ServiceStatus {
 pub(super) struct RingBuffer {
     cap: usize,
     lines: VecDeque<(OutputStream, String)>,
+    /// Lines ever pushed, evicted ones included: the sequence number the
+    /// next line gets. A reader that remembers it asks for "from here" and
+    /// neither re-reads what it has nor loses its place when old lines go.
+    pushed: u64,
+}
+
+/// What [`RingBuffer::since`] found: `lines` are the ones numbered `start..next`.
+/// `start` is later than the requested position when lines in between were
+/// already evicted.
+pub struct LogSlice {
+    pub start: u64,
+    pub next: u64,
+    pub lines: Vec<(OutputStream, String)>,
 }
 
 impl RingBuffer {
@@ -67,6 +80,7 @@ impl RingBuffer {
         RingBuffer {
             cap,
             lines: VecDeque::new(),
+            pushed: 0,
         }
     }
 
@@ -75,10 +89,26 @@ impl RingBuffer {
             self.lines.pop_front();
         }
         self.lines.push_back((stream, line));
+        self.pushed += 1;
     }
 
     fn snapshot(&self) -> Vec<(OutputStream, String)> {
         self.lines.iter().cloned().collect()
+    }
+
+    fn since(&self, from: u64) -> LogSlice {
+        let first = self.pushed - self.lines.len() as u64;
+        let start = from.clamp(first, self.pushed);
+        LogSlice {
+            start,
+            next: self.pushed,
+            lines: self
+                .lines
+                .iter()
+                .skip((start - first) as usize)
+                .cloned()
+                .collect(),
+        }
     }
 }
 
@@ -225,6 +255,11 @@ impl ServiceHandle {
 
     pub fn log_snapshot(&self) -> Vec<(OutputStream, String)> {
         self.log.lock().unwrap().snapshot()
+    }
+
+    /// The lines from sequence number `from` on (see [`RingBuffer`]).
+    pub fn log_since(&self, from: u64) -> LogSlice {
+        self.log.lock().unwrap().since(from)
     }
 
     /// Services keep their address claimed throughout graceful shutdown.
@@ -480,6 +515,15 @@ pub(crate) fn kill_orphaned_descendants(pid: u32) {
     }
 }
 
+/// What walking a process tree needs from each process: its parent, start
+/// time and status, which `sysinfo` reports whatever is asked for. The
+/// default `refresh_processes` also reads every process's memory, CPU, disk
+/// use and executable path (one `sysctl` per process) — on a busy machine
+/// that is most of what a service's supervisor spent, several times a second.
+pub(crate) fn tree_refresh() -> sysinfo::ProcessRefreshKind {
+    sysinfo::ProcessRefreshKind::new()
+}
+
 /// Every still-alive process currently descended from `pid` — children,
 /// grandchildren, and so on — found by scanning every process this
 /// machine currently has for one whose `parent()` matches something
@@ -495,7 +539,7 @@ fn descendant_pids(pid: u32) -> Vec<sysinfo::Pid> {
         return Vec::new();
     }
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::All, true, tree_refresh());
 
     let root = sysinfo::Pid::from_u32(pid);
     let mut frontier = vec![root];
@@ -1147,5 +1191,50 @@ stop_timeout: 2s"#,
             1
         );
         assert!(ledger.active_running().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod log_slice_tests {
+    use super::*;
+
+    fn texts(slice: &LogSlice) -> Vec<&str> {
+        slice.lines.iter().map(|(_, t)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn a_reader_asks_from_where_it_stopped_and_loses_nothing() {
+        let mut ring = RingBuffer::new(3);
+        ring.push(OutputStream::Stdout, "a".into());
+        ring.push(OutputStream::Stdout, "a".into());
+        let first = ring.since(0);
+        assert_eq!(
+            (first.start, first.next, texts(&first)),
+            (0, 2, vec!["a", "a"])
+        );
+        // Identical lines are told apart by their number, not their text.
+        ring.push(OutputStream::Stderr, "a".into());
+        let second = ring.since(first.next);
+        assert_eq!(
+            (second.start, second.next, texts(&second)),
+            (2, 3, vec!["a"])
+        );
+        assert!(ring.since(second.next).lines.is_empty());
+    }
+
+    #[test]
+    fn lines_evicted_before_the_reader_came_are_reported_by_a_later_start() {
+        let mut ring = RingBuffer::new(2);
+        for i in 0..5 {
+            ring.push(OutputStream::Stdout, format!("l{i}"));
+        }
+        let slice = ring.since(1);
+        assert_eq!(
+            (slice.start, slice.next, texts(&slice)),
+            (3, 5, vec!["l3", "l4"])
+        );
+        // A position from the future is clamped, never a panic.
+        let ahead = ring.since(99);
+        assert_eq!((ahead.start, ahead.next, ahead.lines.len()), (5, 5, 0));
     }
 }

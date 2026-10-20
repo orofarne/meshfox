@@ -2517,6 +2517,66 @@ pub async fn get_service_log(
     Ok(lines.into_iter().map(|l| (l.stream, l.text)).collect())
 }
 
+/// The lines of a service's output from sequence number `since` on (see
+/// `GET /api/services/log`'s `since`): what a follower polls with, keeping
+/// `next` for its following call instead of fetching the whole buffer again.
+pub struct ServiceLogSlice {
+    /// Later than the `since` asked for when lines in between were evicted.
+    pub start: u64,
+    pub next: u64,
+    pub lines: Vec<(OutputStream, String)>,
+}
+
+pub async fn get_service_log_since(
+    port: u16,
+    node_id: &str,
+    block: &str,
+    since: u64,
+) -> Result<ServiceLogSlice, String> {
+    let since = since.to_string();
+    let url = reqwest::Url::parse_with_params(
+        &format!("{}/api/services/log", base_url(port)),
+        &[("nodeId", node_id), ("block", block), ("since", &since)],
+    )
+    .map_err(|e| e.to_string())?;
+    let res = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
+    }
+    #[derive(serde::Deserialize)]
+    struct Line {
+        stream: OutputStream,
+        text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Slice {
+        start: u64,
+        next: u64,
+        lines: Vec<Line>,
+    }
+    let slice: Slice = res.json().await.map_err(|e| e.to_string())?;
+    Ok(ServiceLogSlice {
+        start: slice.start,
+        next: slice.next,
+        lines: slice
+            .lines
+            .into_iter()
+            .map(|l| (l.stream, l.text))
+            .collect(),
+    })
+}
+
 pub async fn stop_service(port: u16, node_id: &str, block: &str) -> Result<(), String> {
     let res = client()
         .post(format!("{}/api/services/stop", base_url(port)))

@@ -415,10 +415,13 @@ fn spawn_worker(
 
 /// Runs until `child` exits, one way or another: naturally, or because
 /// `shutdown` fired (the watcher itself is going down) — in which case
-/// this kills it and then still waits, so the caller never sees this
+/// this stops it and then still waits, so the caller never sees this
 /// return before the process is actually gone (matters for a worker
 /// holding real subprocess trees of its own, same reasoning
-/// `stream_exec::SpawnedProcess::kill` documents).
+/// `stream_exec::SpawnedProcess::kill` documents). The stop is a
+/// `SIGTERM` ([`terminate`]), not a `SIGKILL`: only a worker that is told
+/// can stop the runs, services and terminals it started, each in a process
+/// group of its own; killed outright, it leaves every one of them behind.
 async fn watch_worker(
     mut child: Child,
     shutdown_rx: &mut broadcast::Receiver<()>,
@@ -427,8 +430,7 @@ async fn watch_worker(
     tokio::select! {
         _ = child.wait() => {}
         _ = shutdown_rx.recv() => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            terminate(&mut child).await;
         }
         Ok(()) = &mut kill_rx => {
             terminate(&mut child).await;

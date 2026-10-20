@@ -3074,7 +3074,8 @@ async fn run_via_worker(
             "meshfox: {} service(s) running — streaming their output below; Ctrl-C stops them and exits",
             started_services.len()
         );
-        let mut printed = vec![0usize; started_services.len()];
+        // Per service: the sequence number of the next output line to ask for.
+        let mut next_line = vec![0u64; started_services.len()];
         let mut crash_reported = vec![false; started_services.len()];
         let mut any_crashed = false;
         let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -3084,17 +3085,25 @@ async fn run_via_worker(
                     let services = worker_client::list_services(port).await.unwrap_or_default();
                     let mut any_running = false;
                     for (i, (node_id, block)) in started_services.iter().enumerate() {
-                        let log = worker_client::get_service_log(port, node_id, block)
-                            .await
-                            .unwrap_or_default();
-                        for (stream, text) in log.iter().skip(printed[i]) {
-                            let tag = match stream {
-                                meshfox_server::stream_exec::OutputStream::Stderr => " (stderr)",
-                                meshfox_server::stream_exec::OutputStream::Stdout => "",
-                            };
-                            println!("[{block}]{tag} {text}");
+                        if let Ok(slice) =
+                            worker_client::get_service_log_since(port, node_id, block, next_line[i])
+                                .await
+                        {
+                            if slice.start > next_line[i] {
+                                eprintln!(
+                                    "[{block}] (meshfox: {} lines of output skipped — the service wrote them faster than they were read)",
+                                    slice.start - next_line[i]
+                                );
+                            }
+                            for (stream, text) in &slice.lines {
+                                let tag = match stream {
+                                    meshfox_server::stream_exec::OutputStream::Stderr => " (stderr)",
+                                    meshfox_server::stream_exec::OutputStream::Stdout => "",
+                                };
+                                println!("[{block}]{tag} {text}");
+                            }
+                            next_line[i] = slice.next;
                         }
-                        printed[i] = log.len();
                         let status = services
                             .iter()
                             .find(|s| &s.node_id == node_id && &s.block == block)

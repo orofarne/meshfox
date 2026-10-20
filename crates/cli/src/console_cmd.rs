@@ -90,7 +90,8 @@ async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), Strin
     let mut cursors: HashMap<Address, (Option<i64>, std::sync::Arc<std::sync::atomic::AtomicU64>)> =
         HashMap::new();
     let mut seen: HashMap<Address, i64> = HashMap::new();
-    let mut services: HashMap<Address, (u32, String, Vec<String>)> = HashMap::new();
+    // Per service: pid, last status shown, sequence number of the next output line.
+    let mut services: HashMap<Address, (u32, String, u64)> = HashMap::new();
     let mut result = State::Clear;
     let mut disconnected = false;
     let mut tasks = Tasks::default();
@@ -186,8 +187,8 @@ async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), Strin
                 let mut transitioning = Vec::new();
                 for service in current_services {
                     let addr = (service.node_id.clone(), service.block.clone());
-                    let entry = services.entry(addr).or_insert((service.pid, String::new(), Vec::new()));
-                    if entry.0 != service.pid { *entry = (service.pid, String::new(), Vec::new()); }
+                    let entry = services.entry(addr).or_insert((service.pid, String::new(), 0));
+                    if entry.0 != service.pid { *entry = (service.pid, String::new(), 0); }
                     if entry.1 != service.status {
                         eprintln!("[{}::{}] service {} (pid {})", service.node_id, service.block, service.status, service.pid);
                         entry.1 = service.status.clone();
@@ -197,15 +198,12 @@ async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), Strin
                     if matches!(service.status.as_str(), "starting" | "stopping" | "restarting") {
                         transitioning.push(service.block.clone());
                     }
-                    if let Ok(log) = api::get_service_log(port, &service.node_id, &service.block).await {
-                        let lines: Vec<_> = log.into_iter().map(|(stream, text)| format!("{stream:?}: {text}")).collect();
-                        let overlap = overlap(&entry.2, &lines);
-                        for line in &lines[overlap..] {
-                            let is_stderr = line.starts_with("Stderr: ");
-                            let text = line.split_once(": ").map_or(line.as_str(), |(_, text)| text);
+                    if let Ok(slice) = api::get_service_log_since(port, &service.node_id, &service.block, entry.2).await {
+                        for (stream, text) in &slice.lines {
+                            let is_stderr = matches!(stream, meshfox_server::stream_exec::OutputStream::Stderr);
                             output(&(service.node_id.clone(), service.block.clone()), text, is_stderr);
                         }
-                        entry.2 = lines;
+                        entry.2 = slice.next;
                     }
                 }
                 let state = if !active.is_empty() {
@@ -220,12 +218,4 @@ async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), Strin
             }
         }
     }
-}
-
-// Service logs are bounded snapshots, so a rolling buffer can lose its prefix.
-fn overlap(previous: &[String], current: &[String]) -> usize {
-    (0..=previous.len().min(current.len()))
-        .rev()
-        .find(|&n| previous[previous.len() - n..] == current[..n])
-        .unwrap_or(0)
 }

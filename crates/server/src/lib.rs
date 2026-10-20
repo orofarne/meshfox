@@ -2180,24 +2180,102 @@ fn untouched_worker_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(5 * 60))
 }
 
-/// Polls `canvas_path`'s mtime on a plain OS thread — simpler and more
-/// portable than pulling in a filesystem-event-notification dependency, and
-/// cheap enough at this interval for a single file — reloading `state.raw`
-/// whenever the file's content actually differs from what the server
-/// already has in memory, and broadcasting a `changed` event over
-/// `/api/watch` so every open tab reloads. Comparing content, not just
-/// mtime, is what keeps this from re-broadcasting the server's own writes
-/// back to itself: by the time this notices the mtime bump from
-/// `AppState::save`, `state.raw` already matches what's now on disk, so
-/// nothing looks different and nothing is sent.
-///
-/// (path, mtime, len) of every `include` target of the current document.
-fn include_stamps(state: &AppState) -> Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)> {
-    let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = Canvas::from_markdown(&raw) else {
-        return Vec::new();
-    };
-    meshfox_core::include::list_includes(&canvas, &state.canvas_path)
+/// (mtime, len) of a watched file — `None` while it is missing.
+type FileStamp = Option<(std::time::SystemTime, u64)>;
+
+/// How long a [`WatchPlan`] is trusted when the document text has not
+/// changed: configuration, variable answers and an `include` target's own
+/// text can all change what is watched without touching the canvas file.
+const WATCH_PLAN_TTL: Duration = Duration::from_secs(3);
+
+/// What the file watcher polls, worked out from the document once and then
+/// reused: parsing it, resolving its `include`s and re-reading every config
+/// file and answer cache to build the [`FileAccess`](meshfox_core::FileAccess)
+/// are what a tick used to spend its time on (a few document parses twice a
+/// second, forever, per worker). A tick now only confines each target again
+/// — so a file or image that appears is noticed at once — and stats it.
+struct WatchPlan {
+    raw: String,
+    built: std::time::Instant,
+    /// The document as written, for its `include` nodes.
+    canvas: Option<Canvas>,
+    include_access: meshfox_core::FileAccess,
+    /// `(id, target)` of every `file` node shown with `display="code"`.
+    file_targets: Vec<(String, String)>,
+    /// `(authored path, base directory, destination)` of every local image
+    /// in the document with its `include`s spliced in.
+    images: Vec<(PathBuf, PathBuf, String)>,
+    /// Confines `file_targets` and `images`; built only when there are any.
+    access: Option<meshfox_core::FileAccess>,
+}
+
+impl WatchPlan {
+    fn build(state: &AppState) -> WatchPlan {
+        let raw = state.raw.lock().unwrap().clone();
+        let canvas = Canvas::from_markdown(&raw).ok();
+        let include_access = match &canvas {
+            Some(c) if c.nodes.iter().any(|n| n.node_type == NodeType::Include) => {
+                meshfox_core::FileAccess::for_canvas_path(c, &state.canvas_path)
+            }
+            _ => meshfox_core::FileAccess::none(),
+        };
+        let file_targets: Vec<(String, String)> = canvas
+            .iter()
+            .flat_map(|c| &c.nodes)
+            .filter(|n| n.node_type == NodeType::File && n.display == Some(FileDisplay::Code))
+            .filter_map(|n| Some((n.id.clone(), n.target.clone()?)))
+            .collect();
+        let root = canvas_root_dir(&state.canvas_path);
+        let mut images = Vec::new();
+        let resolved = canvas.as_ref().and_then(|c| {
+            meshfox_core::include::resolve_with_access(c, &state.canvas_path, &include_access).ok()
+        });
+        for node in resolved.iter().flat_map(|c| &c.nodes) {
+            let destinations = meshfox_core::image_attrs::local_image_destinations(&node.text);
+            if destinations.is_empty() {
+                continue;
+            }
+            let base = node
+                .asset_base
+                .as_deref()
+                .map(std::path::Path::new)
+                .unwrap_or(root);
+            let Ok(base) = base.canonicalize() else {
+                continue;
+            };
+            for destination in destinations {
+                let destination = destination.trim_start_matches('/').to_string();
+                images.push((base.join(&destination), base.clone(), destination));
+            }
+        }
+        let access = (!file_targets.is_empty() || !images.is_empty()).then(|| file_access(state));
+        WatchPlan {
+            raw,
+            built: std::time::Instant::now(),
+            canvas,
+            include_access,
+            file_targets,
+            images,
+            access,
+        }
+    }
+
+    /// Whether the plan no longer matches the document, or is old enough
+    /// that what it was built from may have changed on disk.
+    fn is_stale(&self, state: &AppState) -> bool {
+        self.built.elapsed() >= WATCH_PLAN_TTL || state.raw.lock().unwrap().as_str() != self.raw
+    }
+
+    /// (path, mtime, len) of every `include` target of the document.
+    fn include_stamps(&self, state: &AppState) -> Vec<(PathBuf, FileStamp)> {
+        let Some(canvas) = &self.canvas else {
+            return Vec::new();
+        };
+        meshfox_core::include::list_includes_with_access(
+            canvas,
+            &state.canvas_path,
+            &self.include_access,
+        )
         .into_iter()
         .map(|info| {
             let stamp = std::fs::metadata(&info.path)
@@ -2206,75 +2284,57 @@ fn include_stamps(state: &AppState) -> Vec<(PathBuf, Option<(std::time::SystemTi
             (info.path, stamp)
         })
         .collect()
-}
-
-/// (node id, (mtime, len) of the confined target — `None` while it is
-/// missing, unconfirmed or outside every trusted root) of every `file` node
-/// shown with `display="code"`. Resolved through [`file_access`], so a
-/// `$VAR` target follows the variable's current value. Nothing is read or
-/// resolved at all for a canvas without such a node.
-fn file_node_stamps(state: &AppState) -> Vec<(String, Option<(std::time::SystemTime, u64)>)> {
-    let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = Canvas::from_markdown(&raw) else {
-        return Vec::new();
-    };
-    let targets: Vec<(String, String)> = canvas
-        .nodes
-        .iter()
-        .filter(|n| n.node_type == NodeType::File && n.display == Some(FileDisplay::Code))
-        .filter_map(|n| Some((n.id.clone(), n.target.clone()?)))
-        .collect();
-    if targets.is_empty() {
-        return Vec::new();
     }
-    let access = file_access(state);
-    let dir = canvas_root_dir(&state.canvas_path);
-    targets
-        .into_iter()
-        .map(|(id, target)| {
-            let stamp = access
-                .confine(dir, &target)
-                .ok()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
-            (id, stamp)
-        })
-        .collect()
-}
 
-/// Images share the serving routes' confinement rules. Keep the authored path
-/// as the key so deletion, recreation and atomic replacement are observable.
-fn image_stamps(
-    state: &AppState,
-) -> std::collections::BTreeMap<PathBuf, Option<(std::time::SystemTime, u64)>> {
-    let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = resolved_canvas_structure(&raw, &state.canvas_path) else {
-        return Default::default();
-    };
-    let root = canvas_root_dir(&state.canvas_path);
-    let access = file_access(state);
-    let mut stamps = std::collections::BTreeMap::new();
-    for node in &canvas.nodes {
-        let base = node
-            .asset_base
-            .as_deref()
-            .map(std::path::Path::new)
-            .unwrap_or(root);
-        let Ok(base) = base.canonicalize() else {
-            continue;
+    /// (node id, (mtime, len) of the confined target — `None` while it is
+    /// missing, unconfirmed or outside every trusted root) of every `file`
+    /// node shown with `display="code"`. Confined through the file access
+    /// the plan was built with, so a `$VAR` target follows the variable's
+    /// value as of then.
+    fn file_stamps(&self, state: &AppState) -> Vec<(String, FileStamp)> {
+        let Some(access) = &self.access else {
+            return Vec::new();
         };
-        for destination in meshfox_core::image_attrs::local_image_destinations(&node.text) {
-            let path = base.join(destination.trim_start_matches('/'));
-            let stamp = access
-                .confine(&base, destination.trim_start_matches('/'))
-                .ok()
-                .and_then(|resolved| std::fs::metadata(resolved).ok())
-                .filter(|meta| meta.is_file())
-                .and_then(|meta| meta.modified().ok().map(|time| (time, meta.len())));
-            stamps.insert(path, stamp);
-        }
+        let dir = canvas_root_dir(&state.canvas_path);
+        self.file_targets
+            .iter()
+            .map(|(id, target)| {
+                let stamp = access
+                    .confine(dir, target)
+                    .ok()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+                (id.clone(), stamp)
+            })
+            .collect()
     }
-    stamps
+
+    /// Images share the serving routes' confinement rules. The authored path
+    /// is the key so deletion, recreation and atomic replacement are
+    /// observable.
+    fn image_stamps(&self) -> std::collections::BTreeMap<PathBuf, FileStamp> {
+        let Some(access) = &self.access else {
+            return Default::default();
+        };
+        self.images
+            .iter()
+            .map(|(path, base, destination)| {
+                let stamp = access
+                    .confine(base, destination)
+                    .ok()
+                    .and_then(|resolved| std::fs::metadata(resolved).ok())
+                    .filter(|meta| meta.is_file())
+                    .and_then(|meta| meta.modified().ok().map(|time| (time, meta.len())));
+                (path.clone(), stamp)
+            })
+            .collect()
+    }
+}
+
+/// [`WatchPlan::image_stamps`] for a plan built right now.
+#[cfg(test)]
+fn image_stamps(state: &AppState) -> std::collections::BTreeMap<PathBuf, FileStamp> {
+    WatchPlan::build(state).image_stamps()
 }
 
 /// Once, when a canvas's worker starts: removes the hidden files `tangle`
@@ -2293,17 +2353,33 @@ fn sweep_tangled_files(state: &AppState) {
     meshfox_core::tangle::sweep_canvas(&canvas, &state.canvas_path);
 }
 
+/// Polls `canvas_path`'s mtime on a plain OS thread — simpler and more
+/// portable than pulling in a filesystem-event-notification dependency, and
+/// cheap enough at this interval for a single file — reloading `state.raw`
+/// whenever the file's content actually differs from what the server
+/// already has in memory, and broadcasting a `changed` event over
+/// `/api/watch` so every open tab reloads. Comparing content, not just
+/// mtime, is what keeps this from re-broadcasting the server's own writes
+/// back to itself: by the time this notices the mtime bump from
+/// `AppState::save`, `state.raw` already matches what's now on disk, so
+/// nothing looks different and nothing is sent.
+///
+/// The same tick stamps the files the document shows (see [`WatchPlan`]).
 fn spawn_file_watcher(state: Arc<AppState>) {
     std::thread::spawn(move || {
         let mut last_mtime = std::fs::metadata(&state.canvas_path)
             .and_then(|m| m.modified())
             .ok();
-        let mut last_includes = include_stamps(&state);
-        let mut last_files = file_node_stamps(&state);
-        let mut last_images = image_stamps(&state);
+        let mut plan = WatchPlan::build(&state);
+        let mut last_includes = plan.include_stamps(&state);
+        let mut last_files = plan.file_stamps(&state);
+        let mut last_images = plan.image_stamps();
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            let images = image_stamps(&state);
+            if plan.is_stale(&state) {
+                plan = WatchPlan::build(&state);
+            }
+            let images = plan.image_stamps();
             if images != last_images {
                 last_images = images;
                 state.canvas_events.push(ServerEvent::ImagesChanged);
@@ -2311,17 +2387,19 @@ fn spawn_file_watcher(state: Arc<AppState>) {
             // A code preview's target changing on disk — a block that just
             // ran wrote it, or an editor did. The canvas file itself is
             // untouched, so this is its own, light event (no reload).
-            let files = file_node_stamps(&state);
+            let files = plan.file_stamps(&state);
             if files != last_files {
                 last_files = files;
                 state.canvas_events.push(ServerEvent::FilesChanged);
             }
             // An `include` target edited on its own leaves the canvas file
             // untouched, so it is stamped separately and just announced.
-            let stamps = include_stamps(&state);
+            let stamps = plan.include_stamps(&state);
             if stamps != last_includes {
                 last_includes = stamps;
                 state.canvas_events.push(ServerEvent::Changed);
+                // The included text is part of what the plan was built from.
+                plan = WatchPlan::build(&state);
             }
             let Ok(meta) = std::fs::metadata(&state.canvas_path) else {
                 continue;
@@ -9547,9 +9625,11 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ServiceKeyQuery {
+struct ServiceLogQuery {
     node_id: String,
     block: String,
+    /// Sequence number of the first line wanted; see `services::LogSlice`.
+    since: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -9559,14 +9639,19 @@ struct ServiceLogLine {
     text: String,
 }
 
-/// `GET /api/services/log?nodeId=..&block=..` — the service's full retained
-/// output buffer (see `crate::services`'s `RingBuffer`), polled rather than
-/// streamed: simple and proportionate at this scale, no second live
-/// transport alongside `/api/run`'s NDJSON one.
+/// `GET /api/services/log?nodeId=..&block=..[&since=N]` — the service's
+/// retained output buffer (see `crate::services`'s `RingBuffer`), polled
+/// rather than streamed: simple and proportionate at this scale, no second
+/// live transport alongside `/api/run`'s NDJSON one.
+///
+/// Without `since`, every retained line as a JSON array. With it, only the
+/// lines numbered `since` on, as `{start, next, lines}`: a poller keeps
+/// `next` and asks from there, instead of fetching the whole buffer each time.
+/// A `start` past `since` means the lines between were already evicted.
 async fn get_service_log(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<ServiceKeyQuery>,
-) -> Result<Json<Vec<ServiceLogLine>>, ApiError> {
+    Query(q): Query<ServiceLogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let services = state.services.lock().unwrap();
     let handle = services
         .get(&(q.node_id.clone(), q.block.clone()))
@@ -9576,13 +9661,23 @@ async fn get_service_log(
                 format!("no service {:?}/{:?}", q.node_id, q.block),
             )
         })?;
-    Ok(Json(
-        handle
-            .log_snapshot()
+    let lines = |lines: Vec<(stream_exec::OutputStream, String)>| -> Vec<ServiceLogLine> {
+        lines
             .into_iter()
             .map(|(stream, text)| ServiceLogLine { stream, text })
-            .collect(),
-    ))
+            .collect()
+    };
+    Ok(Json(match q.since {
+        None => serde_json::json!(lines(handle.log_snapshot())),
+        Some(since) => {
+            let slice = handle.log_since(since);
+            serde_json::json!({
+                "start": slice.start,
+                "next": slice.next,
+                "lines": lines(slice.lines),
+            })
+        }
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -20270,6 +20365,36 @@ mod service_endpoint_tests {
     }
 
     #[tokio::test]
+    async fn the_service_log_can_be_read_from_a_line_number_on() {
+        let canvas_path = write_test_canvas(SERVICE_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        run_ws_events(addr, &[("block", "srv")]).await;
+        let url = "/api/services/log?nodeId=root&block=srv";
+        let (status, whole) = get(addr, url).await;
+        assert_eq!(status, 200);
+        assert!(serde_json::from_str::<serde_json::Value>(&whole)
+            .unwrap()
+            .is_array());
+        let (status, body) = get(addr, &format!("{url}&since=0")).await;
+        assert_eq!(status, 200, "{body}");
+        let slice: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let next = slice["next"].as_u64().unwrap();
+        assert_eq!(slice["start"], 0);
+        assert_eq!(slice["lines"].as_array().unwrap().len() as u64, next);
+        let (_, body) = get(addr, &format!("{url}&since={next}")).await;
+        let again: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(again["lines"].as_array().unwrap().len(), 0);
+        assert_eq!(again["next"].as_u64().unwrap(), next);
+        let _ = post_json(
+            addr,
+            "/api/services/stop",
+            r#"{"nodeId":"root","block":"srv"}"#,
+        )
+        .await;
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
     async fn run_block_spawns_a_service_and_it_shows_up_as_running() {
         let canvas_path = write_test_canvas(SERVICE_CANVAS);
         let addr = spawn_test_server(canvas_path.clone()).await;
@@ -22378,6 +22503,29 @@ mod image_watch_tests {
         assert_eq!(image_stamps(&state)[&dir.join("plot.png")], None);
         std::fs::write(dir.join("plot.png"), b"back").unwrap();
         assert!(image_stamps(&state)[&dir.join("plot.png")].is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The watcher polls twice a second, forever: what it watches is worked
+    /// out once, not per tick. A file appearing is still seen by the plan it
+    /// already has; only the document's own text makes it stale.
+    #[tokio::test]
+    async fn a_watch_plan_is_reused_until_the_document_changes() {
+        let dir = std::env::temp_dir().join(format!("meshfox-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let path = dir.join("test.canvas.md");
+        let doc = "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n![plot](plot.png)\n";
+        std::fs::write(&path, doc).unwrap();
+        let state = build_state(path, false, None).await.unwrap();
+        let plan = WatchPlan::build(&state);
+        assert!(!plan.is_stale(&state));
+        assert_eq!(plan.image_stamps()[&dir.join("plot.png")], None);
+        std::fs::write(dir.join("plot.png"), b"png").unwrap();
+        assert!(!plan.is_stale(&state), "a new file is not a new plan");
+        assert!(plan.image_stamps()[&dir.join("plot.png")].is_some());
+        state.raw.lock().unwrap().push_str("\nmore text\n");
+        assert!(plan.is_stale(&state));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

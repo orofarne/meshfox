@@ -36,8 +36,23 @@ pub enum IncludeError {
 /// `canvas` was parsed from, used to resolve a relative include target
 /// against its directory.
 pub fn resolve(canvas: &Canvas, base_path: &Path) -> Result<Canvas, IncludeError> {
-    let access = crate::FileAccess::for_canvas_path(canvas, base_path);
-    resolve_with_access(canvas, base_path, &access)
+    resolve_with_access(canvas, base_path, &access_for(canvas, base_path))
+}
+
+/// The file access `canvas`'s `include` nodes are confined by. Building it
+/// re-reads every configuration file and the answer cache, so a document
+/// without an `include` node (the common case, and the one a polling caller
+/// hits twice a second) gets an empty one instead: nothing consults it.
+fn access_for(canvas: &Canvas, base_path: &Path) -> crate::FileAccess {
+    if canvas
+        .nodes
+        .iter()
+        .any(|n| n.node_type == NodeType::Include)
+    {
+        crate::FileAccess::for_canvas_path(canvas, base_path)
+    } else {
+        crate::FileAccess::none()
+    }
 }
 
 pub fn resolve_with_access(
@@ -116,8 +131,7 @@ pub struct IncludeInfo {
 /// `IncludeInfo`), without ever reading its target's content — `base_path`
 /// is the file `canvas` was parsed from, same as `resolve`.
 pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
-    let access = crate::FileAccess::for_canvas_path(canvas, base_path);
-    list_includes_with_access(canvas, base_path, &access)
+    list_includes_with_access(canvas, base_path, &access_for(canvas, base_path))
 }
 
 pub fn list_includes_with_access(

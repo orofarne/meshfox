@@ -34,7 +34,28 @@ fn command(dir: &Path) -> Command {
     );
     cmd
 }
-fn setup(body: &str) -> (PathBuf, PathBuf) {
+/// A test's scratch directory, removed when the test ends however it ends —
+/// a failed assertion included. Declared before anything that runs in it, so
+/// it is dropped after the processes started there have been stopped.
+struct TestDir(PathBuf);
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+fn setup(body: &str) -> (TestDir, PathBuf) {
     let dir = std::env::temp_dir().join(format!("meshfox-logs-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
     std::fs::write(
@@ -48,7 +69,7 @@ fn setup(body: &str) -> (PathBuf, PathBuf) {
         format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{body}"),
     )
     .unwrap();
-    (dir, canvas)
+    (TestDir(dir), canvas)
 }
 fn invoke(dir: &Path, canvas: &Path, args: &[&str]) -> std::process::Output {
     command(dir).arg(canvas).args(args).output().unwrap()
@@ -211,9 +232,19 @@ fn failed_dependency_records_the_target_as_not_started() {
 struct Coordinator(Process);
 impl Drop for Coordinator {
     fn drop(&mut self) {
+        // SIGTERM lets the coordinator stop its workers, and a worker stop
+        // what it started; a hung one is killed rather than waited on forever.
         unsafe {
             libc::kill(self.0 .0.id() as i32, libc::SIGTERM);
         }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if matches!(self.0 .0.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.0 .0.kill();
         let _ = self.0 .0.wait();
     }
 }
@@ -260,6 +291,31 @@ fn detached_chain_returns_id_and_finishes_after_client_exits() {
     assert!(logs.contains("detached-output"), "{logs}");
     assert!(logs.contains("chain-finished"), "{logs}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stopping_the_coordinator_stops_what_a_detached_chain_started() {
+    let (dir, canvas) =
+        setup("```sh name=slow\necho $$ > pid\nwhile [ ! -f release ]; do sleep 0.05; done\n```\n");
+    let coordinator = coordinator(&dir, &canvas);
+    success(&dir, &canvas, &["run", "-d", "slow"]);
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(dir.join("pid"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // SAFETY: signal 0 only asks whether the process exists.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "the block should be running"
+    );
+    drop(coordinator);
+    wait_for(|| unsafe { libc::kill(pid, 0) } != 0);
 }
 
 #[test]
