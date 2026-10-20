@@ -9383,7 +9383,7 @@ async fn get_active_runs(State(state): State<Arc<AppState>>) -> Json<Vec<ActiveR
                 status: "running",
                 exit_code: None,
                 uptime_ms: handle.uptime_ms(),
-                history_id: None,
+                history_id: handle.run_id(),
                 started_at: None,
             });
         }
@@ -10300,7 +10300,7 @@ async fn subscribe_run_impl(
     // still current (see `serve_stored_run`).
     let handle = match registered {
         Some(h)
-            if query.run_id.is_none()
+            if (query.run_id.is_none() || query.run_id == h.run_id())
                 && matches!(h.outcome(), run_registry::RunOutcome::Running) =>
         {
             h
@@ -21301,6 +21301,20 @@ mod run_lock_tests {
             .unwrap_or_else(|| panic!("expected an active-runs entry for root/slow, got: {body}"));
         assert_eq!(entry["kind"], "plain");
         assert_eq!(entry["status"], "running");
+        let id = entry["historyId"]
+            .as_i64()
+            .expect("live run has a persisted identity");
+        let events = subscribe_ws_events(
+            addr,
+            &format!("/api/run/subscribe?nodeId=root&block=slow&runId={id}&sinceSeq=0"),
+        )
+        .await;
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "line" && e["text"] == "done"));
+        assert!(events
+            .iter()
+            .any(|e| e["type"] == "done" && e["exitCode"] == 0));
 
         let run_events = run.await.unwrap();
         assert!(run_events.iter().any(|e| e["type"] == "done"));

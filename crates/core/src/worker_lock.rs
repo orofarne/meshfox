@@ -48,6 +48,25 @@ pub fn is_held(canvas_path: &Path) -> bool {
     true
 }
 
+/// Find an existing worker without creating discovery files or becoming a worker.
+pub fn get(canvas_path: &Path) -> io::Result<Option<u16>> {
+    let path = lock_path(canvas_path);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: a valid owned fd; the nonblocking probe is released on drop.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(None);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return Err(error);
+    }
+    read_port_with_retry(&path).map(Some)
+}
+
 /// Where a canvas's worker-discovery lock lives — canonicalizes `canvas_path`
 /// first so callers that reach the same file via different (relative,
 /// symlinked, differently-`cwd`'d) spellings still agree on one path; falls
@@ -265,6 +284,21 @@ mod tests {
         let path = dir.join("doc.canvas.md");
         std::fs::write(&path, "# Doc\n").unwrap();
         path
+    }
+
+    #[test]
+    fn discovery_never_creates_and_ignores_unlocked_stale_port() {
+        let path = tmp_canvas("discovery");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().join(".meshfox"));
+        assert_eq!(get(&path).unwrap(), None);
+        assert!(!lock_path(&path).exists());
+        let Acquired::Us(mut guard) = try_acquire(&path).unwrap() else {
+            panic!("free lock")
+        };
+        guard.write_port(4242).unwrap();
+        assert_eq!(get(&path).unwrap(), Some(4242));
+        drop(guard);
+        assert_eq!(get(&path).unwrap(), None);
     }
 
     #[test]

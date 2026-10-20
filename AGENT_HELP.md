@@ -230,6 +230,31 @@ starting/stopping/restarting services count as activity, and a crashed service
 or failed stop shows failure. Progress-only terminals withdraw the indicator
 when services are ready. TUI exit and handled shutdown signals clear status.
 
+### Observe an existing core
+
+`meshfox console [CANVAS]` (or `meshfox CANVAS console`, or `--canvas CANVAS`)
+attaches to an already running core. It never starts a core or executes blocks.
+Without a path it discovers a single `.canvas.md` file by name, without reading
+canvas contents. For a marked plain `.md` canvas, pass its path. A missing core is an
+error; a configured but unreachable coordinator is not bypassed.
+
+The console replays buffered output of running plain blocks, follows new runs,
+and reports service state and bounded service-log snapshots. Historical finished
+runs at initial attachment are omitted. TTY sessions are outside its scope.
+Output carries `node::block` prefixes; stderr output goes to stderr. Service
+snapshots are reconciled by their overlapping lines (identical repeated lines
+in a completely rolled-over buffer cannot be distinguished).
+
+`--terminal-status auto|off|iterm2|progress|title` and
+`MESHFOX_TERMINAL_STATUS` work as for run/TUI. The indicator aggregates active
+blocks, failures and ready services, shows waiting while disconnected, and
+clears on exit. Ctrl-C detaches without cancelling runs or stopping services.
+The console retries discovery after connection loss, including port changes.
+Rust passive run subscriptions resume with sequence cursors and a persisted
+run identity, so reconnecting cannot splice another invocation's output into
+the original stream. Workers without persisted run identities cannot resume
+that stream safely.
+
 ### Native calls between canvases
 
 A `meshfox` fence is YAML with required `canvas` and `run`, optional `set`

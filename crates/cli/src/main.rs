@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+mod console_cmd;
 mod coordinator;
 mod cores_cmd;
 mod lsp;
@@ -116,6 +117,13 @@ enum SessionOp {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Observe an already running core; Ctrl-C detaches without stopping tasks.
+    Console {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+        #[arg(long, value_enum, default_value = terminal_status::default_mode())]
+        terminal_status: terminal_status::Mode,
+    },
     /// Run one or more named code blocks.
     ///
     /// The last argument is a comma-separated list of block names; every
@@ -1287,6 +1295,22 @@ fn main() {
     };
 
     match command {
+        Command::Console {
+            canvas,
+            terminal_status,
+        } => {
+            let path = canvas.resolve().unwrap_or_else(|| {
+                console_cmd::discover().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                })
+            });
+            let runtime = tokio::runtime::Runtime::new().expect("async runtime");
+            if let Err(error) = runtime.block_on(console_cmd::run(path, terminal_status)) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Command::Run {
             terminal_status,
             confirm,

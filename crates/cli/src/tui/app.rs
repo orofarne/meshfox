@@ -8732,6 +8732,7 @@ mod tests {
         .await;
         let run = |block: &str, kind: &str, status: &str, code: Option<i32>| {
             crate::worker_client::ActiveRunDto {
+                history_id: None,
                 node_id: "root".into(),
                 block: block.into(),
                 kind: kind.into(),
@@ -8819,6 +8820,7 @@ mod tests {
         let mut app = App::new(path, tx, None, None).await.unwrap();
         let run = |node: &str, kind: &str, status: &str, exit_code: Option<i32>| {
             crate::worker_client::ActiveRunDto {
+                history_id: None,
                 node_id: node.into(),
                 block: "b".into(),
                 kind: kind.into(),
@@ -9322,6 +9324,7 @@ mod tests {
 
     fn active_run(block: &str, kind: &str, status: &str) -> crate::worker_client::ActiveRunDto {
         crate::worker_client::ActiveRunDto {
+            history_id: None,
             node_id: "root".into(),
             block: block.into(),
             kind: kind.into(),

@@ -1437,56 +1437,104 @@ pub enum SubscribeEvent {
     Done { exit_code: Option<i32> },
 }
 
-/// `GET /api/run/subscribe?nodeId=..&block=..` — watches one address's own
-/// most recent run independent of whoever started it (a passive tab/TUI
-/// session reacting to `WatchEvent::RunStarted`, mirroring the web UI's
-/// own `watchAutorunBlock`). A WebSocket, not an HTTP-streamed response —
-/// replays every buffered line, then tails live output until the run's own
-/// terminal outcome, at which point the socket closes. `since_seq` is
-/// always `0` here (unlike the web UI, which reconnects with its own
-/// last-seen `seq` — TUI only ever opens one subscription per run, ended by
-/// the server's own terminal event, so there's no reconnect case to
-/// resume). This address never having run at all (or the reservation
-/// racing ahead of `runs_registry` somehow) is a deliberate silent no-op
-/// server-side (the socket upgrades, then closes immediately with zero
-/// messages) — indistinguishable here from a connect failure, and handled
-/// the same way: just an empty channel, best-effort, same as the web UI's
-/// own `.catch()` on this call.
+/// Passive subscription with resumable output. A persisted run identity pins
+/// reconnects to the original invocation, even when its address runs again.
 pub fn subscribe_run(
     port: u16,
     node_id: String,
     block: String,
 ) -> tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent> {
+    subscribe_run_id(port, node_id, block, None)
+}
+
+pub fn subscribe_run_id(
+    port: u16,
+    node_id: String,
+    block: String,
+    run_id: Option<i64>,
+) -> tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent> {
+    subscribe_run_cursor(
+        port,
+        node_id,
+        block,
+        run_id,
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    )
+}
+
+/// Share a cursor across worker-port changes as well as socket reconnects.
+pub fn subscribe_run_cursor(
+    port: u16,
+    node_id: String,
+    block: String,
+    run_id: Option<i64>,
+    saved_cursor: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let url = reqwest::Url::parse_with_params(
-            &format!("ws://127.0.0.1:{port}/api/run/subscribe"),
-            &[("nodeId", node_id.as_str()), ("block", block.as_str())],
-        );
-        let Ok(url) = url else { return };
-        let Ok((mut ws, _)) = tokio_tungstenite::connect_async(url.as_str()).await else {
-            return;
+        let id = match run_id {
+            Some(id) => Some(id),
+            None => list_active_runs(port).await.ok().and_then(|runs| {
+                runs.into_iter()
+                    .find(|r| r.node_id == node_id && r.block == block && r.kind == "plain")
+                    .and_then(|r| r.history_id)
+            }),
         };
+        let mut cursor = saved_cursor.load(std::sync::atomic::Ordering::Relaxed);
         loop {
-            let msg = match ws_next(&mut ws).await {
-                WsNext::Frame(msg) => msg,
-                WsNext::Closed => return,
-                // The run's own end never arrived: report the stream as
-                // ended abnormally (exit code unknown) rather than leave the
-                // block showing "running" for ever.
-                WsNext::Silent => {
-                    let _ = tx.send(SubscribeEvent::Done { exit_code: None });
-                    return;
+            let mut url = reqwest::Url::parse_with_params(
+                &format!("ws://127.0.0.1:{port}/api/run/subscribe"),
+                &[("nodeId", node_id.as_str()), ("block", block.as_str())],
+            )
+            .expect("local subscription URL");
+            url.query_pairs_mut()
+                .append_pair("sinceSeq", &cursor.to_string());
+            if let Some(id) = id {
+                url.query_pairs_mut().append_pair("runId", &id.to_string());
+            }
+            let connection = tokio::select! {
+                _ = tx.closed() => return,
+                result = tokio_tungstenite::connect_async(url.as_str()) => result,
+            };
+            if let Ok((mut ws, _)) = connection {
+                loop {
+                    let next = tokio::select! {
+                        _ = tx.closed() => return,
+                        next = ws_next(&mut ws) => next,
+                    };
+                    let WsNext::Frame(tokio_tungstenite::tungstenite::Message::Text(text)) = next
+                    else {
+                        if matches!(next, WsNext::Frame(_)) {
+                            continue;
+                        }
+                        break;
+                    };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    let Ok(event) = serde_json::from_value::<SubscribeEvent>(value.clone()) else {
+                        continue;
+                    };
+                    if let Some(seq) = value["seq"].as_u64() {
+                        if seq < cursor {
+                            continue;
+                        }
+                        cursor = seq.saturating_add(1);
+                        saved_cursor.store(cursor, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let done = matches!(event, SubscribeEvent::Done { .. });
+                    if tx.send(event).is_err() || done {
+                        return;
+                    }
                 }
-            };
-            let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_str::<SubscribeEvent>(&text) else {
-                continue;
-            };
-            if tx.send(event).is_err() {
+            }
+            // An unidentifiable run cannot safely resume after an address is reused.
+            if id.is_none() {
                 return;
+            }
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
             }
         }
     });
@@ -2412,6 +2460,8 @@ pub async fn tty_attach(
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveRunDto {
+    #[serde(default)]
+    pub history_id: Option<i64>,
     pub node_id: String,
     pub block: String,
     pub kind: String,
@@ -3006,4 +3056,75 @@ pub fn child_step_label(child: &serde_json::Value) -> Option<String> {
         canvas.file_name()?.to_string_lossy(),
         event["block"].as_str()?
     ))
+}
+
+#[cfg(test)]
+mod subscription_resume_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+
+    #[tokio::test]
+    async fn reconnect_pins_run_and_resumes_after_last_sequence() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for (cursor, frames) in [
+                (
+                    "sinceSeq=7",
+                    vec![r#"{"type":"line","seq":7,"stream":"stdout","text":"first"}"#],
+                ),
+                (
+                    "sinceSeq=8",
+                    vec![
+                        r#"{"type":"line","seq":7,"stream":"stdout","text":"duplicate"}"#,
+                        r#"{"type":"line","seq":8,"stream":"stderr","text":"second"}"#,
+                        r#"{"type":"done","outcome":"exited","exitCode":0}"#,
+                    ],
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     response| {
+                        let query = request.uri().query().unwrap();
+                        assert!(query.contains("runId=42"));
+                        assert!(query.contains(cursor));
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
+                for frame in frames {
+                    ws.send(tokio_tungstenite::tungstenite::Message::Text(frame.into()))
+                        .await
+                        .unwrap();
+                }
+                ws.close(None).await.unwrap();
+                let _ = ws.next().await;
+            }
+        });
+        let cursor = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let mut events = subscribe_run_cursor(
+            port,
+            "root".into(),
+            "build".into(),
+            Some(42),
+            cursor.clone(),
+        );
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    SubscribeEvent::Line { text, .. } => output.push(text),
+                    SubscribeEvent::Done { exit_code } => assert_eq!(exit_code, Some(0)),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, ["first", "second"]);
+        assert_eq!(cursor.load(std::sync::atomic::Ordering::Relaxed), 9);
+        server.await.unwrap();
+    }
 }

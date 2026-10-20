@@ -79,6 +79,23 @@ pub async fn resolve(canvas_path: &Path) -> io::Result<Resolved> {
     }
 }
 
+/// Find a running worker. Never asks the coordinator to start one.
+pub async fn get(canvas_path: &Path) -> io::Result<Option<u16>> {
+    let root = crate::canvas_root_dir(canvas_path);
+    if let Some(socket) = meshfox_core::config::server_socket(root) {
+        let canonical = canvas_path.canonicalize()?;
+        let cores = watcher_protocol::request_list_cores(&socket).await?;
+        return match cores.into_iter().find(|c| c.canvas_path == canonical) {
+            Some(core) => core
+                .port
+                .map(Some)
+                .ok_or_else(|| io::Error::other("core is still starting")),
+            None => Ok(None),
+        };
+    }
+    worker_lock::get(canvas_path)
+}
+
 /// Return a worker that can own a short CLI or MCP operation. If this
 /// process wins the per-file lock, keep it in an embedded worker until the
 /// caller's Tokio runtime ends. A failed bind is an error, never permission
