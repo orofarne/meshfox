@@ -59,13 +59,13 @@ pub fn prepare_run(
                     })?;
                     let app = crate::args::Application::parse(&addr.block_name)
                         .map_err(DepsError::Arguments)?;
-                    let raw_block = crate::scan_runnable_blocks(&node.id, &node.text)
+                    let raw_block = node.runnable_blocks()
                         .into_iter()
                         .find(|b| b.name.as_deref() == Some(&app.definition))
                         .ok_or_else(|| {
                             DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone())
                         })?;
-                    let signatures = crate::args::scan_signatures(&node.id, &node.text)
+                    let signatures = crate::args::scan_node_signatures(node)
                         .map_err(|e| DepsError::Arguments(e.to_string()))?;
                     let locals: HashSet<_> = signatures
                         .iter()
@@ -158,7 +158,7 @@ fn potential_secrets(
                     continue;
                 }
                 candidates.extend(
-                    crate::scan_runnable_blocks(&node.id, &node.text)
+                    node.runnable_blocks()
                         .into_iter()
                         .filter(|b| b.attrs.contains_key("outputs"))
                         .map(|b| BlockAddr::new(&node.id, b.name.unwrap())),
@@ -177,13 +177,13 @@ fn potential_secrets(
         };
         let app =
             crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
-        let Some(raw) = crate::scan_runnable_blocks(&node.id, &node.text)
+        let Some(raw) = node.runnable_blocks()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(&app.definition))
         else {
             continue;
         };
-        let signatures = crate::args::scan_signatures(&node.id, &node.text)
+        let signatures = crate::args::scan_node_signatures(node)
             .map_err(|e| DepsError::Arguments(e.to_string()))?;
         let locals: HashSet<_> = signatures
             .iter()
@@ -244,7 +244,7 @@ fn potential_secrets(
                     continue;
                 }
                 candidates.extend(
-                    crate::scan_runnable_blocks(&producer_node.id, &producer_node.text)
+                    producer_node.runnable_blocks()
                         .into_iter()
                         .filter(|b| b.attrs.contains_key("outputs"))
                         .map(|b| BlockAddr::new(&producer_node.id, b.name.unwrap())),

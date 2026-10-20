@@ -85,7 +85,10 @@ pub use locate::{locate_node, LocateError, LocatedNode};
 pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, ParseError};
 pub use merge::{merge3, side_by_side, ConflictHunk, DiffKind, DiffRow, Merge, MergeConflict};
 pub use options::{declared_options, OptionsError};
-pub use output::{cached_output_hash, format_duration_ms, write_output, ExecOutput};
+pub use output::{
+    cached_node_output_hash, cached_output_hash, format_duration_ms, write_block_output,
+    write_output, ExecOutput,
+};
 pub use shared_env::{load as load_shared_env, SharedEnv, SharedOrigin, SharedVar};
 pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tag_colors::{
@@ -222,8 +225,8 @@ pub(crate) fn output_path_var_names(canvas: &Canvas) -> std::collections::HashSe
         if node.plain_markdown_include {
             continue;
         }
-        let signatures = args::scan_signatures(&node.id, &node.text).unwrap_or_default();
-        for mut producer in scan_runnable_blocks(&node.id, &node.text) {
+        let signatures = crate::args::scan_node_signatures(node).unwrap_or_default();
+        for mut producer in node.runnable_blocks() {
             producer.attrs.remove("inputs");
             let local: std::collections::HashSet<_> = signatures
                 .iter()
@@ -291,7 +294,7 @@ pub fn autorun_blocks_for_changed_vars(
     let decls = vars::declared_vars(canvas).unwrap_or_default();
     let mut out = Vec::new();
     for node in &canvas.nodes {
-        for block in scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             if !block.autorun {
                 continue;
             }
@@ -299,7 +302,7 @@ pub fn autorun_blocks_for_changed_vars(
             let bound;
             let block = if block.env.iter().any(|env| env.var_name.contains("${")) {
                 let Ok(selected) =
-                    args::bind_block(&node.id, &node.text, name, &canvas.artifact_values)
+                    args::bind_node_block(node, name, &canvas.artifact_values)
                 else {
                     continue;
                 };
@@ -336,7 +339,7 @@ pub fn resolve_target(
 ) -> Result<BlockAddr, RunError> {
     let node = canvas.resolve_path(path)?;
     if block_name.contains('[')
-        || args::scan_signatures(&node.id, &node.text)
+        || crate::args::scan_node_signatures(node)
             .map_err(|e| DepsError::Arguments(e.to_string()))?
             .iter()
             .any(|s| s.block.name.as_deref() == Some(block_name))
@@ -363,7 +366,7 @@ pub fn resolve_target(
 
 fn has_runnable_block(canvas: &Canvas, node_id: &str, block_name: &str) -> bool {
     canvas.node(node_id).is_some_and(|n| {
-        scan_runnable_blocks(node_id, &n.text)
+        n.runnable_blocks()
             .iter()
             .any(|b| b.name.as_deref() == Some(block_name))
     })
@@ -376,7 +379,7 @@ fn has_runnable_block(canvas: &Canvas, node_id: &str, block_name: &str) -> bool 
 /// (`deps::validate`) is what actually reports the conflict.
 fn default_block_name(canvas: &Canvas, node_id: &str) -> Option<String> {
     let node = canvas.node(node_id)?;
-    let blocks = scan_runnable_blocks(node_id, &node.text);
+    let blocks = node.runnable_blocks();
     fence::default_block(node_id, &blocks)
         .ok()
         .flatten()?

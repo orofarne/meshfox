@@ -288,6 +288,54 @@ pub const NODE_ATTRS: &[&str] = &[
     "edgeVia",
     "createdAt",
     "updatedAt",
+    // A runnable `file` node's block attributes (`FILE_BLOCK_ATTRS`).
+    "deps",
+    "inputs",
+    "outputs",
+    "env",
+    "cache",
+    "tty",
+    "autoclose",
+    "service",
+    "always",
+    "default",
+    "output",
+    "output-attrs",
+    "autorun",
+    "confirm",
+    "render",
+    "send",
+    "tangle",
+    "lease",
+    "defer",
+    "argv",
+];
+/// The fence attributes a runnable `file` node may carry on its own
+/// `meshfox:node` line (`Node::block_attrs`) — the same vocabulary as a
+/// fence's info string, minus `name` (the block is always named after the
+/// node), `interpreter` (its own `Node` field) and `fold` (already a node
+/// attribute with its own meaning). Honored only on `type="file"`.
+pub const FILE_BLOCK_ATTRS: &[&str] = &[
+    "deps",
+    "inputs",
+    "outputs",
+    "env",
+    "cache",
+    "tty",
+    "autoclose",
+    "service",
+    "always",
+    "default",
+    "output",
+    "output-attrs",
+    "autorun",
+    "confirm",
+    "render",
+    "send",
+    "tangle",
+    "lease",
+    "defer",
+    "argv",
 ];
 /// `meshfox:edge`'s own attribute vocabulary — `from` is required, the
 /// rest optional styling (`canvas.rs`'s `ExtraEdge`/style enums).
@@ -316,6 +364,27 @@ pub fn unknown_node_edge_attr(markdown: &str) -> Option<crate::attrs::UnknownAtt
                 context: format!("the meshfox:node comment under heading {:?}", seg.title),
                 attr: attr.to_string(),
             });
+        }
+        // A fence-style attribute only means something on a runnable file
+        // node; anywhere else it would be silently ignored.
+        let runnable_file = seg.node_attrs.get("type").map(String::as_str) == Some("file")
+            && seg
+                .node_attrs
+                .get("interpreter")
+                .is_some_and(|i| !i.trim().is_empty());
+        if !runnable_file {
+            if let Some(attr) = FILE_BLOCK_ATTRS
+                .iter()
+                .find(|attr| seg.node_attrs.contains_key(**attr))
+            {
+                return Some(crate::attrs::UnknownAttrError {
+                    context: format!(
+                        "the meshfox:node comment under heading {:?} (block attributes need type=\"file\" and an interpreter)",
+                        seg.title
+                    ),
+                    attr: attr.to_string(),
+                });
+            }
         }
         for edge in &seg.edge_attrs {
             if let Some(attr) = crate::attrs::first_unknown(edge, EDGE_ATTRS) {
@@ -354,6 +423,9 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
     let ids = assign_ids(&segments)?;
     let parents = resolve_parent_ids(&segments, &ids)?;
 
+    // Cached-output regions of the whole document, found once: a runnable
+    // `file` node's body may end in one (see `follows_file_node_body`).
+    let output_regions = crate::output::output_byte_ranges(markdown);
     let mut nodes = Vec::with_capacity(segments.len());
     for ((seg, id), parent) in segments.iter().zip(ids.iter()).zip(parents) {
         let node_type = match seg.node_attrs.get("type").map(String::as_str) {
@@ -378,10 +450,49 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                 }
                 (None, None)
             }
-            NodeType::File | NodeType::Link | NodeType::Include => match parse_link_body(&body) {
-                Some((_, target, caption)) => (Some(target), caption),
-                None => return Err(ParseError::InvalidLinkBody(id.clone(), node_type.as_str())),
-            },
+            NodeType::File | NodeType::Link | NodeType::Include => {
+                let invalid = || ParseError::InvalidLinkBody(id.clone(), node_type.as_str());
+                // A `file` node's block may have cached output after its
+                // caption (`crate::output`); everything else about the
+                // body is validated without it. Anything but exactly one
+                // trailing region is still an invalid body.
+                let link_body = if node_type == NodeType::File {
+                    let raw_body = &markdown[seg.body_span.clone()];
+                    let regions: Vec<_> = output_regions
+                        .iter()
+                        .filter(|r| seg.body_span.start <= r.start && r.end <= seg.body_span.end)
+                        .collect();
+                    match regions.as_slice() {
+                        [] => body.clone(),
+                        [region] if markdown[region.end..seg.body_span.end].trim().is_empty() => {
+                            crate::comment::strip(
+                                &raw_body[..region.start - seg.body_span.start],
+                            )
+                            .trim()
+                            .to_string()
+                        }
+                        _ => return Err(invalid()),
+                    }
+                } else {
+                    body.clone()
+                };
+                // A runnable file node's `meshfox:arg` signature sits right
+                // above its link, the way it sits above a fence.
+                let runnable = node_type == NodeType::File
+                    && seg
+                        .node_attrs
+                        .get("interpreter")
+                        .is_some_and(|i| !i.trim().is_empty());
+                let link_body = if runnable {
+                    skip_leading_arg_lines(&link_body)
+                } else {
+                    link_body
+                };
+                match parse_link_body(&link_body) {
+                    Some((_, target, caption)) => (Some(target), caption),
+                    None => return Err(invalid()),
+                }
+            }
             NodeType::Text => (None, None),
         };
 
@@ -470,6 +581,19 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             body_rev: None,
             asset_base: None,
             plain_markdown_include: false,
+            block_attrs: if node_type == NodeType::File {
+                FILE_BLOCK_ATTRS
+                    .iter()
+                    .filter_map(|key| {
+                        seg.node_attrs
+                            .get(*key)
+                            .map(|value| (key.to_string(), value.clone()))
+                    })
+                    .collect()
+            } else {
+                Default::default()
+            },
+            target_digest: None,
         });
     }
 
@@ -640,6 +764,9 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
     }
     if let Some(i) = &node.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
+    }
+    for (key, value) in &node.block_attrs {
+        parts.push(format!("{key}=\"{value}\""));
     }
     if node.preview {
         parts.push("preview=\"true\"".to_string());
@@ -984,6 +1111,14 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     }
     if let Some(i) = &meta.interpreter {
         parts.push(format!("interpreter=\"{i}\""));
+    }
+    // Like `parent=`, `NodeMeta` has no field for a file node's block
+    // attributes: carry over what is already on the line so a drag or a
+    // resize never silently drops `deps=`/`cache`/... .
+    for key in FILE_BLOCK_ATTRS {
+        if let Some(value) = seg.node_attrs.get(*key) {
+            parts.push(format!("{key}=\"{value}\""));
+        }
     }
     if let Some(true) = meta.preview {
         parts.push("preview=\"true\"".to_string());
@@ -2937,6 +3072,27 @@ fn parse_comment(line: &str, tag: &str) -> Option<String> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
     inner.strip_prefix(tag).map(|rest| rest.trim().to_string())
+}
+
+/// `body` without its leading blank lines and `meshfox:arg` declaration
+/// lines (see `crate::args`): what is left must start with the link.
+fn skip_leading_arg_lines(body: &str) -> String {
+    let mut rest = body;
+    loop {
+        let (line, tail) = rest.split_once('\n').unwrap_or((rest, ""));
+        let trimmed = line.trim();
+        let is_arg = trimmed.starts_with("<!-- meshfox:arg ") && trimmed.ends_with("-->");
+        if trimmed.is_empty() && rest.is_empty() {
+            return String::new();
+        }
+        if !(trimmed.is_empty() || is_arg) {
+            return rest.to_string();
+        }
+        if tail.is_empty() && !rest.contains('\n') {
+            return String::new();
+        }
+        rest = tail;
+    }
 }
 
 /// Parses a `file`/`link`/`include` body: the first line must be *exactly*
@@ -5539,5 +5695,174 @@ Reused from Tests as well.
     fn unknown_node_edge_attr_ignores_a_meshfox_node_comment_written_inside_a_fence() {
         let doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```\n<!-- meshfox:node id=\"x\" colr=\"1\" -->\n```\n";
         assert_eq!(unknown_node_edge_attr(doc), None);
+    }
+
+    const FILE_BLOCK_DOC: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Seed\n<!-- meshfox:node id=\"seed\" type=\"file\" interpreter=\"bash\" cache=\"true\" deps=\"setup\" -->\n\n",
+        "[seed](./seed.sh)\n\nLoads the data.\n",
+    );
+
+    #[test]
+    fn runnable_file_node_gets_one_implicit_block_from_node_attrs() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        let node = canvas.node("seed").unwrap();
+        assert_eq!(node.block_attrs.get("cache").map(String::as_str), Some("true"));
+        let blocks = node.runnable_blocks();
+        assert_eq!(blocks.len(), 1);
+        let block = &blocks[0];
+        assert_eq!(block.name.as_deref(), Some("seed"));
+        assert!(block.cache);
+        assert_eq!(block.deps.len(), 1);
+        assert_eq!(block.interpreter.as_deref(), Some("bash"));
+        assert_eq!(block.target.as_ref().unwrap().path, "./seed.sh");
+        assert!(block.code.is_empty());
+    }
+
+    #[test]
+    fn file_node_fingerprint_follows_the_target_content() {
+        let mut canvas = parse(FILE_BLOCK_DOC).unwrap();
+        let before = crate::fence::fingerprint(&canvas.node("seed").unwrap().runnable_blocks()[0]);
+        canvas.nodes[1].set_target_digest(b"echo one");
+        let one = crate::fence::fingerprint(&canvas.node("seed").unwrap().runnable_blocks()[0]);
+        canvas.nodes[1].set_target_digest(b"echo two");
+        let two = crate::fence::fingerprint(&canvas.node("seed").unwrap().runnable_blocks()[0]);
+        assert_ne!(before, one);
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn file_node_body_accepts_one_trailing_cached_output_region() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        let node = canvas.node("seed").unwrap();
+        let block = &node.runnable_blocks()[0];
+        let output = crate::output::ExecOutput {
+            exit_code: 0,
+            output: "hello\n".into(),
+            duration_ms: 5,
+            stdout: "hello\n".into(),
+            stderr: String::new(),
+        };
+        let body = crate::output::write_node_output(&node.text, block, &output).unwrap();
+        let doc = FILE_BLOCK_DOC.replace(&node.text, &body);
+        let reparsed = parse(&doc).unwrap();
+        let again = reparsed.node("seed").unwrap();
+        assert_eq!(again.target.as_deref(), Some("./seed.sh"));
+        assert_eq!(again.caption.as_deref(), Some("Loads the data."));
+        assert_eq!(
+            crate::output::cached_node_output_hash(&again.text, "seed"),
+            Some(crate::fence::fingerprint(&again.runnable_blocks()[0]))
+        );
+        // Re-running replaces the region instead of stacking a second one.
+        let rewritten = crate::output::write_node_output(&again.text, &again.runnable_blocks()[0], &output).unwrap();
+        assert_eq!(rewritten.matches("<!-- meshfox:output ").count(), 1);
+    }
+
+    #[test]
+    fn file_node_body_rejects_text_after_the_output_region() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        let node = canvas.node("seed").unwrap();
+        let output = crate::output::ExecOutput {
+            exit_code: 0,
+            output: "x\n".into(),
+            duration_ms: 1,
+            stdout: "x\n".into(),
+            stderr: String::new(),
+        };
+        let body = crate::output::write_node_output(&node.text, &node.runnable_blocks()[0], &output).unwrap();
+        let doc = FILE_BLOCK_DOC.replace(&node.text, &format!("{body}\ntrailing prose\n"));
+        assert!(matches!(parse(&doc), Err(ParseError::InvalidLinkBody(..))));
+    }
+
+    #[test]
+    fn dragging_a_file_node_keeps_its_block_attrs() {
+        let canvas = parse(FILE_BLOCK_DOC).unwrap();
+        let mut meta = NodeMeta::from_node(canvas.node("seed").unwrap());
+        meta.x = Some(10.0);
+        let moved = set_node_meta(FILE_BLOCK_DOC, "seed", &meta).unwrap();
+        let again = parse(&moved).unwrap();
+        assert_eq!(again.node("seed").unwrap().block_attrs, canvas.node("seed").unwrap().block_attrs);
+        assert_eq!(again.node("seed").unwrap().x, Some(10.0));
+    }
+
+    const FILE_ARGS_DOC: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## Extract\n<!-- meshfox:node id=\"extract\" type=\"file\" interpreter=\"python3\" -->\n\n",
+        "<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" default=\"en\" -->\n",
+        "<!-- meshfox:arg name=\"pages\" type=\"int\" default=\"0\" -->\n",
+        "[extract](./extract.py)\n\nPulls the tables.\n",
+    );
+
+    #[test]
+    fn file_node_takes_arguments_declared_right_above_its_link() {
+        let canvas = parse(FILE_ARGS_DOC).unwrap();
+        let node = canvas.node("extract").unwrap();
+        assert_eq!(node.target.as_deref(), Some("./extract.py"));
+        assert_eq!(node.caption.as_deref(), Some("Pulls the tables."));
+        let signatures = crate::args::scan_node_signatures(node).unwrap();
+        assert_eq!(signatures.len(), 1);
+        let names: Vec<_> = signatures[0].args.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["lang", "pages"]);
+        crate::args::validate(&canvas).unwrap();
+    }
+
+    #[test]
+    fn file_node_application_binds_values_and_builds_argv_in_declaration_order() {
+        let canvas = parse(FILE_ARGS_DOC).unwrap();
+        let node = canvas.node("extract").unwrap();
+        let block =
+            crate::args::bind_node_block(node, "extract[pages=03,lang=hy]", &Default::default()).unwrap();
+        assert_eq!(block.name.as_deref(), Some("extract[lang=hy,pages=3]"));
+        assert_eq!(block.argv, ["--lang=hy", "--pages=3"]);
+        assert_eq!(block.arguments["lang"], "hy");
+        assert!(block.target.is_some());
+        // Defaults fill in when the address binds nothing.
+        let defaulted = crate::args::bind_node_block(node, "extract", &Default::default()).unwrap();
+        assert_eq!(defaulted.argv, ["--lang=en", "--pages=0"]);
+    }
+
+    #[test]
+    fn argv_false_leaves_the_environment_only() {
+        let doc = FILE_ARGS_DOC.replace("interpreter=\"python3\"", "interpreter=\"python3\" argv=\"false\"");
+        let canvas = parse(&doc).unwrap();
+        let block = crate::args::bind_node_block(canvas.node("extract").unwrap(), "extract[lang=hy]", &Default::default()).unwrap();
+        assert!(block.argv.is_empty());
+        assert_eq!(block.arguments["lang"], "hy");
+    }
+
+    #[test]
+    fn a_block_with_arguments_cannot_be_cached() {
+        let doc = FILE_ARGS_DOC.replace("interpreter=\"python3\"", "interpreter=\"python3\" cache=\"true\"");
+        let canvas = parse(&doc).unwrap();
+        let err = crate::args::validate(&canvas).unwrap_err().to_string();
+        assert!(err.contains("cannot use `cache`"), "{err}");
+        let fence = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n<!-- meshfox:arg name=\"n\" default=\"1\" -->\n```bash name=\"x\" cache\necho $n\n```\n";
+        let canvas = parse(fence).unwrap();
+        assert!(crate::args::validate(&canvas).is_err());
+    }
+
+    #[test]
+    fn file_node_arguments_must_sit_immediately_above_the_link() {
+        let doc = FILE_ARGS_DOC.replace("[extract](./extract.py)", "Some prose.\n\n[extract](./extract.py)");
+        // Prose between the signature and the link is not a link body.
+        assert!(parse(&doc).is_err());
+        // A non-runnable file node has no signature to declare.
+        let plain = FILE_ARGS_DOC.replace(" interpreter=\"python3\"", "");
+        assert!(parse(&plain).is_err());
+    }
+
+    #[test]
+    fn block_attrs_are_rejected_off_a_runnable_file_node_and_tty_on_one() {
+        let text_node = "# Root\n<!-- meshfox:node id=\"root\" cache=\"true\" -->\n";
+        assert!(unknown_node_edge_attr(text_node).is_some());
+        let link_only = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## F\n<!-- meshfox:node id=\"f\" type=\"file\" deps=\"root\" -->\n\n[f](./f.sh)\n";
+        assert!(unknown_node_edge_attr(link_only).is_some());
+        assert!(unknown_node_edge_attr(FILE_BLOCK_DOC).is_none());
+        let tty = FILE_BLOCK_DOC.replace("cache=\"true\"", "tty=\"true\"");
+        let canvas = parse(&tty).unwrap();
+        assert!(matches!(
+            crate::deps::validate(&canvas),
+            Err(crate::deps::DepsError::FileNodeUnsupportedAttr(..))
+        ));
     }
 }

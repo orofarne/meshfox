@@ -213,6 +213,8 @@ mod tests {
             interpreter: None,
             attrs: std::collections::HashMap::new(),
             code: String::new(),
+            argv: Vec::new(),
+            target: None,
             span: 0..0,
         };
         assert_eq!(form_block(&block).unwrap_err(), FormError::MissingName);

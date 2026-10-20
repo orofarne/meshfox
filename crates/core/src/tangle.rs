@@ -162,7 +162,7 @@ pub fn orphans(canvas: &Canvas, canvas_path: &Path) -> Vec<PathBuf> {
         if !dirs.contains(&cwd) {
             dirs.push(cwd.clone());
         }
-        for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             if block.tangle() {
                 if let Some(name) = &block.name {
                     keep.insert((cwd.clone(), file_name(canvas_path, name, Some(&block.lang))));

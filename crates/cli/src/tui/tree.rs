@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use meshfox_core::{scan_runnable_blocks, Canvas, NodeType};
+use meshfox_core::{Canvas, NodeType};
 
 pub struct TreeRow {
     pub node_id: String,
@@ -87,7 +87,7 @@ fn visit(
     let links = outgoing.get(&node.id);
     let has_children = !children.is_empty() || links.is_some_and(|links| !links.is_empty());
     let is_expanded = depth == 0 || expanded.contains(&node.id);
-    let blocks = scan_runnable_blocks(&node.id, &node.text);
+    let blocks = node.runnable_blocks();
     let constraint_ok = if node.constraint_results.is_empty() {
         None
     } else {

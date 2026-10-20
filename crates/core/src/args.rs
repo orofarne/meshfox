@@ -97,7 +97,24 @@ fn declaration(rest: &str) -> Result<ArgDecl, String> {
 }
 
 pub fn scan_signatures(node_id: &str, markdown: &str) -> Result<Vec<Signature>, ArgsError> {
-    let blocks = fence::scan_runnable_blocks(node_id, markdown);
+    scan_signatures_for(
+        node_id,
+        markdown,
+        fence::scan_runnable_blocks(node_id, markdown),
+    )
+}
+
+/// [`scan_signatures`] for a whole node, so a runnable `file` node's
+/// implicit block (its link line) can carry a signature like a fence.
+pub fn scan_node_signatures(node: &crate::canvas::Node) -> Result<Vec<Signature>, ArgsError> {
+    scan_signatures_for(&node.id, &node.text, node.runnable_blocks())
+}
+
+fn scan_signatures_for(
+    node_id: &str,
+    markdown: &str,
+    blocks: Vec<CodeBlock>,
+) -> Result<Vec<Signature>, ArgsError> {
     let fences = fence::fenced_byte_ranges(markdown);
     let outputs = crate::output::output_byte_ranges(markdown);
     let mut pending = Vec::new();
@@ -121,6 +138,12 @@ pub fn scan_signatures(node_id: &str, markdown: &str) -> Result<Vec<Signature>, 
                     return Err(error(
                         line_number,
                         "env binding targets an argument name".into(),
+                    ));
+                }
+                if block.cache {
+                    return Err(error(
+                        first_line,
+                        "a block with arguments cannot use `cache`: cached output is kept per block, not per application".into(),
                     ));
                 }
                 signatures.push(Signature {
@@ -184,7 +207,7 @@ pub fn scan_signatures(node_id: &str, markdown: &str) -> Result<Vec<Signature>, 
 
 pub fn validate(canvas: &Canvas) -> Result<(), ArgsError> {
     for node in &canvas.nodes {
-        scan_signatures(&node.id, &node.text)?;
+        scan_node_signatures(node)?;
     }
     Ok(())
 }
@@ -475,6 +498,22 @@ pub fn static_env_names(block: &CodeBlock, args: &[ArgDecl]) -> Result<Vec<Strin
     Ok(names)
 }
 
+/// [`bind_block`] for a whole node, so a runnable `file` node's implicit
+/// block (`fence::target_block`) binds arguments like any fence.
+pub fn bind_node_block(
+    node: &crate::canvas::Node,
+    address: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> Result<CodeBlock, String> {
+    bind_in(
+        &node.id,
+        &node.text,
+        node.runnable_blocks(),
+        address,
+        values,
+    )
+}
+
 /// Bind a definition without changing its source, signature, or canvas variables.
 pub fn bind_block(
     node_id: &str,
@@ -482,9 +521,26 @@ pub fn bind_block(
     address: &str,
     values: &std::collections::HashMap<String, String>,
 ) -> Result<CodeBlock, String> {
+    bind_in(
+        node_id,
+        markdown,
+        fence::scan_runnable_blocks(node_id, markdown),
+        address,
+        values,
+    )
+}
+
+fn bind_in(
+    node_id: &str,
+    markdown: &str,
+    blocks: Vec<CodeBlock>,
+    address: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> Result<CodeBlock, String> {
     let app = Application::parse(address)?;
-    let mut block = fence::scan_runnable_blocks(node_id, markdown)
-        .into_iter()
+    let mut block = blocks
+        .iter()
+        .cloned()
         .find(|b| b.name.as_deref() == Some(app.definition.as_str()))
         .ok_or_else(|| {
             format!(
@@ -492,7 +548,8 @@ pub fn bind_block(
                 app.definition
             )
         })?;
-    let signatures = scan_signatures(node_id, markdown).map_err(|e| e.to_string())?;
+    let signatures =
+        scan_signatures_for(node_id, markdown, blocks).map_err(|e| e.to_string())?;
     let signature = signatures.iter().find(|s| s.block.span == block.span);
     let args = signature.map(|s| s.args.as_slice()).unwrap_or_default();
     static_env_names(&block, args)?;
@@ -521,6 +578,14 @@ pub fn bind_block(
         };
         let canonical = canonical_value(arg, &value)?;
         block.arguments.insert(arg.name.clone(), canonical);
+    }
+    // `--name=value` per argument in declaration order, after the script
+    // path; `argv="false"` leaves the interpreter with the environment only.
+    if block.attrs.get("argv").map(String::as_str) != Some("false") {
+        block.argv = args
+            .iter()
+            .map(|arg| format!("--{}={}", arg.name, block.arguments[&arg.name]))
+            .collect();
     }
     block.name = Some(canonical_name(&app.definition, &block.arguments));
     for env in &mut block.env {
@@ -568,13 +633,54 @@ pub fn prepare_arguments(
     values: &std::collections::HashMap<String, String>,
     choice_sources: &std::collections::HashMap<String, String>,
 ) -> Result<ArgumentPreparation, String> {
+    prepare_in(
+        node_id,
+        markdown,
+        fence::scan_runnable_blocks(node_id, markdown),
+        address,
+        answers,
+        values,
+        choice_sources,
+    )
+}
+
+/// [`prepare_arguments`] for a whole node (a runnable `file` node's
+/// implicit block included).
+pub fn prepare_node_arguments(
+    node: &crate::canvas::Node,
+    address: &str,
+    answers: &std::collections::BTreeMap<String, String>,
+    values: &std::collections::HashMap<String, String>,
+    choice_sources: &std::collections::HashMap<String, String>,
+) -> Result<ArgumentPreparation, String> {
+    prepare_in(
+        &node.id,
+        &node.text,
+        node.runnable_blocks(),
+        address,
+        answers,
+        values,
+        choice_sources,
+    )
+}
+
+fn prepare_in(
+    node_id: &str,
+    markdown: &str,
+    blocks: Vec<CodeBlock>,
+    address: &str,
+    answers: &std::collections::BTreeMap<String, String>,
+    values: &std::collections::HashMap<String, String>,
+    choice_sources: &std::collections::HashMap<String, String>,
+) -> Result<ArgumentPreparation, String> {
     let mut app = Application::parse(address)?;
     for (name, value) in answers {
         app.bindings
             .insert(name.clone(), Binding::Literal(value.clone()));
     }
-    let block = fence::scan_runnable_blocks(node_id, markdown)
-        .into_iter()
+    let block = blocks
+        .iter()
+        .cloned()
         .find(|b| b.name.as_deref() == Some(app.definition.as_str()))
         .ok_or_else(|| {
             format!(
@@ -582,7 +688,8 @@ pub fn prepare_arguments(
                 app.definition
             )
         })?;
-    let signatures = scan_signatures(node_id, markdown).map_err(|e| e.to_string())?;
+    let signatures = scan_signatures_for(node_id, markdown, blocks.clone())
+        .map_err(|e| e.to_string())?;
     let args = signatures
         .iter()
         .find(|s| s.block.span == block.span)
@@ -646,9 +753,10 @@ pub fn prepare_arguments(
     }
     let block = if fields.iter().all(|f| f.resolved) {
         Some(
-            bind_block(
+            bind_in(
                 node_id,
                 markdown,
+                blocks,
                 &canonical_name(&app.definition, &supplied),
                 values,
             )?

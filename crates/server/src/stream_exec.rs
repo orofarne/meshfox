@@ -285,6 +285,46 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
+    spawn_interpreter_on(
+        interpreter,
+        ScriptSource::Code(code),
+        &[],
+        lang,
+        envs,
+        cwd,
+        origin,
+    )
+}
+
+/// What `spawn_interpreter_on` hands its interpreter as the script argument.
+pub enum ScriptSource<'a> {
+    /// Inline code (a fence): written to a temp (or tangled) file first.
+    Code(&'a str),
+    /// An existing file (a `file` node's target), passed through as is —
+    /// never copied, never removed.
+    File(&'a Path),
+}
+
+/// `spawn_interpreter`'s body, generalized over where the script comes
+/// from — a fence's inline code, or the file a runnable `file` node points
+/// at (`meshfox_core::CodeBlock::target`).
+///
+/// `script_args` follow the script path on the command line — a block's
+/// `--name=value` argument flags (`meshfox_core::CodeBlock::argv`).
+pub fn spawn_interpreter_on<I, K, V>(
+    interpreter: &str,
+    source: ScriptSource<'_>,
+    script_args: &[String],
+    lang: Option<&str>,
+    envs: I,
+    cwd: Option<&Path>,
+    origin: Option<meshfox_core::tangle::BlockOrigin<'_>>,
+) -> io::Result<SpawnedProcess>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
     let envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = envs
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string()))
@@ -322,10 +362,13 @@ where
         )
     })?;
 
-    let (path, cleanup) = meshfox_core::script_file(code, lang, cwd, origin)?;
+    let (path, cleanup) = match source {
+        ScriptSource::Code(code) => meshfox_core::script_file(code, lang, cwd, origin)?,
+        ScriptSource::File(path) => (path.to_path_buf(), None),
+    };
 
     let mut command = Command::new(&program);
-    command.args(&args).arg(&path);
+    command.args(&args).arg(&path).args(script_args);
     apply_run_env(
         &mut command,
         meshfox_core::process_env::prepare(cwd, envs, &extra_envs),
@@ -401,10 +444,28 @@ where
         // `button`, so this never needs to consider one.
         return spawn_bash(":", envs, cwd);
     }
-    match &block.interpreter {
-        Some(interpreter) => spawn_interpreter(
+    if let (Some(target), Some(interpreter)) = (&block.target, &block.interpreter) {
+        // A runnable `file` node: the target is the script. A relative path
+        // is taken against the block's working directory (callers that
+        // confine paths resolve it to an absolute one first).
+        let path = cwd
+            .map(|dir| dir.join(&target.path))
+            .unwrap_or_else(|| Path::new(&target.path).to_path_buf());
+        return spawn_interpreter_on(
             interpreter,
-            &block.code,
+            ScriptSource::File(&path),
+            &block.argv,
+            Some(&block.lang),
+            envs,
+            cwd,
+            block_origin(block, canvas_path),
+        );
+    }
+    match &block.interpreter {
+        Some(interpreter) => spawn_interpreter_on(
+            interpreter,
+            ScriptSource::Code(&block.code),
+            &block.argv,
             Some(&block.lang),
             envs,
             cwd,
@@ -978,6 +1039,8 @@ mod tests {
             interpreter: None,
             attrs: std::collections::HashMap::new(),
             code: "echo hi".to_string(),
+            argv: Vec::new(),
+            target: None,
             span: 0..0,
         }
     }

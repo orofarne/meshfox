@@ -672,11 +672,11 @@ pub fn validate_selected_env(
 }
 
 fn static_block_env_names(
-    node_id: &str,
-    markdown: &str,
+    node: &crate::canvas::Node,
     block: &crate::CodeBlock,
 ) -> Result<Vec<String>, VarsError> {
-    let signatures = crate::args::scan_signatures(node_id, markdown).map_err(|e| {
+    let node_id = node.id.as_str();
+    let signatures = crate::args::scan_node_signatures(node).map_err(|e| {
         VarsError::EnvNameTemplate(
             node_id.into(),
             block.name.clone().unwrap_or_default(),
@@ -713,9 +713,9 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .map(|s| (s.decl.name.as_str(), &s.decl))
         .collect();
     for node in &canvas.nodes {
-        for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             let mut refs: Vec<(String, &'static str)> =
-                static_block_env_names(&node.id, &node.text, &block)?
+                static_block_env_names(node, &block)?
                     .into_iter()
                     .map(|name| (name, "env"))
                     .chain(
@@ -742,7 +742,7 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
                 }
             }
             let argument_names: std::collections::HashSet<_> =
-                crate::args::scan_signatures(&node.id, &node.text)
+                crate::args::scan_node_signatures(node)
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|sig| sig.block.span == block.span)
@@ -808,9 +808,9 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
     let decls = declared_vars(canvas)?;
     let declared: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).collect();
     for node in &canvas.nodes {
-        for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             let refs: Vec<(String, &'static str)> =
-                static_block_env_names(&node.id, &node.text, &block)?
+                static_block_env_names(node, &block)?
                     .into_iter()
                     .map(|name| (name, "env"))
                     .chain(
@@ -825,7 +825,7 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
                     )
                     .collect();
             let argument_names: std::collections::HashSet<_> =
-                crate::args::scan_signatures(&node.id, &node.text)
+                crate::args::scan_node_signatures(node)
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|sig| sig.block.span == block.span)
@@ -877,7 +877,7 @@ pub fn validate_var_refs(canvas: &Canvas) -> Result<(), VarsError> {
 
     // A block argument's `choices_var` must name a declared variable too.
     for node in &canvas.nodes {
-        let Ok(signatures) = crate::args::scan_signatures(&node.id, &node.text) else {
+        let Ok(signatures) = crate::args::scan_node_signatures(node) else {
             continue; // reported by `args::validate`
         };
         for arg in signatures.iter().flat_map(|s| &s.args) {

@@ -115,9 +115,32 @@ pub struct CodeBlock {
     pub interpreter: Option<String>,
     pub attrs: HashMap<String, String>,
     pub code: String,
+    /// Extra command-line arguments for the interpreter, after the script
+    /// path: `--name=value` per declared `meshfox:arg`, in declaration
+    /// order. Filled by `crate::args` when the block is bound; empty for a
+    /// block without arguments, with `argv="false"`, or without an
+    /// `interpreter=` (a plain `bash` fence has no script argument to
+    /// append to — it gets the environment only).
+    pub argv: Vec<String>,
+    /// `Some` for the implicit block of a runnable `file` node
+    /// (`target_block`): its code is not inline but the target file, which
+    /// is run as `interpreter <target>`; `code` stays empty. `None` for an
+    /// ordinary fence.
+    pub target: Option<BlockTarget>,
     /// Byte range of the whole fence (opening ` ``` ` line through the
     /// closing ` ``` ` line, inclusive) within the source Markdown.
     pub span: Range<usize>,
+}
+
+/// Where a `file` node's implicit block takes its code from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BlockTarget {
+    /// The node's link target, exactly as authored (resolved and confined
+    /// by whoever runs it, against the canvas's own directory).
+    pub path: String,
+    /// Digest of the target file's content, if the loader had file access
+    /// (`Node::target_digest`); folded into `fingerprint`.
+    pub digest: Option<String>,
 }
 
 impl CodeBlock {
@@ -544,6 +567,9 @@ const FENCE_ATTRS: &[&str] = &[
     "tty",
     "autoclose",
     "service",
+    "autostop",
+    "lease",
+    "defer",
     "always",
     "default",
     "interpreter",
@@ -555,6 +581,7 @@ const FENCE_ATTRS: &[&str] = &[
     "send",
     "fold",
     "tangle",
+    "argv",
 ];
 
 /// Known `render=` values — see `CodeBlock::render`'s own doc comment and
@@ -591,6 +618,20 @@ fn build_code_block(
     attrs: HashMap<String, String>,
     name: String,
 ) -> CodeBlock {
+    block_from_attrs(lang, attrs, name, f.code, None, f.span)
+}
+
+/// The one place a `CodeBlock` is assembled from an attribute map — shared
+/// by real fences (`build_code_block`) and a `file` node's implicit block
+/// (`target_block`), so both read `deps=`/`env=`/`cache`/... identically.
+fn block_from_attrs(
+    lang: String,
+    attrs: HashMap<String, String>,
+    name: String,
+    code: String,
+    target: Option<BlockTarget>,
+    span: Range<usize>,
+) -> CodeBlock {
     let cache = attrs.get("cache").map(|v| v != "false").unwrap_or(false);
     let default = attrs.get("default").map(|v| v != "false").unwrap_or(false);
     let tty = attrs.get("tty").map(|v| v != "false").unwrap_or(false);
@@ -624,9 +665,60 @@ fn build_code_block(
         env,
         interpreter,
         attrs,
-        code: f.code,
-        span: f.span,
+        code,
+        argv: Vec::new(),
+        target,
+        span,
     }
+}
+
+/// The implicit block of a runnable `file` node (`Node::is_runnable_file`):
+/// named after the node, configured by the fence-style attributes on its
+/// `meshfox:node` line (`Node::block_attrs`) plus its `interpreter`, and
+/// running the target file instead of inline code. Its `span` is empty —
+/// there is no fence to point at; cached output goes after the node body
+/// (`crate::output::write_node_output`).
+pub fn target_block(node: &crate::canvas::Node) -> CodeBlock {
+    let mut attrs: HashMap<String, String> = node
+        .block_attrs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    attrs.insert("name".to_string(), node.id.clone());
+    if let Some(interpreter) = &node.interpreter {
+        attrs.insert("interpreter".to_string(), interpreter.clone());
+    }
+    block_from_attrs(
+        node.lang.clone().unwrap_or_else(|| "text".to_string()),
+        attrs,
+        node.id.clone(),
+        String::new(),
+        Some(BlockTarget {
+            path: node.target.clone().unwrap_or_default(),
+            digest: node.target_digest.clone(),
+        }),
+        link_line_span(&node.text),
+    )
+}
+
+/// Byte range of the link line inside a `file` node's body — the line a
+/// `meshfox:arg` signature must immediately precede, standing in for a
+/// fence's opening line. Empty when there is none.
+fn link_line_span(body: &str) -> Range<usize> {
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            return offset..offset + line.trim_end_matches('\n').len();
+        }
+        offset += line.len();
+    }
+    0..0
+}
+
+/// Digest of a target file's content for `BlockTarget::digest` — the same
+/// FNV-1a the fingerprint itself uses.
+pub fn content_digest(content: &[u8]) -> String {
+    format!("{:08x}", fnv1a(content))
 }
 
 /// One ` ```starlark constraint ` fence found by `scan_constraint_blocks` —
@@ -755,6 +847,15 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         block.code.clone(),
         block.interpreter.clone().unwrap_or_default(),
     ];
+    if let Some(target) = &block.target {
+        // A file node's code is the file: both which file and what is in
+        // it decide whether a recorded result is still valid.
+        parts.push(format!(
+            "target\u{0}{}\u{0}{}",
+            target.path,
+            target.digest.as_deref().unwrap_or_default()
+        ));
+    }
     // Bound applications keep the source fingerprint; selected names/values are
     // folded by session_fingerprint together with their arguments.
     let source_env;
@@ -777,7 +878,7 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         }
         parts.push(part);
     }
-    for name in ["lease", "defer"] {
+    for name in ["lease", "defer", "argv"] {
         if let Some(value) = block.attrs.get(name) {
             parts.push(format!("{name}={value}"));
         }
@@ -1613,5 +1714,18 @@ mod tests {
         // fence at all — a typo'd key here is just prose to meshfox.
         let md = "```yaml cach\nkey: value\n```\n";
         assert_eq!(unknown_fence_attr(md), None);
+    }
+
+    #[test]
+    fn every_suggested_fence_attribute_is_a_known_one() {
+        for attr in crate::suggest::FENCE_VALUE_ATTRS
+            .iter()
+            .chain(crate::suggest::FENCE_FLAG_ATTRS)
+        {
+            assert!(
+                FENCE_ATTRS.contains(attr),
+                "{attr:?} is offered by completion but rejected by `meshfox validate`"
+            );
+        }
     }
 }

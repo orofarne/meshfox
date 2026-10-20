@@ -1794,7 +1794,7 @@ impl App {
     /// what would have caught that at authoring time, not this.
     fn try_build_inline_form(&self, node_id: &str, block_name: &str) -> Option<InlineFormState> {
         let node = self.display_canvas.node(node_id)?;
-        let block = scan_runnable_blocks(node_id, &node.text)
+        let block = node.runnable_blocks()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(block_name))?;
         if !meshfox_core::is_form(&block.lang) {
@@ -1860,7 +1860,7 @@ impl App {
         let Some(node) = self.display_canvas.node(&node_id) else {
             return;
         };
-        let form_blocks: Vec<String> = scan_runnable_blocks(&node_id, &node.text)
+        let form_blocks: Vec<String> = node.runnable_blocks()
             .into_iter()
             .filter(|b| meshfox_core::is_form(&b.lang))
             .filter_map(|b| b.name)
@@ -2412,7 +2412,7 @@ impl App {
     /// which has no run, source or output of its own).
     fn is_form_block(&self, addr: &BlockAddr) -> bool {
         self.display_canvas.node(&addr.node_id).is_some_and(|node| {
-            scan_runnable_blocks(&node.id, &node.text).iter().any(|b| {
+            node.runnable_blocks().iter().any(|b| {
                 b.name.as_deref() == Some(addr.block_name.as_str())
                     && meshfox_core::is_form(&b.lang)
             })
@@ -2421,7 +2421,7 @@ impl App {
 
     pub(super) fn is_button_block(&self, addr: &BlockAddr) -> bool {
         self.display_canvas.node(&addr.node_id).is_some_and(|node| {
-            scan_runnable_blocks(&node.id, &node.text).iter().any(|b| {
+            node.runnable_blocks().iter().any(|b| {
                 b.name.as_deref() == Some(addr.block_name.as_str())
                     && meshfox_core::is_button(&b.lang)
             })
@@ -2435,7 +2435,7 @@ impl App {
         let Some(node) = self.display_canvas.node(&row.node_id) else {
             return;
         };
-        let blocks: Vec<_> = scan_runnable_blocks(&node.id, &node.text)
+        let blocks: Vec<_> = node.runnable_blocks()
             .into_iter()
             .filter_map(|b| b.name)
             .collect();
@@ -2461,7 +2461,7 @@ impl App {
         let Some(node) = self.display_canvas.node(&addr.node_id) else {
             return;
         };
-        let Some(block) = scan_runnable_blocks(&node.id, &node.text)
+        let Some(block) = node.runnable_blocks()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(&addr.block_name))
         else {
@@ -3077,7 +3077,7 @@ impl App {
         self.rebuild_rows();
         self.jump_to_node(id);
         if let Some(node) = self.display_canvas.node(id) {
-            for block in scan_runnable_blocks(id, &node.text) {
+            for block in node.runnable_blocks() {
                 if !super::search::ranges(&block.code, self.search.query.trim()).is_empty() {
                     if let Some(name) = block.name {
                         self.block_views.insert(
@@ -3712,7 +3712,7 @@ impl App {
         };
         if self.selected_block.as_ref().is_some_and(|addr| {
             addr.node_id != node.id
-                || !scan_runnable_blocks(&node.id, &node.text)
+                || !node.runnable_blocks()
                     .iter()
                     .any(|b| b.name.as_deref() == Some(&addr.block_name))
         }) {
@@ -4840,7 +4840,7 @@ impl App {
                 run.output_markdown = self
                     .display_canvas
                     .node(&addr.node_id)
-                    .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+                    .map(|n| n.runnable_blocks())
                     .unwrap_or_default()
                     .into_iter()
                     .find(|b| b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
@@ -5065,7 +5065,7 @@ impl App {
     fn block_output_markdown(&self, addr: &BlockAddr) -> bool {
         self.display_canvas
             .node(&addr.node_id)
-            .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+            .map(|n| n.runnable_blocks())
             .unwrap_or_default()
             .into_iter()
             .find(|b| b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
@@ -5647,7 +5647,7 @@ impl App {
     fn is_tty_block(&self, addr: &BlockAddr) -> bool {
         self.display_canvas
             .node(&addr.node_id)
-            .map(|n| meshfox_core::scan_runnable_blocks(&addr.node_id, &n.text))
+            .map(|n| n.runnable_blocks())
             .unwrap_or_default()
             .into_iter()
             .any(|b| b.tty && b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
@@ -6119,7 +6119,7 @@ impl App {
             self.status = "a runnable file node keeps no run history".into();
             return;
         }
-        let blocks: Vec<_> = scan_runnable_blocks(&node_id, &node.text)
+        let blocks: Vec<_> = node.runnable_blocks()
             .into_iter()
             .filter(|b| {
                 !b.service && !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang)
@@ -6179,7 +6179,7 @@ impl App {
             }
             Ok(entries) => {
                 let tty = self.display_canvas.node(&node_id).is_some_and(|n| {
-                    scan_runnable_blocks(&node_id, &n.text)
+                    n.runnable_blocks()
                         .iter()
                         .any(|b| b.tty && b.name.as_deref() == Some(block.as_str()))
                 });

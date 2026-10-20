@@ -221,9 +221,9 @@ fn producer_templates(
         if node.plain_markdown_include {
             continue;
         }
-        let signatures = crate::args::scan_signatures(&node.id, &node.text)
+        let signatures = crate::args::scan_node_signatures(node)
             .map_err(|e| crate::DepsError::Arguments(e.to_string()))?;
-        for block in crate::scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             if !block.attrs.contains_key("outputs") {
                 continue;
             }
@@ -391,7 +391,7 @@ fn infer_producer(
                     let address =
                         crate::args::canonical_name(&producer.definition.block_name, bindings);
                     let bound =
-                        match crate::args::bind_block(&node.id, &node.text, &address, values) {
+                        match crate::args::bind_node_block(node, &address, values) {
                             Ok(bound) => bound,
                             Err(message) => {
                                 rejected.get_or_insert_with(|| {
@@ -450,10 +450,7 @@ fn producers(
             continue;
         }
         let node = canvas.node(&producer.definition.node_id).unwrap();
-        let block = crate::args::bind_block(
-            &node.id,
-            &node.text,
-            &producer.definition.block_name,
+        let block = crate::args::bind_node_block(node, &producer.definition.block_name,
             values,
         )
         .map_err(crate::DepsError::Arguments)?;
@@ -493,10 +490,10 @@ pub fn producer_deps(
             if node.plain_markdown_include {
                 continue;
             }
-            for mut producer in crate::scan_runnable_blocks(&node.id, &node.text) {
+            for mut producer in node.runnable_blocks() {
                 producer.attrs.remove("inputs");
                 let local: std::collections::HashSet<_> =
-                    crate::args::scan_signatures(&node.id, &node.text)
+                    crate::args::scan_node_signatures(node)
                         .map_err(|e| crate::DepsError::Arguments(e.to_string()))?
                         .into_iter()
                         .filter(|sig| sig.block.span == producer.span)
@@ -662,7 +659,7 @@ pub fn fingerprint(
 pub fn validate(canvas: &Canvas) -> Result<(), crate::DepsError> {
     producers(canvas, &graph_values(canvas))?;
     for node in &canvas.nodes {
-        for block in crate::scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             let addr = BlockAddr::new(&node.id, block.name.as_deref().unwrap());
             for attr in ["inputs", "outputs"] {
                 if block.attrs.contains_key(attr) && declarations(&block, attr).is_empty() {

@@ -334,9 +334,11 @@ fn render_output_block_image(
 /// (always inside its own single fence) and, for markdown mode, exactly
 /// what `escape_html_comments` guarantees at write time.
 pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
-    const START_PREFIX: &str = "<!-- meshfox:output ";
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
-    let follows_a_real_fence = |pos: usize| fence_ranges.iter().any(|r| r.end + 1 == pos);
+    let follows_a_real_fence = |pos: usize| {
+        fence_ranges.iter().any(|r| r.end + 1 == pos)
+            || follows_file_node_body(markdown, &fence_ranges, pos)
+    };
 
     let mut ranges = Vec::new();
     let mut search_from = 0;
@@ -362,6 +364,61 @@ pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
         }
     }
     ranges
+}
+
+/// The second place a cached-output region legitimately sits: at the end of
+/// a runnable `file` node's body, right after its link and caption — that
+/// node has no fence to follow (`crate::output::write_node_output`). True
+/// when the nearest real `meshfox:node` comment above `pos` declares
+/// `type="file"` and everything between it and `pos` is just the link line
+/// plus plain caption lines: no fence, heading or comment. Stricter than
+/// "somewhere after a file node" for the same reason the fence rule is
+/// strict — a stray mention of the marker in prose must never swallow the
+/// text after it.
+fn follows_file_node_body(markdown: &str, fence_ranges: &[Range<usize>], pos: usize) -> bool {
+    const NODE_PREFIX: &str = "<!-- meshfox:node";
+    let before = &markdown[..pos];
+    let mut search_end = before.len();
+    let comment_start = loop {
+        let Some(start) = before[..search_end].rfind(NODE_PREFIX) else {
+            return false;
+        };
+        let at_line_start = start == 0 || before.as_bytes()[start - 1] == b'\n';
+        let in_fence = fence_ranges.iter().any(|r| r.start <= start && start < r.end);
+        if at_line_start && !in_fence {
+            break start;
+        }
+        search_end = start;
+    };
+    let after_comment = &before[comment_start..];
+    let Some((comment_line, body)) = after_comment.split_once('\n') else {
+        return false;
+    };
+    let attrs = crate::attrs::parse_attrs(
+        comment_line
+            .trim()
+            .strip_prefix("<!--")
+            .and_then(|rest| rest.strip_suffix("-->"))
+            .map(|rest| rest.trim().trim_start_matches("meshfox:node"))
+            .unwrap_or_default()
+            .trim(),
+    );
+    if attrs.get("type").map(String::as_str) != Some("file") {
+        return false;
+    }
+    let body = body.trim_end();
+    let mut lines = body.lines().skip_while(|line| line.trim().is_empty());
+    let Some(link) = lines.next() else {
+        return false;
+    };
+    link.trim_start().starts_with('[')
+        && lines.all(|line| {
+            let line = line.trim_start();
+            !(line.starts_with('#')
+                || line.starts_with("```")
+                || line.starts_with("~~~")
+                || line.starts_with("<!--"))
+        })
 }
 
 /// Remove complete cached-output regions whose preceding source fence no longer
@@ -410,9 +467,38 @@ pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Op
     let block = blocks
         .iter()
         .find(|b| b.name.as_deref() == Some(block_name))?;
-    let insert_point = block.span.end;
+    Some(splice_output(
+        markdown,
+        block_name,
+        block.span.end,
+        &render_for_block(block_name, block, output),
+    ))
+}
+
+/// `write_output` for a whole node: a runnable `file` node's output goes
+/// at the end of its body (`write_node_output`), any other node's after the
+/// named fence. Returns the node's new body text.
+pub fn write_block_output(
+    node: &crate::canvas::Node,
+    block_name: &str,
+    output: &ExecOutput,
+) -> Option<String> {
+    if node.is_runnable_file() {
+        let blocks = node.runnable_blocks();
+        let block = blocks
+            .iter()
+            .find(|b| b.name.as_deref() == Some(block_name))?;
+        write_node_output(&node.text, block, output)
+    } else {
+        write_output(&node.text, block_name, output)
+    }
+}
+
+/// The rendered cached-output region for `block` (`output=` picks the
+/// shape), stamped with `block`'s own fingerprint.
+fn render_for_block(block_name: &str, block: &crate::fence::CodeBlock, output: &ExecOutput) -> String {
     let hash = fingerprint(block);
-    let rendered = match block.attrs.get("output").map(String::as_str) {
+    match block.attrs.get("output").map(String::as_str) {
         Some("markdown") => render_output_block_markdown(block_name, output, &hash),
         Some("image") => render_output_block_image(
             block_name,
@@ -421,7 +507,69 @@ pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Op
             block.attrs.get("output-attrs").map(String::as_str),
         ),
         _ => render_output_block(block_name, output, &hash),
+    }
+}
+
+/// `write_output` for a runnable `file` node, whose block (`block`, from
+/// `Node::runnable_blocks`) has no fence in `body`: the region goes at the
+/// very end of the body, after the link and caption, replacing any region
+/// already there. `body` is the node's raw body text.
+pub fn write_node_output(
+    body: &str,
+    block: &crate::fence::CodeBlock,
+    output: &ExecOutput,
+) -> Option<String> {
+    let name = block.name.as_deref()?;
+    let keep = match trailing_region_start(body) {
+        Some(start) => body[..start].trim_end(),
+        None if body.contains(START_PREFIX) => return None,
+        None => body.trim_end(),
     };
+    let rendered = render_for_block(name, block, output);
+    Some(format!("{keep}\n\n{}\n", rendered.trim_end_matches('\n')))
+}
+
+const START_PREFIX: &str = "<!-- meshfox:output ";
+
+/// Where the cached-output region at the end of a runnable `file` node's
+/// body starts: its first line-leading start marker, provided the body
+/// ends with the end marker. `body` is only the node's own text, so this
+/// cannot use `output_byte_ranges` (whose anchor is the node's comment
+/// line, outside the body); the parser has already validated the shape.
+fn trailing_region_start(body: &str) -> Option<usize> {
+    if !body.trim_end().ends_with(END_MARKER) {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(rel) = body[from..].find(START_PREFIX) {
+        let start = from + rel;
+        if start == 0 || body.as_bytes()[start - 1] == b'\n' {
+            return Some(start);
+        }
+        from = start + START_PREFIX.len();
+    }
+    None
+}
+
+/// `cached_output_hash` for a runnable `file` node: the hash of the one
+/// region at the end of `body`, if it belongs to `block_name`.
+pub fn cached_node_output_hash(body: &str, block_name: &str) -> Option<String> {
+    let region = &body[trailing_region_start(body)?..];
+    if !region.starts_with(&start_marker_prefix(block_name)) {
+        return None;
+    }
+    let line_end = region.find("-->")? + "-->".len();
+    let inner = region[..line_end]
+        .strip_prefix("<!--")?
+        .strip_suffix("-->")?
+        .trim()
+        .strip_prefix("meshfox:output")?;
+    crate::attrs::parse_attrs(inner.trim()).remove("hash")
+}
+
+/// Puts `rendered` into `markdown` right after `insert_point` (a fence's
+/// end), replacing the block's own existing region if one follows there.
+fn splice_output(markdown: &str, block_name: &str, insert_point: usize, rendered: &str) -> String {
     let marker = start_marker_prefix(block_name);
 
     let after = &markdown[insert_point..];
@@ -452,7 +600,7 @@ pub fn write_output(markdown: &str, block_name: &str, output: &ExecOutput) -> Op
         result.push('\n');
     }
     result.push_str(rest);
-    Some(result)
+    result
 }
 
 /// Reads back the `hash=` `write_output` embedded in `block_name`'s own

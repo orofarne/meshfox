@@ -1131,23 +1131,10 @@ Requires Rust (stable, via [rustup](https://rustup.rs/)) and Node.js for the web
 
 `crates/server` embeds `web/dist` at compile time (via `rust-embed`), so **build the frontend before building anything that depends on it** — a fresh clone has an empty `web/dist` (just a tracked `.gitkeep`, see `.gitignore`) and `meshfox view` will happily start and serve the API, but its UI route will just say the assets weren't built rather than show anything.
 
-```sh
-cd web && npm install && npm run build   # do this first — see above
-cargo build --workspace                  # build core/server/cli into the one `meshfox` binary
-cargo test --workspace                   # run core's unit tests
+From a fresh clone, before `meshfox` is on your `PATH`, run any subcommand as `cargo run -p meshfox-cli -- <subcommand> <canvas>` (for example `validate examples/hello.canvas.md`). Each part of the build and test routine is a runnable block in its own node below; this button runs all of them (the "Full check" block below), same as `meshfox run development full-check`:
 
-# run block "smoke" on the node reached via tests -> smoke-test
-cargo run -p meshfox-cli -- run examples/hello.canvas.md tests smoke-test smoke
-
-# validate and view both take the canvas path the same way
-cargo run -p meshfox-cli -- validate examples/hello.canvas.md
-cargo run -p meshfox-cli -- view examples/hello.canvas.md   # UI + API on :4590, opens read-only,
-                                                              # launches your browser (--no-open to skip)
-# (once meshfox is on your PATH: `meshfox view README.md`, `meshfox run
-# README.md usage usage-help help`, etc. `run` recognizes a leading path by
-# its .md suffix — node ids never have one — so it stays unambiguous
-# alongside its own path/block-name arguments; auto-discovery still works
-# everywhere too when the path is omitted)
+```button name="full-check" deps="full-check/full-check"
+✅ Full check
 ```
 
 Working on the frontend itself: the embedded copy is a snapshot from your last `npm run build`, so for live-reloading UI development run `cd web && npm run dev` (on :5173) in a second terminal alongside `meshfox view` (on :4590) — Vite proxies `/api` to :4590, same as before.

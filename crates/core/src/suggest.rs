@@ -23,6 +23,7 @@ pub const FENCE_VALUE_ATTRS: &[&str] = &[
     "output-attrs",
     "render",
     "send",
+    "argv",
 ];
 
 pub const FENCE_FLAG_ATTRS: &[&str] = &[
@@ -177,6 +178,7 @@ pub fn finite_values(kind: AttrKind, name: &str) -> &'static [&'static str] {
         (AttrKind::Edge, "style") => &["solid", "dashed", "dotted"],
         (AttrKind::Edge, "arrowStart" | "arrowEnd") => &["none", "arrow"],
         (AttrKind::Fence, "output") => &["text", "markdown", "image"],
+        (AttrKind::Fence, "argv") => &["false", "true"],
         (AttrKind::Fence, "render") => crate::fence::RENDER_KINDS,
         (AttrKind::Fence, name) if FENCE_FLAG_ATTRS.contains(&name) => &["true", "false"],
         _ => &[],

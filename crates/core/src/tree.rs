@@ -1,7 +1,7 @@
 //! Root/path resolution over the Canvas tree (`Node::parent` links).
 
 use crate::canvas::{Canvas, Node};
-use crate::fence::{scan_runnable_blocks, CodeBlock};
+use crate::fence::CodeBlock;
 use thiserror::Error;
 
 /// One runnable code block reachable from the root, paired with the
@@ -109,7 +109,7 @@ impl Canvas {
     }
 
     fn collect_runnable(&self, node: &Node, path: &mut Vec<String>, out: &mut Vec<RunnableBlock>) {
-        for block in scan_runnable_blocks(&node.id, &node.text) {
+        for block in node.runnable_blocks() {
             out.push(RunnableBlock {
                 path: path.clone(),
                 node_id: node.id.clone(),
@@ -162,6 +162,8 @@ mod tests {
             body_rev: None,
             asset_base: None,
             plain_markdown_include: false,
+            block_attrs: Default::default(),
+            target_digest: None,
         }
     }
 

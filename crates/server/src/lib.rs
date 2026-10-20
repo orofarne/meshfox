@@ -2368,7 +2368,7 @@ async fn persist_run_outputs(state: &AppState, pending: &[PendingOutput]) -> Res
         if node.plain_markdown_include {
             continue;
         }
-        let Some(updated) = meshfox_core::write_output(&node.text, &output.block, &output.result)
+        let Some(updated) = meshfox_core::write_block_output(node, &output.block, &output.result)
         else {
             continue;
         };
@@ -2729,10 +2729,7 @@ fn steps_needing_a_lock(
         let Some(node) = canvas.node(&addr.node_id) else {
             continue;
         };
-        let Some(block) = meshfox_core::args::bind_block(
-            &addr.node_id,
-            &node.text,
-            &addr.block_name,
+        let Some(block) = meshfox_core::args::bind_node_block(node, &addr.block_name,
             &HashMap::new(),
         )
         .ok() else {
@@ -3093,7 +3090,7 @@ async fn prepare_arguments_local(
     let mut block_name = request.block.clone();
     let app = meshfox_core::args::Application::parse(&block_name)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
-    if !meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+    if !node.runnable_blocks()
         .iter()
         .any(|block| block.name.as_deref() == Some(app.definition.as_str()))
         && app.bindings.is_empty()
@@ -3101,7 +3098,7 @@ async fn prepare_arguments_local(
         let mut extended = path.clone();
         extended.push(&request.block);
         if let Ok(child) = canvas.resolve_path(&extended) {
-            let blocks = meshfox_core::scan_runnable_blocks(&child.id, &child.text);
+            let blocks = child.runnable_blocks();
             if let Ok(Some(default)) = meshfox_core::fence::default_block(&child.id, &blocks) {
                 node = child;
                 block_name = default.name.clone().unwrap();
@@ -3111,17 +3108,15 @@ async fn prepare_arguments_local(
     let choice_sources = argument_choice_sources(
         &state,
         &canvas,
-        &node.id,
-        &node.text,
+        node,
         &block_name,
         &request.args,
     )
     .await;
     let mut argument_values = canvas.artifact_values.clone();
     argument_values.extend(choice_sources.clone());
-    let prepared = meshfox_core::args::prepare_arguments(
-        &node.id,
-        &node.text,
+    let prepared = meshfox_core::args::prepare_node_arguments(
+        node,
         &block_name,
         &request.args,
         &argument_values,
@@ -3131,7 +3126,7 @@ async fn prepare_arguments_local(
     let canonical_path = canvas.id_path_to(&node.id).unwrap_or_default();
     let canonical_refs: Vec<&str> = canonical_path.iter().map(String::as_str).collect();
     if let Some(address) = &prepared.block {
-        let bound = meshfox_core::args::bind_block(&node.id, &node.text, address, &argument_values)
+        let bound = meshfox_core::args::bind_node_block(node, address, &argument_values)
             .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
         meshfox_core::vars::validate_selected_env(&canvas, &node.id, &bound)
             .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
@@ -3172,15 +3167,14 @@ async fn prepare_arguments_local(
 async fn argument_choice_sources(
     state: &Arc<AppState>,
     canvas: &Canvas,
-    node_id: &str,
-    node_text: &str,
+    node: &meshfox_core::Node,
     block_name: &str,
     answers: &std::collections::BTreeMap<String, String>,
 ) -> HashMap<String, String> {
     let Ok(app) = meshfox_core::args::Application::parse(block_name) else {
         return HashMap::new();
     };
-    let Ok(signatures) = meshfox_core::args::scan_signatures(node_id, node_text) else {
+    let Ok(signatures) = meshfox_core::args::scan_node_signatures(node) else {
         return HashMap::new();
     };
     let mut sources: Vec<String> = signatures
@@ -3431,7 +3425,7 @@ async fn run_from_source_for_status(
 ) -> Option<HashMap<String, String>> {
     let node = canvas.node(&addr.node_id)?;
     let cwd = node.cwd(canvas_root_dir(canvas_path));
-    let block = meshfox_core::scan_runnable_blocks(&addr.node_id, &node.text)
+    let block = node.runnable_blocks()
         .into_iter()
         .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))?;
     if !stream_exec::supports(&block) {
@@ -4398,8 +4392,11 @@ fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
 /// needs the resolved tree's `asset_base`s, not the JSON response itself).
 fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
     let canvas = parse_or_error(raw)?;
-    meshfox_core::include::resolve(&canvas, canvas_path)
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+    let mut resolved = meshfox_core::include::resolve(&canvas, canvas_path)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    // A runnable file node's block fingerprint covers its target's content.
+    resolved.hydrate_target_digests(canvas_path);
+    Ok(resolved)
 }
 
 #[derive(Debug, Serialize)]
@@ -6061,7 +6058,7 @@ async fn update_block_attrs(
 
     let canvas = parse_or_error(&located.raw)?;
     let node = canvas.node(&located.local_id).ok_or_else(not_found)?;
-    if !meshfox_core::scan_runnable_blocks(&located.local_id, &node.text)
+    if !node.runnable_blocks()
         .iter()
         .any(|b| b.name.as_deref() == Some(block_name.as_str()))
     {
@@ -6429,23 +6426,18 @@ async fn run_file_node(
     })
 }
 
-/// Runs a runnable `file` node's `interpreter target` (see
-/// `meshfox_core::Node::is_runnable_file`) — the counterpart to `run_block`
-/// for a node that has no fenced code of its own to run, just a target file
-/// on disk. Streams the same `RunEvent`s `run_block` does (`nodeId`/`block`
-/// both set to the node's own id, matching the "sole implicit block shares
-/// its node's id" convention `resolve_target` already uses for fenced
-/// blocks — see `crate::fence::is_default`), registered in `state.runs` the
-/// same way too, so the web UI's existing kill button and live-output
-/// handling work unchanged. No `deps=`/`cache`/`env=`/`tty` concepts apply
-/// here — a `file` node's body is just a link, nothing to chain, cache, or
-/// seize a terminal for.
+/// `GET /api/nodes/:id/run`'s body: runs a runnable `file` node's block
+/// (`meshfox_core::Node::is_runnable_file`) — now just the ordinary block
+/// run (`run_block_impl`) of the node's one implicit block, named after
+/// the node, so `deps=`/`env=`/`cache`/`confirm`/the run ledger all apply
+/// exactly as for a fence. Kept as its own endpoint for older clients: it
+/// runs only the block itself (`noDeps`) and never writes output back
+/// (`persist` off), as before.
 async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let located = locate_node(&primary_raw, &id)?;
-    let canvas = parse_or_error(&located.raw)?;
+    let canvas = resolved_canvas(&primary_raw, &state.canvas_path)?;
     let node = canvas
-        .node(&located.local_id)
+        .node(&id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
     if !node.is_runnable_file() {
         return Err(ApiError(
@@ -6453,88 +6445,25 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
             format!("node {id:?} isn't a runnable file node (needs type=\"file\", a target, and an interpreter)"),
         ));
     }
-    let interpreter = node
-        .interpreter
-        .clone()
-        .expect("checked by is_runnable_file");
-    let (interpreter_program, interpreter_args) = meshfox_core::split_interpreter(&interpreter)
-        .ok_or_else(|| {
-            ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "node {id:?}'s interpreter={interpreter:?} isn't a valid shell-word command"
-                ),
-            )
-        })?;
-    let target = node.target.as_deref().expect("checked by is_runnable_file");
-    let canvas_path = &state.canvas_path;
-    let resolved_path = resolve_confined_target(&state, target)?;
-    // Same file `canvas_path` above already resolved to (the primary
-    // document, or the `include` target this node actually lives in) —
-    // its own directory is this node's `PWD`, not wherever `meshfox view`
-    // itself happens to be running from.
-    let node_cwd = canvas_root_dir(canvas_path).to_path_buf();
-
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
-    state.runs.lock().unwrap().insert(run_id.clone(), kill_tx);
-
-    let stream = async_stream::stream! {
-        let _guard = RunGuard { state: Arc::clone(&state), run_id: run_id.clone() };
-        yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone(), chain_id: None }));
-        yield Ok(ndjson_line(&RunEvent::StepStart { node_id: id.clone(), block: id.clone() }));
-        let step_started = std::time::Instant::now();
-
-        let mut proc = match stream_exec::spawn_process(
-            &interpreter_program,
-            interpreter_args.iter().map(std::ffi::OsStr::new).chain([resolved_path.as_os_str()]),
-            Some(&node_cwd),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
-                return;
-            }
-        };
-
-        let exit_code = loop {
-            tokio::select! {
-                line = proc.output_rx.recv() => {
-                    match line {
-                        Some((stream, text)) => {
-                            yield Ok(ndjson_line(&RunEvent::Output {
-                                node_id: id.clone(),
-                                block: id.clone(),
-                                stream,
-                                text,
-                                child: None,
-                            }));
-                        }
-                        None => {
-                            let status = proc.child.wait().await;
-                            break status.ok().and_then(|s| s.code()).unwrap_or(-1);
-                        }
-                    }
-                }
-                _ = &mut kill_rx => {
-                    let _ = proc.kill();
-                    let _ = proc.child.wait().await;
-                    yield Ok(ndjson_line(&RunEvent::Killed { node_id: id.clone(), block: id.clone() }));
-                    return;
-                }
-            }
-        };
-
-        let duration_ms = step_started.elapsed().as_millis() as u64;
-        yield Ok(ndjson_line(&RunEvent::StepEnd { node_id: id.clone(), block: id.clone(), exit_code, duration_ms }));
-        yield Ok(ndjson_line(&RunEvent::Done { exit_code }));
-    };
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(Body::from_stream(stream))
-        .unwrap())
+    let path = canvas
+        .id_path_to(&id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    run_block_impl(
+        state,
+        RunRequest {
+            source: web_source(),
+            confirm: false,
+            path,
+            block: id,
+            persist: false,
+            no_deps: true,
+            fresh: false,
+            skip_fresh: false,
+            vars: HashMap::new(),
+            save_secrets: Default::default(),
+        },
+    )
+    .await
 }
 
 /// Who is asking `open_node_file` to open something — decides *where* the
@@ -7427,10 +7356,7 @@ async fn run_block_impl_sized(
     if detach
         && chain.iter().chain(cleanups.iter()).any(|addr| {
             canvas.node(&addr.node_id).is_some_and(|node| {
-                meshfox_core::args::bind_block(
-                    &node.id,
-                    &node.text,
-                    &addr.block_name,
+                meshfox_core::args::bind_node_block(node, &addr.block_name,
                     &HashMap::new(),
                 )
                 .is_ok_and(|block| block.tty)
@@ -7771,10 +7697,9 @@ async fn run_block_impl_sized(
                 }));
                 break;
             };
-            let node_text = step_node.text.clone();
             let canvas_path_for_step = &state.canvas_path;
             let cwd = step_node.cwd(canvas_root_dir(canvas_path_for_step));
-            let Some(block) = meshfox_core::args::bind_block(&addr.node_id, &node_text, &addr.block_name, &HashMap::new()).ok()
+            let Some(block) = meshfox_core::args::bind_node_block(step_node, &addr.block_name, &HashMap::new()).ok()
             else {
                 yield Ok(ndjson_line(&RunEvent::Error {
                     message: format!(
@@ -7895,6 +7820,19 @@ async fn run_block_impl_sized(
             let mut resolved_block = block.clone();
             if block.interpreter.is_some() {
                 resolved_block.interpreter = meshfox_core::args::resolve_interpreter(&block, &resolved_vars);
+            }
+            // A runnable `file` node's block runs its target: confine it
+            // (same boundary as the preview) and hand the spawn an
+            // absolute path.
+            if let Some(target) = resolved_block.target.as_mut() {
+                match resolve_confined_target(&state, &target.path) {
+                    Ok(path) => target.path = path.to_string_lossy().into_owned(),
+                    Err(e) => {
+                        final_exit_code = 1;
+                        yield Ok(ndjson_line(&RunEvent::Error { message: e.1 }));
+                        break;
+                    }
+                }
             }
 
             // `service` blocks branch out here, before the normal
@@ -8368,7 +8306,7 @@ async fn run_block_impl_sized(
                     stdout: stdout_only,
                     stderr: stderr_only,
                 };
-                if let Some(updated) = meshfox_core::write_output(&node_text, &addr.block_name, &result) {
+                if let Some(updated) = meshfox_core::write_block_output(step_node, &addr.block_name, &result) {
                     if let Some(patched) = mdcanvas::set_node_body(&located.raw, &located.local_id, &updated) {
                         file_raws.insert(None, patched);
                     }
@@ -8720,7 +8658,7 @@ async fn get_form_fields(
             format!("no node {:?}", query.node_id),
         )
     })?;
-    let block = meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+    let block = node.runnable_blocks()
         .into_iter()
         .find(|b| b.name.as_deref() == Some(query.block.as_str()))
         .ok_or_else(|| {
@@ -8823,7 +8761,7 @@ async fn submit_form(
     let node = canvas
         .node(&req.node_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
-    let block = meshfox_core::scan_runnable_blocks(&node.id, &node.text)
+    let block = node.runnable_blocks()
         .into_iter()
         .find(|b| b.name.as_deref() == Some(req.block.as_str()))
         .ok_or_else(|| {
@@ -8932,10 +8870,7 @@ fn find_tty_block(
             canvas
                 .node(&addr.node_id)
                 .and_then(|node| {
-                    meshfox_core::args::bind_block(
-                        &addr.node_id,
-                        &node.text,
-                        &addr.block_name,
+                    meshfox_core::args::bind_node_block(node, &addr.block_name,
                         &HashMap::new(),
                     )
                     .ok()
@@ -9873,7 +9808,7 @@ async fn debug_start(
     let node = canvas
         .node(&req.node_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
-    let blocks = meshfox_core::scan_runnable_blocks(&req.node_id, &node.text);
+    let blocks = node.runnable_blocks();
     let block = match &req.block_name {
         Some(name) => blocks
             .iter()
@@ -16193,6 +16128,84 @@ mod run_file_tests {
             .expect("a step-end event");
         assert_eq!(step_end["exitCode"], 0);
         assert_eq!(events.last().unwrap()["type"], "done");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&target_path);
+    }
+
+    #[tokio::test]
+    async fn file_node_block_runs_deps_and_caches_output_like_a_fence() {
+        let script_name = format!("meshfox-run-file-test-{}-seed.sh", uuid::Uuid::new_v4());
+        let canvas_path = write_test_canvas(&format!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Setup\n<!-- meshfox:node id=\"setup\" -->\n\n```bash name=\"prep\"\necho preparing\n```\n\n\
+             ## Seed\n<!-- meshfox:node id=\"seed\" type=\"file\" interpreter=\"bash\" cache=\"true\" deps=\"setup/prep\" -->\n\n\
+             [seed](./{script_name})\n\nLoads the data.\n"
+        ));
+        let target_path = canvas_path.with_file_name(&script_name);
+        std::fs::write(&target_path, "echo hi from seed\n").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let events = run_ws_events(
+            addr,
+            "/api/run?path=seed&block=seed&persist=true&confirm=true",
+        )
+        .await;
+        let steps: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "step-start")
+            .map(|e| format!("{}/{}", e["nodeId"].as_str().unwrap(), e["block"].as_str().unwrap()))
+            .collect();
+        assert_eq!(steps, ["setup/prep", "seed/seed"], "events: {events:?}");
+        assert_eq!(events.last().unwrap()["type"], "done", "events: {events:?}");
+
+        let written = std::fs::read_to_string(&canvas_path).unwrap();
+        assert!(
+            written.contains("<!-- meshfox:output name=\"seed\""),
+            "cached output missing from:\n{written}"
+        );
+        assert!(written.contains("hi from seed"));
+        // Still a valid canvas whose file node keeps its link and caption.
+        let canvas = meshfox_core::Canvas::from_markdown(&written).unwrap();
+        let node = canvas.node("seed").unwrap();
+        assert_eq!(node.caption.as_deref(), Some("Loads the data."));
+        assert_eq!(node.target.as_deref(), Some(format!("./{script_name}").as_str()));
+
+        // A second run replaces the region instead of stacking another.
+        let _ = run_ws_events(addr, "/api/run?path=seed&block=seed&persist=true&noDeps=true").await;
+        let again = std::fs::read_to_string(&canvas_path).unwrap();
+        assert_eq!(again.matches("<!-- meshfox:output name=\"seed\"").count(), 1);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&target_path);
+    }
+
+    #[tokio::test]
+    async fn file_node_application_gets_arguments_as_env_and_argv() {
+        let script_name = format!("meshfox-run-file-test-{}-args.sh", uuid::Uuid::new_v4());
+        let canvas_path = write_test_canvas(&format!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Extract\n<!-- meshfox:node id=\"extract\" type=\"file\" interpreter=\"bash\" -->\n\n\
+             <!-- meshfox:arg name=\"lang\" default=\"en\" -->\n\
+             <!-- meshfox:arg name=\"pages\" type=\"int\" default=\"0\" -->\n\
+             [extract](./{script_name})\n"
+        ));
+        let target_path = canvas_path.with_file_name(&script_name);
+        std::fs::write(&target_path, "echo \"env=$lang argv=$*\"\n").unwrap();
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let events = run_ws_events(
+            addr,
+            "/api/run?path=extract&block=extract%5Blang%3Dhy%5D&noDeps=true",
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "output" && e["text"] == "env=hy argv=--lang=hy --pages=0"),
+            "events: {events:?}"
+        );
+        assert_eq!(events.last().unwrap()["type"], "done", "events: {events:?}");
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&target_path);

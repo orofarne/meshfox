@@ -411,6 +411,21 @@ pub struct Node {
     /// can only ever fail to save. `false` for every other node.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plain_markdown_include: bool,
+    /// `file`-node only: the runnable-fence attributes (`deps`, `env`,
+    /// `cache`, `confirm`, `tty`, ...) authored on its `meshfox:node` line —
+    /// see `FILE_BLOCK_ATTRS`. They configure the node's one implicit
+    /// block (`Node::runnable_blocks`) exactly like the info string of a
+    /// fence would; `interpreter` is not in here, it has its own field.
+    /// Empty for every other node.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub block_attrs: std::collections::BTreeMap<String, String>,
+    /// `file`-node only: digest of the target file's current content, set
+    /// by whoever loaded the canvas with file access
+    /// (`Node::set_target_digest`). Folded into the implicit block's
+    /// fingerprint so cache/stale follow the file, not just the link.
+    /// Never serialized: runtime state, not document content.
+    #[serde(skip)]
+    pub target_digest: Option<String>,
 }
 
 impl Node {
@@ -425,6 +440,28 @@ impl Node {
                 .interpreter
                 .as_deref()
                 .is_some_and(|i| !i.trim().is_empty())
+    }
+
+    /// The node's runnable blocks: what `scan_runnable_blocks` finds in its
+    /// body, or — for a runnable `file` node — its one implicit block
+    /// (`crate::fence::target_block`), named after the node and reading its
+    /// code from the target file. Every caller that used to scan
+    /// `node.text` directly goes through here so both kinds of node look
+    /// the same to the rest of the system.
+    pub fn runnable_blocks(&self) -> Vec<crate::fence::CodeBlock> {
+        if self.is_runnable_file() {
+            vec![crate::fence::target_block(self)]
+        } else {
+            crate::fence::scan_runnable_blocks(&self.id, &self.text)
+        }
+    }
+
+    /// Records the digest of the target file's content (see
+    /// `Node::target_digest`). A no-op for anything but a runnable file node.
+    pub fn set_target_digest(&mut self, content: &[u8]) {
+        if self.is_runnable_file() {
+            self.target_digest = Some(crate::fence::content_digest(content));
+        }
     }
 
     /// The directory this node's own runnable block(s) should execute
@@ -442,6 +479,32 @@ impl Node {
 }
 
 impl Canvas {
+    /// Fills `Node::target_digest` for every runnable `file` node by reading
+    /// its target (confined like any other file read, see
+    /// `FileAccess::confine`). A target that is missing or outside what the
+    /// canvas may read simply gets no digest — running it reports the real
+    /// error; this only makes cache/stale follow the file's content.
+    pub fn hydrate_target_digests(&mut self, canvas_path: &std::path::Path) {
+        let access = crate::dirvars::FileAccess::for_canvas_path(self, canvas_path);
+        let canvas_dir = canvas_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        for node in &mut self.nodes {
+            if !node.is_runnable_file() {
+                continue;
+            }
+            let dir = node.cwd(&canvas_dir);
+            let target = node.target.clone().unwrap_or_default();
+            if let Ok(path) = access.confine(&dir, &target) {
+                if let Ok(content) = std::fs::read(path) {
+                    node.set_target_digest(&content);
+                }
+            }
+        }
+    }
+
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.id == id)
     }

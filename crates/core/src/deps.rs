@@ -18,7 +18,7 @@
 //! in the chain and continues once it exits.
 
 use crate::canvas::Canvas;
-use crate::fence::{scan_runnable_blocks, BlockRef};
+use crate::fence::BlockRef;
 use crate::vars::VarDecl;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -76,6 +76,8 @@ pub enum DepsError {
     FormAttrConflict(String, String, &'static str),
     #[error("node {0:?} block {1:?}: `tangle` needs an `interpreter=` — without one the code runs under `bash -c` and never becomes a file to place")]
     TangleWithoutInterpreter(String, String),
+    #[error("node {0:?}: `{1}` isn't supported on a file node's block (it runs its target file directly)")]
+    FileNodeUnsupportedAttr(String, &'static str),
     #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
     SendWithoutForm(String, String),
     #[error("node {0:?} block {1:?}: `output-attrs=` only means anything with `output=\"image\"`")]
@@ -189,7 +191,7 @@ fn find_block_with_values(
         .node(&addr.node_id)
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), addr.block_name.clone()))?;
     let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
-    if !scan_runnable_blocks(&addr.node_id, &node.text)
+    if !node.runnable_blocks()
         .iter()
         .any(|b| b.name.as_deref() == Some(app.definition.as_str()))
     {
@@ -198,7 +200,7 @@ fn find_block_with_values(
             addr.block_name.clone(),
         ));
     }
-    let block = crate::args::bind_block(&addr.node_id, &node.text, &addr.block_name, values)
+    let block = crate::args::bind_node_block(node, &addr.block_name, values)
         .map_err(DepsError::Arguments)?;
     crate::vars::validate_selected_env(canvas, &addr.node_id, &block)?;
     Ok(block)
@@ -263,11 +265,11 @@ fn validate_application_ref(
     let node = canvas
         .node(&addr.node_id)
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), app.definition.clone()))?;
-    let block = scan_runnable_blocks(&node.id, &node.text)
+    let block = node.runnable_blocks()
         .into_iter()
         .find(|block| block.name.as_deref() == Some(&app.definition))
         .ok_or_else(|| DepsError::BlockNotFound(addr.node_id.clone(), app.definition.clone()))?;
-    let signatures = crate::args::scan_signatures(&node.id, &node.text)
+    let signatures = crate::args::scan_node_signatures(node)
         .map_err(|e| DepsError::Arguments(e.to_string()))?;
     let args = signatures
         .iter()
@@ -275,7 +277,7 @@ fn validate_application_ref(
         .map(|sig| sig.args.as_slice())
         .unwrap_or_default();
     let owner_node = canvas.node(node_id).unwrap();
-    let local: HashSet<_> = crate::args::scan_signatures(node_id, &owner_node.text)
+    let local: HashSet<_> = crate::args::scan_node_signatures(owner_node)
         .map_err(|e| DepsError::Arguments(e.to_string()))?
         .into_iter()
         .filter(|sig| sig.block.span == owner.span)
@@ -759,7 +761,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
     crate::artifacts::validate(canvas)?;
     let decls = crate::vars::declared_vars(canvas)?;
     for node in &canvas.nodes {
-        let blocks = scan_runnable_blocks(&node.id, &node.text);
+        let blocks = node.runnable_blocks();
         if let Err(names) = crate::fence::default_block(&node.id, &blocks) {
             return Err(DepsError::MultipleDefaults(node.id.clone(), names));
         }
@@ -883,6 +885,20 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                 }
                 crate::form::form_block(block)?;
             }
+            if node.is_runnable_file() {
+                for (unsupported, present) in [
+                    ("tty", block.tty),
+                    ("service", block.service),
+                    ("tangle", block.tangle()),
+                ] {
+                    if present {
+                        return Err(DepsError::FileNodeUnsupportedAttr(
+                            node.id.clone(),
+                            unsupported,
+                        ));
+                    }
+                }
+            }
             if block.tangle() && block.interpreter.is_none() {
                 return Err(DepsError::TangleWithoutInterpreter(
                     node.id.clone(),
@@ -929,7 +945,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                 })
             });
             if !has_unbound_refs
-                && !crate::args::scan_signatures(&node.id, &node.text)
+                && !crate::args::scan_node_signatures(node)
                     .map_err(|e| DepsError::Arguments(e.to_string()))?
                     .iter()
                     .any(|sig| {
