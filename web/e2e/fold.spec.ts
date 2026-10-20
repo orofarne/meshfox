@@ -201,7 +201,13 @@ test("a folded auto-placed node restores its real height after an unrelated canv
   await page.locator(".mesh-node-add-child").first().click();
   const titleEditInput = page.locator(".mesh-node-title-edit-input");
   await expect(titleEditInput).toBeFocused();
-  await titleEditInput.press("Enter");
+  // The canvas refresh right after the creation can blur the still-fresh
+  // input on its own, which commits the title just like Enter does — so
+  // press Enter only while the input is still there, until it is gone.
+  await expect(async () => {
+    if (await titleEditInput.count()) await titleEditInput.press("Enter", { timeout: 1000 });
+    await expect(titleEditInput).toHaveCount(0, { timeout: 1000 });
+  }).toPass();
 
   await node(page, "sibling-node").locator(".mesh-node-fold-toggle").click();
 

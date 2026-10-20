@@ -21,11 +21,20 @@ export function viewportTransform(page: Page): Promise<string> {
  * `fitView()` isn't synchronous (it resolves a promise / can animate), so
  * reading the viewport transform immediately after the click resolves can
  * still catch the pre-click value; waiting for it to differ from whatever
- * it was beforehand avoids that race. */
+ * it was beforehand avoids that race, and then for it to stop moving. */
 export async function clickFitViewAndWait(page: Page) {
   const before = await viewportTransform(page);
   await page.locator(".react-flow__controls-fitview").click();
-  await expect.poll(() => viewportTransform(page)).not.toBe(before);
+  // The viewport animates towards the fitted view: the first changed value is
+  // still mid-flight, and a click aimed at a node then lands on whatever
+  // moves under the pointer. Settled means unchanged across a short pause.
+  await expect
+    .poll(async () => {
+      const first = await viewportTransform(page);
+      await page.waitForTimeout(150);
+      return first !== before && first === (await viewportTransform(page));
+    })
+    .toBe(true);
 }
 
 /** Neutralizes App.tsx's "fold everything with children except root by

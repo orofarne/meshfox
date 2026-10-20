@@ -36,7 +36,7 @@ test("quick-run on a plain (non-tty) default block still streams output the norm
 test("quick-run on a default block with deps runs its dependency chain first, not just the block itself", async ({ page }) => {
   await node(page, "chained").locator(".mesh-node-quick-run-icon").click();
 
-  await expect(node(page, "dep-source").locator(".mesh-code-block")).toContainText("dep-ran");
+  await expect(node(page, "dep-source")).toContainText("output · exit 0");
   await expect(node(page, "chained").locator(".mesh-code-block")).toContainText("chained-ran");
   await expect(page.locator(".error")).toHaveCount(0);
 });
@@ -118,18 +118,28 @@ test("a runnable file node gets the controls of a fence: run, chain, history and
   await block.locator(".mesh-code-source-toggle", { hasText: "‹/›" }).click();
   await expect(block).toContainText("echo file-block-ran");
 
-  // Plain run: just the file, its output right under the block.
+  // Plain run: just the file, its output right under the block. The source is
+  // unfolded and already contains "file-block-ran", so wait for the finished
+  // run's own status line — a second run started while the first process is
+  // still alive would hit the "already running elsewhere" dialog.
   await block.locator(".mesh-code-block-head button", { hasText: "run file-block" }).click();
-  await expect(block).toContainText("file-block-ran");
+  await expect(block).toContainText("output · exit 0");
 
   // Chain run goes through the ordinary run path (deps first).
   await block.locator("button.mesh-run-chain").click();
-  await expect(block).toContainText("file-block-ran");
+  await expect(node(page, "dep-source")).toContainText("output · exit 0");
+  await expect(block).toContainText("output · exit 0");
   await expect(page.locator(".error")).toHaveCount(0);
+  await expect(page.locator(".vars-modal-backdrop")).toHaveCount(0);
 
-  // Both runs are in the block's history.
-  await block.getByRole("button", { name: "Run history" }).click();
+  // Both runs are in the block's history. The chain run is still finishing
+  // when its output first reads "exit 0" (the plain run's status is already
+  // there), and its completion re-renders the node and can close a dialog
+  // opened in the meantime — so reopen it until it lists both runs.
   const history = page.getByRole("dialog", { name: /Run history/ });
-  await expect(history).toBeVisible();
+  await expect(async () => {
+    if (!(await history.isVisible())) await block.getByRole("button", { name: "Run history" }).click();
+    await expect(history.getByRole("option")).toHaveCount(2, { timeout: 1000 });
+  }).toPass();
   await expect(history).toContainText("file-block");
 });

@@ -1318,6 +1318,10 @@ limactl shell mfx -- bash -lc '
       build-essential pkg-config curl git gnome-keyring libsecret-tools dbus-user-session python3
   }
   [ -x "$HOME/.cargo/bin/cargo" ] || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; }
+  # The 20 GiB guest disk fills up with stale artifacts across runs; drop the
+  # build cache once it passes 8 GiB so a build never dies with ENOSPC.
+  used=$(du -sk "$HOME/target" 2>/dev/null | cut -f1); used=${used:-0}
+  [ "$used" -lt 8388608 ] || rm -rf "$HOME/target"
 '
 ```
 
@@ -1328,7 +1332,7 @@ limactl shell mfx -- bash -lc "
   set -e
   cd '$PWD'
   export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH
-  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_TERM_COLOR=always FORCE_COLOR=1
+  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_TERM_COLOR=always FORCE_COLOR=1 CARGO_INCREMENTAL=0
   scripts/secret-service-it.sh
 "
 ```
@@ -1340,7 +1344,7 @@ limactl shell mfx -- bash -lc "
   set -e
   cd '$PWD'
   export CARGO_TARGET_DIR=\$HOME/target PATH=\$HOME/.cargo/bin:\$PATH
-  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_TERM_COLOR=always FORCE_COLOR=1
+  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_TERM_COLOR=always FORCE_COLOR=1 CARGO_INCREMENTAL=0
   cargo build -p meshfox-cli
   scripts/systemd-socket-activation-it.sh
 "

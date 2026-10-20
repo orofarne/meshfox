@@ -4132,6 +4132,21 @@ fn run_event_msg(event: &RunEvent) -> Message {
 /// overrides the interval (test hook).
 const WS_HEARTBEAT_SECS: u64 = 15;
 
+/// Ends a `tty` viewer's socket with a real closing handshake: sends `Close`,
+/// then reads until the peer's own `Close` answer (or a short timeout). A
+/// viewer keeps sending frames (its terminal size, keystrokes) that nothing
+/// reads once the session is over; closing a socket with such unread data
+/// makes the OS answer with a TCP reset, and a reset makes the browser throw
+/// away whatever it had not read yet — the final `done` event included, so
+/// the panel reported "Connection lost" for a run that had finished fine.
+async fn close_tty_socket(socket: &mut WebSocket) {
+    let _ = socket.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = socket.recv().await {}
+    })
+    .await;
+}
+
 fn heartbeat_message() -> Message {
     Message::Text(r#"{"type":"heartbeat"}"#.to_string())
 }
@@ -8132,7 +8147,21 @@ async fn run_block_impl_sized(
                     block: addr.block_name.clone(),
                 });
                 let mut kill_requested = false;
-                let tty_exit_code = loop {
+                // A session that already ended before the subscription above
+                // (`echo hi; exit 4`) broadcast its `Done` to nobody, so
+                // waiting on `tty_rx` would never see it — `outcome()` is
+                // set before `Done` is sent, which makes this check
+                // race-free, same as `relay_tty_session`'s.
+                let tty_exit_code = 'wait: {
+                    match handle.outcome() {
+                        tty_registry::RunOutcome::Running => {}
+                        tty_registry::RunOutcome::Exited { exit_code } => break 'wait exit_code,
+                        tty_registry::RunOutcome::Killed => {
+                            killed = true; killed_addr = Some(addr.clone());
+                            break 'wait -1;
+                        }
+                    }
+                    loop {
                     tokio::select! {
                         event = tty_rx.recv() => {
                             let outcome = match event {
@@ -8164,6 +8193,7 @@ async fn run_block_impl_sized(
                             kill_requested = true;
                             handle.kill();
                         }
+                    }
                     }
                 };
                 tty_exit_code
@@ -9236,7 +9266,7 @@ async fn pump_tty_run_response_into_ws(
             }
         }
     }
-    let _ = socket.close().await;
+    close_tty_socket(&mut socket).await;
 }
 
 /// Finishes (as `Killed`) every `run_ledger` row still left in `0` on drop
@@ -9327,7 +9357,7 @@ async fn relay_tty_viewer(
             tty_registry::RunOutcome::Running => return,
         };
         let _ = socket.send(run_event_msg(&event)).await;
-        let _ = socket.send(Message::Close(None)).await;
+        close_tty_socket(&mut socket).await;
     }
 }
 

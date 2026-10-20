@@ -2609,15 +2609,16 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   const components = useMemo(() => makeMarkdownComponents(data.assetBase), [data.assetBase]);
 
+  let markdownIdx = 0;
   let constraintIdx = 0;
   let renderIdx = 0;
   return (
     <div className="mesh-node-body nopan" ref={wheelRef}>
-      {segments.map((seg, i) => {
+      {segments.map((seg) => {
         if (seg.type === "markdown") {
           return (
             <ReactMarkdown
-              key={`markdown-${i}`}
+              key={`markdown-${markdownIdx++}`}
               remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
               components={components}
               urlTransform={allowDataImageUrls}
@@ -2627,17 +2628,17 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
           );
         }
         if (seg.type === "render") {
-          return <RenderFenceBlock key={`render-${i}`} seg={seg}
-            result={data.renderResults?.[renderIdx++]} assetBase={data.assetBase} />;
+          const result = data.renderResults?.[renderIdx];
+          return <RenderFenceBlock key={`render-${renderIdx++}`} seg={seg}
+            result={result} assetBase={data.assetBase} />;
         }
         if (seg.type === "constraint") {
           // Matched to `data.constraintResults` purely by position — both
           // are built from the same document order (see
           // `MeshNodeData.constraintResults`'s doc comment).
           const status = data.constraintResults?.[constraintIdx];
-          constraintIdx += 1;
           return (
-            <ConstraintFenceBlock key={`constraint-${i}`} seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
+            <ConstraintFenceBlock key={`constraint-${constraintIdx++}`} seg={seg} status={status} onRecheck={data.onRecheckConstraint} />
           );
         }
         return <RunnableCodeBlock key={seg.name} seg={seg} data={data} nodeId={nodeId} />;
