@@ -1718,6 +1718,45 @@ boundaries flush preceding output immediately. Storage errors mark a transcript
 incomplete without stopping execution. Session reset preserves transcripts. On a read-only canvas the journal
 lives in memory for the worker's lifetime, like the rest of the session DB.
 
+## Saved-journal statistics (`meshfox stats`)
+
+`meshfox stats` computes a snapshot over retained invocation journals for the
+canvas. A block address selects its participation in any chain; `--chain`
+selects chains requested for that target and includes their dependencies.
+`--since` accepts a nonnegative relative duration (`7d`, `2w`, `1h`, `30m`)
+or an RFC3339 timestamp with any offset, filtering by invocation start time.
+`--json` returns the full report; ordinary output shows overall results,
+duration median/p95, skip counts, slowest blocks, frequently failing blocks,
+and recent outcomes for a selected block.
+
+Every report states the retained and selected chain counts and oldest/newest
+start times. Rotation limits coverage; requesting a time window does not imply
+that its complete history is available. There are no persistent statistics
+aggregates or new database tables, and the logs-list pagination limit does not
+limit statistics. The worker reads metadata from its journal under the shared
+session-DB lock and computes the report off the async executor; the CLI only
+calls `/api/stats`. Reading statistics never executes user blocks.
+
+Success rate divides known successes by successes plus failures, keeping
+cancellation, interruption, running and unknown outcomes separate. Skips and
+service startup/reuse are separate from successful executions; unreached and
+pending steps are separate from attempts. Skip rate divides skips by skips plus
+attempts. An estimate of avoided work sums known durations of skipped sources;
+it is not net wall-clock savings.
+
+Chain duration uses the admission-to-terminal span of succeeded/failed chains;
+block duration uses completed succeeded/failed steps with a recorded duration.
+A running chain contributes no chain duration, but its completed steps may
+contribute block durations. Cancelled/interrupted and unfinished steps do not
+contribute durations. Median averages the two middle samples for even counts;
+p95 uses nearest rank. Empty duration samples and success-rate denominators
+are null in JSON and `n/a` in text. Chain and step durations are kept separate.
+Incomplete transcripts are flagged and missing outcomes are not inferred as
+successes. Metadata survives output limits, so output truncation/disabled output
+storage alone does not exclude a journal from statistics. Block recent history
+is limited to the last twelve observed outcomes; ranking lists show five entries
+in text and all blocks remain available in JSON.
+
 ## Read-only canvases
 
 A canvas whose file, or the directory its `.meshfox/` state would live

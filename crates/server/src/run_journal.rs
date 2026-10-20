@@ -322,6 +322,93 @@ impl RunJournal {
         rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)
     }
 
+    /// Read one consistent metadata snapshot; never load stdout or effective output.
+    pub(crate) fn stats(
+        &self,
+        address: Option<(String, String)>,
+        chain: bool,
+        since: Option<(String, i64)>,
+    ) -> io::Result<crate::run_stats::Report> {
+        use crate::run_stats::Snapshot;
+        use std::collections::BTreeMap;
+        let (retained, runs) = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt=conn.prepare("SELECT id,live_id,node_id,block,path,source,options,status,exit_code,started_at,ended_at,truncated,output_disabled,incomplete,
+            CAST(ROUND((julianday(ended_at)-julianday(started_at))*86400000) AS INTEGER) FROM chain_runs ORDER BY id").map_err(sqlite_err)?;
+            let rows = stmt
+                .query_map([], |r| Ok((read_summary(r)?, r.get::<_, Option<i64>>(14)?)))
+                .map_err(sqlite_err)?;
+            let rows = rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_err)?;
+            let retained: Vec<_> = rows.iter().map(|(s, _)| s.clone()).collect();
+            let mut stmt = conn
+                .prepare("SELECT chain_id,node_id,block FROM chain_steps ORDER BY chain_id,rowid")
+                .map_err(sqlite_err)?;
+            let rows_steps = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                    ))
+                })
+                .map_err(sqlite_err)?;
+            let mut steps = BTreeMap::<i64, Vec<(String, String)>>::new();
+            for row in rows_steps {
+                let (id, addr) = row.map_err(sqlite_err)?;
+                steps.entry(id).or_default().push(addr);
+            }
+            let mut stmt=conn.prepare("SELECT seq,time,json_remove(event,'$.effective','$.output') FROM chain_events
+            WHERE chain_id=?1 AND json_extract(event,'$.type') IN ('step-start','step-end','step-skipped','step-not-started','service-started','tty-start','killed') ORDER BY seq").map_err(sqlite_err)?;
+            let mut runs = Vec::new();
+            for (summary, duration) in rows {
+                let plan = steps.remove(&summary.id).unwrap_or_default();
+                if since.as_ref().is_some_and(|(_, cutoff)| {
+                    meshfox_core::timestamp::unix_timestamp(&summary.started_at)
+                        .is_none_or(|time| time < *cutoff)
+                }) {
+                    continue;
+                }
+                if let Some(addr) = &address {
+                    let matches = if chain {
+                        (summary.node_id.clone(), summary.block.clone()) == *addr
+                    } else {
+                        plan.contains(addr)
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+                let events = stmt
+                    .query_map([summary.id], |r| {
+                        let text: String = r.get(2)?;
+                        Ok(Event {
+                            seq: r.get(0)?,
+                            time: r.get(1)?,
+                            event: serde_json::from_str(&text).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?,
+                        })
+                    })
+                    .map_err(sqlite_err)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(sqlite_err)?;
+                runs.push(Snapshot {
+                    summary,
+                    duration_ms: duration.and_then(|v| u64::try_from(v).ok()),
+                    steps: plan,
+                    events,
+                });
+            }
+            (retained, runs)
+        };
+        Ok(crate::run_stats::summarize(
+            &retained, runs, address, chain, since,
+        ))
+    }
+
     pub fn contains(&self, id: i64, address: (&str, &str)) -> io::Result<bool> {
         self.conn.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM chain_steps WHERE chain_id=?1 AND node_id=?2 AND block=?3)",params![id,address.0,address.1],|r|r.get(0)).map_err(sqlite_err)
     }
@@ -486,27 +573,12 @@ pub(crate) struct Query {
     since_seq: i64,
 }
 
-pub(crate) async fn api(
-    axum::extract::State(state): axum::extract::State<Arc<crate::AppState>>,
-    axum::extract::Query(query): axum::extract::Query<Query>,
-) -> Result<axum::Json<Page>, crate::ApiError> {
+/// Shared historical-address resolution for logs and statistics.
+pub(crate) fn resolve_selector(
+    state: &crate::AppState,
+    selector: &[String],
+) -> Result<Option<(String, String)>, crate::ApiError> {
     use axum::http::StatusCode;
-    let fail = |e: io::Error| {
-        crate::ApiError(
-            if e.kind() == io::ErrorKind::NotFound {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            },
-            e.to_string(),
-        )
-    };
-    let selector: Vec<String> = if query.selector.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&query.selector)
-            .map_err(|e| crate::ApiError(StatusCode::BAD_REQUEST, e.to_string()))?
-    };
     let address = if let Some((block, path)) = selector.split_last() {
         let raw = state.raw.lock().unwrap().clone();
         let canvas = crate::resolved_canvas(&raw, &state.canvas_path).ok();
@@ -544,6 +616,31 @@ pub(crate) async fn api(
     } else {
         None
     };
+    Ok(address)
+}
+
+pub(crate) async fn api(
+    axum::extract::State(state): axum::extract::State<Arc<crate::AppState>>,
+    axum::extract::Query(query): axum::extract::Query<Query>,
+) -> Result<axum::Json<Page>, crate::ApiError> {
+    use axum::http::StatusCode;
+    let fail = |e: io::Error| {
+        crate::ApiError(
+            if e.kind() == io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
+            e.to_string(),
+        )
+    };
+    let selector: Vec<String> = if query.selector.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&query.selector)
+            .map_err(|e| crate::ApiError(StatusCode::BAD_REQUEST, e.to_string()))?
+    };
+    let address = resolve_selector(&state, &selector)?;
     let borrowed = address.as_ref().map(|(n, b)| (n.as_str(), b.as_str()));
     let runs = if query.list || query.id.is_none() {
         state
@@ -807,5 +904,119 @@ mod tests {
                 .status,
             "interrupted"
         );
+    }
+}
+
+#[cfg(test)]
+mod stats_snapshot_tests {
+    use super::*;
+    fn setup(keep: usize) -> (RunJournal, RunLedger) {
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let journal = RunJournal::new(conn.clone(), 1000, keep).unwrap();
+        (journal, RunLedger::from_connection(conn).unwrap())
+    }
+    fn chain(journal: &RunJournal, ledger: &RunLedger, target: &str, day: u32) -> i64 {
+        let id = journal
+            .start(
+                "live",
+                "root",
+                target,
+                &[],
+                "test",
+                json!({"steps":[{"nodeId":"root","block":"dep"},{"nodeId":"root","block":target}]}),
+            )
+            .unwrap();
+        journal
+            .append(
+                id,
+                json!({"type":"step-start","nodeId":"root","block":"dep"}),
+                ledger,
+            )
+            .unwrap();
+        journal.append(id,json!({"type":"step-end","nodeId":"root","block":"dep","exitCode":0,"durationMs":100}),ledger).unwrap();
+        journal
+            .append(id, json!({"type":"done","exitCode":0}), ledger)
+            .unwrap();
+        journal
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE chain_runs SET started_at=?2,ended_at=?3 WHERE id=?1",
+                params![
+                    id,
+                    format!("2026-10-{day:02}T10:00:00.000Z"),
+                    format!("2026-10-{day:02}T10:00:01.250Z")
+                ],
+            )
+            .unwrap();
+        id
+    }
+    #[test]
+    fn retained_coverage_cutoff_and_target_vs_block_filters_use_one_snapshot() {
+        let (journal, ledger) = setup(2);
+        chain(&journal, &ledger, "old", 18);
+        chain(&journal, &ledger, "target", 19);
+        chain(&journal, &ledger, "other", 20);
+        let all = journal.stats(None, false, None).unwrap();
+        assert_eq!(all.coverage.retained_chains, 2);
+        assert_eq!(
+            all.coverage.retained_from.as_deref(),
+            Some("2026-10-19T10:00:00.000Z")
+        );
+        assert_eq!(all.chain_duration.median_ms, Some(1250.0));
+        let cutoff = crate::run_stats::parse_since("2026-10-20T14:00:00+04:00").unwrap();
+        let last = journal
+            .stats(
+                None,
+                false,
+                Some(("2026-10-20T14:00:00+04:00".into(), cutoff)),
+            )
+            .unwrap();
+        assert_eq!(last.coverage.retained_chains, 2);
+        assert_eq!(last.coverage.matching_chains, 1);
+        assert_eq!(
+            last.coverage.from.as_deref(),
+            Some("2026-10-20T10:00:00.000Z")
+        );
+        let dep = journal
+            .stats(Some(("root".into(), "dep".into())), false, None)
+            .unwrap();
+        assert_eq!(dep.coverage.matching_chains, 2);
+        assert_eq!(dep.blocks.len(), 1);
+        assert_eq!(dep.blocks[0].outcomes.succeeded, 2);
+        let target = journal
+            .stats(Some(("root".into(), "target".into())), true, None)
+            .unwrap();
+        assert_eq!(target.coverage.matching_chains, 1);
+        assert_eq!(
+            target
+                .blocks
+                .iter()
+                .find(|b| b.block == "target")
+                .unwrap()
+                .not_started,
+            1
+        );
+        let dep_target = journal
+            .stats(Some(("root".into(), "dep".into())), true, None)
+            .unwrap();
+        assert_eq!(dep_target.coverage.matching_chains, 0);
+    }
+    #[test]
+    fn statistics_are_not_capped_by_the_logs_list_limit() {
+        let (journal, ledger) = setup(1010);
+        for _ in 0..1003 {
+            let id = journal
+                .start("live", "root", "target", &[], "test", json!({}))
+                .unwrap();
+            journal
+                .append(id, json!({"type":"done","exitCode":0}), &ledger)
+                .unwrap();
+        }
+        assert_eq!(journal.list(None, true).unwrap().len(), 1000);
+        let stats = journal.stats(None, false, None).unwrap();
+        assert_eq!(stats.coverage.retained_chains, 1003);
+        assert_eq!(stats.chains.succeeded, 1003);
     }
 }

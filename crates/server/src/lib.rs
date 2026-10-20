@@ -59,6 +59,7 @@ pub mod run_ledger;
 /// is specifically a multi-tab-webui concern) registry for a plain
 /// block's own most recent run.
 mod run_registry;
+pub mod run_stats;
 /// Generic seq + ring-buffer + `subscribe_from` primitive — see its own
 /// module doc comment.
 mod seq_log;
@@ -5015,7 +5016,7 @@ async fn clear_layout(
     let canvas = parse_or_error(&raw)?;
     for node in &canvas.nodes {
         let meta = NodeMeta {
-        block_attrs: None,
+            block_attrs: None,
             x: None,
             y: None,
             width: None,
@@ -5879,7 +5880,7 @@ async fn update_node(
             )
         };
         let meta = NodeMeta {
-        block_attrs: None,
+            block_attrs: None,
             x: if req.clear_position {
                 req.x
             } else {
@@ -6864,7 +6865,7 @@ async fn reparent_node(
             if let Some(new_node) = new_canvas.node(local_id) {
                 if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
                     let meta = NodeMeta {
-        block_attrs: None,
+                        block_attrs: None,
                         x: Some(local_x),
                         y: Some(local_y),
                         width: new_node.width,
@@ -11037,6 +11038,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/redo", post(api_redo))
         .route("/api/history", get(api_history))
         .route("/api/logs", get(run_journal::api))
+        .route("/api/stats", get(run_stats::api))
         .route("/api/history/goto", post(api_history_goto))
         .route("/api/nodes", post(create_node))
         .route("/api/nodes/:id", patch(update_node).delete(remove_node))
@@ -16370,8 +16372,14 @@ mod run_file_tests {
                 _ => continue,
             }
         }
-        let step_end = events.iter().find(|e| e["type"] == "step-end").expect("step-end");
-        assert_eq!(step_end["exitCode"], 0, "the run is not a failure: {step_end}");
+        let step_end = events
+            .iter()
+            .find(|e| e["type"] == "step-end")
+            .expect("step-end");
+        assert_eq!(
+            step_end["exitCode"], 0,
+            "the run is not a failure: {step_end}"
+        );
         assert_eq!(events.last().unwrap()["type"], "done");
         let texts: Vec<&str> = events
             .iter()

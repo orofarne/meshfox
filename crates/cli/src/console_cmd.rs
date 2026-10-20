@@ -32,7 +32,7 @@ pub fn discover() -> Result<PathBuf, String> {
     match paths.as_slice() {
         [path] => Ok(path.clone()),
         [] => Err("no .canvas.md file found; pass --canvas explicitly".into()),
-        _ => Err("multiple canvases found; pass --canvas explicitly".into()),
+        many => Err(crate::ambiguous_canvas_error(many)),
     }
 }
 

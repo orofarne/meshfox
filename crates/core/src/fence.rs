@@ -777,7 +777,10 @@ pub fn file_node_markdown(node: &crate::canvas::Node, code: &str) -> Option<Stri
         out.push_str(line);
         out.push('\n');
     }
-    out.push_str(&format!("{ticks}{lang} {}\n{code}\n{ticks}\n", info.join(" ")));
+    out.push_str(&format!(
+        "{ticks}{lang} {}\n{code}\n{ticks}\n",
+        info.join(" ")
+    ));
 
     if !region.is_empty() {
         if let Some(block) = scan_code_blocks(&out).into_iter().next() {

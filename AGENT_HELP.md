@@ -317,6 +317,57 @@ events or 50 ms; control events flush the preceding output immediately. A storag
 failure marks the transcript incomplete without stopping execution. Normal session reset invalidates freshness
 but does not erase these historical transcripts.
 
+### Statistics from saved journals
+
+```sh
+meshfox stats                            # overview of this canvas
+meshfox project.canvas.md stats          # explicit canvas (also --canvas PATH)
+meshfox stats build --chain              # chains requested for build
+meshfox stats tests smoke                # only the tests::smoke block
+meshfox stats --since 7d                 # invocation start time, relative or RFC3339
+meshfox stats build --chain --json       # complete machine-readable report
+```
+
+Statistics use only retained invocation journals. The report always shows the
+number and oldest/newest start times of the retained chains, plus the number
+and time span matching the selection. `--since` does not recover rotated-out
+history: a requested month may contain only the most recently retained runs.
+Empty selections succeed with zero counts and null duration/rate fields in
+JSON (`n/a` in text). This is not an all-time counter.
+
+A block address selects that block's participation across retained chains,
+including dependencies and freshness skips. `--chain` selects chains whose
+requested target matches the address and includes their dependency steps.
+These address rules match `logs`; removed block definitions remain selectable
+by their stored address. The owning worker computes one metadata snapshot via
+`GET /api/stats`; the CLI never opens the canvas or session database. Starting
+a worker to read statistics does not execute blocks. There are no new database
+tables or stored aggregates, and the logs list's 1000-row limit does not cap
+statistics.
+
+Success percentage is `succeeded / (succeeded + failed)`. Killed, interrupted,
+running and unknown outcomes are shown separately. Freshness skips, unreached
+steps and service startup/reuse do not count as successful block executions.
+Block duration samples use successful/failed `step-end` events with a recorded
+duration; chain duration samples use the admission-to-terminal timestamp span
+of succeeded/failed chains. Running, killed and interrupted invocations have no
+chain duration sample. A completed step in a running chain can still contribute
+its completed block duration. Chain and step times are never added together.
+Median averages the middle pair for even samples; p95 uses nearest rank
+(`ceil(0.95 * N)`). Zero samples are `n/a`, not zero milliseconds.
+
+The overview ranks the five blocks with the largest total completed step time
+and the five with the most known failed attempts; JSON includes every block.
+The block view also shows its last twelve observed outcomes with chain IDs and
+times in JSON. Skip percentage is skipped / (attempted + skipped), excluding
+unreached/pending steps and successful service-start/reuse markers. Estimated
+work avoided sums the known durations carried by skips and is labelled as an
+estimate; it is not a claim about saved wall-clock time. Incomplete transcripts
+are flagged, with unknown outcomes/unobserved planned steps kept distinct from
+successes. Output truncation or disabled output storage does not discard the
+retained step metadata used by statistics. Text output uses the same terminal
+colour rules as logs; JSON and redirected output have no added ANSI styling.
+
 ### Native calls between canvases
 
 A `meshfox` fence is YAML with required `canvas` and `run`, optional `set`

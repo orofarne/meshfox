@@ -518,7 +518,8 @@ impl Canvas {
                     node.set_target_digest(&content);
                 }
             }
-            node.block_fingerprint = Some(crate::fence::fingerprint(&crate::fence::target_block(node)));
+            node.block_fingerprint =
+                Some(crate::fence::fingerprint(&crate::fence::target_block(node)));
         }
     }
 

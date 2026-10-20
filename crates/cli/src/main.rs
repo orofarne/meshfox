@@ -37,6 +37,7 @@ mod prune_cmd;
 mod run_output;
 mod secret_cmd;
 mod serve;
+mod stats_cmd;
 mod syntax_registry;
 mod terminal_status;
 mod tui;
@@ -82,7 +83,7 @@ struct Cli {
 /// A canvas path, accepted either as a positional argument or via
 /// `--canvas` — the two are equivalent and mutually exclusive. Kept as a
 /// shared, flattened block so every subcommand that has a positional slot
-/// free for it (i.e. every one except `run` and `node <op>`, whose own
+/// free for it (i.e. every one except `run`/`logs`/`stats` and `node <op>`, whose own
 /// positional slot is taken by other arguments — see `splice_leading_canvas`)
 /// accepts both spellings the same way.
 #[derive(Args)]
@@ -118,6 +119,24 @@ enum SessionOp {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Summarize retained invocation journals (not all-time execution history).
+    Stats {
+        /// Block address as in run; omit for an overview of this canvas.
+        #[arg(num_args = 0..)]
+        args: Vec<String>,
+        /// Canvas path; otherwise discover a single .canvas.md in this directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        /// Select chains requested for this target, including their dependencies.
+        #[arg(long)]
+        chain: bool,
+        /// Filter by invocation start time: RFC3339 or a duration such as 7d.
+        #[arg(long, value_parser = stats_cmd::since_arg)]
+        since: Option<String>,
+        /// Print the complete report as JSON, without terminal formatting.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read a block's or chain's saved transcript. Follow never starts another run.
     Logs {
         /// Block address as in run; omit to select the latest chain.
@@ -1164,12 +1183,12 @@ fn splice_leading_canvas(mut args: Vec<String>) -> Vec<String> {
         // No subcommand at all (`meshfox test.md`): leave it as the sole
         // argument, handled below as "open it, same as `meshfox view`".
         None => args.insert(1, canvas),
-        // `run` and `node <op> ...` take an explicit `--canvas` flag
+        // `run`, `logs`, `stats` and `node <op> ...` take an explicit `--canvas` flag
         // instead of their own leading positional — `run`'s own args are a
         // free-form node-path/block-name list with nothing else to anchor
         // a bare path against, and `node <op>`'s positional slot is two
         // segments in (`node add`, `node rm`, ...), not on `node` itself.
-        Some("run" | "logs") => {
+        Some("run" | "logs" | "stats") => {
             args.insert(2, "--canvas".to_string());
             args.insert(3, canvas);
         }
@@ -1328,6 +1347,26 @@ fn main() {
     };
 
     match command {
+        Command::Stats {
+            args,
+            canvas,
+            chain,
+            since,
+            json,
+        } => {
+            let path = canvas.unwrap_or_else(|| {
+                console_cmd::discover().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                })
+            });
+            let runtime = tokio::runtime::Runtime::new().expect("async runtime");
+            if let Err(error) = runtime.block_on(stats_cmd::run(path, args, chain, since, json)) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+
         Command::Logs {
             args,
             canvas,
@@ -2396,6 +2435,18 @@ fn mcp_cmd() {
 /// Files named `*.canvas.md` always count. A plain `*.md` file also counts
 /// if it opens with the `<!-- meshfox:canvas -->` marker (see README) —
 /// this is how e.g. README.md itself can be run without renaming it.
+/// Shared diagnostic for commands that discover canvas paths differently.
+fn ambiguous_canvas_error(paths: &[PathBuf]) -> String {
+    let names: Vec<_> = paths
+        .iter()
+        .map(|path| path.file_name().unwrap_or_default().to_string_lossy())
+        .collect();
+    format!(
+        "multiple canvas files found: {} — pass one explicitly",
+        names.join(", ")
+    )
+}
+
 fn find_canvas() -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(".")
@@ -2424,19 +2475,7 @@ fn find_canvas() -> PathBuf {
             std::process::exit(1);
         }
         many => {
-            let names: Vec<String> = many
-                .iter()
-                .map(|p| {
-                    p.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect();
-            eprintln!(
-                "multiple canvas files found: {} — pass one explicitly",
-                names.join(", ")
-            );
+            eprintln!("{}", ambiguous_canvas_error(many));
             std::process::exit(1);
         }
     }
@@ -4229,7 +4268,7 @@ fn apply_node_mv(raw: &str, node_id: &str, new_parent_id: &str) -> Result<String
             if let Some(new_node) = new_canvas.node(node_id) {
                 if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
                     let meta = NodeMeta {
-        block_attrs: None,
+                        block_attrs: None,
                         x: Some(local_x),
                         y: Some(local_y),
                         width: new_node.width,
@@ -4631,10 +4670,12 @@ fn apply_node_block(
         interpreter,
         code: code.map(str::to_string),
     };
-    if let Some(why) = Canvas::from_markdown(raw)
-        .ok()
-        .and_then(|canvas| canvas.node(node_id).filter(|n| n.is_runnable_file()).and(patch.file_node_conflict()))
-    {
+    if let Some(why) = Canvas::from_markdown(raw).ok().and_then(|canvas| {
+        canvas
+            .node(node_id)
+            .filter(|n| n.is_runnable_file())
+            .and(patch.file_node_conflict())
+    }) {
         return Err(why.to_string());
     }
     let updated = mdcanvas::set_fence_attrs(raw, node_id, block_name, &patch).ok_or_else(|| {

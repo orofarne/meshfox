@@ -5430,8 +5430,7 @@ impl App {
     /// `console_pending_collapse`/`has_services` already follow for their
     /// own ticks.
     pub fn spinner_active(&self) -> bool {
-        self.run.as_ref().is_some_and(RunState::is_running)
-            || !self.external_running.is_empty()
+        self.run.as_ref().is_some_and(RunState::is_running) || !self.external_running.is_empty()
     }
 
     /// Advances `spinner_tick` by one frame — see that field's own doc

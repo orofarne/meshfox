@@ -3113,3 +3113,25 @@ pub async fn logs(
     }
     response.json().await.map_err(|e| fail(e.to_string()))
 }
+
+/// Compute statistics in the owning worker from a consistent journal snapshot.
+pub async fn stats(
+    port: u16,
+    params: &[(String, String)],
+) -> Result<meshfox_server::run_stats::Report, String> {
+    let url = reqwest::Url::parse_with_params(&format!("{}/api/stats", base_url(port)), params)
+        .map_err(|e| e.to_string())?;
+    let response = client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !response.status().is_success() {
+        return Err(response
+            .text()
+            .await
+            .unwrap_or_else(|_| "could not read statistics".into()));
+    }
+    response.json().await.map_err(|e| e.to_string())
+}

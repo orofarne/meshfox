@@ -167,7 +167,7 @@ fn print_summary(run: &Summary, json_output: bool) {
     );
 }
 
-fn style(text: impl AsRef<str>, sgr: &str) -> String {
+pub(crate) fn style(text: impl AsRef<str>, sgr: &str) -> String {
     let text = text.as_ref();
     if run_output::color_enabled() {
         format!("\x1b[{sgr}m{text}\x1b[0m")

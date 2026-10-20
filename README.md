@@ -695,6 +695,23 @@ The default transcript shows what happened in that invocation, including skips a
 
 `meshfox project.canvas.md run -d build` (or `--detach`) requires a configured, reachable coordinator (`server_socket`); it never falls back to a standalone core or starts a background watcher. It resolves inputs and confirmations, waits for the worker to accept the chain, prints its numeric ID, and returns. Exit code 0 means accepted; inspect the final outcome with `meshfox project.canvas.md logs --id 42 --follow`, or watch the canvas with `console`. Services keep running according to their normal lifecycle; run-scoped leases and deferred cleanup still finish in the worker. TTY chains (including TTY cleanup) are rejected. For a comma-separated block list, each target is admitted independently and prints one ID; they may execute concurrently, and a later admission error does not cancel an earlier accepted chain.
 
+### Saved-journal statistics (`stats`)
+<!-- meshfox:node id="saved-journal-statistics-stats" -->
+
+`meshfox stats` summarizes the invocation journals still retained for a canvas. The report shows its actual history coverage, outcomes, median/p95 durations, skips, slowest blocks and frequently failing blocks:
+
+```text
+meshfox project.canvas.md stats
+meshfox project.canvas.md stats build --chain
+meshfox project.canvas.md stats tests smoke
+meshfox project.canvas.md stats --since 7d
+meshfox project.canvas.md stats --json
+```
+
+A block address selects that block's participation across chains; `--chain` selects chains requested for the target and includes their dependency steps. The block view also shows recent outcomes. `--since` filters invocation start time and accepts durations or RFC3339 timestamps.
+
+Coverage is explicitly limited to saved journals: requesting a month does not recover rotated-out history. Skips, cancellations, interruptions, running steps and service startup/reuse are shown separately from successful executions. Median and p95 use completed success/failure durations, with chain time separate from step time. Reading statistics through the worker API executes no blocks and creates no persistent aggregates. See SPEC.md's "Saved-journal statistics" for counting and percentile rules.
+
 ## How-to
 <!-- meshfox:node id="how-to" -->
 
