@@ -235,10 +235,12 @@ pub(crate) const SOURCE_EDITOR_THEME: &str = "base16-ocean.dark";
 /// `Option` chain either way, so there's no cost to not panicking on it.
 const SOURCE_EDITOR_LANG: &str = "md";
 
-/// Default `App::output_height` — see `App::resize_handle_at`/
+/// Default `App::output_height_pct` — see `App::resize_handle_at`/
 /// `on_resize_drag` for how a mouse drag on the border can change it.
-pub(super) const DEFAULT_OUTPUT_HEIGHT: u16 = 9;
-/// Default `App::tree_width_pct` — same reasoning as `DEFAULT_OUTPUT_HEIGHT`.
+pub(super) const DEFAULT_OUTPUT_HEIGHT_PCT: u16 = 20;
+/// The fewest rows the Output pane keeps (its border plus one content row).
+pub(super) const MIN_OUTPUT_HEIGHT: u16 = 3;
+/// Default `App::tree_width_pct` — same reasoning as `DEFAULT_OUTPUT_HEIGHT_PCT`.
 pub(super) const DEFAULT_TREE_WIDTH_PCT: u16 = 30;
 pub(super) const FOOTER_HEIGHT: u16 = 1;
 
@@ -299,14 +301,14 @@ pub(super) const TREE_COLLAPSED_WIDTH: u16 = 2;
 /// in `App::on_mouse` then simply never match a collapsed pane, with no
 /// separate "are we fullscreen, and which pane" branch needed there.
 ///
-/// `tree_width_pct`/`output_height` (`App`'s own fields, adjustable by
+/// `tree_width_pct`/`output_height_pct` (`App`'s own fields, adjustable by
 /// dragging the border between panes — see `App::on_resize_drag`) size the
 /// tree/document horizontal split and the Output pane's own height; both
 /// are ignored while `fullscreen` is set, same as before either field
 /// existed.
 /// `console_collapsed`/`tree_collapsed` (see `App`'s own fields) shrink the
 /// Output row to a 1-line strip / the Tree column to `TREE_COLLAPSED_WIDTH`
-/// instead of their usual `output_height`/`tree_width_pct` — collapsing
+/// instead of their usual `output_height_pct`/`tree_width_pct` — collapsing
 /// only ever shrinks a pane along its own axis, it never disappears
 /// entirely, so it stays visible/clickable to expand manually at any time
 /// (see `App::on_mouse`'s own collapsed-strip click handling for each).
@@ -314,7 +316,7 @@ pub fn compute_layout(
     area: Rect,
     fullscreen: Option<Focus>,
     tree_width_pct: u16,
-    output_height: u16,
+    output_height_pct: u16,
     console_collapsed: bool,
     tree_collapsed: bool,
 ) -> PaneLayout {
@@ -333,7 +335,14 @@ pub fn compute_layout(
         };
     }
 
-    let output_row_height = if console_collapsed { 1 } else { output_height };
+    let content_height = area.height.saturating_sub(FOOTER_HEIGHT);
+    let max_output = content_height.saturating_sub(MIN_MAIN_HEIGHT);
+    let output_row_height = if console_collapsed {
+        1
+    } else {
+        let wanted = (content_height as u32 * output_height_pct as u32 / 100) as u16;
+        wanted.max(MIN_OUTPUT_HEIGHT).min(max_output.max(1))
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -375,6 +384,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(se) = &mut app.source_editor {
         let syntax_set = Arc::clone(app.highlighter.syntax_set());
         render_source_editor(f, area, se, &syntax_set, &app.editor_theme);
+        if let Some(palette) = &mut app.palette {
+            palette.render(f, area);
+        }
         return;
     }
 
@@ -391,7 +403,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         area,
         app.fullscreen,
         app.navigation_width_pct(),
-        app.output_height,
+        app.output_height_pct,
         app.console_collapsed,
         app.tree_collapsed,
     );
@@ -433,12 +445,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_services_view(f, area, &*app, sv);
     } else if let Some(tv) = &app.tty_sessions_view {
         render_tty_sessions_view(f, area, &*app, tv);
+    } else if let Some(sv) = &app.stats_view {
+        render_stats_view(f, area, sv);
     } else if let Some(hv) = &app.history_view {
         render_history_view(f, area, hv);
     } else if let Some(rv) = &app.run_history_view {
         render_run_history_view(f, area, rv);
     } else if app.show_help {
         render_help(f, area, &*app);
+    }
+    if let Some(palette) = &mut app.palette {
+        palette.render(f, area);
     }
 }
 
@@ -2075,7 +2092,9 @@ pub(super) fn block_picker_list_rect(area: Rect, block_count: usize) -> Rect {
 fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerState) {
     let rect = block_picker_rect(area, bp.blocks.len());
     f.render_widget(Clear, rect);
-    let mode = if bp.history {
+    let mode = if bp.stats {
+        "statistics"
+    } else if bp.history {
         "run history"
     } else if bp.with_deps {
         "run (with deps)"
@@ -2432,6 +2451,38 @@ fn history_time(created_at: &str) -> String {
 /// still applied read normally; the redo tail (undone, `applied == false`)
 /// is dimmed, and the newest applied step — the canvas's current state — is
 /// marked. `enter` jumps to the highlighted row.
+/// The palette's statistics view: `meshfox stats`' text, scrollable.
+fn render_stats_view(f: &mut Frame, area: Rect, sv: &super::app::StatsViewState) {
+    let rect = centered_rect(area.width * 9 / 10, area.height * 8 / 10, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" statistics ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let mut ansi = super::ansi::Ansi::default();
+    let lines: Vec<Line> = sv
+        .lines
+        .iter()
+        .skip(sv.scroll)
+        .take(usize::from(layout[0].height))
+        .map(|l| ansi.line(l, Style::default()))
+        .collect();
+    f.render_widget(Paragraph::new(lines), layout[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "j/k scroll · PgUp/PgDn · g/G top/bottom · q/esc close",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        layout[1],
+    );
+}
+
 fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewState) {
     let current = hv.entries.iter().position(|e| e.applied);
     let rect = centered_rect(72, (hv.entries.len() as u16 + 4).min(area.height), area);
@@ -2666,8 +2717,10 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "S               reset session — forget which blocks already ran,",
         "                so the next chain run re-runs every dependency",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
-        "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-p",
+        "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-Space",
         "                suggest attributes/tags, Ctrl-g Unicode, esc close)",
+        "ctrl-p          command palette (also inside the editor): node",
+        "                edits, run statistics, and every action above",
         "                mouse click/drag/scroll inside the editor",
         "                (unavailable on a read-only canvas, like H below)",
         "i               (Document focus) open/focus this node's own form —",

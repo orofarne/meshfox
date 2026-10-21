@@ -92,7 +92,7 @@ pub struct SourceEditorState {
     /// other keypress, so it only ever fires as an immediate follow-up,
     /// never a "leftover" confirmation from several edits ago.
     pending_discard: bool,
-    /// `Ctrl-p` popup — TODO.canvas.md: "Саджесты... в TUI". `open_attr_suggest`
+    /// `Ctrl-Space` popup — TODO.canvas.md: "Саджесты... в TUI". `open_attr_suggest`
     /// fills `attr_suggest_kind`/`attr_suggest_candidates` from whatever
     /// `meshfox:node`/`meshfox:edge`/fence-attribute line the cursor is
     /// currently on; `on_attr_suggest_key` drives selection while this is
@@ -104,10 +104,10 @@ pub struct SourceEditorState {
     /// Every distinct tag used anywhere in the currently loaded canvas
     /// (nodes and extra edges alike), computed once by the caller
     /// (`App::open_source_editor`) when the editor opens — the candidate
-    /// source for the `tags="..."`-value flavor of `Ctrl-p` below.
+    /// source for the `tags="..."`-value flavor of `Ctrl-Space` below.
     /// TODO.canvas.md: "Саджест по тегам в TUI".
     all_tags: Vec<String>,
-    /// Same `Ctrl-p` popup mechanism as `attr_suggest_*`, but triggered
+    /// Same `Ctrl-Space` popup mechanism as `attr_suggest_*`, but triggered
     /// instead when the cursor sits inside an already-typed `tags="..."`
     /// value (`open_attr_suggest` picks between the two) — candidates are
     /// tag names already used elsewhere in the document, not attribute
@@ -387,12 +387,19 @@ impl SourceEditorState {
                 // Item 2 — opens the attribute-suggestion popup for
                 // whatever meshfox:node/meshfox:edge/fence-attribute line
                 // the cursor's currently on.
-                KeyCode::Char('p') => {
+                // `Ctrl-Space` reaches us as `Ctrl-Space`, `Ctrl-@` or a bare
+                // NUL depending on the terminal; `Ctrl-t` is the fallback for
+                // terminals that swallow it. (`Ctrl-p` is the command palette.)
+                KeyCode::Char('t') | KeyCode::Char(' ') | KeyCode::Char('@') => {
                     self.open_attr_suggest();
                     return SourceEditorOutcome::Stay;
                 }
                 _ => {}
             }
+        }
+        if key.code == KeyCode::Null {
+            self.open_attr_suggest();
+            return SourceEditorOutcome::Stay;
         }
         // Only Normal mode's own Esc is ours to take — Insert mode's Esc
         // has to reach `events` below first (it's what steps back to
@@ -534,7 +541,7 @@ impl SourceEditorState {
         Ok(())
     }
 
-    /// `Ctrl-p` — opens the attribute-suggestion popup for whatever
+    /// `Ctrl-Space`/`Ctrl-t` — opens the attribute-suggestion popup for whatever
     /// `meshfox:node`/`meshfox:edge`/fence-attribute line the cursor is
     /// currently on (`detect_attr_context`), pre-filtered to only the
     /// attributes that line doesn't already have (`attr_candidates`).
@@ -546,7 +553,7 @@ impl SourceEditorState {
     /// attribute names — the natural reading of "cursor is inside the tags
     /// value" as *intent* to add another tag, not to add a whole new
     /// attribute.
-    fn open_attr_suggest(&mut self) {
+    pub(super) fn open_attr_suggest(&mut self) {
         let text = self.editor.lines.to_string();
         let row = self.editor.cursor.row;
         let Some(line) = text.lines().nth(row) else {
@@ -1365,7 +1372,7 @@ mod tests {
         let _ = std::fs::remove_file(&se.path);
     }
 
-    // TODO.canvas.md: "Саджест по тегам в TUI" — `Ctrl-p`'s tag-value
+    // TODO.canvas.md: "Саджест по тегам в TUI" — `Ctrl-Space`'s tag-value
     // flavor, taken when the cursor sits inside an already-typed
     // `tags="..."` value rather than on the rest of the line.
     #[test]

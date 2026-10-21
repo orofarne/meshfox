@@ -28,10 +28,24 @@ Type "r"
 Wait+Screen /Report ready for South/
 Sleep 2s
 
-# Show the local chart, then edit this node in the source editor.
+# Show the local chart, then add a node from the command palette.
 Type "j"
 Wait+Screen /Images render right inside/
 Sleep 3s
+Ctrl+P
+Wait+Screen /Commands/
+Sleep 2s
+Type "new child"
+Sleep 1s
+Enter
+Wait+Screen /Title:/
+Type "Next steps"
+Sleep 500ms
+Enter
+Wait+Screen /Next steps/
+Sleep 1s
+
+# Write its text in the source editor and save.
 Type "e"
 Sleep 1s
 Type "Go"

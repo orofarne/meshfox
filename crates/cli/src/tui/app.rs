@@ -75,7 +75,7 @@ const MAX_TREE_WIDTH_PCT: u16 = 85;
 /// plus a couple of lines of real output; the upper bound instead comes
 /// from `ui::MIN_MAIN_HEIGHT` (leaving the tree/document row usable), since
 /// that one depends on the terminal's own current height.
-const MIN_OUTPUT_HEIGHT: u16 = 3;
+const MIN_OUTPUT_HEIGHT: u16 = ui::MIN_OUTPUT_HEIGHT;
 
 /// A modal form for one or more declared variables at once — all of them
 /// visible and editable together (arrow keys move the focused field,
@@ -169,6 +169,9 @@ pub struct BlockPickerState {
     /// `true` when the choice opens the block's run history (`L`) instead of
     /// running it (`r`/`R`) — same "which block?" question, different answer.
     pub history: bool,
+    /// `true` when the choice opens the block's statistics (palette)
+    /// instead; `history` is then `false`.
+    pub stats: bool,
 }
 
 /// An *already-connected* `/api/run/tty` socket (see
@@ -207,6 +210,14 @@ pub struct TtySessionsViewState {
 
 /// How many undo-log steps the `H` view asks the worker for.
 const HISTORY_VIEW_LIMIT: usize = 200;
+
+/// The palette's "Run statistics" view: the same report `meshfox stats`
+/// prints, scrollable. Worker-only, like the history views.
+#[derive(Default)]
+pub struct StatsViewState {
+    pub lines: Vec<String>,
+    pub scroll: usize,
+}
 
 /// The `H` history view — see `App::open_history_view`,
 /// `App::on_history_view_key`, `ui::render_history_view`. Worker-only: the
@@ -572,12 +583,13 @@ pub struct App {
     /// staying pinned open just because focus happened to pass through it
     /// once.
     auto_expanded_pane: Option<Focus>,
-    /// The Output pane's own height, in rows — `ui::compute_layout`'s own
-    /// `Constraint::Length`. Adjustable the same way as `tree_width_pct`,
+    /// The Output pane's own height as a percentage of the rows above the
+    /// footer — `ui::compute_layout` turns it into a `Constraint::Length`, so
+    /// the pane scales with the terminal. Adjustable the same way as `tree_width_pct`,
     /// via the border between the tree/document row and Output; clamped to
     /// `MIN_OUTPUT_HEIGHT..=` whatever still leaves `ui::MIN_MAIN_HEIGHT`
     /// rows for the tree/document row above it.
-    pub output_height: u16,
+    pub output_height_pct: u16,
     /// Which border (if any) a `MouseEventKind::Down(Left)` most recently
     /// landed on and is still being dragged — `None` outside an active
     /// resize gesture. Set by `resize_handle_at`, consumed by
@@ -663,6 +675,7 @@ pub struct App {
     pub tty_sessions_view: Option<TtySessionsViewState>,
     /// The `H` history view, `None` while closed.
     pub history_view: Option<HistoryViewState>,
+    pub stats_view: Option<StatsViewState>,
     /// The `L` run-history view, when open.
     pub run_history_view: Option<RunHistoryViewState>,
     /// Last-fetched `GET /api/runs`, filtered to `kind == "tty" && status
@@ -692,6 +705,11 @@ pub struct App {
     /// The `dir`/`file` path picker (`Ctrl-O` on such a field of `var_form`
     /// or `active_inline_form`), drawn above whichever of them opened it.
     pub path_picker: Option<super::path_picker::PathPickerState>,
+    /// The `Ctrl-p` command palette (see `super::palette`).
+    pub palette: Option<super::palette::Palette>,
+    /// A node id to select once the next reload brings it into the tree —
+    /// set by palette commands that create a node.
+    select_after_reload: Option<String>,
     pub status: String,
     pub show_help: bool,
     /// How far the `?` help modal's own content is scrolled down — counts
@@ -1158,6 +1176,8 @@ impl App {
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
         let editor_theme = crate::syntax_registry::resolve_editor_theme(&syntax_root);
         let external_editor = super::external_editor::configured(&syntax_root);
+        let output_height_pct = meshfox_core::config::tui_output_height_pct(&syntax_root)
+            .unwrap_or(ui::DEFAULT_OUTPUT_HEIGHT_PCT);
 
         let info = match worker_port {
             Some(port) => crate::worker_client::info(port).await,
@@ -1202,7 +1222,7 @@ impl App {
             show_all_map_edges: false,
             tree_collapsed: false,
             auto_expanded_pane: None,
-            output_height: ui::DEFAULT_OUTPUT_HEIGHT,
+            output_height_pct,
             resize_drag: None,
             highlighter: Highlighter::with_extra_syntaxes(&syntax_root, &editor_theme),
             editor_theme,
@@ -1225,6 +1245,7 @@ impl App {
             pending_http_tty_attach: None,
             tty_sessions_view: None,
             history_view: None,
+            stats_view: None,
             run_history_view: None,
             live_tty_sessions: Vec::new(),
             block_runs: None,
@@ -1236,6 +1257,8 @@ impl App {
             block_picker: None,
             var_form: None,
             path_picker: None,
+            palette: None,
+            select_after_reload: None,
             status: if read_only {
                 READ_ONLY_STATUS.into()
             } else {
@@ -1280,6 +1303,17 @@ impl App {
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) {
+        if self.palette.is_some() {
+            self.on_palette_key(key).await;
+            return;
+        }
+        if key.code == KeyCode::Char('p')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.palette_allowed()
+        {
+            self.open_palette();
+            return;
+        }
         if let Some(se) = &mut self.source_editor {
             match se.on_key(key) {
                 SourceEditorOutcome::Stay => {}
@@ -1367,6 +1401,10 @@ impl App {
         }
         if self.tty_sessions_view.is_some() {
             self.on_tty_sessions_view_key(key).await;
+            return;
+        }
+        if self.stats_view.is_some() {
+            self.on_stats_view_key(key);
             return;
         }
         if self.history_view.is_some() {
@@ -2129,7 +2167,9 @@ impl App {
                     return;
                 };
                 let name = bp.blocks[bp.selected].name.clone();
-                if bp.history {
+                if bp.stats {
+                    self.open_stats_view(Some((bp.node_id, name))).await;
+                } else if bp.history {
                     self.open_run_history_for(bp.node_id, name).await;
                 } else {
                     self.start_run(bp.node_id, name, bp.with_deps).await;
@@ -2206,7 +2246,7 @@ impl App {
             area,
             self.fullscreen,
             self.navigation_width_pct(),
-            self.output_height,
+            self.output_height_pct,
             self.console_collapsed,
             self.tree_collapsed,
         );
@@ -2647,6 +2687,368 @@ impl App {
 
     /// Opens the path picker for the focused `dir`/`file` field, starting
     /// from the text it currently holds.
+    /// Whether `Ctrl-p` may open the palette right now: not over another
+    /// modal, and not while a text field of the main view has the keys.
+    fn palette_allowed(&self) -> bool {
+        if let Some(se) = &self.source_editor {
+            return !(se.file_picker_open
+                || se.attr_suggest_open
+                || se.tag_suggest_open
+                || se.unicode_picker.is_some());
+        }
+        self.table_mode.is_none()
+            && self.path_picker.is_none()
+            && self.var_form.is_none()
+            && self.block_picker.is_none()
+            && self.run_confirmation.is_none()
+            && !self.reset_session_confirm
+            && self.service_conflict.is_none()
+            && self.services_view.is_none()
+            && self.tty_sessions_view.is_none()
+            && self.history_view.is_none()
+            && self.stats_view.is_none()
+            && self.run_history_view.is_none()
+            && !self.show_help
+            && !self.search.open
+            && !self.active_inline_form.as_ref().is_some_and(|f| f.editing)
+    }
+
+    fn open_palette(&mut self) {
+        let (title, id) = self
+            .rows
+            .get(self.selected)
+            .map(|r| (r.title.clone(), r.node_id.clone()))
+            .unwrap_or_default();
+        // Candidates for "move under": every visible, non-included node
+        // except the selection and the rows nested below it (a move into
+        // its own subtree would be a cycle).
+        let selected_depth = self.rows.get(self.selected).map(|r| r.depth);
+        let mut parents = Vec::new();
+        let mut skip_below: Option<usize> = None;
+        for (i, row) in self.rows.iter().enumerate() {
+            if skip_below.is_some_and(|d| row.depth > d) {
+                continue;
+            }
+            skip_below = None;
+            if i == self.selected {
+                skip_below = selected_depth;
+                continue;
+            }
+            if row.reference.is_none() {
+                parents.push((
+                    row.node_id.clone(),
+                    format!("{}{}", "  ".repeat(row.depth), row.title),
+                ));
+            }
+        }
+        let edges = self
+            .display_canvas
+            .node(&id)
+            .map(|n| {
+                n.extra_parents
+                    .iter()
+                    .map(|e| {
+                        let title = self
+                            .display_canvas
+                            .node(&e.from)
+                            .map_or_else(|| e.from.clone(), |p| p.title.clone());
+                        (e.from.clone(), title)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.palette = Some(super::palette::Palette::new(
+            self.source_editor.is_some(),
+            title,
+            id,
+            parents,
+            edges,
+        ));
+    }
+
+    async fn on_palette_key(&mut self, key: KeyEvent) {
+        use super::palette::Outcome;
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
+        match palette.on_key(key) {
+            Outcome::Stay => {}
+            Outcome::Close => self.palette = None,
+            Outcome::Run(request) => self.run_palette_request(request).await,
+        }
+    }
+
+    async fn run_palette_request(&mut self, request: super::palette::Request) {
+        use super::palette::CommandId;
+        self.palette = None;
+        match request.id {
+            CommandId::InsertUnicode => {
+                if let Some(se) = &mut self.source_editor {
+                    se.unicode_picker = Some(super::unicode_picker::UnicodePicker::new());
+                }
+                return;
+            }
+            CommandId::SuggestAttributes => {
+                if let Some(se) = &mut self.source_editor {
+                    se.open_attr_suggest();
+                }
+                return;
+            }
+            CommandId::Stats => {
+                self.open_stats_view(None).await;
+                return;
+            }
+            CommandId::BlockStats => {
+                self.open_block_view(true).await;
+                return;
+            }
+            CommandId::Press(c) => {
+                // The same path the key takes, so the palette entry and its
+                // shortcut can't drift apart.
+                let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+                Box::pin(self.on_key(key)).await;
+                return;
+            }
+            _ => {}
+        }
+        // The rest change the node tree through the worker. From the editor
+        // that only makes sense once the buffer is saved: the reload that
+        // follows would otherwise collide with unsaved edits.
+        if let Some(se) = &mut self.source_editor {
+            if se.dirty() {
+                se.error = Some("unsaved changes — Ctrl-s to save before changing nodes".into());
+                return;
+            }
+        }
+        let Some(port) = self.worker_port else {
+            self.status = "node commands need a worker — none reachable".into();
+            return;
+        };
+        let Some(row) = self.rows.get(self.selected) else {
+            self.status = "no node selected".into();
+            return;
+        };
+        if row.reference.is_some() {
+            self.status = "this node comes from an included file — edit it there".into();
+            return;
+        }
+        let id = row.node_id.clone();
+        let text = request.text.unwrap_or_default();
+        let parent = {
+            let depth = row.depth;
+            self.rows[..self.selected]
+                .iter()
+                .rev()
+                .find(|r| r.depth < depth && r.reference.is_none())
+                .map(|r| r.node_id.clone())
+        };
+        // Neighbours among the selected node's siblings, for reordering.
+        let depth = self.rows[self.selected].depth;
+        let previous_sibling = self.rows[..self.selected]
+            .iter()
+            .rev()
+            .filter(|r| r.reference.is_none())
+            .take_while(|r| r.depth >= depth)
+            .find(|r| r.depth == depth)
+            .map(|r| r.node_id.clone());
+        let next_sibling = self.rows[self.selected + 1..]
+            .iter()
+            .filter(|r| r.reference.is_none())
+            .take_while(|r| r.depth >= depth)
+            .find(|r| r.depth == depth)
+            .map(|r| r.node_id.clone());
+        let already_declared = self
+            .display_canvas
+            .node(&id)
+            .zip(Some(text.as_str()))
+            .is_some_and(|(n, new_parent)| n.extra_parents.iter().any(|e| e.from == new_parent));
+        use crate::worker_client::{
+            create_node, move_sibling, remove_node, rename_node_id, reparent_node, update_node,
+            EdgeOps, NodeUpdate,
+        };
+        let result = match request.id {
+            CommandId::NewChild => create_node(port, &id, &text, true, None)
+                .await
+                .map(|new_id| {
+                    self.expanded.insert(id.clone());
+                    self.select_after_reload = Some(new_id);
+                    format!("created \"{text}\"")
+                }),
+            CommandId::NewSibling => match parent {
+                Some(parent) => create_node(port, &parent, &text, true, None)
+                    .await
+                    .map(|new_id| {
+                        self.select_after_reload = Some(new_id);
+                        format!("created \"{text}\"")
+                    }),
+                None => Err("the root node has no siblings".to_string()),
+            },
+            CommandId::Rename => {
+                let update = NodeUpdate {
+                    title: Some(text.clone()),
+                    ..Default::default()
+                };
+                update_node(port, &id, &update)
+                    .await
+                    .map(|()| format!("renamed to \"{text}\""))
+            }
+            CommandId::ChangeId => rename_node_id(port, &id, &text).await.map(|()| {
+                self.select_after_reload = Some(text.clone());
+                format!("id is now \"{text}\"")
+            }),
+            CommandId::MoveUp => match previous_sibling {
+                Some(target) => move_sibling(port, &id, &target, true)
+                    .await
+                    .map(|()| "moved up".to_string()),
+                None => Err("already the first sibling".to_string()),
+            },
+            CommandId::MoveDown => match next_sibling {
+                Some(target) => move_sibling(port, &id, &target, false)
+                    .await
+                    .map(|()| "moved down".to_string()),
+                None => Err("already the last sibling".to_string()),
+            },
+            CommandId::MoveTo => {
+                // `reparent_node` only promotes an existing extra-parent
+                // edge, so declare one first (as `meshfox node mv` does).
+                let declared = if already_declared {
+                    Ok(())
+                } else {
+                    let update = NodeUpdate {
+                        edges: Some(EdgeOps {
+                            add: vec![text.clone()],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    update_node(port, &id, &update).await
+                };
+                match declared {
+                    Ok(()) => reparent_node(port, &id, &text).await.map(|()| {
+                        self.expanded.insert(text.clone());
+                        self.select_after_reload = Some(id.clone());
+                        "moved".to_string()
+                    }),
+                    Err(e) => Err(e),
+                }
+            }
+            CommandId::Delete => remove_node(port, &id, false)
+                .await
+                .map(|()| "deleted node and its subtree".to_string()),
+            CommandId::DeleteKeepChildren => remove_node(port, &id, true)
+                .await
+                .map(|()| "deleted node, children kept".to_string()),
+            CommandId::AddEdge => {
+                let update = NodeUpdate {
+                    edges: Some(EdgeOps {
+                        add: vec![text.clone()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                update_node(port, &id, &update)
+                    .await
+                    .map(|()| "edge added".to_string())
+            }
+            CommandId::RemoveEdge => {
+                let update = NodeUpdate {
+                    edges: Some(EdgeOps {
+                        remove: vec![text.clone()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                update_node(port, &id, &update)
+                    .await
+                    .map(|()| "edge removed".to_string())
+            }
+            CommandId::InsertUnicode
+            | CommandId::SuggestAttributes
+            | CommandId::Stats
+            | CommandId::BlockStats
+            | CommandId::Press(_) => return,
+        };
+        let focus = self
+            .select_after_reload
+            .clone()
+            .unwrap_or_else(|| id.clone());
+        let message = match result {
+            Ok(message) => {
+                self.refresh_after_node_command(port, &focus).await;
+                message
+            }
+            Err(e) => format!("command failed: {e}"),
+        };
+        self.status = message;
+    }
+
+    /// Pulls the document the worker now has into the tree and, if the
+    /// source editor is open on it, into the editor's (saved, so safe to
+    /// replace) buffer, with the cursor on `focus` where it still exists.
+    async fn refresh_after_node_command(&mut self, port: u16, focus: &str) {
+        let Ok(raw) = crate::worker_client::get_canvas_raw(port).await else {
+            return;
+        };
+        let display = crate::worker_client::get_canvas(port).await.ok();
+        self.apply_external_reload(raw.clone(), display);
+        self.pending_external_change = None;
+        let Some(se) = self.source_editor.as_mut() else {
+            return;
+        };
+        if se.path != self.canvas_path {
+            return;
+        }
+        let (path, is_canvas) = (se.path.clone(), se.is_canvas);
+        let cursor = mdcanvas::node_body_offset(&raw, focus)
+            .map(|off| source_editor::byte_offset_to_cursor(&raw, off));
+        se.finish_switch(path, is_canvas, raw);
+        if let Some(cursor) = cursor {
+            se.editor.cursor = cursor;
+        }
+    }
+
+    async fn open_stats_view(&mut self, block: Option<(String, String)>) {
+        let Some(port) = self.worker_port else {
+            self.status = "statistics need a worker — none reachable".into();
+            return;
+        };
+        let selector = match block {
+            Some((node_id, block)) => serde_json::json!([node_id, block]).to_string(),
+            None => "[]".to_string(),
+        };
+        let params = [
+            ("selector".to_string(), selector),
+            ("chain".to_string(), "false".to_string()),
+        ];
+        match crate::worker_client::stats(port, &params).await {
+            Ok(report) => {
+                let text = crate::stats_cmd::render_report(&report);
+                self.stats_view = Some(StatsViewState {
+                    lines: text.lines().map(str::to_string).collect(),
+                    scroll: 0,
+                });
+            }
+            Err(e) => self.status = format!("statistics failed: {e}"),
+        }
+    }
+
+    fn on_stats_view_key(&mut self, key: KeyEvent) {
+        let Some(view) = &mut self.stats_view else {
+            return;
+        };
+        let last = view.lines.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.stats_view = None,
+            KeyCode::Up | KeyCode::Char('k') => view.scroll = view.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => view.scroll = (view.scroll + 1).min(last),
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(10),
+            KeyCode::PageDown => view.scroll = (view.scroll + 10).min(last),
+            KeyCode::Home | KeyCode::Char('g') => view.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => view.scroll = last,
+            _ => {}
+        }
+    }
+
     async fn open_path_picker(&mut self, target: super::path_picker::PickerTarget) {
         use super::path_picker::{PathPickerState, PickerTarget};
         let (decl, current) = match target {
@@ -2807,7 +3209,7 @@ impl App {
     /// tree and document panes, or between the tree/document row and
     /// Output below it. `None` while a pane is fullscreen — there's nothing
     /// to drag apart then (`ui::compute_layout` itself ignores
-    /// `tree_width_pct`/`output_height` in that case too).
+    /// `tree_width_pct`/`output_height_pct` in that case too).
     ///
     /// The vertical seam is genuinely two adjacent border columns (tree's
     /// own right border, then document's own left border right next to
@@ -2837,7 +3239,7 @@ impl App {
     /// The other half of a resize gesture `resize_handle_at` started —
     /// called on every `MouseEventKind::Drag(Left)` while `resize_drag` is
     /// `Some`, translating the cursor's current position back into a new
-    /// `tree_width_pct`/`output_height`. `area` is the whole terminal, same
+    /// `tree_width_pct`/`output_height_pct`. `area` is the whole terminal, same
     /// as what `ui::compute_layout` itself sizes the panes against, so a
     /// drag to column/row `N` reproduces exactly the split that would put
     /// the border there.
@@ -2863,8 +3265,13 @@ impl App {
                     return; // terminal too short to leave any room to negotiate
                 }
                 let target_row = row.saturating_sub(area.y);
-                let new_height = content_height.saturating_sub(target_row);
-                self.output_height = new_height.clamp(MIN_OUTPUT_HEIGHT, max_output_height);
+                let new_height = content_height
+                    .saturating_sub(target_row)
+                    .clamp(MIN_OUTPUT_HEIGHT, max_output_height);
+                // Round up so the layout's own truncating division lands on
+                // (at least) the row the cursor is on.
+                let pct = (new_height as u32 * 100).div_ceil(content_height as u32);
+                self.output_height_pct = pct.min(100) as u16;
             }
         }
     }
@@ -3299,6 +3706,15 @@ impl App {
                 self.decls = declared_vars(&self.canvas).unwrap_or_default();
                 self.rebuild_display_canvas(display);
                 self.rebuild_rows();
+                if let Some(id) = self.select_after_reload.take() {
+                    if let Some(pos) = self
+                        .rows
+                        .iter()
+                        .position(|r| r.reference.is_none() && r.node_id == id)
+                    {
+                        self.selected = pos;
+                    }
+                }
                 self.render_current_document();
                 self.status = "reloaded — file changed on disk".into();
             }
@@ -4358,6 +4774,7 @@ impl App {
             selected: 0,
             with_deps,
             history: false,
+            stats: false,
         });
     }
 
@@ -4737,6 +5154,9 @@ impl App {
         let path = self.path_to(&node_id);
         self.output_scroll = 0;
         self.output_hscroll = 0;
+        // Passively-watched output is rendered *after* the run's own lines, so
+        // leftovers from earlier runs would otherwise bury this run's fresh tail.
+        self.external_console_lines.clear();
         self.status.clear();
         // Only worth auto-opening the console for a real chain — a single
         // block's own output isn't worth losing screen space over. Worker
@@ -5185,6 +5605,9 @@ impl App {
             self.external_running.remove(&addr);
             return;
         }
+        // The foreground run already prints its own lines; echoing the passive
+        // stream's copy would append after (and hide) its fresh output.
+        let console = console && !self.run.as_ref().is_some_and(|r| r.chain.contains(&addr));
         if console {
             self.console_last_activity = Some(std::time::Instant::now());
             match &event {
@@ -6066,15 +6489,30 @@ impl App {
     /// never leaves a run record behind, so those aren't offered (and a node
     /// with none says so).
     async fn open_run_history(&mut self) {
+        self.open_block_view(false).await;
+    }
+
+    /// `L` (run history) and the palette's block statistics resolve their
+    /// block the same way: the Document's selected block, else the node's
+    /// only block, else a picker. `stats` picks which view that opens.
+    async fn open_block_view(&mut self, stats: bool) {
         if self.focus == Focus::Document {
             if let Some(addr) = self.selected_block.clone() {
-                self.activate_block_action(addr, markdown::BlockAction::History)
-                    .await;
+                if stats {
+                    self.open_stats_view(Some((addr.node_id, addr.block_name)))
+                        .await;
+                } else {
+                    self.activate_block_action(addr, markdown::BlockAction::History)
+                        .await;
+                }
                 return;
             }
         }
         if self.worker_port.is_none() {
-            self.status = "run history needs a worker — none reachable".into();
+            self.status = format!(
+                "{} needs a worker — none reachable",
+                if stats { "statistics" } else { "run history" }
+            );
             return;
         }
         let Some(row) = self.rows.get(self.selected) else {
@@ -6089,17 +6527,29 @@ impl App {
             .runnable_blocks()
             .into_iter()
             .filter(|b| {
-                !b.service && !meshfox_core::is_button(&b.lang) && !meshfox_core::is_form(&b.lang)
+                (stats || !b.service)
+                    && !meshfox_core::is_button(&b.lang)
+                    && !meshfox_core::is_form(&b.lang)
             })
             .collect();
         match blocks.len() {
-            0 => self.status = "no block in this node keeps a run history".into(),
+            0 => {
+                self.status = if stats {
+                    "no block in this node to show statistics for".into()
+                } else {
+                    "no block in this node keeps a run history".into()
+                }
+            }
             1 => {
                 let name = blocks[0]
                     .name
                     .clone()
                     .expect("scan_runnable_blocks always names its blocks");
-                self.open_run_history_for(node_id, name).await;
+                if stats {
+                    self.open_stats_view(Some((node_id, name))).await;
+                } else {
+                    self.open_run_history_for(node_id, name).await;
+                }
             }
             _ => {
                 let default_name = fence::default_block(&node_id, &blocks)
@@ -6128,7 +6578,8 @@ impl App {
                     blocks: choices,
                     selected,
                     with_deps: false,
-                    history: true,
+                    history: !stats,
+                    stats,
                 });
             }
         }

@@ -215,6 +215,18 @@ fn tui_image_protocol_from_table(table: &toml::Table) -> Result<Option<String>, 
     }
 }
 
+/// Configured `[tui] output_height_pct`: the Output pane's initial height as a
+/// percentage of the terminal. Anything but an integer in `1..=90` is ignored,
+/// so the TUI falls back to its own default instead of refusing to start.
+pub fn tui_output_height_pct(canvas_root: &Path) -> Option<u16> {
+    tui_output_height_pct_from_table(&load(canvas_root))
+}
+
+fn tui_output_height_pct_from_table(table: &toml::Table) -> Option<u16> {
+    let pct = table.get("tui")?.get("output_height_pct")?.as_integer()?;
+    u16::try_from(pct).ok().filter(|p| (1..=90).contains(p))
+}
+
 /// Default for [`session_max_output_bytes`] — 256 KiB per block, same
 /// figure `tty_registry::BYTE_CAPACITY` uses for a pty's own scrollback.
 pub const DEFAULT_SESSION_MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -474,6 +486,21 @@ mod tests {
 
     fn lock_server_socket_env() -> std::sync::MutexGuard<'static, ()> {
         SERVER_SOCKET_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn tui_output_height_pct_accepts_only_sane_integers() {
+        let pct = |v: &str| {
+            tui_output_height_pct_from_table(
+                &format!("[tui]\noutput_height_pct = {v}").parse().unwrap(),
+            )
+        };
+        assert_eq!(pct("35"), Some(35));
+        assert_eq!(pct("0"), None);
+        assert_eq!(pct("95"), None);
+        assert_eq!(pct("-5"), None);
+        assert_eq!(pct("\"20\""), None);
+        assert_eq!(tui_output_height_pct_from_table(&toml::Table::new()), None);
     }
 
     #[test]

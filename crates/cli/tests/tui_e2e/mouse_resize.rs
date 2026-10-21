@@ -6,7 +6,7 @@
 //! `MouseEventKind::Down(Left)` against the seam between two panes and,
 //! for the rest of the gesture (`Drag(Left)` until the matching `Up(Left)`),
 //! translate the cursor's own position into a new `tree_width_pct`/
-//! `output_height` on `App`.
+//! `output_height_pct` on `App`.
 
 use std::time::Duration;
 
@@ -52,8 +52,8 @@ fn dragging_the_output_seam_resizes_the_output_pane() {
 
     // Output starts collapsed to a fixed 1-row strip (`App::
     // console_collapsed`'s own default) — `ui::compute_layout` pins a
-    // collapsed pane's own height to 1 regardless of `output_height`, so
-    // dragging its seam while collapsed silently updates `output_height`
+    // collapsed pane's own height to 1 regardless of `output_height_pct`, so
+    // dragging its seam while collapsed silently updates `output_height_pct`
     // with no visible effect at all (nothing to actually grow). Expand it
     // first, same as a real user would have to before resizing it.
     let (strip_row, strip_col) = session.find("Output").expect("collapsed Output strip");

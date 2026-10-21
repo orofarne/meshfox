@@ -1,14 +1,14 @@
 <!-- meshfox:canvas -->
 # TUI screencast
 
-Record a silent TUI demo, roughly 30 seconds long, as MP4 and WebM, with sharp SIXEL images.
+Record a silent TUI demo, roughly 35 seconds long, as MP4 and WebM, with sharp SIXEL images.
 
 Run **Install dependencies** once and **Build meshfox** when needed, then **Record with Playwright**. Playwright and its Chromium browser are prepared through the canvas-local **Node environment** automatically. Blocks run relative to this document (`scripts/screencast`).
 
 <!-- meshfox:var name="output_dir" type="dir" default="../../target/screencast-playwright" prompt="Output directory" -->
 <!-- meshfox:var name="NODE" from="node-environment/node-setup" -->
 
-The demo shows Markdown and tree navigation, live canvas search, streamed ANSI output, changing a variable through Configure, rerunning, a local chart image, and saving a prose edit in the source editor.
+The demo shows Markdown and tree navigation, live canvas search, streamed ANSI output, changing a variable through Configure, rerunning, a local chart image, adding a node from the command palette (`Ctrl-p`), and writing and saving its text in the source editor.
 
 Timing and keystrokes live in [demo.tape](demo.tape). ttyd renders the TUI and SIXEL layer; Playwright records the full browser viewport. The report uses only Bash, printf and sleep; the chart is a bundled PNG.
 
@@ -84,6 +84,9 @@ try {
     viewport: { width: 1600, height: 1000 },
     recordVideo: { dir: path.join(outputDir, 'raw'), size: { width: 1600, height: 1000 } },
   });
+  // The video starts with this page, before it has painted anything: that
+  // blank leading frame is white. It is trimmed off below.
+  const pageStart = performance.now();
   const page = await context.newPage();
   page.on('pageerror', error => console.error('Browser:', error.message));
   await page.goto('http://127.0.0.1:' + port);
@@ -94,6 +97,8 @@ try {
   const firstWait = tape.findIndex(line => line.startsWith('Wait+Screen'));
   let chartPending = false;
   let chartCaptured = false;
+  let chartSeconds;
+  let readyAt;
   for (const raw of tape.slice(firstWait)) {
     const line = raw.trim();
     if (!line || line.startsWith('#') || line === 'Show' || line === 'Hide') continue;
@@ -107,6 +112,7 @@ try {
           rows.push(buffer.getLine(i)?.translateToString(true) || '');
         return new RegExp(source).test(rows.join('\n'));
       }, source);
+      readyAt ??= performance.now();
       if (source.includes('Images render')) chartPending = true;
     } else if (line.startsWith('Sleep ')) {
       const value = line.slice(6);
@@ -121,8 +127,7 @@ try {
           return visible > 1000;
         });
         await page.screenshot({ path: path.join(outputDir, 'sixel-chart.png') });
-        await fs.writeFile(path.join(outputDir, 'chart-time.json'),
-          JSON.stringify({ seconds: await page.evaluate(() => performance.now() / 1000) }));
+        chartSeconds = await page.evaluate(() => performance.now() / 1000);
         chartCaptured = true;
       }
     } else if (line.startsWith('EndCard ')) {
@@ -148,8 +153,8 @@ try {
       await page.keyboard.type(line.slice(6, -1), { delay: 40 });
     } else if (line.startsWith('Backspace ')) {
       for (let i = 0; i < Number(line.slice(10)); i++) await page.keyboard.press('Backspace');
-    } else if (['Enter', 'Escape', 'Ctrl+S'].includes(line)) {
-      await page.keyboard.press(line === 'Ctrl+S' ? 'Control+s' : line);
+    } else if (['Enter', 'Escape', 'Ctrl+S', 'Ctrl+P'].includes(line)) {
+      await page.keyboard.press(line.startsWith('Ctrl+') ? 'Control+' + line.slice(5).toLowerCase() : line);
     } else {
       throw Error('Unsupported tape command: ' + line);
     }
@@ -159,10 +164,16 @@ try {
   await context.close();
   context = undefined;
   const videoPath = await video.path();
+  // Start the video just before the TUI first appeared, so no blank page shows.
+  const trim = Math.max(0.4, (readyAt - pageStart) / 1000 - 0.5);
   const webm = path.join(outputDir, 'meshfox-tui-sixel.webm');
-  await fs.copyFile(videoPath, webm);
-  execFileSync('ffmpeg', ['-y', '-i', webm, '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-    '-movflags', '+faststart', path.join(outputDir, 'meshfox-tui-sixel.mp4')], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const encode = (codec, out) => execFileSync('ffmpeg', ['-y', '-ss', String(trim), '-i', videoPath,
+    ...codec, out], { stdio: ['ignore', 'ignore', 'pipe'] });
+  encode(['-c:v', 'libvpx-vp9', '-b:v', '0', '-crf', '30'], webm);
+  encode(['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart'],
+    path.join(outputDir, 'meshfox-tui-sixel.mp4'));
+  await fs.writeFile(path.join(outputDir, 'chart-time.json'),
+    JSON.stringify({ seconds: chartSeconds - trim }));
   console.log('Created SIXEL WebM, MP4 and screenshot in ' + outputDir);
 } finally {
   await context?.close().catch(() => {});
@@ -203,7 +214,7 @@ execFileSync(process.execPath, [cli, 'install', 'chromium'], { stdio: 'inherit' 
 ```
 
 ### Recording tape
-<!-- meshfox:node id="recording-tape" type="file" -->
+<!-- meshfox:node id="recording-tape" type="file" display="code" -->
 
 [demo.tape](demo.tape)
 

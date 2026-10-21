@@ -2975,6 +2975,42 @@ current directory — except `create`, which always requires an explicit
 path, since there's nothing to auto-discover for a file that doesn't exist
 yet.
 
+### TUI command palette
+
+`Ctrl-p` opens a modal command palette in the TUI's main view and in the
+fullscreen source editor (not over another modal or a focused text field).
+Typing fuzzy-filters the commands (case-insensitive subsequence, tighter
+matches first); Up/Down moves, Enter chooses, Esc steps back and then closes.
+Each command shows the key that does the same thing, if there is one.
+
+Main-view commands (not listed inside the editor) are the existing actions:
+run (with deps / only this block), kill, reset session, services, terminal
+sessions, document history, block run history, open file target, configure
+variables, edit source, search, fullscreen and collapse pane, help, quit. Each
+replays its key through the normal key handler, so the two cannot differ.
+"Block statistics" and "Canvas statistics" show the report `meshfox stats`
+prints (retained journals only) in a scrollable view; both need a worker. Block
+statistics pick their block like `L` (run history): the block selected in the
+Document pane while that pane is focused, else the selected node's only block,
+else a block picker. Canvas statistics cover the whole canvas.
+
+Structure commands act on the selected tree row through the worker, the same
+operations as `meshfox node` and the browser's Edit mode: new child node, new
+sibling node, rename, change id, move to another parent, move up/down among
+siblings, add or remove an incoming edge, delete with its subtree, delete
+keeping its children. Title, id and delete confirmation are asked in the
+palette (prefilled where there is a current value); a parent or edge source is
+picked from a filterable list that leaves out the node itself and its visible
+descendants. A created node is selected once the reload brings it in. They need
+a worker and refuse a node that comes from an `include`.
+
+From the source editor, structure commands run only on a saved buffer
+(otherwise the editor shows "unsaved changes"). The editor stays open: its
+buffer is replaced with the document as the worker now has it, with the cursor
+on the affected node. Editor commands (insert Unicode symbol, suggest
+attributes) are listed only inside the editor. `Ctrl-Space` (also received as
+`Ctrl-@` or NUL) or `Ctrl-t` suggests attributes in the editor.
+
 ### TUI source-editor Unicode palette
 
 In the fullscreen TUI source editor, `Ctrl-g` opens a modal Unicode palette.

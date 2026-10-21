@@ -62,8 +62,20 @@ fn label(name: &str) -> String {
     style(format!("{name}:"), "1")
 }
 
-fn duration(stats: &DurationStats) {
-    println!(
+/// `println!` into a buffer, so the same text can go to a terminal or the TUI.
+macro_rules! outln {
+    ($out:expr) => {
+        $out.push('\n')
+    };
+    ($out:expr, $($arg:tt)*) => {{
+        use std::fmt::Write as _;
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
+fn duration(out: &mut String, stats: &DurationStats) {
+    outln!(
+        out,
         "{} median {} · p95 {} · {} {} (completed successes/failures)",
         label("Duration"),
         ms(stats.median_ms),
@@ -76,7 +88,7 @@ fn duration(stats: &DurationStats) {
         }
     );
 }
-fn outcomes(name: &str, counts: &Outcomes) {
+fn outcomes(out: &mut String, name: &str, counts: &Outcomes) {
     let parts = [
         (counts.succeeded, "succeeded", "32"),
         (counts.failed, "failed", "31"),
@@ -88,21 +100,29 @@ fn outcomes(name: &str, counts: &Outcomes) {
     .into_iter()
     .map(|(n, name, color)| style(format!("{n} {name}"), if n == 0 { "2" } else { color }))
     .collect::<Vec<_>>();
-    println!("{} {} · {}", label(name), counts.total(), parts.join(" · "));
+    outln!(
+        out,
+        "{} {} · {}",
+        label(name),
+        counts.total(),
+        parts.join(" · ")
+    );
     match counts.success_rate() {
-        Some(rate) => println!(
+        Some(rate) => outln!(
+            out,
             "{} {rate:.1}% ({}/{} succeeded+failed)",
             label("Success"),
             counts.succeeded,
             counts.succeeded + counts.failed
         ),
-        None => println!(
+        None => outln!(
+            out,
             "{} n/a (no known succeeded/failed outcomes)",
             label("Success")
         ),
     }
 }
-fn skips(blocks: &[BlockStats]) {
+fn skips(out: &mut String, blocks: &[BlockStats]) {
     let skipped: u64 = blocks.iter().map(|b| b.skipped).sum();
     let attempts: u64 = blocks.iter().map(|b| b.outcomes.total()).sum();
     let rate = if skipped + attempts == 0 {
@@ -113,7 +133,8 @@ fn skips(blocks: &[BlockStats]) {
             100.0 * skipped as f64 / (skipped + attempts) as f64
         )
     };
-    println!(
+    outln!(
+        out,
         "{} {skipped} · {rate} of attempted/skipped steps · {} {} · {} {}",
         label("Skipped"),
         label("not started"),
@@ -123,7 +144,8 @@ fn skips(blocks: &[BlockStats]) {
     );
     let unobserved: u64 = blocks.iter().map(|b| b.unobserved).sum();
     if unobserved > 0 {
-        println!(
+        outln!(
+            out,
             "{} {unobserved} (incomplete transcripts; not counted as attempts)",
             label("Unobserved planned steps")
         );
@@ -131,13 +153,14 @@ fn skips(blocks: &[BlockStats]) {
     let services_started: u64 = blocks.iter().map(|b| b.services_started).sum();
     let services_reused: u64 = blocks.iter().map(|b| b.services_reused).sum();
     if services_started + services_reused > 0 {
-        println!("{} {services_started} started · {services_reused} reused (outside execution success rates)", label("Services"));
+        outln!(out, "{} {services_started} started · {services_reused} reused (outside execution success rates)", label("Services"));
     }
     let avoided = blocks
         .iter()
         .fold(0u64, |sum, b| sum.saturating_add(b.estimated_avoided_ms));
     if skipped > 0 {
-        println!(
+        outln!(
+            out,
             "{} {} ({} of {skipped} skipped source durations; not elapsed time saved)",
             label("Estimated work avoided"),
             meshfox_core::format_duration_ms(avoided),
@@ -149,13 +172,27 @@ fn skips(blocks: &[BlockStats]) {
     }
 }
 fn print_report(report: &Report) {
+    print!("{}", render_report(report));
+}
+
+/// The report as the CLI prints it (ANSI-styled when colour is on); the
+/// TUI's statistics view shows the same text.
+pub fn render_report(report: &Report) -> String {
+    let mut buf = String::new();
+    let out = &mut buf;
+    write_report(out, report);
+    buf
+}
+
+fn write_report(out: &mut String, report: &Report) {
     let selected = report.address.as_ref().map_or_else(
         || "canvas".into(),
         |a| format!("{}::{} · {}", a.node_id, a.block, report.scope),
     );
-    println!("{}", style(format!("Statistics · {selected}"), "1;36"));
+    outln!(out, "{}", style(format!("Statistics · {selected}"), "1;36"));
     let c = &report.coverage;
-    println!(
+    outln!(
+        out,
         "{} {} chains · {} — {}",
         label("Retained history"),
         c.retained_chains,
@@ -163,19 +200,22 @@ fn print_report(report: &Report) {
         c.retained_to.as_deref().unwrap_or("n/a")
     );
     if let Some(since) = &c.requested_since {
-        println!(
+        outln!(
+            out,
             "{} {since} · only retained journals are available",
             label("Requested since")
         );
     }
-    println!(
+    outln!(
+        out,
         "{} {} chains · {} — {}",
         label("Selected"),
         c.matching_chains,
         c.from.as_deref().unwrap_or("n/a"),
         c.to.as_deref().unwrap_or("n/a")
     );
-    println!(
+    outln!(
+        out,
         "{}",
         style(
             "Coverage is limited to retained journals; no all-time aggregates.",
@@ -183,7 +223,8 @@ fn print_report(report: &Report) {
         )
     );
     if c.incomplete_chains > 0 {
-        println!(
+        outln!(
+            out,
             "{}",
             style(
                 format!(
@@ -195,7 +236,8 @@ fn print_report(report: &Report) {
         );
     }
     if c.truncated_chains > 0 {
-        println!(
+        outln!(
+            out,
             "{}",
             style(
                 format!(
@@ -207,22 +249,22 @@ fn print_report(report: &Report) {
         );
     }
     if c.matching_chains == 0 {
-        println!("\nNo saved invocations match this selection.");
+        outln!(out, "\nNo saved invocations match this selection.");
         return;
     }
-    println!();
+    outln!(out);
     if report.scope == "block" {
         if let Some(block) = report.blocks.first() {
-            outcomes("Block attempts", &block.outcomes);
-            duration(&block.duration);
-            skips(&report.blocks);
-            recent(block);
+            outcomes(out, "Block attempts", &block.outcomes);
+            duration(out, &block.duration);
+            skips(out, &report.blocks);
+            recent(out, block);
         }
         return;
     }
-    outcomes("Chains", &report.chains);
-    duration(&report.chain_duration);
-    skips(&report.blocks);
+    outcomes(out, "Chains", &report.chains);
+    duration(out, &report.chain_duration);
+    skips(out, &report.blocks);
     let mut slow: Vec<_> = report
         .blocks
         .iter()
@@ -236,7 +278,8 @@ fn print_report(report: &Report) {
             .then(a.block.cmp(&b.block))
     });
     if !slow.is_empty() {
-        println!(
+        outln!(
+            out,
             "\n{}",
             style(
                 "Slowest blocks · sum of completed step time (separate from chain time)",
@@ -244,7 +287,8 @@ fn print_report(report: &Report) {
             )
         );
         for b in slow.iter().take(5) {
-            println!(
+            outln!(
+                out,
                 "  {}::{} · total {} · median {} · p95 {} · {} samples",
                 b.node_id,
                 b.block,
@@ -268,12 +312,14 @@ fn print_report(report: &Report) {
             .then(a.block.cmp(&b.block))
     });
     if !failures.is_empty() {
-        println!(
+        outln!(
+            out,
             "\n{}",
             style("Most failures · known succeeded/failed attempts", "1;31")
         );
         for b in failures.iter().take(5) {
-            println!(
+            outln!(
+                out,
                 "  {}::{} · {}/{} failed",
                 b.node_id,
                 b.block,
@@ -283,7 +329,7 @@ fn print_report(report: &Report) {
         }
     }
 }
-fn recent(block: &BlockStats) {
+fn recent(out: &mut String, block: &BlockStats) {
     if block.recent.is_empty() {
         return;
     }
@@ -303,7 +349,8 @@ fn recent(block: &BlockStats) {
             _ => "?".into(),
         })
         .collect();
-    println!(
+    outln!(
+        out,
         "{} {}",
         label(&format!("Recent {} (oldest → newest)", items.len())),
         items.join(" ")
@@ -326,9 +373,10 @@ fn recent(block: &BlockStats) {
             legend.push(name);
         }
     }
-    println!("{}", style(legend.join(" · "), "2"));
+    outln!(out, "{}", style(legend.join(" · "), "2"));
     let last = block.recent.last().unwrap();
-    println!(
+    outln!(
+        out,
         "{} chain #{} · {} · {}",
         label("Last"),
         last.chain_id,
