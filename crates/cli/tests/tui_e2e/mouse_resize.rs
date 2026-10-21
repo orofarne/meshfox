@@ -62,10 +62,8 @@ fn dragging_the_output_seam_resizes_the_output_pane() {
 
     // The Output pane's own title sits right on its top border row — one
     // row *above* it is the tree/document row's own bottom border, which
-    // is the actual resize handle (Output's own top border/title row is
-    // deliberately excluded — see `App::resize_handle_at`'s own doc
-    // comment — so a click there keeps behaving as a plain focus click,
-    // not a resize start).
+    // is one resize handle (Output's own top border/title row is the other,
+    // see the next test — a plain click there still just focuses).
     let (title_row, col) = session
         .find("Output")
         .expect("Output pane title, now expanded");
@@ -82,5 +80,34 @@ fn dragging_the_output_seam_resizes_the_output_pane() {
     assert!(
         new_title_row + 3 <= title_row,
         "dragging the seam up should grow the Output pane, moving its title row up — was at row {title_row}, now at {new_title_row}"
+    );
+}
+
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn dragging_the_output_title_row_resizes_the_output_pane() {
+    let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
+    session
+        .wait_for("Root", Duration::from_secs(5))
+        .expect("initial render");
+
+    let (strip_row, strip_col) = session.find("Output").expect("collapsed Output strip");
+    session.send_mouse_click(strip_row, strip_col);
+    std::thread::sleep(Duration::from_millis(150));
+
+    let (title_row, col) = session
+        .find("Output")
+        .expect("Output pane title, now expanded");
+
+    session.send_mouse_drag(title_row, col, title_row.saturating_sub(5), col);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (new_title_row, _) = session
+        .find("Output")
+        .expect("Output pane title, now moved");
+    assert!(
+        new_title_row + 3 <= title_row,
+        "dragging the title row up should grow the Output pane — was at row {title_row}, now at {new_title_row}"
     );
 }

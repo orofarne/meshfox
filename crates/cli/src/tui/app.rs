@@ -2264,6 +2264,19 @@ impl App {
                     self.resize_drag = Some(drag);
                     return; // starting a resize claims the click — no pane underneath it
                 }
+                // Output's own top border is a resize handle too, but it is also
+                // the title row (click to focus, double-click/icon for
+                // fullscreen) — so only *arm* the drag and let the click fall
+                // through; a plain click never moves the border.
+                if !self.console_collapsed
+                    && self.fullscreen.is_none()
+                    && mouse.row == layout.output.y
+                    && mouse.column
+                        < (layout.output.x + layout.output.width)
+                            .saturating_sub(1 + ui::FULLSCREEN_ICON_WIDTH)
+                {
+                    self.resize_drag = Some(ResizeDrag::Horizontal);
+                }
 
                 if point_in(layout.tree, mouse.column, mouse.row) {
                     if self.tree_collapsed {
