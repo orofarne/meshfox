@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2
+
+- New: syntax highlighting for meshfox's own bookkeeping comments
+  (`<!-- meshfox:node ... -->`, `meshfox:edge`, `meshfox:var`, ...) wherever
+  the raw file is shown as text: git diffs/blame, "Open With... -> Text
+  Editor", plain `.md` files.
+- Changed: README and Marketplace page now link to the meshfox website.
+- Changed: dependency updates (`markdown-it`) and minor internal cleanups;
+  no functional changes.
+
 ## 0.4.1
 
 - Changed: dependency updates (security fixes); no functional changes.

@@ -10,6 +10,9 @@ launched from Finder/Dock/Spotlight don't always inherit a login shell's
 PATH, so this covers the common case of a real install that VS Code just
 can't see. Set `meshfox.executablePath` in settings to override both.
 
+More about meshfox itself — the format, the CLI, the TUI and the MCP
+server — at [meshfox.orofarne.net](https://meshfox.orofarne.net/).
+
 On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode)
 as `Orofarne.meshfox-vscode` — install from there (Extensions view, search
 "meshfox", or `ext install Orofarne.meshfox-vscode`) rather than building
