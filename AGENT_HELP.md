@@ -157,6 +157,14 @@ specific cases:
   each invocation, including when reached as dependencies. If `run` reports
   confirmation required, ask the user before retrying with `confirm: true`;
   never infer approval from a prior run. CLI uses `--confirm` for automation.
+  A long chain can outlive a tool call (and its result can be too big to
+  read): pass `detach: true` to get the `chain_id` back at once, then read
+  the run with `logs` (`id` = that chain_id; pass the previous `next_seq` as
+  `since_seq` to follow it) instead of waiting. `logs` with `list: true`
+  lists past invocations and `stats` summarises them; `skip_fresh: true`
+  skips a still-fresh block (CLI: `--skip-fresh`, `-d`/`--detach`). `list`
+  shows the runnable blocks and `render` the Markdown of `starlark render`
+  fences.
 - **A multi-step debug session** (`debug_start`/`debug_send`/`debug_stop`):
   a persistent shell in a node/block's own resolved cwd/env, so state
   (exported vars, files a snippet wrote) survives between calls — a

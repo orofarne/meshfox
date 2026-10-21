@@ -457,7 +457,15 @@ mod tests {
         assert!(report.skipped[0].reason.contains("worker"));
 
         drop(guard);
-        let report = scan_of(&dir, false, &temp, SystemTime::now());
+        // A `flock` belongs to the open file description, so a child another
+        // test forks in this process just before its `exec` can briefly keep
+        // the lock alive after the guard is dropped; give it time to go.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut report = scan_of(&dir, false, &temp, SystemTime::now());
+        while report.candidates.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            report = scan_of(&dir, false, &temp, SystemTime::now());
+        }
         assert_eq!(report.candidates.len(), 1, "free once the worker is gone");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&temp);

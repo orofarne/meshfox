@@ -85,6 +85,8 @@ fn call_deadline(own_budget: Option<Duration>) -> Duration {
 /// still going: the call's own `timeout_ms`, default 10 minutes, at most an
 /// hour (the call's deadline is this plus a minute — see `call_deadline`).
 const DEFAULT_RUN_TIMEOUT_MS: u64 = 600_000;
+/// How many invocations `logs` lists when `limit` isn't given.
+const DEFAULT_LOGS_LIST_LIMIT: usize = 20;
 const MAX_RUN_TIMEOUT_MS: u64 = 3_600_000;
 /// Per step, the tail of its output kept in a `run` result.
 const RUN_OUTPUT_CAP_BYTES: usize = 20_000;
@@ -623,6 +625,21 @@ struct RunParams {
     /// session_reset). Not combinable with no_deps.
     #[serde(default)]
     fresh: bool,
+    /// The opposite of fresh: hold the named block itself to the same
+    /// "already ran this session and hasn't changed" check a dependency gets,
+    /// and skip it when it passes — so a step that declares `inputs=`/
+    /// `outputs=` (an install, a build) only works when something changed.
+    /// Without it a block requested by name always runs. Not combinable
+    /// with fresh.
+    #[serde(default)]
+    skip_fresh: bool,
+    /// Return as soon as the worker has accepted the chain, with its
+    /// `chain_id`, instead of waiting for it to finish. The run keeps going
+    /// in the worker, independent of this call and of this session; follow it
+    /// with `logs` (`id` = the returned chain_id) or `stats`. timeout_ms
+    /// doesn't apply to a detached run.
+    #[serde(default)]
+    detach: bool,
     /// Values for declared `meshfox:var`s that aren't already resolvable
     /// (from the on-disk cache, the environment or a default). Never for a
     /// `secret` variable — secrets are not passed through this tool.
@@ -640,6 +657,96 @@ struct RunParams {
 
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct SessionResetParams {}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct LogsParams {
+    /// Block address as in `run`: the node-id path leading to the node, then
+    /// the block name (or just the node id for its default block). Omit to
+    /// select the latest chain.
+    #[serde(default)]
+    selector: Vec<String>,
+    /// Select the whole chain requested for this target, not just its block.
+    #[serde(default)]
+    chain: bool,
+    /// Select one particular chain run (its id, as listed by `list: true` or
+    /// returned by a detached `run`).
+    #[serde(default)]
+    id: Option<i64>,
+    /// Include the original output used by steps that were skipped.
+    #[serde(default)]
+    effective: bool,
+    /// List the matching invocations, newest first, instead of one
+    /// transcript: `runs` holds their summaries.
+    #[serde(default)]
+    list: bool,
+    /// With `list`: how many of the newest invocations to return (default
+    /// 20). Each comes without its `options` (the chain's full step list);
+    /// read one with `id` for the whole story. `runs_total` says how many
+    /// matched.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Events up to this sequence number were already seen: pass the
+    /// previous result's `next_seq` to read on (poll a running chain). A page
+    /// with `more: true` has further events ready right away.
+    #[serde(default)]
+    since_seq: i64,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct StatsParams {
+    /// Block address as in `run`; omit for every block.
+    #[serde(default)]
+    selector: Vec<String>,
+    /// Select the chains requested for this target, including their
+    /// dependencies.
+    #[serde(default)]
+    chain: bool,
+    /// Only invocations started since this instant: RFC3339 or a duration
+    /// such as `7d`, `2w`, `1h`.
+    #[serde(default)]
+    since: Option<String>,
+    /// Keep each block's `recent` list (its latest invocations, one entry
+    /// per chain). Off by default: the aggregates (durations, outcomes, rates)
+    /// are what most questions need, and the lists make the report long.
+    #[serde(default)]
+    include_recent: bool,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct ListParams {}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct RenderParams {
+    /// Only the render blocks of this node.
+    #[serde(default)]
+    node: Option<String>,
+    /// Only render blocks with this `name=`.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+struct PruneParams {
+    /// The directory to scan, relative to this server's root directory (or
+    /// absolute, as long as it is under it). Default: the root itself.
+    #[serde(default)]
+    path: Option<String>,
+    /// Also scan subdirectories (version-control and dependency directories
+    /// are always skipped).
+    #[serde(default)]
+    recursive: bool,
+    /// Actually remove what was found. Without it this only reports what
+    /// would be removed. Run history and variable caches are never touched.
+    #[serde(default)]
+    yes: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CoresKillParams {
+    /// The canvas whose core to stop, relative to this server's root
+    /// directory (or absolute, under it). The file may already be gone.
+    path: String,
+}
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 struct NodeRenameParams {
@@ -1080,6 +1187,12 @@ impl CanvasCtx {
                     .to_string(),
             ));
         }
+        if params.fresh && params.skip_fresh {
+            return Err(invalid_params(
+                "fresh and skip_fresh can't be combined — one forces the run, the other skips it"
+                    .to_string(),
+            ));
+        }
         let port = self.worker_port().await?;
         let raw = crate::worker_client::get_canvas_raw(port)
             .await
@@ -1183,15 +1296,37 @@ impl CanvasCtx {
             &name,
             params.no_deps,
             params.fresh,
-            false,
+            params.skip_fresh,
             vars,
             std::collections::HashSet::new(),
             None,
             params.confirm,
-            false,
+            params.detach,
         )
         .await
         .map_err(|e| ErrorData::internal_error(format!("couldn't start the run: {e}"), None))?;
+
+        if params.detach {
+            // The worker's first word is the accepted chain's id; the chain
+            // itself carries on without this call (as `meshfox run -d` does).
+            return match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Some(crate::worker_client::RunEvent::Started {
+                    chain_id: Some(chain_id),
+                    ..
+                })) => Ok(CallToolResult::structured(json!({
+                    "detached": true,
+                    "chain_id": chain_id,
+                }))),
+                Ok(event) => Err(ErrorData::internal_error(
+                    format!("the worker didn't accept the detached run: {event:?}"),
+                    None,
+                )),
+                Err(_) => Err(ErrorData::internal_error(
+                    "the worker didn't answer a detached run within 30 s",
+                    None,
+                )),
+            };
+        }
 
         let timeout_ms = params
             .timeout_ms
@@ -1419,6 +1554,139 @@ impl CanvasCtx {
         })))
     }
 
+    /// Reads the saved transcript of a run from the worker's persistent run history — a finished chain's steps and their output, or (with `list: true`) the newest-first list of invocations. Follow a running chain by calling again with the previous `next_seq` as `since_seq`; a detached run's `chain_id` goes in `id`. Never starts a run.
+    async fn logs(&self, params: LogsParams) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let mut query = vec![
+            (
+                "selector".to_string(),
+                serde_json::to_string(&params.selector)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+            ),
+            ("chain".to_string(), params.chain.to_string()),
+            ("effective".to_string(), params.effective.to_string()),
+            ("list".to_string(), params.list.to_string()),
+            ("sinceSeq".to_string(), params.since_seq.to_string()),
+        ];
+        if let Some(id) = params.id {
+            query.push(("id".to_string(), id.to_string()));
+        }
+        let page = crate::worker_client::logs(port, &query)
+            .await
+            .map_err(|e| invalid_params(e.message))?;
+        let mut page = serde_json::to_value(&page)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if params.list {
+            compact_run_list(&mut page, params.limit.unwrap_or(DEFAULT_LOGS_LIST_LIMIT));
+        }
+        Ok(CallToolResult::structured(page))
+    }
+
+    /// Summarises the run history the worker still retains (not all-time execution history): per block, how many runs succeeded, failed or were skipped, and their durations. Narrow it with a block address, `chain`, or `since` (RFC3339 or a duration like `7d`).
+    async fn stats(&self, params: StatsParams) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let mut query = vec![
+            (
+                "selector".to_string(),
+                serde_json::to_string(&params.selector)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+            ),
+            ("chain".to_string(), params.chain.to_string()),
+        ];
+        if let Some(since) = params.since {
+            query.push((
+                "since".to_string(),
+                crate::stats_cmd::since_arg(&since).map_err(invalid_params)?,
+            ));
+        }
+        let report = crate::worker_client::stats(port, &query)
+            .await
+            .map_err(invalid_params)?;
+        let mut report = serde_json::to_value(&report)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if !params.include_recent {
+            drop_recent(&mut report);
+        }
+        Ok(CallToolResult::structured(report))
+    }
+
+    /// Lists every runnable block (a code fence with a name=) as a tree path plus block name — what `run` takes as node_id/block — with the equivalent `meshfox run …` command line. Like the CLI's `list`, it reads this file only (no `include` resolution).
+    async fn list(&self, _params: ListParams) -> Result<CallToolResult, ErrorData> {
+        let raw = self.read_raw().await?;
+        let canvas = Canvas::from_markdown(&raw).map_err(|e| invalid_params(e.to_string()))?;
+        let blocks = canvas
+            .list_runnable()
+            .map_err(|e| invalid_params(e.to_string()))?;
+        let blocks: Vec<serde_json::Value> = blocks
+            .iter()
+            .map(|b| {
+                let name = b.block.name.as_deref().unwrap_or("?");
+                json!({
+                    "node_id": b.node_id,
+                    "path": b.path,
+                    "block": name,
+                    "default": meshfox_core::fence::is_default(&b.block, &b.node_id),
+                    "tty": b.block.tty,
+                    "service": b.block.service,
+                    "cache": b.block.cache,
+                    "command": crate::run_command(&b.path, name, &b.node_id),
+                })
+            })
+            .collect();
+        Ok(CallToolResult::structured(json!({ "blocks": blocks })))
+    }
+
+    /// Evaluates the `starlark render` fences and returns the Markdown each computes — the view the web UI and TUI show under its `starlark · name` header. `node` and `name` narrow it. A block that fails comes back with `ok: false` and its Starlark `error` (and makes the overall `ok` false); naming a node or block with no render fence is a tool error.
+    async fn render(&self, params: RenderParams) -> Result<CallToolResult, ErrorData> {
+        let raw = self.read_raw().await?;
+        let (mut canvas, access) =
+            crate::resolved_for_evaluation(&raw, &self.canvas_path).map_err(invalid_params)?;
+        let outcomes = crate::render_outcomes(&mut canvas, &self.canvas_path, &access);
+        let total = outcomes.len();
+        let selected: Vec<_> = outcomes
+            .iter()
+            .filter(|o| params.node.as_deref().is_none_or(|id| o.node_id == id))
+            .filter(|o| {
+                params
+                    .name
+                    .as_deref()
+                    .is_none_or(|n| o.result.label.ends_with(&format!("/{n}")))
+            })
+            .collect();
+        if selected.is_empty() {
+            return Err(invalid_params(format!(
+                "no starlark render block{}{} ({total} in the document)",
+                params
+                    .node
+                    .as_deref()
+                    .map(|id| format!(" in node {id:?}"))
+                    .unwrap_or_default(),
+                params
+                    .name
+                    .as_deref()
+                    .map(|n| format!(" named {n:?}"))
+                    .unwrap_or_default(),
+            )));
+        }
+        let ok = selected.iter().all(|o| o.result.error.is_none());
+        let blocks: Vec<serde_json::Value> = selected
+            .iter()
+            .map(|o| {
+                json!({
+                    "node_id": o.node_id,
+                    "title": o.title,
+                    "label": o.result.label,
+                    "ok": o.result.error.is_none(),
+                    "markdown": o.result.markdown,
+                    "error": o.result.error,
+                })
+            })
+            .collect();
+        Ok(CallToolResult::structured(
+            json!({ "ok": ok, "blocks": blocks }),
+        ))
+    }
+
     /// Finds every node matching a CSS selector — answers "which nodes have tag X" / "children of node Y" without grepping the raw file or walking node_show one node at a time. Matching runs against a synthetic document built from the canvas tree, via the same CSS engine a browser uses.
     async fn node_find(&self, params: NodeFindParams) -> Result<CallToolResult, ErrorData> {
         let raw = self.read_raw().await?;
@@ -1457,6 +1725,36 @@ impl CanvasCtx {
         }
         Ok(CallToolResult::structured(result))
     }
+}
+
+/// `stats` without `include_recent`: removes each block's `recent` list.
+fn drop_recent(report: &mut serde_json::Value) {
+    let Some(blocks) = report.get_mut("blocks").and_then(|b| b.as_array_mut()) else {
+        return;
+    };
+    for block in blocks {
+        if let Some(block) = block.as_object_mut() {
+            block.remove("recent");
+        }
+    }
+}
+
+/// `logs`' `list` mode keeps the newest `limit` invocations (the worker
+/// lists them newest first) and drops each one's `options` — the chain's
+/// whole step list, the bulk of a summary — so a long history stays readable.
+/// Adds `runs_total`.
+fn compact_run_list(page: &mut serde_json::Value, limit: usize) {
+    let Some(runs) = page.get_mut("runs").and_then(|r| r.as_array_mut()) else {
+        return;
+    };
+    let total = runs.len();
+    runs.truncate(limit);
+    for run in runs.iter_mut() {
+        if let Some(run) = run.as_object_mut() {
+            run.remove("options");
+        }
+    }
+    page["runs_total"] = json!(total);
 }
 
 /// `text`'s first `limit` characters and how many characters that left out
@@ -1614,6 +1912,15 @@ impl MeshfoxMcpRoot {
             .expect("just checked starts_with the same root");
         let canvas_id = rel.to_string_lossy().replace('\\', "/");
         Ok((canonical, canvas_id))
+    }
+
+    /// `resolve_under_root`'s boundary check for a directory (`prune`).
+    fn resolve_dir_under_root(&self, requested: &str) -> Result<PathBuf, ErrorData> {
+        let (canonical, _) = self.resolve_under_root(requested)?;
+        if !canonical.is_dir() {
+            return Err(invalid_params(format!("{requested:?} isn't a directory")));
+        }
+        Ok(canonical)
     }
 
     /// Same boundary check as `resolve_under_root`, but for a path that
@@ -2227,7 +2534,7 @@ impl MeshfoxMcpRoot {
     }
 
     #[tool(
-        description = "Same as run, scoped to canvas_id (see canvas_open) — runs a block and its deps= chain in that canvas; fresh: true runs the whole chain for real."
+        description = "Same as run, scoped to canvas_id (see canvas_open) — runs a block and its deps= chain in that canvas; fresh: true runs the whole chain for real, skip_fresh: true skips the block itself when it is still fresh, detach: true returns the chain_id at once and leaves the run going (read it with logs)."
     )]
     async fn run(
         &self,
@@ -2442,6 +2749,170 @@ impl MeshfoxMcpRoot {
         )
         .await
     }
+
+    #[tool(
+        description = "Same as logs, scoped to canvas_id (see canvas_open) — reads a saved run transcript (or lists invocations with list: true) from that canvas's run history; follow a running chain by passing the previous next_seq as since_seq."
+    )]
+    async fn logs(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<LogsParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(&canvas_id, "logs", call_deadline(None), |ctx| async move {
+            ctx.logs(inner).await
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Same as stats, scoped to canvas_id (see canvas_open) — summarises the run history that canvas's worker still retains."
+    )]
+    async fn stats(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<StatsParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(&canvas_id, "stats", call_deadline(None), |ctx| async move {
+            ctx.stats(inner).await
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Same as list, scoped to canvas_id (see canvas_open) — lists that canvas's runnable blocks with the node_id/block to pass to run."
+    )]
+    async fn list(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<ListParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(&canvas_id, "list", call_deadline(None), |ctx| async move {
+            ctx.list(inner).await
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Same as render, scoped to canvas_id (see canvas_open) — the Markdown each `starlark render` fence in that canvas computes."
+    )]
+    async fn render(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<RenderParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(
+            &canvas_id,
+            "render",
+            call_deadline(None),
+            |ctx| async move { ctx.render(inner).await },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Finds — and with yes: true removes — the regenerable files meshfox leaves behind in a directory under this server's root: tangled files whose block or canvas is gone, environments (.meshfox/<canvas>.venv/.node) whose canvas file is gone, and stale meshfox temp files. Only reports unless yes is set. A canvas with a running worker is skipped; run history and variable caches are never touched."
+    )]
+    async fn prune(
+        &self,
+        Parameters(params): Parameters<PruneParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let dir = match params.path.as_deref() {
+            Some(path) => self.resolve_dir_under_root(path)?,
+            None => self.root.clone(),
+        };
+        let (recursive, yes) = (params.recursive, params.yes);
+        let report = tokio::task::spawn_blocking(move || {
+            let report = meshfox_core::prune::scan(&meshfox_core::prune::Scan {
+                root: &dir,
+                recursive,
+                temp_dir: &std::env::temp_dir(),
+                now: std::time::SystemTime::now(),
+            });
+            let mut removed = Vec::new();
+            let mut failed = Vec::new();
+            if yes {
+                for candidate in &report.candidates {
+                    match meshfox_core::prune::remove(candidate) {
+                        Ok(()) => removed.push(candidate.path.display().to_string()),
+                        Err(e) => failed.push(format!("{}: {e}", candidate.path.display())),
+                    }
+                }
+            }
+            json!({
+                "applied": yes,
+                "candidates": report.candidates.iter().map(|c| json!({
+                    "path": c.path.display().to_string(),
+                    "kind": c.kind.heading(),
+                    "bytes": c.bytes,
+                    "reason": c.reason,
+                })).collect::<Vec<_>>(),
+                "skipped": report.skipped.iter().map(|s| json!({
+                    "path": s.path.display().to_string(),
+                    "reason": s.reason,
+                })).collect::<Vec<_>>(),
+                "removed": removed,
+                "failed": failed,
+            })
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("prune failed: {e}"), None))?;
+        let failed = !report["failed"].as_array().is_none_or(Vec::is_empty);
+        let mut result = CallToolResult::structured(report);
+        if failed {
+            result.is_error = Some(true);
+        }
+        Ok(result)
+    }
+
+    #[tool(
+        description = "Lists the live cores (per-canvas workers) of the persistent coordinator `server_socket` points at — canvas path, port (null while starting) and pid — limited to canvases under this server's root. Fails when no `server_socket` is configured."
+    )]
+    async fn cores_list(
+        &self,
+        Parameters(_params): Parameters<EmptyParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let socket = crate::cores_cmd::configured_socket().map_err(invalid_params)?;
+        let cores = meshfox_server::watcher_protocol::request_list_cores(&socket)
+            .await
+            .map_err(|e| invalid_params(crate::cores_cmd::describe(&socket, e)))?;
+        let cores: Vec<_> = cores
+            .into_iter()
+            .filter(|c| c.canvas_path.starts_with(&self.root))
+            .collect();
+        Ok(CallToolResult::structured(json!({ "cores": cores })))
+    }
+
+    #[tool(
+        description = "Stops the core (worker) serving a canvas under this server's root, via the persistent coordinator `server_socket` points at. Fails with `no such core` if none is running for it, or when no `server_socket` is configured. The canvas file may already be gone."
+    )]
+    async fn cores_kill(
+        &self,
+        Parameters(params): Parameters<CoresKillParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let socket = crate::cores_cmd::configured_socket().map_err(invalid_params)?;
+        let requested = Path::new(&params.path);
+        let joined = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.root.join(requested)
+        };
+        // A deleted canvas can't be canonicalized; the coordinator matches by
+        // the path it recorded, so fall back to the path as given.
+        let path = joined.canonicalize().unwrap_or(joined);
+        if !path.starts_with(&self.root)
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(invalid_params(format!(
+                "{:?} is outside this server's root directory ({})",
+                params.path,
+                self.root.display()
+            )));
+        }
+        meshfox_server::watcher_protocol::request_kill(&socket, &path)
+            .await
+            .map_err(|e| invalid_params(crate::cores_cmd::describe(&socket, e)))?;
+        Ok(CallToolResult::structured(
+            json!({ "killed": path.display().to_string() }),
+        ))
+    }
 }
 
 /// Whether an index scope may be shown to an MCP client rooted at `root`:
@@ -2564,6 +3035,61 @@ mod tests {
     }
 
     #[test]
+    fn drop_recent_removes_each_blocks_recent_list_and_keeps_the_rest() {
+        let mut report = serde_json::json!({
+            "blocks": [
+                { "block": "a", "duration": { "samples": 2 }, "recent": [{ "chainId": 1 }] },
+                { "block": "b", "recent": [] },
+            ],
+            "chainDuration": { "samples": 2 },
+        });
+        super::drop_recent(&mut report);
+        assert_eq!(
+            report,
+            serde_json::json!({
+                "blocks": [
+                    { "block": "a", "duration": { "samples": 2 } },
+                    { "block": "b" },
+                ],
+                "chainDuration": { "samples": 2 },
+            })
+        );
+
+        // A report without blocks is left alone.
+        let mut empty = serde_json::json!({ "scope": "chain" });
+        super::drop_recent(&mut empty);
+        assert_eq!(empty, serde_json::json!({ "scope": "chain" }));
+    }
+
+    #[test]
+    fn compact_run_list_keeps_the_newest_runs_without_their_options() {
+        let mut page = serde_json::json!({
+            "runs": [
+                { "id": 3, "options": { "steps": [1, 2] } },
+                { "id": 2, "options": {} },
+                { "id": 1 },
+            ],
+            "events": [],
+        });
+        super::compact_run_list(&mut page, 2);
+        assert_eq!(
+            page["runs"],
+            serde_json::json!([{ "id": 3 }, { "id": 2 }]),
+            "{page}"
+        );
+        assert_eq!(page["runs_total"], 3);
+
+        // A limit above the count keeps everything; a page without `runs`
+        // (a transcript read) is left alone.
+        let mut all = serde_json::json!({ "runs": [{ "id": 1 }] });
+        super::compact_run_list(&mut all, 20);
+        assert_eq!(all["runs_total"], 1);
+        let mut transcript = serde_json::json!({ "selected": null });
+        super::compact_run_list(&mut transcript, 20);
+        assert!(transcript.get("runs_total").is_none());
+    }
+
+    #[test]
     fn node_json_omits_body_by_default_and_includes_it_when_asked() {
         let markdown = "<!-- meshfox:canvas -->\n# Root\n\n## Child\n<!-- meshfox:node id=\"child\" -->\n\nsome node text\n";
         let canvas = Canvas::from_markdown(markdown).unwrap();
@@ -2613,7 +3139,16 @@ mod tests {
                 tool.name
             );
             // The root tools that aren't scoped to one canvas.
-            if !["canvas_open", "canvas_list", "secret_list"].contains(&&*tool.name) {
+            if ![
+                "canvas_open",
+                "canvas_list",
+                "secret_list",
+                "prune",
+                "cores_list",
+                "cores_kill",
+            ]
+            .contains(&&*tool.name)
+            {
                 assert!(
                     names.contains("canvas_id"),
                     "{}: names {names:?}",

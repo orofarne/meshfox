@@ -35,7 +35,7 @@ pub fn run(op: CoresOp) -> Result<(), String> {
     runtime.block_on(run_op(op, &socket))
 }
 
-fn configured_socket() -> Result<PathBuf, String> {
+pub(crate) fn configured_socket() -> Result<PathBuf, String> {
     meshfox_core::config::server_socket(Path::new("."))
         .ok_or_else(|| "no `server_socket` configured; there is no coordinator to ask".to_string())
 }
@@ -75,7 +75,7 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
 /// A reply the coordinator itself sent (`io::ErrorKind::Other`, see
 /// `parse_ack`) passes through verbatim; anything else means the
 /// coordinator couldn't be reached or answered badly.
-fn describe(socket: &Path, e: io::Error) -> String {
+pub(crate) fn describe(socket: &Path, e: io::Error) -> String {
     if e.kind() == io::ErrorKind::Other {
         e.to_string()
     } else {
