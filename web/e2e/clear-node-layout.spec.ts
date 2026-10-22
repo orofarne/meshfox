@@ -24,11 +24,21 @@ function clearLayoutButton(page: Page) {
   return page.locator(".mesh-node-toolbar .mesh-node-clear-layout");
 }
 
+// Every test rewrites the fixture; restoring it here, not at the end of each
+// test body, keeps one failing test from leaving the next ones a canvas whose
+// authored x/y/w/h are already gone.
+let pristine = "";
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
+  pristine = await fetchRaw(page);
   await page.waitForSelector(".mesh-node");
   await clickFitViewAndWait(page);
   await page.getByRole("button", { name: "Edit" }).click();
+});
+
+test.afterEach(async ({ page }) => {
+  if (pristine && (await fetchRaw(page)) !== pristine) await restoreRaw(page, pristine);
 });
 
 test("a node with any authored x/y/w/h shows the ↺ button, a fully auto one doesn't", async ({ page }) => {

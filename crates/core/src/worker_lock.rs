@@ -167,7 +167,7 @@ pub enum Acquired {
 /// (the interpreter picking where a venv goes). Probes the directory the way
 /// the lock does: it must be possible to create `.meshfox/` and write in it.
 pub fn is_read_only(canvas_path: &Path) -> bool {
-    if canvas_file_is_read_only(canvas_path) {
+    if crate::capabilities::requested().read_only || canvas_file_is_read_only(canvas_path) {
         return true;
     }
     let Some(dir) = lock_path(canvas_path).parent().map(Path::to_path_buf) else {
@@ -194,8 +194,12 @@ pub fn is_read_only(canvas_path: &Path) -> bool {
 /// `Us` with [`LockGuard::read_only`], no lock taken and nothing left on disk.
 /// The lock itself is the probe for the directory, so there's no separate test
 /// write that could disagree with what's actually needed.
+///
+/// A process started with `--read-only` (see [`crate::capabilities`]) is
+/// served read-only whatever the filesystem says, and never joins a worker
+/// that is already serving the canvas: it always gets a private one.
 pub fn try_acquire(canvas_path: &Path) -> io::Result<Acquired> {
-    if canvas_file_is_read_only(canvas_path) {
+    if crate::capabilities::requested().read_only || canvas_file_is_read_only(canvas_path) {
         return Ok(Acquired::Us(LockGuard::read_only()));
     }
     let path = lock_path(canvas_path);

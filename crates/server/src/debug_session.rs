@@ -53,6 +53,7 @@ pub struct SendOutcome {
 
 impl DebugSession {
     pub fn spawn(cwd: &std::path::Path, envs: HashMap<String, String>) -> io::Result<Self> {
+        meshfox_core::capabilities::require_exec()?;
         let mut command = Command::new("bash");
         // `--noprofile --norc`: a plain interactive-less shell, not a login
         // shell — nothing from the user's own `.bashrc` should silently

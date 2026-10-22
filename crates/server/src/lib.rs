@@ -19,6 +19,7 @@ use axum::{
     routing::{get, patch, post, put},
     Json, Router,
 };
+use meshfox_core::capabilities::Capabilities;
 use meshfox_core::{
     mdcanvas, merge3, worker_lock, Canvas, ExecOutput, ExtraEdge, FenceAttrsPatch, FileDisplay,
     Merge, MergeConflict, NodeMeta, NodeType, RunError, VarCache,
@@ -136,6 +137,10 @@ struct AppState {
     /// when the worker takes its lock (`worker_lock::try_acquire`); every
     /// write to the file goes through `write_raw`, which refuses.
     read_only: bool,
+    /// The worker refuses to run anything — blocks, services, interactive
+    /// sessions, debug shells. Fixed at startup like `read_only`, and
+    /// independent of it: a no-exec canvas can still be edited.
+    no_exec: bool,
     raw: Mutex<String>,
     snapshot_version: Mutex<(u64, String)>,
     server_session: String,
@@ -2003,7 +2008,7 @@ async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
             Err(error) => (None, Some(error)),
         };
     Json(
-        serde_json::json!({ "readOnly": state.read_only, "secretStore": if keychain { "keychain" } else { "plaintext" },
+        serde_json::json!({ "readOnly": state.read_only, "noExec": state.no_exec, "secretStore": if keychain { "keychain" } else { "plaintext" },
         "tuiImageProtocol": image_protocol, "tuiImageProtocolError": image_protocol_error }),
     )
 }
@@ -2026,6 +2031,48 @@ fn edits_canvas(method: &axum::http::Method, path: &str) -> bool {
     }
     path.starts_with("/api/canvas/")
         || matches!(path, "/api/undo" | "/api/redo" | "/api/history/goto")
+}
+
+/// Whether `method path` starts running code — what a `--no-exec` worker
+/// refuses. Most of these are `GET` (a WebSocket upgrade or an event stream),
+/// so unlike [`edits_canvas`] the method says nothing; the path does. Viewing
+/// a run that is already going (`/api/run/subscribe`, `/api/run/tty/attach`),
+/// stopping one and the read-only lookups stay available. Anything that
+/// resolves a variable by running its `from=` block (`/api/args`,
+/// `/api/vars`, `/api/form/fields`) is not listed: it reaches a process only
+/// through the spawn functions, which refuse as well, and the variable is
+/// then reported as not computed.
+fn runs_code(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/run"
+            | "/api/run/force"
+            | "/api/run/tty"
+            | "/api/form/submit"
+            | "/api/services/restart"
+            | "/api/services/force-start"
+            | "/api/debug/start"
+            | "/api/debug/send"
+            | "/api/canvas-call/prepare"
+            | "/api/canvas-call/run"
+    ) || (path.starts_with("/api/nodes/") && path.ends_with("/run"))
+}
+
+/// Refuses every request for which [`runs_code`] holds, with `403`, when the
+/// worker was started with `--no-exec`.
+async fn deny_exec_when_no_exec(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.no_exec && runs_code(req.uri().path()) {
+        return ApiError(
+            StatusCode::FORBIDDEN,
+            "this core was started with --no-exec: running is disabled".to_string(),
+        )
+        .into_response();
+    }
+    next.run(req).await
 }
 
 /// Refuses every request for which [`edits_canvas`] holds, with `403`, when
@@ -3290,8 +3337,14 @@ async fn argument_choice_sources(
         .filter(|d| sources.contains(&d.name))
         .cloned()
         .collect();
-    let computed =
-        materialize_choices_and_defaults(canvas, &decls, &wanted, &state.canvas_path).await;
+    let computed = materialize_choices_and_defaults(
+        canvas,
+        &decls,
+        &wanted,
+        &state.canvas_path,
+        state.no_exec,
+    )
+    .await;
     let closure = meshfox_core::close_over_var_refs(&decls, wanted.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
         .iter()
@@ -3386,8 +3439,14 @@ async fn get_vars_with_plan(
     // `materialize_choices_and_defaults`), never a `from=` variable only
     // ever reached through an ordinary `env=` — that one's value is still
     // computed during the real run, same as always.
-    let computed =
-        materialize_choices_and_defaults(&canvas, &decls, &relevant, &state.canvas_path).await;
+    let computed = materialize_choices_and_defaults(
+        &canvas,
+        &decls,
+        &relevant,
+        &state.canvas_path,
+        state.no_exec,
+    )
+    .await;
 
     let cache = state.vars_cache.lock().unwrap();
     let closure =
@@ -3465,7 +3524,13 @@ async fn materialize_choices_and_defaults(
     decls: &[meshfox_core::VarDecl],
     for_decls: &[meshfox_core::VarDecl],
     canvas_path: &std::path::Path,
+    no_exec: bool,
 ) -> HashMap<String, String> {
+    // Computing a `from=` variable runs its block; a `--no-exec` core leaves
+    // every such field unresolved instead.
+    if no_exec {
+        return HashMap::new();
+    }
     let mut chain: Vec<meshfox_core::BlockAddr> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for d in for_decls {
@@ -3640,8 +3705,14 @@ async fn get_configure_vars(
     // reaching a `from=`-computed variable needs that variable's own
     // source block actually run to show real choices instead of an empty
     // dropdown.
-    let computed =
-        materialize_choices_and_defaults(&canvas, &decls, &configurable, &state.canvas_path).await;
+    let computed = materialize_choices_and_defaults(
+        &canvas,
+        &decls,
+        &configurable,
+        &state.canvas_path,
+        state.no_exec,
+    )
+    .await;
 
     let cache = state.vars_cache.lock().unwrap();
     let closure =
@@ -7423,7 +7494,7 @@ async fn force_run(
                 &effective_overrides(&state, &req.vars),
             )?
             .chain;
-            require_run_confirmation(&canvas, &chain, req.confirm)?;
+            require_run_allowed(&state, &canvas, &chain, req.confirm)?;
             force_run_kill_prep(&state, &force).await?;
             run_block_impl(state, req).await
         }
@@ -7437,6 +7508,40 @@ async fn force_run(
 struct ForceTarget {
     node_id: String,
     block: String,
+}
+
+/// The preflight every request that would run blocks goes through before it
+/// starts anything: a `--no-exec` worker runs nothing, a read-only worker
+/// starts no `service` (its run ledger lives in memory, so two read-only
+/// cores would never see each other's service and fight over its ports), and
+/// a block that needs confirmation has to have been confirmed.
+fn require_run_allowed(
+    state: &AppState,
+    canvas: &Canvas,
+    chain: &[meshfox_core::BlockAddr],
+    confirmed: bool,
+) -> Result<(), ApiError> {
+    if state.no_exec {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "this core was started with --no-exec: running blocks is disabled".to_string(),
+        ));
+    }
+    if state.read_only {
+        let service = chain.iter().find(|addr| {
+            meshfox_core::deps::find_block(canvas, addr).is_ok_and(|block| block.service)
+        });
+        if let Some(addr) = service {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                format!(
+                    "{:?} is a `service` block, and a read-only core never starts services",
+                    addr.block_name
+                ),
+            ));
+        }
+    }
+    require_run_confirmation(canvas, chain, confirmed)
 }
 
 fn require_run_confirmation(
@@ -7489,7 +7594,7 @@ async fn run_block_impl_sized(
     let chain = plan.chain;
     let cleanups = meshfox_core::deps::cleanup_blocks(&canvas, &chain)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    require_run_confirmation(&canvas, &cleanups, req.confirm)?;
+    require_run_allowed(&state, &canvas, &cleanups, req.confirm)?;
     if detach
         && chain.iter().chain(cleanups.iter()).any(|addr| {
             canvas.node(&addr.node_id).is_some_and(|node| {
@@ -7514,7 +7619,7 @@ async fn run_block_impl_sized(
     )
     .await?;
     canvas_call::admit(&native_calls, req.confirm)?;
-    require_run_confirmation(&canvas, &chain, req.confirm)?;
+    require_run_allowed(&state, &canvas, &chain, req.confirm)?;
     let persist = req.persist;
 
     // Resolve only the declared variables this chain's blocks actually
@@ -7772,7 +7877,7 @@ async fn run_block_impl_sized(
                     break;
                 }
             };
-            if let Err(error) = require_run_confirmation(&canvas, &chain, req.confirm) {
+            if let Err(error) = require_run_allowed(&state, &canvas, &chain, req.confirm) {
                 final_exit_code = 1;
                 yield Ok(ndjson_line(&RunEvent::Error { message: error.1 }));
                 break;
@@ -8884,8 +8989,14 @@ async fn get_form_fields(
     // Same reasoning as `get_vars`: a `choices_var`/`default_var` chain
     // reaching a `from=`-computed variable needs that variable's own
     // source block actually run to show real choices.
-    let computed =
-        materialize_choices_and_defaults(&canvas, &decls, &field_decls, &state.canvas_path).await;
+    let computed = materialize_choices_and_defaults(
+        &canvas,
+        &decls,
+        &field_decls,
+        &state.canvas_path,
+        state.no_exec,
+    )
+    .await;
     let closure =
         meshfox_core::close_over_var_refs(&decls, field_decls.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
@@ -9183,7 +9294,7 @@ async fn run_block_tty(
             &effective_overrides(&state, &req.vars),
         )?
         .chain;
-        require_run_confirmation(&canvas, &chain, req.confirm)?;
+        require_run_allowed(&state, &canvas, &chain, req.confirm)?;
         force_run_kill_prep(
             &state,
             &ForceTarget {
@@ -9770,7 +9881,8 @@ async fn restart_service(
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
     let canvas = resolved_canvas(&raw, &state.canvas_path)?;
-    require_run_confirmation(
+    require_run_allowed(
+        &state,
         &canvas,
         &[meshfox_core::BlockAddr::new(
             req.node_id.clone(),
@@ -9828,7 +9940,7 @@ async fn force_start_service(
     let canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, false)?;
-    require_run_confirmation(&canvas, &chain, req.confirm)?;
+    require_run_allowed(&state, &canvas, &chain, req.confirm)?;
     let target = chain
         .last()
         .cloned()
@@ -10278,6 +10390,10 @@ enum SubscribeEvent {
         seq: u64,
         stream: stream_exec::OutputStream,
         text: String,
+        /// Core clock (Unix epoch ms) when the line was recorded; absent
+        /// for output replayed from the run ledger, which stores none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        time_ms: Option<u64>,
     },
     /// Terminal — always the last line this endpoint ever sends for a
     /// given connection. `exit_code` is only present for `outcome:
@@ -10387,18 +10503,18 @@ fn serve_stored_run(
     .ok_or_else(not_found)?;
 
     let stored = state.run_ledger.load_output(run.id).map_err(io_err)?;
-    let lines: Vec<(u64, stream_exec::OutputStream, String)> = match stored {
+    let lines: Vec<(u64, stream_exec::OutputStream, String, Option<u64>)> = match stored {
         Some(lines) => lines
             .into_iter()
             .enumerate()
-            .map(|(i, (s, t))| (i as u64, s, t))
+            .map(|(i, (s, t))| (i as u64, s, t, None))
             .collect(),
         None => match finished.filter(|h| h.run_id() == Some(run.id)) {
             Some(h) => h
                 .subscribe_from(0)
                 .0
                 .into_iter()
-                .map(|l| (l.seq, l.stream, l.text))
+                .map(|l| (l.seq, l.stream, l.text, Some(l.time_ms)))
                 .collect(),
             None => Vec::new(),
         },
@@ -10415,12 +10531,13 @@ fn serve_stored_run(
     };
     let mut chunks: Vec<io::Result<Bytes>> = lines
         .into_iter()
-        .filter(|(seq, _, _)| *seq >= query.since_seq)
-        .map(|(seq, stream, text)| {
+        .filter(|(seq, _, _, _)| *seq >= query.since_seq)
+        .map(|(seq, stream, text, time_ms)| {
             Ok(subscribe_ndjson_line(&SubscribeEvent::Line {
                 seq,
                 stream,
                 text,
+                time_ms,
             }))
         })
         .collect();
@@ -10546,6 +10663,7 @@ async fn subscribe_run_impl(
                 seq: line.seq,
                 stream: line.stream,
                 text: line.text,
+                time_ms: Some(line.time_ms),
             }));
         }
         let already_done = handle.outcome();
@@ -10561,6 +10679,7 @@ async fn subscribe_run_impl(
                         seq: line.seq,
                         stream: line.stream,
                         text: line.text,
+                        time_ms: Some(line.time_ms),
                     }));
                 }
                 Ok(run_registry::RunEvent::Done(outcome)) => {
@@ -10592,6 +10711,7 @@ async fn subscribe_run_impl(
                             seq: line.seq,
                             stream: line.stream,
                             text: line.text,
+                            time_ms: Some(line.time_ms),
                         }));
                     }
                     let outcome = handle.outcome();
@@ -11003,18 +11123,26 @@ async fn build_state(
     auto_exit: bool,
     watcher_socket: Option<PathBuf>,
 ) -> std::io::Result<Arc<AppState>> {
-    build_state_with(canvas_path, auto_exit, watcher_socket, false).await
+    build_state_with(
+        canvas_path,
+        auto_exit,
+        watcher_socket,
+        Capabilities::UNRESTRICTED,
+    )
+    .await
 }
 
-/// `build_state`, for a canvas that is `read_only` (see `AppState::read_only`)
-/// or not. A read-only canvas gets its session database and variable cache
-/// in memory: nothing is written next to the canvas, or anywhere else.
+/// `build_state`, for a worker with the given `caps` (see `AppState::read_only`
+/// and `AppState::no_exec`). A read-only canvas gets its session database and
+/// variable cache in memory: nothing is written next to the canvas, or
+/// anywhere else.
 async fn build_state_with(
     canvas_path: PathBuf,
     auto_exit: bool,
     watcher_socket: Option<PathBuf>,
-    read_only: bool,
+    caps: Capabilities,
 ) -> std::io::Result<Arc<AppState>> {
+    let Capabilities { read_only, no_exec } = caps;
     let raw = std::fs::read_to_string(&canvas_path)?;
     if let Err(e) = Canvas::from_markdown(&raw) {
         return Err(std::io::Error::new(
@@ -11125,6 +11253,7 @@ async fn build_state_with(
         canvas_path,
         tables,
         read_only,
+        no_exec,
         raw: Mutex::new(raw),
         snapshot_version: Mutex::new((0, String::new())),
         server_session: uuid::Uuid::new_v4().to_string(),
@@ -11240,6 +11369,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             deny_edits_when_read_only,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            deny_exec_when_no_exec,
         ))
         // Declared *after* the layer above on purpose: a health check is not
         // use. If it counted as API activity, a client probing a worker every
@@ -11357,18 +11490,31 @@ pub async fn serve_as_worker(
     mut lock_guard: worker_lock::LockGuard,
     ready_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 ) -> std::io::Result<()> {
-    let state = build_state_with(
-        canvas_path.clone(),
-        auto_exit,
-        watcher_socket.clone(),
-        lock_guard.is_read_only(),
-    )
-    .await?;
-    if state.read_only && !quiet {
-        eprintln!(
-            "meshfox: {} isn't writable — serving it read-only (blocks run, nothing is saved)",
-            canvas_path.display()
-        );
+    let requested = meshfox_core::capabilities::requested();
+    let caps = Capabilities {
+        read_only: lock_guard.is_read_only() || requested.read_only,
+        no_exec: requested.no_exec,
+    };
+    let state =
+        build_state_with(canvas_path.clone(), auto_exit, watcher_socket.clone(), caps).await?;
+    if !quiet {
+        if requested.read_only {
+            eprintln!(
+                "meshfox: serving {} read-only on request (nothing is saved)",
+                canvas_path.display()
+            );
+        } else if state.read_only {
+            eprintln!(
+                "meshfox: {} isn't writable — serving it read-only (blocks run, nothing is saved)",
+                canvas_path.display()
+            );
+        }
+        if state.no_exec {
+            eprintln!(
+                "meshfox: serving {} with execution disabled (--no-exec)",
+                canvas_path.display()
+            );
+        }
     }
     sweep_tangled_files(&state);
     spawn_file_watcher(Arc::clone(&state));
@@ -22040,7 +22186,7 @@ mod read_only_tests {
     }
 
     async fn spawn_read_only_server(canvas_path: PathBuf) -> SocketAddr {
-        let state = build_state_with(canvas_path, false, None, true)
+        let state = build_state_with(canvas_path, false, None, Capabilities::READ_ONLY)
             .await
             .expect("valid test canvas");
         let app = build_app(state);
@@ -22082,7 +22228,7 @@ mod read_only_tests {
         std::fs::write(&canvas_path, TANGLE_CANVAS).unwrap();
         let (kept, leftover, other_canvas) = tangle_files_next_to(&canvas_path);
 
-        let state = build_state_with(canvas_path, false, None, false)
+        let state = build_state_with(canvas_path, false, None, Capabilities::UNRESTRICTED)
             .await
             .expect("valid test canvas");
         sweep_tangled_files(&state);
@@ -22100,7 +22246,7 @@ mod read_only_tests {
         std::fs::write(&canvas_path, TANGLE_CANVAS).unwrap();
         let (_, leftover, _) = tangle_files_next_to(&canvas_path);
 
-        let state = build_state_with(canvas_path, false, None, true)
+        let state = build_state_with(canvas_path, false, None, Capabilities::READ_ONLY)
             .await
             .expect("valid test canvas");
         sweep_tangled_files(&state);
@@ -22254,7 +22400,12 @@ mod read_only_tests {
         let (dir, canvas_path) = canvas_in_own_dir();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let state = runtime
-            .block_on(build_state_with(canvas_path.clone(), false, None, true))
+            .block_on(build_state_with(
+                canvas_path.clone(),
+                false,
+                None,
+                Capabilities::READ_ONLY,
+            ))
             .unwrap();
         let err = state.write_raw("changed").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
@@ -22784,5 +22935,222 @@ mod configured_file_access_tests {
         assert_eq!(invalid.status(), 403);
         assert!(invalid.text().await.unwrap().contains("files.allow"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    const CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "## A\n<!-- meshfox:node id=\"a\" -->\n\n",
+        "```bash name=\"go\"\necho hello\n```\n\n",
+        "```bash name=\"srv\" service\nsleep 30\n```\n",
+    );
+
+    fn canvas_in_own_dir() -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-capability-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.canvas.md");
+        std::fs::write(&path, CANVAS).unwrap();
+        (dir, path)
+    }
+
+    async fn spawn_server(canvas_path: PathBuf, caps: Capabilities) -> (Arc<AppState>, SocketAddr) {
+        let state = build_state_with(canvas_path, false, None, caps)
+            .await
+            .expect("valid test canvas");
+        let app = build_app(state.clone());
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        (state, addr)
+    }
+
+    fn addr_of(node: &str, block: &str) -> meshfox_core::BlockAddr {
+        meshfox_core::BlockAddr::new(node.to_string(), block.to_string())
+    }
+
+    // `GET /api/vars` resolves `choices_var=` through a `from=` variable by
+    // running that variable's block. A no-exec core must not, so the choices
+    // stay unresolved; the unrestricted core is the control that proves the
+    // fixture would otherwise run it.
+    #[tokio::test]
+    async fn no_exec_leaves_dynamic_choices_unresolved_without_running_the_producer() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (caps, expect_run) in [
+            (Capabilities::NO_EXEC, false),
+            (Capabilities::UNRESTRICTED, true),
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("meshfox-capability-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("producer-ran");
+            let canvas = format!(
+                concat!(
+                    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                    "<!-- meshfox:var name=\"REGIONS_LIST\" from=\"root/list-regions\" -->\n",
+                    "<!-- meshfox:var name=\"REGION\" type=\"select\" choices_var=\"REGIONS_LIST\" -->\n\n",
+                    "```bash name=\"list-regions\"\ntouch '{}'\necho \"REGIONS_LIST=us-east-1,eu-west-1\" >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+                    "```bash name=\"use-region\" env=\"$REGION\"\necho \"$REGION\"\n```\n",
+                ),
+                marker.display()
+            );
+            let path = dir.join("doc.canvas.md");
+            std::fs::write(&path, canvas).unwrap();
+            let (_state, addr) = spawn_server(path, caps).await;
+
+            let body = reqwest::get(format!("http://{addr}/api/vars?block=use-region"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+            assert_eq!(statuses[0]["name"], "REGION");
+            assert_eq!(marker.exists(), expect_run, "{caps:?}: producer ran?");
+            let resolved = statuses[0]["choices"] == serde_json::json!(["us-east-1", "eu-west-1"]);
+            assert_eq!(resolved, expect_run, "{caps:?}: choices {body}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn every_route_that_starts_code_is_listed_and_the_viewers_are_not() {
+        for path in [
+            "/api/run",
+            "/api/run/force",
+            "/api/run/tty",
+            "/api/nodes/a/run",
+            "/api/form/submit",
+            "/api/services/restart",
+            "/api/services/force-start",
+            "/api/debug/start",
+            "/api/debug/send",
+            "/api/canvas-call/prepare",
+            "/api/canvas-call/run",
+        ] {
+            assert!(runs_code(path), "{path} starts code");
+        }
+        for path in [
+            "/api/canvas",
+            "/api/info",
+            "/api/run/subscribe",
+            "/api/run/history",
+            "/api/run/tty/attach",
+            "/api/kill",
+            "/api/services",
+            "/api/services/stop",
+            "/api/debug/stop",
+            "/api/canvas-call/stop",
+            "/api/nodes/a/open",
+            "/api/nodes/a/table",
+        ] {
+            assert!(!runs_code(path), "{path} does not start code");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_no_exec_worker_refuses_to_run_but_still_edits_and_reports_it() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let (_state, addr) = spawn_server(canvas_path, Capabilities::NO_EXEC).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let info = client
+            .get(format!("{base}/api/info"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+        assert_eq!(info["noExec"], true);
+        assert_eq!(info["readOnly"], false);
+
+        for request in [
+            client.get(format!("{base}/api/run?path=a&block=go")),
+            client.get(format!("{base}/api/nodes/a/run")),
+            client.post(format!("{base}/api/debug/start")),
+            client.post(format!("{base}/api/canvas-call/run")),
+        ] {
+            let response = request.send().await.expect("request");
+            assert_eq!(response.status(), 403);
+            let body = response.text().await.unwrap();
+            assert!(body.contains("--no-exec"), "unexpected body: {body}");
+        }
+
+        let edit = client
+            .patch(format!("{base}/api/nodes/a"))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({ "title": "Renamed" }).to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = edit.status();
+        let body = edit.text().await.unwrap();
+        assert!(status.is_success(), "{status}: {body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_run_preflight_refuses_everything_when_no_exec() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let state = build_state_with(canvas_path, false, None, Capabilities::NO_EXEC)
+            .await
+            .unwrap();
+        let canvas =
+            resolved_canvas(&state.raw.lock().unwrap().clone(), &state.canvas_path).unwrap();
+        let error = require_run_allowed(&state, &canvas, &[addr_of("a", "go")], true).unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_read_only_worker_runs_blocks_but_never_starts_a_service() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let state = build_state_with(canvas_path, false, None, Capabilities::READ_ONLY)
+            .await
+            .unwrap();
+        let canvas =
+            resolved_canvas(&state.raw.lock().unwrap().clone(), &state.canvas_path).unwrap();
+        require_run_allowed(&state, &canvas, &[addr_of("a", "go")], true)
+            .expect("a plain block runs");
+        let error = require_run_allowed(
+            &state,
+            &canvas,
+            &[addr_of("a", "go"), addr_of("a", "srv")],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(error.1.contains("service"), "{}", error.1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unrestricted_worker_allows_both() {
+        let (dir, canvas_path) = canvas_in_own_dir();
+        let state = build_state_with(canvas_path, false, None, Capabilities::UNRESTRICTED)
+            .await
+            .unwrap();
+        let canvas =
+            resolved_canvas(&state.raw.lock().unwrap().clone(), &state.canvas_path).unwrap();
+        require_run_allowed(
+            &state,
+            &canvas,
+            &[addr_of("a", "go"), addr_of("a", "srv")],
+            true,
+        )
+        .expect("nothing is restricted");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

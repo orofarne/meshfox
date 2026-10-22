@@ -36,7 +36,25 @@ pub fn discover() -> Result<PathBuf, String> {
     }
 }
 
-fn output(addr: &Address, text: &str, stderr: bool) {
+/// UTC `HH:MM:SS.mmm` of a core timestamp (Unix epoch ms) — the same clock
+/// and zone as the saved run transcripts' `time` fields. A line the core
+/// recorded no time for (service logs, output replayed from the run ledger)
+/// shows placeholders.
+fn utc_clock(time_ms: Option<u64>) -> String {
+    let Some(ms) = time_ms else {
+        return "--:--:--.---".into();
+    };
+    let secs = ms / 1000 % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60,
+        ms % 1000
+    )
+}
+
+fn output(addr: &Address, text: &str, stderr: bool, timestamps: bool, time_ms: Option<u64>) {
     let color = if stderr {
         std::io::stderr().is_terminal()
     } else {
@@ -50,6 +68,11 @@ fn output(addr: &Address, text: &str, stderr: bool) {
         if stderr { " stderr" } else { "" }
     );
     for line in text.lines() {
+        let prefix = if timestamps {
+            format!("{} {prefix}", utc_clock(time_ms))
+        } else {
+            prefix.clone()
+        };
         let rendered = if color {
             format!(
                 "\x1b[{}m{prefix}\x1b[0m {line}",
@@ -67,14 +90,22 @@ fn output(addr: &Address, text: &str, stderr: bool) {
     let _ = std::io::stdout().flush();
 }
 
-pub async fn run(path: PathBuf, mode: terminal_status::Mode) -> Result<(), String> {
+pub async fn run(
+    path: PathBuf,
+    mode: terminal_status::Mode,
+    timestamps: bool,
+) -> Result<(), String> {
     tokio::select! {
-        result = monitor(path, mode) => result,
+        result = monitor(path, mode, timestamps) => result,
         signal = tokio::signal::ctrl_c() => signal.map_err(|e| e.to_string()),
     }
 }
 
-async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), String> {
+async fn monitor(
+    path: PathBuf,
+    mode: terminal_status::Mode,
+    timestamps: bool,
+) -> Result<(), String> {
     let mut port = coordinator::get(&path)
         .await
         .map_err(|e| e.to_string())?
@@ -108,8 +139,8 @@ async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), Strin
             }
             Some((addr, event)) = rx.recv() => {
                 match event {
-                    api::SubscribeEvent::Line { stream, text } => {
-                        output(&addr, &text, matches!(stream, meshfox_server::stream_exec::OutputStream::Stderr));
+                    api::SubscribeEvent::Line { stream, text, time_ms } => {
+                        output(&addr, &text, matches!(stream, meshfox_server::stream_exec::OutputStream::Stderr), timestamps, time_ms);
                     }
                     api::SubscribeEvent::Done { exit_code } => {
                         eprintln!("[{}::{}] finished (exit {})", addr.0, addr.1,
@@ -201,7 +232,7 @@ async fn monitor(path: PathBuf, mode: terminal_status::Mode) -> Result<(), Strin
                     if let Ok(slice) = api::get_service_log_since(port, &service.node_id, &service.block, entry.2).await {
                         for (stream, text) in &slice.lines {
                             let is_stderr = matches!(stream, meshfox_server::stream_exec::OutputStream::Stderr);
-                            output(&(service.node_id.clone(), service.block.clone()), text, is_stderr);
+                            output(&(service.node_id.clone(), service.block.clone()), text, is_stderr, timestamps, None);
                         }
                         entry.2 = slice.next;
                     }

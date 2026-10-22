@@ -775,13 +775,15 @@ pub async fn get_includes(port: u16) -> Result<Vec<IncludeEntry>, String> {
 
 /// What `GET /api/info` says about the worker: whether it serves this
 /// canvas read-only (the canvas or its directory isn't writable: blocks
-/// run, edits are refused) and whether `secret` answers go to the OS
+/// run, edits are refused), whether it was started with `--no-exec` (edits
+/// work, running is refused) and whether `secret` answers go to the OS
 /// keychain. Best-effort: a worker that can't be asked (or an older one
 /// without the endpoint) is taken to be editable with plaintext secrets,
 /// and its own refusal says otherwise.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WorkerInfo {
     pub read_only: bool,
+    pub no_exec: bool,
     pub secret_keychain: bool,
 }
 
@@ -801,6 +803,7 @@ pub async fn info(port: u16) -> WorkerInfo {
         .await
         .map(|v| WorkerInfo {
             read_only: v["readOnly"] == true,
+            no_exec: v["noExec"] == true,
             secret_keychain: v["secretStore"] == "keychain",
         })
         .unwrap_or_default()
@@ -1433,7 +1436,13 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
     rename_all_fields = "camelCase"
 )]
 pub enum SubscribeEvent {
-    Line { stream: OutputStream, text: String },
+    Line {
+        stream: OutputStream,
+        text: String,
+        /// Core clock (Unix epoch ms) when the worker recorded the line.
+        #[serde(default)]
+        time_ms: Option<u64>,
+    },
     Done { exit_code: Option<i32> },
 }
 
@@ -1623,7 +1632,7 @@ pub async fn run_output(
             continue;
         };
         match serde_json::from_str::<SubscribeEvent>(&text) {
-            Ok(SubscribeEvent::Line { stream, text }) => lines.push((stream, text)),
+            Ok(SubscribeEvent::Line { stream, text, .. }) => lines.push((stream, text)),
             Ok(SubscribeEvent::Done { .. }) => break,
             Err(_) => {}
         }
@@ -2183,7 +2192,7 @@ async fn run_stream_inner(
         .map_err(|e| e.to_string())?;
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(ws_connect_error_text)?;
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -2273,6 +2282,23 @@ impl std::fmt::Display for TtyConnectError {
             ),
             TtyConnectError::Other(e) => write!(f, "{e}"),
         }
+    }
+}
+
+/// A failed WebSocket upgrade as text. A worker that refuses the request (a
+/// `--no-exec` core, a read-only one asked to start a service) says why in the
+/// response body; that reason, not a bare `HTTP error: 403 Forbidden`, is what
+/// the person running the command needs to see.
+fn ws_connect_error_text(err: tokio_tungstenite::tungstenite::Error) -> String {
+    let tokio_tungstenite::tungstenite::Error::Http(resp) = &err else {
+        return err.to_string();
+    };
+    let body = resp.body().clone().unwrap_or_default();
+    let text = String::from_utf8_lossy(&body).trim().to_string();
+    if text.is_empty() {
+        err.to_string()
+    } else {
+        text
     }
 }
 

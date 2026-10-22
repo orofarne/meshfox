@@ -344,6 +344,9 @@ fn spawn_worker(
     if !auto_exit {
         command.arg("--no-auto-exit");
     }
+    // A worker's restrictions are the process's own, so a watcher started with
+    // `--read-only`/`--no-exec` hands them on to every worker it spawns.
+    command.args(meshfox_core::capabilities::requested().args());
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

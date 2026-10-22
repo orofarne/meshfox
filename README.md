@@ -159,6 +159,8 @@ A run that was still in flight when the core died leaves no saved output, same a
 
 **Read-only canvases.** If the canvas file, or the directory its `.meshfox/` state would go in, can't be written (a read-only mount, someone else's checkout, a container image), meshfox serves it read-only instead of failing: blocks run, and nothing is written to disk. No lock file is taken (several workers can serve the same canvas side by side), the session database and variable answers live in memory only, a `cache`d block's output isn't written into the file, and edits — from the browser, TUI, CLI or MCP — are refused with a message saying why. The browser UI hides `Edit`; the TUI's `e` and `H` are unavailable. The local `.meshfox/config.toml` is still read, and a `python_venv` block's venv goes under the system temp dir. See SPEC.md's "Read-only canvases".
 
+**Restricting a core on request.** `--read-only` (or `MESHFOX_READ_ONLY=1`) serves a canvas the same way even when it *is* writable, as a private core that never joins a running one — so any number of them can look at one canvas side by side. `--no-exec` (or `MESHFOX_NO_EXEC=1`) keeps viewing and editing but refuses to run anything: blocks, services, `tty` sessions, debug shells. Together they make a pure viewer. A read-only core doesn't start `service` blocks, and neither switch isolates what the blocks themselves do (a script that writes into the project still does). See SPEC.md's "Restricting a core".
+
 ## Usage
 <!-- meshfox:node id="usage" -->
 

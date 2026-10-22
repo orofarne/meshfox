@@ -1711,7 +1711,11 @@ chain survive per-block history rotation and subsequent document edits.
 
 `--follow` replays and tails only the selected invocation, using sequence
 cursors, and ends when it completes. Ctrl-C detaches without cancellation.
-`meshfox console` instead remains attached across invocations. All history
+`meshfox console` instead remains attached across invocations; its
+`--timestamps` flag prefixes each output line with the UTC `HH:MM:SS.mmm` at
+which the core recorded it (`timeMs` on `/api/run/subscribe` lines), the same
+clock as the transcripts' `time` fields; lines the core has no time for
+(service logs, ledger replays) show `--:--:--.---`. All history
 access goes through the worker API, including when a worker must be started
 just to read saved logs. Reading a failed invocation returns exit 0; missing
 history or a read failure returns nonzero. Pre-existing per-block history is
@@ -1815,6 +1819,65 @@ lifetime.
 - **Clients**: the browser UI shows its `read-only` badge with no `Edit`
   button; the TUI's `e` (source editor) and `H` (history) only report why
   they're unavailable.
+
+## Restricting a core: `--read-only` and `--no-exec`
+
+Two switches, accepted by every command (`meshfox doc.canvas.md run --read-only
+go`) and also set by `MESHFOX_READ_ONLY=1` / `MESHFOX_NO_EXEC=1` (anything but
+empty, `0`, `false`, `no` or `off` counts as set; the MCP server is configured
+this way). They restrict the *core* — the worker process serving the canvas —
+for its whole lifetime; neither can be lifted again, and a `.meshfox/config.toml`
+cannot set them (a checked-out repository must not be able to loosen, or
+silently impose, what the person running it asked for). A core's restrictions
+are the process's own: a `meshfox view` started with a switch hands it on to
+every worker it spawns.
+
+**`--read-only`** serves the canvas exactly as "Read-only canvases" above
+describes — no lock, no port file, session state in memory, every edit refused
+with `403` — but on request, whether or not the files are writable. Blocks still
+run. Because such a core holds no lock and is not discoverable, it is always a
+*private* worker: it never joins a core already serving the canvas (nor one an
+external `server_socket` coordinator would hand out), so any number of them
+can serve one canvas next to each other and next to a normal one. Two
+consequences:
+
+- `service` blocks are refused (`403`, "a read-only core never starts
+  services"). A service outlives its run and holds ports, and the run ledger
+  that notices a second start is in memory here, so two read-only cores would
+  never see each other's. The same refusal applies to a canvas that is
+  read-only because of its filesystem. `tty` blocks work: the pty belongs to the
+  one core that started it.
+- `run --detach` is refused: a detached run is handed to a shared core.
+
+**`--no-exec`** serves the canvas with execution disabled: no block, `file`
+node, service, `tty` session, debug shell, `canvas-call` or form `autorun`
+starts a process. Everything else works — viewing, editing, history, search,
+Starlark views (they run inside the core), `display="table"` previews and
+opening files. It is independent of `--read-only`: a no-exec core holds the
+canvas's lock like any other, so a `meshfox run` that finds it is refused with a
+message saying why, and `meshfox run --no-exec` is refused at once. Both
+switches together give a pure viewer that is safe to start any number of times.
+
+What stays unavailable is anything that needs a block's output: a variable with
+`from=`, and the `choices_var=`/`default_var=` that name one, are not computed
+(a `select` with `choicesPending` stays empty). A value already cached in the
+session or a `.meshfox/<file>.env` still applies.
+
+`GET /api/info` reports `{"readOnly", "noExec"}`. `--no-exec` is enforced twice:
+the HTTP layer refuses the routes that start code with `403`, and every function
+that spawns a process refuses on its own, so a route nobody thought of still
+cannot run anything. The clients read it: the web UI shows a `no exec` badge and
+reports the refusal instead of attempting a run, and the TUI does the same in
+its status line; `meshfox mcp` forwards the worker's refusal text. A core
+started with `--no-exec` is joined by later commands like any other core, so
+they are refused too — the restriction belongs to the worker, not the client.
+
+**What `--read-only` does not isolate.** The core keeps no state of its own,
+but the blocks it runs are ordinary programs: whatever a script writes into the
+project, or any other shared resource it uses, is shared with every other core.
+Nor are plain runs of one block in two read-only cores excluded from each other
+(that exclusion is the run ledger, which is per core here). Use `--no-exec`
+as well when nothing should be run at all.
 
 ## Variables
 

@@ -145,6 +145,7 @@ where
     K: AsRef<str>,
     V: AsRef<str>,
 {
+    meshfox_core::capabilities::require_exec()?;
     let envs: Vec<(String, String)> = envs
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_string(), v.as_ref().to_string()))

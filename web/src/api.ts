@@ -9,14 +9,17 @@ export async function fetchCanvas(): Promise<CanvasDoc> {
 }
 
 /**
- * Whether this worker serves its canvas read-only (the canvas or its
- * directory isn't writable): blocks still run, but nothing can be edited, so
- * the toolbar offers no "Edit". Fixed for the worker's whole lifetime.
+ * What this worker was started with, fixed for its whole lifetime:
+ * `readOnly` — it serves its canvas read-only (the canvas or its directory
+ * isn't writable, or `--read-only`): blocks still run, but nothing can be
+ * edited, so the toolbar offers no "Edit"; `noExec` — it was started with
+ * `--no-exec`: editing works, but every run is refused.
  */
-export async function fetchReadOnly(): Promise<boolean> {
+export async function fetchWorkerInfo(): Promise<{ readOnly: boolean; noExec: boolean }> {
   const res = await fetch("/api/info");
   if (!res.ok) throw new Error(`GET /api/info: ${res.status}`);
-  return (await res.json()).readOnly === true;
+  const info = await res.json();
+  return { readOnly: info.readOnly === true, noExec: info.noExec === true };
 }
 
 /**

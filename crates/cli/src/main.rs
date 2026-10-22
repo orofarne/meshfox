@@ -76,6 +76,19 @@ struct Cli {
     #[arg(long)]
     agent_help: bool,
 
+    /// Serve canvases read-only: nothing is written, whether or not the
+    /// files are writable. Blocks still run. Cores started this way are
+    /// private to this process, so any number of them can serve one canvas
+    /// side by side. Same as `MESHFOX_READ_ONLY=1`.
+    #[arg(long, global = true)]
+    read_only: bool,
+
+    /// Serve canvases without running anything: no blocks, services,
+    /// interactive sessions or debug shells. Viewing and editing still work.
+    /// Same as `MESHFOX_NO_EXEC=1`.
+    #[arg(long, global = true)]
+    no_exec: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -172,6 +185,9 @@ enum Command {
         canvas: CanvasOpt,
         #[arg(long, value_enum, default_value = terminal_status::default_mode())]
         terminal_status: terminal_status::Mode,
+        /// Prefix each output line with the UTC time the core recorded it.
+        #[arg(long)]
+        timestamps: bool,
     },
     /// Run one or more named code blocks.
     ///
@@ -1355,6 +1371,11 @@ fn main() {
 
     let cli = Cli::parse_from(args);
 
+    meshfox_core::capabilities::set_requested(meshfox_core::capabilities::Capabilities {
+        read_only: cli.read_only,
+        no_exec: cli.no_exec,
+    });
+
     if cli.agent_help {
         print!("{}", include_str!("../../../AGENT_HELP.md"));
         return;
@@ -1422,6 +1443,7 @@ fn main() {
         Command::Console {
             canvas,
             terminal_status,
+            timestamps,
         } => {
             let path = canvas.resolve().unwrap_or_else(|| {
                 console_cmd::discover().unwrap_or_else(|error| {
@@ -1430,7 +1452,7 @@ fn main() {
                 })
             });
             let runtime = tokio::runtime::Runtime::new().expect("async runtime");
-            if let Err(error) = runtime.block_on(console_cmd::run(path, terminal_status)) {
+            if let Err(error) = runtime.block_on(console_cmd::run(path, terminal_status, timestamps)) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -2834,6 +2856,18 @@ async fn run_async(
     let block_arg = args.pop().expect("clap requires at least one arg");
     let path: Vec<&str> = args.iter().map(String::as_str).collect();
     let block_names = meshfox_core::args::split_list(&block_arg);
+
+    let requested = meshfox_core::capabilities::requested();
+    if requested.no_exec {
+        eprintln!("meshfox run: running is disabled (--no-exec / MESHFOX_NO_EXEC)");
+        terminal_status::exit(2);
+    }
+    if detach && requested.read_only {
+        eprintln!(
+            "meshfox run: --detach hands the run to a shared core, which --read-only never joins"
+        );
+        terminal_status::exit(2);
+    }
 
     let worker = if detach {
         coordinator::get_or_spawn_detached(canvas_path).await

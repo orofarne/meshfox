@@ -18,7 +18,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import {
   fetchCanvas,
-  fetchReadOnly,
+  fetchWorkerInfo,
   saveLayout,
   runBlockStream,
   openNodeFile,
@@ -91,6 +91,8 @@ import { withEdgeGeometry } from "./edgeRouteLayout";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
+
+const NO_EXEC_MESSAGE = "This core was started with --no-exec: running blocks is disabled.";
 
 const nodeTypes = { mesh: MeshNode };
 // "extra" is a real `meshfox:edge`; "tree" is the structural (nesting)
@@ -449,10 +451,20 @@ export default function App() {
   // isn't writable) — as opposed to `!editMode`, which is only "not yet
   // clicked Edit". Hides the Edit button; the worker refuses edits anyway.
   const [workerReadOnly, setWorkerReadOnly] = useState(false);
+  // The worker was started with `--no-exec`: editing works, running is
+  // refused. A browser can't read the reason off a refused WebSocket, so
+  // the run handlers say it themselves instead of attempting the run.
+  const [workerNoExec, setWorkerNoExec] = useState(false);
   useEffect(() => {
-    fetchReadOnly()
-      .then(setWorkerReadOnly)
-      .catch(() => setWorkerReadOnly(false));
+    fetchWorkerInfo()
+      .then((info) => {
+        setWorkerReadOnly(info.readOnly);
+        setWorkerNoExec(info.noExec);
+      })
+      .catch(() => {
+        setWorkerReadOnly(false);
+        setWorkerNoExec(false);
+      });
   }, []);
   // True while the toolbar's "Source" toggle has swapped the graph view for
   // CanvasSourceEditor's raw-Markdown editor — edit-mode-only, see the
@@ -1807,6 +1819,10 @@ export default function App() {
   // goes the same way: its implicit block carries `deps=`/`env=`/arguments.
   const handleRun = useCallback(
     async (nodeId: string, blockName: string, withDeps: boolean) => {
+      if (workerNoExec) {
+        setError(NO_EXEC_MESSAGE);
+        return;
+      }
       if (!canvas) return;
       let path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
@@ -1840,7 +1856,7 @@ export default function App() {
         await executeRun(nodeId, blockName, withDeps);
       }
     },
-    [canvas, executeRun],
+    [canvas, executeRun, workerNoExec],
   );
 
   // `tty` counterpart to `handleRun`: same "check `GET /api/vars` first,
@@ -1850,6 +1866,10 @@ export default function App() {
   // once the modal comes back.
   const handleRunTty = useCallback(
     async (nodeId: string, blockName: string, withDeps: boolean, autoclose: boolean) => {
+      if (workerNoExec) {
+        setError(NO_EXEC_MESSAGE);
+        return;
+      }
       if (!canvas) return;
       let path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
@@ -1875,7 +1895,7 @@ export default function App() {
       }
       await openConfirmedTerminal({ path, blockName, withDeps, autoclose });
     },
-    [canvas],
+    [canvas, workerNoExec],
   );
 
   const handleVarsSubmit = useCallback(
@@ -2377,6 +2397,13 @@ export default function App() {
       // selection highlight as a result). Carried forward by id instead.
       const selectedIds = new Set(prevNodes.filter((n) => n.selected).map((n) => n.id));
       const previousById = new Map(prevNodes.map((n) => [n.id, n.data]));
+      // Same reasoning for the measured box: a fresh node object without it
+      // reads to React Flow as "never measured", and it keeps the node
+      // `visibility: hidden` until its ResizeObserver reports — which it
+      // never does for a node whose DOM (and so size) didn't change, e.g.
+      // after the ↺ reset of a size-only node. Carried forward by id; a real
+      // size change still re-measures through the observer.
+      const previousMeasured = new Map(prevNodes.map((n) => [n.id, n.measured]));
       return canvas.nodes.map((n) => {
         // A document edit must not erase output and wait for /api/runs to
         // replay it: that shrinks expanded nodes before growing them again.
@@ -2459,6 +2486,7 @@ export default function App() {
           id: n.id,
           type: "mesh",
           selected: selectedIds.has(n.id),
+          ...(previousMeasured.get(n.id) ? { measured: previousMeasured.get(n.id) } : {}),
           // `parentId` is React Flow's own native parent/child nesting —
           // once set, `position` above is relative to the parent (exactly
           // what a group member's own x/y already means, see above) and
@@ -3819,6 +3847,11 @@ export default function App() {
             🖥 {liveTtySessions.length}
           </button>
         )}
+        {workerNoExec && (
+          <span className="mode-badge" title={NO_EXEC_MESSAGE}>
+            no exec
+          </span>
+        )}
         {editMode ? (
           <>
             <span className="mode-badge mode-badge-edit">editing</span>
@@ -3858,7 +3891,7 @@ export default function App() {
               className="mode-badge"
               title={
                 workerReadOnly
-                  ? "This canvas or its directory isn't writable — blocks run, but nothing is saved"
+                  ? "This canvas is served read-only (not writable, or started with --read-only) — blocks run, but nothing is saved"
                   : undefined
               }
             >

@@ -221,7 +221,9 @@ mod tests {
             format!("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n{body}"),
         )
         .unwrap();
-        build_state_with(path, false, None, true).await.unwrap()
+        build_state_with(path, false, None, Capabilities::UNRESTRICTED)
+            .await
+            .unwrap()
     }
     fn request(block: &str) -> RunRequest {
         RunRequest {

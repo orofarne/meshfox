@@ -45,6 +45,9 @@ pub struct SeqLine {
     pub stream: OutputStream,
     pub text: String,
     pub child: Option<serde_json::Value>,
+    /// Core wall clock (Unix epoch milliseconds) when the line was recorded
+    /// — the same instant a run transcript's `time` field carries.
+    pub time_ms: u64,
 }
 
 struct RingBuffer {
@@ -75,6 +78,9 @@ impl RingBuffer {
             stream,
             text,
             child,
+            time_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
         };
         if self.lines.len() >= self.cap {
             self.lines.pop_front();

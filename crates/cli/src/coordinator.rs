@@ -58,6 +58,12 @@ pub enum Resolved {
 /// longer sharing state with whatever else that coordinator manages) than
 /// what was configured.
 pub async fn resolve(canvas_path: &Path) -> io::Result<Resolved> {
+    // `--read-only` never joins a shared worker, neither a local one nor one
+    // an external coordinator would hand out: the caller always serves the
+    // canvas itself, in a private worker that keeps nothing on disk.
+    if meshfox_core::capabilities::requested().read_only {
+        return Ok(Resolved::Us(LockGuard::read_only()));
+    }
     let canvas_root = crate::canvas_root_dir(canvas_path);
     if let Some(socket) = meshfox_core::config::server_socket(canvas_root) {
         // Canonicalize before crossing the socket: the coordinator resolves

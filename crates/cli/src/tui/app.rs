@@ -612,6 +612,10 @@ pub struct App {
     /// writable): `e` and `H` — the two ways in that change the file — are
     /// unavailable. Blocks still run. Fixed for the session.
     pub read_only: bool,
+    /// The worker was started with `--no-exec`: the document edits as usual,
+    /// but every run is refused, so the TUI says so up front instead of
+    /// starting one the worker would turn down. Fixed for the session.
+    pub no_exec: bool,
     /// Set only while a `VarFormState` opened by `start_run_via_worker` is
     /// waiting on an answer — see `PendingHttpRun`'s own doc comment.
     pub pending_http_run: Option<PendingHttpRun>,
@@ -1092,6 +1096,9 @@ pub(super) fn var_form_from_statuses_for_test(
     var_form_from_statuses(statuses)
 }
 
+/// What a run attempt says on a core started with `--no-exec`.
+const NO_EXEC_STATUS: &str = "this core was started with --no-exec: running is disabled";
+
 /// What `e`/`H` say on a canvas served read-only — see `App::read_only`.
 const READ_ONLY_STATUS: &str =
     "read-only canvas (it or its directory isn't writable) — blocks run, nothing is saved";
@@ -1184,6 +1191,7 @@ impl App {
             None => Default::default(),
         };
         let read_only = info.read_only;
+        let no_exec = info.no_exec;
         let mut app = App {
             canvas_path,
             raw,
@@ -1229,6 +1237,7 @@ impl App {
             picker,
             worker_port,
             read_only,
+            no_exec,
             pending_http_run: None,
             run_confirmation: None,
             run_confirmation_approved: false,
@@ -1261,6 +1270,8 @@ impl App {
             select_after_reload: None,
             status: if read_only {
                 READ_ONLY_STATUS.into()
+            } else if no_exec {
+                NO_EXEC_STATUS.into()
             } else {
                 String::new()
             },
@@ -4918,6 +4929,10 @@ impl App {
         force: Option<(String, String)>,
         extra_vars: HashMap<String, String>,
     ) {
+        if self.no_exec {
+            self.status = NO_EXEC_STATUS.into();
+            return;
+        }
         let mut node_id = node_id;
         let mut block_name = block_name;
         let mut path = self.path_to(&node_id);
@@ -5642,7 +5657,7 @@ impl App {
             }
         }
         match event {
-            SubscribeEvent::Line { stream, text } => {
+            SubscribeEvent::Line { stream, text, .. } => {
                 // `external_running` not yet holding this address means
                 // this is the first `Line` of a *fresh* subscription (a
                 // new `WatchEvent::RunStarted`, in `spawn_run_subscriber`)
@@ -8278,6 +8293,7 @@ mod tests {
             SubscribeEvent::Line {
                 stream: meshfox_server::stream_exec::OutputStream::Stdout,
                 text: "first recording".into(),
+                time_ms: None,
             },
         );
         assert!(document_text(&app).contains("first recording"));
@@ -8338,6 +8354,7 @@ mod tests {
         let line = |text: &str| SubscribeEvent::Line {
             stream: meshfox_server::stream_exec::OutputStream::Stdout,
             text: text.into(),
+            time_ms: None,
         };
         app.on_reconciled_run_event(addr.clone(), line("old output"), Some(123));
         app.on_reconciled_run_event(
@@ -8388,6 +8405,7 @@ mod tests {
             SubscribeEvent::Line {
                 stream: meshfox_server::stream_exec::OutputStream::Stdout,
                 text: "build".into(),
+                time_ms: None,
             },
         );
         assert!(app.external_running.contains_key(&addr));
@@ -9012,6 +9030,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A `--no-exec` core edits as usual but never runs: the TUI says so
+    // instead of starting a run the worker would refuse.
+    #[tokio::test]
+    async fn a_no_exec_core_refuses_to_start_a_run_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-no-exec-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let mut app = app_with_real_worker(path).await;
+        app.no_exec = true;
+
+        app.start_run("root".into(), "go".into(), true).await;
+        assert!(app.status.contains("no-exec"), "status: {}", app.status);
+        assert!(app.run.is_none());
+        assert!(app.pending_http_run.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The bug this guards: `S` in a worker-routed TUI only cleared the TUI's
     // own state, so the worker still considered every dependency fresh and
     // the next `r` ran only the block itself.
@@ -9588,6 +9628,7 @@ mod tests {
             crate::worker_client::SubscribeEvent::Line {
                 stream: meshfox_server::stream_exec::OutputStream::Stdout,
                 text: "LIVE".into(),
+                time_ms: None,
             },
             None,
         );
@@ -9649,6 +9690,7 @@ mod tests {
             crate::worker_client::SubscribeEvent::Line {
                 stream: meshfox_server::stream_exec::OutputStream::Stdout,
                 text: "LIVE_OUTPUT".into(),
+                time_ms: None,
             },
             None,
         );
@@ -9802,6 +9844,7 @@ mod tests {
             SubscribeEvent::Line {
                 stream: out,
                 text: "hello".into(),
+                time_ms: None,
             },
             Some(1234),
         );
@@ -9811,6 +9854,7 @@ mod tests {
             SubscribeEvent::Line {
                 stream: err,
                 text: "oops".into(),
+                time_ms: None,
             },
             Some(1234),
         );

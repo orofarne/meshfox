@@ -176,6 +176,7 @@ pub(crate) fn spawn_bash_frozen(
 }
 
 fn spawn_bash_command(mut command: Command) -> io::Result<SpawnedProcess> {
+    meshfox_core::capabilities::require_exec()?;
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -216,6 +217,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    meshfox_core::capabilities::require_exec()?;
     let mut command = Command::new(program);
     command.args(args);
     apply_run_env(
@@ -325,6 +327,7 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
+    meshfox_core::capabilities::require_exec()?;
     let envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = envs
         .into_iter()
         .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string()))
