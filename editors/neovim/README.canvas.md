@@ -176,3 +176,73 @@ Completion reads the buffer, so it knows an id you typed a second ago.
 - `vim.g.meshfox_lsp_disable = true` — no language server.
 - `vim.g.meshfox_no_mappings = true` — no `<leader>mn`.
 
+## Guide: working with canvases in Neovim
+<!-- meshfox:node id="guide-working-with-canvases-in-neovim" -->
+
+A walkthrough from a clean Neovim to a comfortable editing session. Each part is described in detail in the sections above; this one is the order in which you will actually meet them.
+
+### 1. Set up once
+
+1. Install `meshfox` and make sure it is on `$PATH` and has the language server: `meshfox lsp --help` must exit 0 (from a checkout, `meshfox README.md run install-from-source` at the repository root installs a current one).
+2. Install the plugin: `meshfox editors/neovim/README.canvas.md run install install` (see "Install"; add `--set WITH_STARLARK=true` if you want constraint bodies highlighted too). It lands in Neovim's own `pack/*/start/` directory, so `init.lua` needs no changes.
+3. Use Neovim 0.11+ (0.12 is what it was developed against); highlighting alone works from 0.10.
+
+Completion is not bundled: bring your own LSP completion client (`blink.cmp`, `nvim-cmp` with the LSP source, or Neovim's built-in `vim.lsp.completion`). The server only provides the candidates.
+
+### 2. Open a canvas and check that everything is on
+
+```sh
+nvim TODO.canvas.md
+```
+
+Inside Neovim:
+
+- `:set filetype?` → `markdown.meshfox`. Any `*.canvas.md` gets it, and so does any `*.md` whose first line is `<!-- meshfox:canvas -->`.
+- `:checkhealth vim.lsp` (or `:lua =vim.lsp.get_clients({ bufnr = 0 })`) → a client named `meshfox` is attached. It is started once per session, on the first canvas you open.
+- Markers such as `<!-- meshfox:node id="x" -->` are coloured as keyword / attribute / value rather than as a plain HTML comment.
+
+### 3. A typical editing loop
+
+1. **Write ordinary Markdown.** A heading is a would-be node; headings nest as the tree does.
+2. **Turn a heading into a node:** put the cursor on it and press `<leader>mn`. The server adds `<!-- meshfox:node id="…" -->` with a fresh random id right below it. `gra` on the same line shows the full menu: the same action, plus "all plain headings of the document at once".
+3. **Fill in attributes with completion.** Inside a marker comment or a runnable fence's info string, type a space (or `"`, `,`, `/`, `<`, `$`) and the menu opens:
+   - names of the attributes still free on that line (`parent=`, `type=`, `tags=`, `deps=`, …); accepting one inserts `name="…"` with the cursor between the quotes;
+   - values: the enumerated choices, node ids for `parent=` and an edge's `from=`, tags already used in the document, block names for `deps=` and `meshfox:var` names for `env=`;
+   - a marker from scratch: type `<!-- m` and pick `meshfox:node` (its id is pre-generated) or `meshfox:edge`.
+4. **Make a code fence runnable.** In a language meshfox doesn't run by itself (`python`, `node`, …) type `interpreter=` on the opening line and pick `@agent`, `@python_venv`, `@node_env`, `python3` or `node`; after that the fence offers the full set of block attributes.
+5. **Read the diagnostics.** The same rules as `meshfox validate` are applied to the *buffer*, saved or not, and the first failure is underlined on the node or attribute it is about. Jump with `]d` / `[d`, read with `<C-w>d` or `vim.diagnostic.open_float()`.
+6. **Navigate the tree.** `vim.lsp.buf.document_symbol()` lists the nodes (any symbol picker works: `telescope`, `fzf-lua`, `snacks.picker`, …); breadcrumb plugins such as `dropbar` or `navic` show the node you are in.
+7. **Save, then look at the result** in the interactive canvas, in another terminal or window: `meshfox view TODO.canvas.md` (browser) or `meshfox tui TODO.canvas.md`. The canvas's worker owns the file and picks up the change you saved.
+
+Inline colour spans (`[text]{color="#e06c75" background-color="#fff3b0"}`) get their own highlighting of the attribute tail, so a typo in the hex value shows up immediately as an uncoloured tail. Spans inside inline code or fences are deliberately left alone.
+
+### 4. Useful `init.lua` snippets
+
+```lua
+-- A particular binary instead of the one on $PATH (not probed):
+vim.g.meshfox_lsp_cmd = { '/path/to/meshfox', 'lsp' }
+
+-- No language server at all, only highlighting:
+vim.g.meshfox_lsp_disable = true
+
+-- No <leader>mn mapping (gra still works):
+vim.g.meshfox_no_mappings = true
+```
+
+Canvas-only settings (wrap, spell, a different `textwidth`, …) go in `after/ftplugin/meshfox.lua`; they apply to canvases and not to other Markdown files.
+
+### 5. When something is off
+
+| Symptom | Likely cause |
+|---|---|
+| `filetype` is plain `markdown` | the file is not `*.canvas.md` and its first line is not `<!-- meshfox:canvas -->` |
+| No markers colouring at all | the parser was not built or installed: run the `build` and `install` blocks again; check that `parser/meshfox.so` exists in the plugin directory |
+| Markers look like ordinary HTML comments | a colourscheme or plugin paints the `html` layer over ours; compare with `vim.inspect_pos()` on a marker (see "Query-authoring gotchas") |
+| Constraint fences are not coloured | expected without the Starlark parser; build it with `WITH_STARLARK=true` or `:TSInstall starlark` |
+| No `meshfox` client in `:checkhealth vim.lsp` | Neovim older than 0.11, `meshfox` not on `$PATH` (Neovim started from a GUI launcher often has a shorter `$PATH`), the binary predates `lsp`, or `vim.g.meshfox_lsp_disable` is set |
+| `gra` says "No code actions available" | the cursor is not on a plain heading (or it already is a node) |
+| Completion menu never opens | no completion client is attached to LSP; the server only supplies items |
+| Plugin loaded twice | it is both installed and on the `runtimepath`; use one of the two |
+
+The server writes nothing and never touches the file: it only reads the text Neovim hands it, so a crashed or disabled server cannot damage a canvas.
+

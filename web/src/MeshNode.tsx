@@ -594,7 +594,7 @@ export interface MeshNodeData {
  * pixelated noise at a low enough zoom. An SVG sized in `em` and colored via
  * `currentColor` scales cleanly at any zoom, same as the surrounding text. */
 /** The ▸/▾ fold marker — mirrors the TUI's own `▾`/`▸` row marker (see
- * README's "Terminal viewer" section) as closely as a spatial canvas
+ * README's "Terminal UI" section) as closely as a spatial canvas
  * allows: folded shrinks this node to a title-only row and, if it has any,
  * hides its whole subtree too (see App.tsx's `foldedNodeIds`). Rendered on
  * every node with real body content — a leaf still gets one, same as any

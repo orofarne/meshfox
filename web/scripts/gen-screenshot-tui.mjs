@@ -101,7 +101,7 @@ try {
 
   // The TUI opens with the root node selected, which is just mascot art
   // (see demo.canvas.md) — clicking the "Hello" tree row (mouse support
-  // covers this, see SPEC.md/README's "Terminal viewer" section) selects
+  // covers this, see SPEC.md/README's "Terminal UI" section) selects
   // it instead, whose body shows off syntax highlighting and a cached run
   // result, the same reason gen-screenshot.mjs's own demo picks it. It's
   // always the pty's second row (first is the tree's own top border), a
