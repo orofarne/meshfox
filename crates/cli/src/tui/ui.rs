@@ -1697,7 +1697,7 @@ fn tail_fit(s: &str, max: usize) -> String {
 /// derive the same inner list rows rect from it without duplicating this
 /// sizing math.
 fn var_form_rect(area: Rect, decl_count: usize) -> Rect {
-    let height = (decl_count as u16 + 4).min(area.height);
+    let height = (decl_count.saturating_mul(2).saturating_add(4)).min(area.height as usize) as u16;
     centered_rect(64, height, area)
 }
 
@@ -1713,6 +1713,11 @@ pub(super) fn var_form_list_rect(area: Rect, decl_count: usize) -> Rect {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
     rows[0]
+}
+
+/// Keep the selected two-line field visible and share the scroll offset with mouse input.
+pub(super) fn var_form_offset(rows: Rect, selected: usize) -> usize {
+    selected.saturating_sub((rows.height as usize / 2).max(1) - 1)
 }
 
 fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
@@ -1803,7 +1808,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                 .as_ref()
                 .map(|e| format!(" ⚠ {e}"))
                 .unwrap_or_default();
-            let prefix = format!("{}{origin_tag}: ", decl.prompt);
+            let prefix = "  ";
             // A `dir`/`file` field ends in a right-aligned, clickable
             // "[Browse… ^o]" (`App::on_modal_mouse` hit-tests the same
             // `BROWSE_MARKER`-wide strip at the row's right edge).
@@ -1820,9 +1825,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             );
             let value = tail_fit(&value, value_budget.max(8));
             let mut spans = vec![
-                Span::raw(decl.prompt.clone()),
-                Span::styled(origin_tag, Style::default().fg(Color::DarkGray)),
-                Span::raw(": "),
+                Span::raw(prefix),
                 Span::styled(value.clone(), Style::default().fg(Color::LightGreen)),
                 Span::styled(save_tag.clone(), Style::default().fg(Color::DarkGray)),
                 Span::styled(error_tag.clone(), Style::default().fg(Color::Red)),
@@ -1842,12 +1845,19 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ));
             }
-            ListItem::new(Line::from(spans))
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::raw(decl.prompt.clone()),
+                    Span::styled(origin_tag, Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::from(spans),
+            ])
         })
         .collect();
 
     let mut state = ListState::default();
     state.select(Some(vf.selected));
+    *state.offset_mut() = var_form_offset(rows[0], vf.selected);
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, rows[0], &mut state);
 
@@ -4302,6 +4312,28 @@ mod tests {
             rv.list_rect.get().width > 0,
             "list position recorded for mouse hit-testing"
         );
+    }
+
+    #[tokio::test]
+    async fn render_var_form_keeps_secret_input_visible_below_long_prompt() {
+        let statuses = serde_json::from_value(serde_json::json!([
+            {"name": "TOKEN", "type": "string",
+             "prompt": "Personal Access Token Firefly III (пусто — пропустить проверку)".repeat(3),
+             "secret": true, "resolved": false, "secretStore": "keychain"}
+        ]))
+        .unwrap();
+        let mut vf = super::super::app::var_form_from_statuses_for_test(statuses);
+        vf.configuring = true;
+        for width in [50, 80, 100] {
+            let area = Rect::new(0, 0, width, 16);
+            let screen = render_to_screen(area, |f| render_var_form(f, area, &vf));
+            assert!(screen.contains("_ (not set)"), "{screen}");
+            vf.inputs[0] = "secret-token".repeat(20);
+            let screen = render_to_screen(area, |f| render_var_form(f, area, &vf));
+            assert!(screen.contains("*_ (not set)"), "{screen}");
+            assert!(!screen.contains("secret-token"), "{screen}");
+            vf.inputs[0].clear();
+        }
     }
 
     #[tokio::test]

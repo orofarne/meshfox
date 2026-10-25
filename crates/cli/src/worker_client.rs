@@ -1443,7 +1443,9 @@ pub enum SubscribeEvent {
         #[serde(default)]
         time_ms: Option<u64>,
     },
-    Done { exit_code: Option<i32> },
+    Done {
+        exit_code: Option<i32>,
+    },
 }
 
 /// Passive subscription with resumable output. A persisted run identity pins

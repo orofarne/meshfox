@@ -1452,7 +1452,9 @@ fn main() {
                 })
             });
             let runtime = tokio::runtime::Runtime::new().expect("async runtime");
-            if let Err(error) = runtime.block_on(console_cmd::run(path, terminal_status, timestamps)) {
+            if let Err(error) =
+                runtime.block_on(console_cmd::run(path, terminal_status, timestamps))
+            {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

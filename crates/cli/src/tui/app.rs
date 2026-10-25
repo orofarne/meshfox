@@ -3201,13 +3201,15 @@ impl App {
             let list_rect = ui::var_form_list_rect(area, vf.decls.len());
             let mut browse = None;
             if mouse.row >= list_rect.y && mouse.row < list_rect.y + list_rect.height {
-                let idx = (mouse.row - list_rect.y) as usize;
+                let idx = ui::var_form_offset(list_rect, vf.selected)
+                    + (mouse.row - list_rect.y) as usize / 2;
                 if idx < vf.decls.len() {
                     vf.selected = idx;
                     // The right-aligned "[Browse… ^o]" strip of a
                     // `dir`/`file` row (see `render_var_form`).
                     let marker = super::path_picker::BROWSE_MARKER.chars().count() as u16;
-                    let on_marker = mouse.column + marker >= list_rect.x + list_rect.width
+                    let on_marker = (mouse.row - list_rect.y) % 2 == 1
+                        && mouse.column + marker >= list_rect.x + list_rect.width
                         && mouse.column < list_rect.x + list_rect.width;
                     if on_marker && matches!(vf.decls[idx].var_type, VarType::Dir | VarType::File) {
                         browse = Some(idx);
