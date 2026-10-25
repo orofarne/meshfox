@@ -46,6 +46,21 @@ echo "clip is $CLIP"
 ```
 
 
+## When
+<!-- meshfox:node id="when" -->
+
+`type="date"` / `type="datetime"` variables: the run-gate modal shows the
+browser's native date and datetime-local controls, the latter next to an
+editable UTC-offset box, and submits canonical `YYYY-MM-DD` / RFC3339.
+
+<!-- meshfox:var name="DAY" type="date" prompt="Day?" required session -->
+<!-- meshfox:var name="AT" type="datetime" prompt="At?" required session -->
+
+```bash name="use-when" env="$DAY,$AT"
+echo "when $DAY $AT"
+```
+
+
 ## Report
 <!-- meshfox:node id="report" -->
 

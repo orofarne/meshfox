@@ -327,12 +327,52 @@ a {
 .canvas-area {
   flex: 1;
   min-height: 0;
+  position: relative;
 }
 
-/* TODO.canvas.md: "Поиск" — a React Flow `<Panel>` (same overlay mechanism
- * `<Controls>`/`<MiniMap>` already use), so no custom absolute positioning
- * of its own is needed. */
+.mesh-document {
+  height: 100%;
+  overflow: auto;
+  background: var(--node-bg);
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.mesh-document-content {
+  box-sizing: border-box;
+  width: min(100%, 1100px);
+  margin: 0 auto;
+  padding: clamp(24px, 5vw, 64px) clamp(16px, 4vw, 48px);
+}
+
+.mesh-document-content > h1 {
+  margin: 0 0 1.5rem;
+  line-height: 1.2;
+}
+
+.mesh-document-content > .mesh-node-body {
+  padding: 0;
+  overflow: visible;
+  line-height: 1.65;
+}
+
+.mesh-document-content .mesh-node-body > :is(p, ul, ol, blockquote) {
+  max-width: 75ch;
+}
+
+.mesh-document-content > .mesh-table {
+  height: min(65vh, 640px);
+}
+
+/* Shared search overlay for the canvas and single-node document. */
 .search-bar {
+  position: absolute;
+  z-index: 10;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 24px);
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -344,6 +384,7 @@ a {
 }
 
 .search-bar input {
+  min-width: 0;
   font: inherit;
   font-size: 0.85rem;
   padding: 0.3rem 0.5rem;
@@ -2676,6 +2717,30 @@ a {
   border-radius: 4px;
   background: var(--bg);
   color: var(--fg);
+}
+
+/* DateField.tsx — a `datetime` is the native datetime-local control plus a
+ * small editable UTC-offset box beside it. */
+.date-field-time {
+  display: flex;
+  gap: 0.4rem;
+  align-items: stretch;
+}
+
+.date-field-time .date-field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.vars-modal-field input.date-field-offset {
+  flex: 0 0 auto;
+  width: 6.2ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.vars-modal-field input.date-field-offset[aria-invalid="true"] {
+  border-color: #d33;
 }
 
 .vars-modal-field input[type="checkbox"] {

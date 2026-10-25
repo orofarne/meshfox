@@ -935,8 +935,9 @@ are examples, not signatures. There is no `block=` or fence `args=` attribute.
 Each declaration accepts `name`, `type`, `choices`, `choices_var`, `default`,
 `prompt`, and `required`. Names use environment identifiers (`[A-Za-z_][A-Za-z0-9_]*`) and
 must be unique within the signature. Types reuse variable types: `string`
-(default), signed 64-bit `int`, `bool` (`true`/`false`), and `select` with
-literal `choices`. Defaults are literal values and must satisfy the type.
+(default), signed 64-bit `int`, `bool` (`true`/`false`), `select` with
+literal `choices`, and `date`/`datetime` (see "Date and datetime variables").
+Defaults are literal values and must satisfy the type.
 Dynamic defaults (`default_var`), `from`, `secret`, and `session` are outside this first
 contract; dynamic choices are `choices_var=`, below. The declaration order controls the manual-run form only.
 
@@ -1190,7 +1191,7 @@ only ever prompting before a run. Its body is a line-based list, one
   `[`/`]` in document order, with the same highlight rules: accent border
   and a filled header while the Document pane has focus, dimmed when
   another pane has it, `›` replacing the corner only while focused.
-  Clicking a field, the Browse marker or Send selects it too. `Enter` (or
+  Clicking a field, the Browse/Pick marker or Send selects it too. `Enter` (or
   `i`) starts editing — the header then reads `· editing` and the foot
   lists the keys — `Esc` stops editing and keeps the selection, and `r`
   says a form is not run.
@@ -1928,11 +1929,21 @@ Attributes:
   one here doesn't, by itself, put it in any block's environment; that's
   opt-in per block, see "Consumption" below.
 - `type` — `string` (default), `int`, `bool`, `select`, `dir` (see
-  "Directory variables" below) or `file` (see "File variables"). Purely a hint
-  for how to *prompt* (a `bool` prompts y/n, a `select` shows its
-  `choices` as a menu, ...) and how a UI renders an input for it — an
-  incoming value (from `--set`, the environment, the cache, or a typed
-  answer) is never validated against it; it's just a string either way.
+  "Directory variables" below), `file` (see "File variables"), `date` or
+  `datetime` (see "Date and datetime variables"). It decides how to
+  *prompt* (a `bool` prompts y/n, a `select` shows its `choices` as a menu,
+  a `date` a calendar, ...) and how a UI renders an input for it. **Every**
+  value is validated against it, wherever it comes from, so a block never
+  receives an `int` that is not an integer or a `date` that is not a day
+  (it still arrives as a plain string): a new answer (`--set`, an interactive
+  prompt, a submitted form or API request) is rejected before it is saved; a
+  value supplied by the process environment, the variable cache or shared
+  config, and a `from=` block's output, fails the run with an error naming
+  the variable, the bad value and where it came from. Such a value is never
+  silently replaced by the default or asked for again — a stale cache entry
+  is corrected with `--set` or by editing the cache file. A secret's value
+  is never echoed into the message. Only a declaration's own `default` is
+  taken as written.
 - `mode` — `type="file"` only: `open` (default) or `save`, see "File
   variables".
 - `ext` — `type="file"` only: a comma-separated list of extensions
@@ -2462,6 +2473,59 @@ cached); a value from `--set`, the environment, shared config, the cache or
 a `from=` block is trusted as is. A `default` with a `..` component under
 `@tmp` is not an `@tmp` path (for `dir` variables too) and needs
 confirmation the same way.
+
+### Date and datetime variables (`type="date"`, `type="datetime"`)
+
+A `date` holds one calendar day, a `datetime` one instant:
+
+    <!-- meshfox:var name="SINCE" type="date" default="2026-01-01" -->
+    <!-- meshfox:var name="DEADLINE" type="datetime" prompt="Deadline?" -->
+
+- The stored value — what is cached, passed with `--set`, sent by a form and
+  put into a block's environment — is always canonical. A `date` is
+  `YYYY-MM-DD` and must be a real day (`2026-02-30` is rejected, `2024-02-29`
+  is fine). A `datetime` is RFC3339 **with an offset**, the same shape as the
+  `createdAt`/`updatedAt` stamps (see "Timestamps"): `2026-10-25T14:30:00+03:00`
+  or `...Z`, a `T` between the parts, fractional seconds allowed. A
+  datetime without an offset is not a valid value, so an instant is never
+  ambiguous between machines.
+- Validation is the same strict check everywhere (`--set`, prompts, forms,
+  API requests, block arguments, the environment, the cache, shared config,
+  `from=` output, and a `default` on a `meshfox:arg`). There is no `min`/`max`, `format=`, or relative
+  default such as `today`/`now`.
+- Interactive text fields are lenient and normalize what was typed into
+  the canonical value: for a `datetime`, a space may replace the `T`,
+  seconds are optional, and the offset may be `Z`, `+03:00`, `+0300` or
+  `+03`; when no offset is typed, the **local offset of the machine the
+  field is edited on** at that wall time is attached (`2026-10-25 14:30`
+  → `2026-10-25T14:30:00+03:00`). This applies to the CLI prompt and the TUI
+  variable form and `form` fences; `--set` and the API do not guess.
+- Starlark has no datetime type; a block's value is the canonical string.
+
+### Date pickers
+
+A `date`/`datetime` field is an ordinary text input that can also be filled
+from a calendar. Typing the value by hand always works.
+
+- **Web.** The browser's own `<input type="date">` is used for a `date`. A
+  `datetime` is `<input type="datetime-local">` (seconds included) next to a
+  small editable UTC-offset box (`+03:00`, `Z`). A first pick takes the
+  browser's offset at that time; the two are combined into the canonical
+  RFC3339 value, and a malformed offset leaves the value empty (rejected on
+  submit) rather than guessing.
+- **TUI.** `Ctrl-O` on a focused `date`/`datetime` field of the variable form
+  or a `form` fence opens a calendar modal over it, starting from the
+  field's value (or now). The field ends in a clickable `[Pick… ^o]`
+  marker, as `dir`/`file` fields end in `[Browse… ^o]`. Keys: `←`/`→` move a
+  day, `↑`/`↓` a week, `PageUp`/`PageDown` (or `[`/`]`) a month, `Home`/`End`
+  the first/last day of the month, `t` today, `Enter` choose, `Esc` cancel;
+  weeks start on Monday. For a `datetime` the modal also has hour, minute,
+  second and offset fields: `Tab`/`Shift-Tab` (or `←`/`→` outside the
+  calendar) move between them, `↑`/`↓` change a field by one (the offset by
+  15 minutes, within −12:00…+14:00), `PageUp`/`PageDown` by ten, `n` sets
+  now. A click on a day selects it (a second click on the selected day
+  chooses it), the arrows in the month header and the wheel page months, and
+  a click on a time field focuses it.
 
 ### Path pickers
 

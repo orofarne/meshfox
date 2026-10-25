@@ -52,3 +52,80 @@ fn filling_in_a_form_field_and_clicking_send_autoruns_the_dependent_block() {
          that references it, with no r press",
         );
 }
+
+/// Exercise the real event loop and renderer: selecting a value changes
+/// only the draft; Send is still required to commit it and trigger autorun.
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn select_dropdown_supports_keyboard_cancel_mouse_and_explicit_send() {
+    let (canvas_path, dir) = fixtures::write_fixture(concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"TUI_SELECT_CHOICE\" type=\"select\" ",
+        "choices=\"AlphaChoice,BetaChoice,GammaChoice\" default=\"AlphaChoice\" session -->\n\n",
+        "```form name=\"pick\" send=\"Send\"\n",
+        "field var=\"TUI_SELECT_CHOICE\" label=\"Choice\"\n```\n\n",
+        "```bash name=\"show\" env=\"$TUI_SELECT_CHOICE\" autorun\n",
+        "printf '%s\\n' \"$TUI_SELECT_CHOICE\" >> select-submissions\n",
+        "echo \"selected choice is $TUI_SELECT_CHOICE\"\n```\n",
+    ));
+    let submissions = dir.join("select-submissions");
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 110);
+    let timeout = Duration::from_secs(5);
+    session.wait_for("Choice: [", timeout).unwrap();
+
+    // A field click opens a list of actual options, rather than a text input.
+    let (row, col) = session.find("Choice:").unwrap();
+    session.send_mouse_click(row, col);
+    session.wait_for("Choose · Enter select", timeout).unwrap();
+    session.wait_for("› AlphaChoice", timeout).unwrap();
+    assert!(session.screen_text().contains("BetaChoice"));
+    assert!(session.screen_text().contains("GammaChoice"));
+    session.send_keys("\x1b[B"); // Down
+    session.wait_for("› BetaChoice", timeout).unwrap();
+    session.send_keys("\r");
+    session
+        .wait_for("Choice: [ BetaChoice ▾ ]", timeout)
+        .unwrap();
+    assert!(!session
+        .screen_text()
+        .contains("selected choice is BetaChoice"));
+
+    // Enter reopens the list at the current value; Escape discards navigation.
+    session.send_keys("\r");
+    session.wait_for("› BetaChoice", timeout).unwrap();
+    session.send_keys("\x1b[B");
+    session.wait_for("› GammaChoice", timeout).unwrap();
+    session.send_keys("\x1b");
+    let deadline = std::time::Instant::now() + timeout;
+    while session.screen_text().contains("Choose · Enter select") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Escape did not close the list"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(session.screen_text().contains("Choice: [ BetaChoice ▾ ]"));
+
+    // Space opens the same list and a mouse click confirms an option.
+    session.send_keys(" ");
+    session.wait_for("Choose · Enter select", timeout).unwrap();
+    let (row, col) = session.find("GammaChoice").unwrap();
+    session.send_mouse_click(row, col);
+    session
+        .wait_for("Choice: [ GammaChoice ▾ ]", timeout)
+        .unwrap();
+    assert!(!session
+        .screen_text()
+        .contains("selected choice is GammaChoice"));
+
+    // Only a separate Send commits the choice and starts the dependent block.
+    let (row, col) = session.find("[Send]").unwrap();
+    session.send_mouse_click(row, col);
+    session
+        .wait_for("selected choice is GammaChoice", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(submissions).unwrap(),
+        "GammaChoice\n"
+    );
+}

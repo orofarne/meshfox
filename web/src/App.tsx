@@ -6,7 +6,6 @@ import {
   Background,
   Controls,
   MiniMap,
-  Panel,
   MarkerType,
   useNodesState,
   useEdgesState,
@@ -74,7 +73,7 @@ import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
 import { parseVarDecls } from "./vars";
 import { parseBody, type CodeSegment } from "./fence";
-import { FileRefreshContext, ForegroundRunContext, MeshNode, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
+import { FileRefreshContext, ForegroundRunContext, MeshNode, NodeDocumentView, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
 import { RunConfirmDialog } from "./RunConfirmDialog";
 import { DocumentOptions } from "./DocumentOptions";
@@ -447,6 +446,9 @@ export default function App() {
   // Opening a canvas shouldn't be one click away from running its bash
   // blocks — read-only until the user explicitly opts in.
   const [editMode, setEditMode] = useState(false);
+  // Count document nodes, never the folded/filtered render list.
+  const documentNodeId = !editMode && canvas?.nodes.length === 1 && !canvas.nodes[0].parent
+    ? canvas.nodes[0].id : null;
   // The worker serves this canvas read-only for good (it or its directory
   // isn't writable) — as opposed to `!editMode`, which is only "not yet
   // clicked Edit". Hides the Edit button; the worker refuses edits anyway.
@@ -3108,8 +3110,7 @@ export default function App() {
   }, [deepLinkNodeId, canvas, flowInstance, nodes, foldedNodeIds, focusNode]);
 
   // TODO.canvas.md: "Поиск" — search across every node's title/body text,
-  // with a small floating bar (a React Flow `<Panel>`, same overlay
-  // mechanism `<Controls>`/`<MiniMap>` already use) to type a query and
+  // with a small floating bar to type a query and
   // step through matches. Deliberately plain substring/case-insensitive,
   // not fuzzy or regex — this is "find the node about X", not a query
   // language.
@@ -3192,7 +3193,9 @@ export default function App() {
       if (!canvas) return;
       setFocusedNodeId(id);
       const ancestors = pathTo(canvas, id).slice(0, -1);
-      const toReveal = [...ancestors, id];
+      // pathTo is a run path: it omits the root, which can itself be folded.
+      const rootId = findRoot(canvas)?.id;
+      const toReveal = [...(rootId ? [rootId] : []), ...ancestors, id];
       const revealSet = new Set(toReveal);
       const snapshot = searchFoldSnapshotRef.current;
       const nextFolded = new Set(foldedNodeIds);
@@ -3246,7 +3249,7 @@ export default function App() {
     searchFoldSnapshotRef.current = new Set(foldedNodeIds);
     setSearchOpen(true);
     // Runs after this render commits the now-mounted `<input>` (the
-    // `Panel` only renders it once `searchOpen` is true) — a plain
+    // search bar only renders it once `searchOpen` is true) — a plain
     // synchronous `.focus()` call right here would still be targeting
     // last render's DOM (or nothing, on the very first open).
     requestAnimationFrame(() => searchInputRef.current?.focus());
@@ -3323,7 +3326,7 @@ export default function App() {
         else handleUndo();
         return;
       }
-      if (visibleOrder.length === 0) return;
+      if (documentNodeId || visibleOrder.length === 0) return;
 
       // `e.code` (the physical key position, e.g. "KeyJ" for whatever key
       // sits where a QWERTY "j" would) rather than `e.key` (the character
@@ -3416,6 +3419,7 @@ export default function App() {
     handleUndo,
     handleRedo,
     editMode,
+    documentNodeId,
   ]);
   // Trimmed once here, not read fresh off `searchQuery` state inside the
   // map below — `useMemo`'s own dependency array needs a primitive it can
@@ -3849,7 +3853,7 @@ export default function App() {
         )}
         {workerNoExec && (
           <span className="mode-badge" title={NO_EXEC_MESSAGE}>
-            no exec
+            noexec
           </span>
         )}
         {editMode ? (
@@ -3885,20 +3889,15 @@ export default function App() {
               done
             </button>
           </>
-        ) : (
-          <>
+        ) : workerReadOnly ? (
             <span
               className="mode-badge"
-              title={
-                workerReadOnly
-                  ? "This canvas is served read-only (not writable, or started with --read-only) — blocks run, but nothing is saved"
-                  : undefined
-              }
+              title="This canvas is served read-only (not writable, or started with --read-only) — changes cannot be saved"
             >
               read-only
             </span>
-            {!workerReadOnly && <button onClick={() => setEditMode(true)}>Edit</button>}
-          </>
+        ) : (
+          <button onClick={() => setEditMode(true)}>Edit</button>
         )}
         {hasConfigurableVars && (
           <button
@@ -3968,6 +3967,7 @@ export default function App() {
     () => withEdgeGeometry(focusedRenderNodes, visibleEdges),
     [focusedRenderNodes, visibleEdges],
   );
+  const documentNode = documentNodeId ? focusedRenderNodes.find(n => n.id === documentNodeId) : undefined;
   const routeRenderNodes = edgeGeometry.nodes;
   const routedVisibleEdges = edgeGeometry.edges;
   const onRouteNodesChange: typeof onNodesChange = useCallback(changes => {
@@ -4004,6 +4004,8 @@ export default function App() {
             onClose={() => setSourceMode(false)}
             onDirtyChange={setSourceDirty}
           />
+        ) : documentNode ? (
+          <NodeDocumentView nodeId={documentNode.id} data={documentNode.data} />
         ) : (
           <ReactFlow
             nodes={routeRenderNodes}
@@ -4056,52 +4058,52 @@ export default function App() {
             <Background />
             <Controls />
             <MiniMap />
-            {searchOpen && (
-              <Panel position="top-center" className="search-bar">
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => {
-                    setSearchQuery(e.target.value);
-                    setSearchMatchIndex(0);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Escape") {
-                      e.preventDefault();
-                      closeSearch();
-                    } else if (e.key === "Enter") {
-                      e.preventDefault();
-                      gotoSearchMatch(e.shiftKey ? -1 : 1);
-                    }
-                  }}
-                  placeholder="Search title/body… (Enter: next, Shift+Enter: prev, Esc: close)"
-                />
-                <span className="search-bar-count">
-                  {searchQuery.trim() === "" ? "" : searchMatches.length === 0 ? "0/0" : `${clampedSearchMatchIndex + 1}/${searchMatches.length}`}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => gotoSearchMatch(-1)}
-                  disabled={searchMatches.length === 0}
-                  title="Previous match (Shift+Enter)"
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  onClick={() => gotoSearchMatch(1)}
-                  disabled={searchMatches.length === 0}
-                  title="Next match (Enter)"
-                >
-                  ↓
-                </button>
-                <button type="button" onClick={closeSearch} title="Close (Esc)">
-                  ×
-                </button>
-              </Panel>
-            )}
           </ReactFlow>
+        )}
+        {searchOpen && (
+          <div className="search-bar" role="search">
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                setSearchMatchIndex(0);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  closeSearch();
+                } else if (e.key === "Enter") {
+                  e.preventDefault();
+                  gotoSearchMatch(e.shiftKey ? -1 : 1);
+                }
+              }}
+              placeholder="Search title/body… (Enter: next, Shift+Enter: prev, Esc: close)"
+            />
+            <span className="search-bar-count">
+              {searchQuery.trim() === "" ? "" : searchMatches.length === 0 ? "0/0" : `${clampedSearchMatchIndex + 1}/${searchMatches.length}`}
+            </span>
+            <button
+              type="button"
+              onClick={() => gotoSearchMatch(-1)}
+              disabled={searchMatches.length === 0}
+              title="Previous match (Shift+Enter)"
+            >
+              ↑
+            </button>
+            <button
+              type="button"
+              onClick={() => gotoSearchMatch(1)}
+              disabled={searchMatches.length === 0}
+              title="Next match (Enter)"
+            >
+              ↓
+            </button>
+            <button type="button" onClick={closeSearch} title="Close (Esc)">
+              ×
+            </button>
+          </div>
         )}
       </div>
       {runConfirmation && (

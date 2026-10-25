@@ -1,4 +1,6 @@
 import { useState, type FormEvent } from "react";
+import { DateField } from "./DateField";
+import { dateValueProblem, isValidDateValue } from "./dateValues";
 import { PathField } from "./PathPicker";
 import type { VarOrigin, VarStatus } from "./types";
 
@@ -43,6 +45,7 @@ const INT_PATTERN = /^[+-]?\d+$/;
 
 function isValidValue(v: VarStatus, value: string, configure = false): boolean {
   if (configure && v.secret && value === "") return true;
+  if (v.type === "date" || v.type === "datetime") return isValidDateValue(v.type, value);
   return v.type !== "int" || INT_PATTERN.test(value);
 }
 
@@ -115,7 +118,11 @@ export function VarsForm({
     e.preventDefault();
     const invalid = vars.find((v) => !isValidValue(v, values[v.name], configure));
     if (invalid) {
-      setError(`${invalid.prompt} needs a whole number (like 42 or -3), not ${JSON.stringify(values[invalid.name])}.`);
+      setError(
+        invalid.type === "date" || invalid.type === "datetime"
+          ? dateValueProblem(invalid.type, invalid.prompt, values[invalid.name])
+          : `${invalid.prompt} needs a whole number (like 42 or -3), not ${JSON.stringify(values[invalid.name])}.`,
+      );
       return;
     }
     setError(null);
@@ -182,6 +189,15 @@ export function VarsForm({
                 onChange={(value) => set(v.name, value)}
                 label={v.prompt}
                 autoFocus={i === 0}
+              />
+            ) : v.type === "date" || v.type === "datetime" ? (
+              <DateField
+                kind={v.type}
+                value={values[v.name]}
+                onChange={(value) => set(v.name, value)}
+                label={v.prompt}
+                autoFocus={i === 0}
+                required
               />
             ) : (
               <input

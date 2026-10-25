@@ -11,6 +11,8 @@ import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
 import { FileTablePreview } from "./TablePreview";
+import { DateField } from "./DateField";
+import { dateValueProblem, isValidDateValue } from "./dateValues";
 import { PathField } from "./PathPicker";
 import {
   BUTTON_LANG,
@@ -1164,7 +1166,7 @@ if (searchHighlight && searchCurrentHighlight) {
 function ensureRangeVisible(
   range: Range,
   root: HTMLElement,
-  rf: { setCenter: (x: number, y: number, opts?: { zoom?: number; duration?: number }) => void; getZoom: () => number; screenToFlowPosition: (pos: { x: number; y: number }) => { x: number; y: number } },
+  rf: { setCenter: (x: number, y: number, opts?: { zoom?: number; duration?: number }) => void; getZoom: () => number; screenToFlowPosition: (pos: { x: number; y: number }) => { x: number; y: number } } | null,
 ) {
   // `getBoundingClientRect()` (what `rangeRect`/`ancestorRect` below are
   // built from) reports *screen*-space pixels — already scaled by
@@ -1185,7 +1187,7 @@ function ensureRangeVisible(
   // `clickFitViewAndWait` alone ever exercised) landed a "centered" match
   // hundreds of screen pixels off — including, at an extreme enough zoom,
   // entirely outside the very ancestor it was supposedly centered within.
-  const zoom = rf.getZoom();
+  const zoom = rf?.getZoom() ?? 1;
   let ancestor = range.startContainer.parentElement;
   while (ancestor && root.contains(ancestor)) {
     if (ancestor.scrollHeight > ancestor.clientHeight) {
@@ -1224,7 +1226,7 @@ function ensureRangeVisible(
   const rect = range.getBoundingClientRect();
   const inViewport =
     rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth;
-  if (inViewport) return;
+  if (inViewport || !rf) return;
   const flowPoint = rf.screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
   rf.setCenter(flowPoint.x, flowPoint.y, { zoom: rf.getZoom(), duration: 400 });
 }
@@ -1332,6 +1334,7 @@ function useSearchHighlight(
   rootRef: React.RefObject<HTMLElement | null>,
   data: Pick<MeshNodeData, "searchQuery" | "searchCurrentOccurrence" | "focused" | "folded" | "text" | "title">,
   skip: boolean,
+  documentView = false,
 ) {
   // `useReactFlow()`'s own returned object/methods aren't guaranteed
   // referentially stable across renders — read via a ref updated every
@@ -1381,7 +1384,7 @@ function useSearchHighlight(
       currentRange = ranges[occurrence];
       searchCurrentHighlight?.add(currentRange);
       const target = currentRange;
-      cancelSettle = waitForStableRect(target, () => ensureRangeVisible(target, root, rfRef.current));
+      cancelSettle = waitForStableRect(target, () => ensureRangeVisible(target, root, documentView ? null : rfRef.current));
     }
 
     return () => {
@@ -1389,7 +1392,7 @@ function useSearchHighlight(
       if (currentRange) searchCurrentHighlight?.delete(currentRange);
       cancelSettle?.();
     };
-  }, [rootRef, data.searchQuery, data.searchCurrentOccurrence, data.focused, data.folded, data.text, data.title, skip]);
+  }, [rootRef, data.searchQuery, data.searchCurrentOccurrence, data.focused, data.folded, data.text, data.title, skip, documentView]);
 }
 
 /** JSON Canvas's six numbered color presets — same hex values as
@@ -1904,6 +1907,7 @@ function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeDa
 const FORM_FIELD_INT_PATTERN = /^[+-]?\d+$/;
 
 function isValidFormFieldValue(f: FormFieldStatus, value: string): boolean {
+  if (f.type === "date" || f.type === "datetime") return isValidDateValue(f.type, value);
   return f.type !== "int" || FORM_FIELD_INT_PATTERN.test(value);
 }
 
@@ -1956,7 +1960,11 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
     if (!fields) return;
     const invalid = fields.find((f) => !isValidFormFieldValue(f, values[f.name] ?? ""));
     if (invalid) {
-      setError(`${invalid.prompt} needs a whole number (like 42 or -3), not ${JSON.stringify(values[invalid.name])}.`);
+      setError(
+        invalid.type === "date" || invalid.type === "datetime"
+          ? dateValueProblem(invalid.type, invalid.label ?? invalid.prompt, values[invalid.name] ?? "")
+          : `${invalid.prompt} needs a whole number (like 42 or -3), not ${JSON.stringify(values[invalid.name])}.`,
+      );
       return;
     }
     setError(null);
@@ -2001,6 +2009,14 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
               kind={f.type}
               mode={f.mode}
               ext={f.ext}
+              value={values[f.name] ?? ""}
+              onChange={(value) => set(f.name, value)}
+              label={f.label ?? f.prompt}
+              autoFocus={i === 0}
+            />
+          ) : f.type === "date" || f.type === "datetime" ? (
+            <DateField
+              kind={f.type}
               value={values[f.name] ?? ""}
               onChange={(value) => set(f.name, value)}
               label={f.label ?? f.prompt}
@@ -2866,6 +2882,20 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
     );
   }
   return <MeshNodeBody data={data} nodeId={nodeId} />;
+}
+
+/** The same live body as a canvas card, with native page scrolling. */
+export function NodeDocumentView({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
+  const pageRef = useRef<HTMLElement | null>(null);
+  useSearchHighlight(pageRef, { ...data, focused: true, folded: false }, false, true);
+  return (
+    <main className="mesh-document" ref={pageRef} aria-label={data.title}>
+      <article className="mesh-document-content" data-node-id={nodeId}>
+        <h1>{data.title}</h1>
+        <NodeBodyContent data={data} nodeId={nodeId} />
+      </article>
+    </main>
+  );
 }
 
 export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeData }) {

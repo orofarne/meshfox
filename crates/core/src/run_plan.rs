@@ -116,6 +116,11 @@ pub fn prepare_run(
             .collect();
         let resolved =
             crate::resolve_with_shared(&declarations, overrides, &cache, computed, shared);
+        if !resolved.invalid.is_empty() {
+            return Err(RunError::InvalidVariables(crate::invalid_vars_error(
+                &resolved.invalid,
+            )));
+        }
         return Ok(PreparedRun {
             chain: final_chain,
             declarations,

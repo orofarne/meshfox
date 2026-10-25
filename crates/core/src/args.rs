@@ -741,6 +741,8 @@ fn prepare_in(
                 vars::VarType::Select => "select",
                 vars::VarType::Dir => "dir",
                 vars::VarType::File => "file",
+                vars::VarType::Date => "date",
+                vars::VarType::DateTime => "datetime",
             },
             prompt: arg.prompt.clone(),
             choices: arg.choices.clone(),
@@ -1065,6 +1067,8 @@ mod tests {
             "<!-- meshfox:arg name=\"lang\" -->\n```text\n```",
             "<!-- meshfox:arg name=\"lang\" -->\n<!-- meshfox:arg name=\"lang\" -->\n```bash name=\"x\"\n```",
             "<!-- meshfox:arg name=\"n\" type=\"int\" default=\"oops\" -->\n```bash name=\"x\"\n```",
+            "<!-- meshfox:arg name=\"d\" type=\"date\" default=\"2026-02-30\" -->\n```bash name=\"x\"\n```",
+            "<!-- meshfox:arg name=\"t\" type=\"datetime\" default=\"2026-10-25T10:00:00\" -->\n```bash name=\"x\"\n```",
             "<!-- meshfox:arg name=\"n\" type=\"select\" -->\n```bash name=\"x\"\n```",
             "<!-- meshfox:arg name=\"MESHFOX_X\" -->\n```bash name=\"x\"\n```",
             "<!-- meshfox:arg name=\"n\" block=\"x\" -->\n```bash name=\"x\"\n```",
@@ -1073,6 +1077,15 @@ mod tests {
         ] {
             assert!(scan_signatures("node", md).is_err(), "accepted {md}");
         }
+    }
+
+    #[test]
+    fn accepts_date_and_datetime_arguments_with_canonical_defaults() {
+        let md = "<!-- meshfox:arg name=\"d\" type=\"date\" default=\"2026-10-25\" -->\n<!-- meshfox:arg name=\"t\" type=\"datetime\" default=\"2026-10-25T14:30:00+03:00\" -->\n```bash name=\"x\"\necho ok\n```\n";
+        let signatures = scan_signatures("node", md).unwrap();
+        let args = &signatures[0].args;
+        assert_eq!(args[0].var_type, vars::VarType::Date);
+        assert_eq!(args[1].var_type, vars::VarType::DateTime);
     }
 
     #[test]

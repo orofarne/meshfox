@@ -83,6 +83,14 @@ const MIN_OUTPUT_HEIGHT: u16 = ui::MIN_OUTPUT_HEIGHT;
 /// rather than asking one at a time. Built either by `advance_run` (just
 /// whatever a run still needs) or by `trigger_configure` (every declared
 /// non-secret variable in the document).
+pub struct SelectPickerState {
+    pub target: super::path_picker::PickerTarget,
+    pub choices: Vec<String>,
+    pub selected: usize,
+    pub rows: Rect,
+    pub offset: usize,
+}
+
 pub struct VarFormState {
     pub arguments: bool,
     pub decls: Vec<VarDecl>,
@@ -709,6 +717,10 @@ pub struct App {
     /// The `dir`/`file` path picker (`Ctrl-O` on such a field of `var_form`
     /// or `active_inline_form`), drawn above whichever of them opened it.
     pub path_picker: Option<super::path_picker::PathPickerState>,
+    /// The `date`/`datetime` calendar (`Ctrl-O` on such a field), the
+    /// counterpart of `path_picker`; the two are never open together.
+    pub date_picker: Option<super::date_picker::DatePickerState>,
+    pub select_picker: Option<SelectPickerState>,
     /// The `Ctrl-p` command palette (see `super::palette`).
     pub palette: Option<super::palette::Palette>,
     /// A node id to select once the next reload brings it into the tree —
@@ -990,8 +1002,28 @@ fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
             Some(v) if decl.choices.iter().any(|c| c == v) => v.to_string(),
             _ => decl.choices.first().cloned().unwrap_or_default(),
         },
-        VarType::String | VarType::Int | VarType::Dir | VarType::File => {
-            suggestion.map(str::to_string).unwrap_or_default()
+        VarType::String
+        | VarType::Int
+        | VarType::Dir
+        | VarType::File
+        | VarType::Date
+        | VarType::DateTime => suggestion.map(str::to_string).unwrap_or_default(),
+    }
+}
+
+/// Rewrites what a person typed into each `date`/`datetime` field into the
+/// canonical value (`2026-10-25 14:30` → `2026-10-25T14:30:00+03:00`, with
+/// the local offset when none was typed). A value that can't be understood
+/// is left as typed, for `validate_value` to reject with its message.
+fn normalize_date_inputs(decls: &[VarDecl], inputs: &mut [String]) {
+    for (decl, input) in decls.iter().zip(inputs.iter_mut()) {
+        let normalized = match decl.var_type {
+            VarType::Date => meshfox_core::datevars::normalize_date_input(input),
+            VarType::DateTime => meshfox_core::datevars::normalize_datetime_input(input),
+            _ => continue,
+        };
+        if let Ok(value) = normalized {
+            *input = value;
         }
     }
 }
@@ -1004,14 +1036,7 @@ fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
 /// it came back `resolved: false`), and none of those fields change how a
 /// single already-missing value is prompted for or validated.
 fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
-    let var_type = match status.var_type.as_str() {
-        "int" => VarType::Int,
-        "bool" => VarType::Bool,
-        "select" => VarType::Select,
-        "dir" => VarType::Dir,
-        "file" => VarType::File,
-        _ => VarType::String,
-    };
+    let var_type = VarType::parse(&status.var_type).unwrap_or(VarType::String);
     VarDecl {
         name: status.name.clone(),
         var_type,
@@ -1266,6 +1291,8 @@ impl App {
             block_picker: None,
             var_form: None,
             path_picker: None,
+            date_picker: None,
+            select_picker: None,
             palette: None,
             select_after_reload: None,
             status: if read_only {
@@ -1339,6 +1366,14 @@ impl App {
         }
         if self.table_mode.is_some() {
             self.on_table_key(key);
+            return;
+        }
+        if self.select_picker.is_some() {
+            self.on_select_picker_key(key);
+            return;
+        }
+        if self.date_picker.is_some() {
+            self.on_date_picker_key(key);
             return;
         }
         if self.path_picker.is_some() {
@@ -1688,7 +1723,93 @@ impl App {
     /// pressed; `Bool`/`Select` are a left/right toggle/cycle instead —
     /// typing a character or backspace does nothing to those, since
     /// there's no text to edit.
+    fn open_select_picker(&mut self, target: super::path_picker::PickerTarget) -> bool {
+        use super::path_picker::PickerTarget;
+        let field = match target {
+            PickerTarget::VarForm(i) => self
+                .var_form
+                .as_ref()
+                .and_then(|f| f.decls.get(i).zip(f.inputs.get(i))),
+            PickerTarget::InlineForm(i) => self
+                .active_inline_form
+                .as_ref()
+                .and_then(|f| f.decls.get(i).zip(f.inputs.get(i))),
+        };
+        let Some((decl, input)) = field else {
+            return false;
+        };
+        if decl.var_type != VarType::Select {
+            return false;
+        }
+        if decl.choices.is_empty() {
+            self.status = "no choices available for this field".into();
+            return true;
+        }
+        self.select_picker = Some(SelectPickerState {
+            target,
+            choices: decl.choices.clone(),
+            selected: decl.choices.iter().position(|c| c == input).unwrap_or(0),
+            rows: Rect::default(),
+            offset: 0,
+        });
+        true
+    }
+
+    fn on_select_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = &mut self.select_picker else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.select_picker = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected =
+                    (picker.selected + picker.choices.len() - 1) % picker.choices.len()
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1) % picker.choices.len()
+            }
+            KeyCode::Home => picker.selected = 0,
+            KeyCode::End => picker.selected = picker.choices.len() - 1,
+            KeyCode::Enter => {
+                let picker = self.select_picker.take().unwrap();
+                let value = picker.choices[picker.selected].clone();
+                match picker.target {
+                    super::path_picker::PickerTarget::VarForm(i) => {
+                        if let Some(input) =
+                            self.var_form.as_mut().and_then(|f| f.inputs.get_mut(i))
+                        {
+                            *input = value;
+                        }
+                    }
+                    super::path_picker::PickerTarget::InlineForm(i) => {
+                        if let Some(input) = self
+                            .active_inline_form
+                            .as_mut()
+                            .and_then(|f| f.inputs.get_mut(i))
+                        {
+                            *input = value;
+                        }
+                    }
+                }
+                self.render_current_document();
+            }
+            _ => {}
+        }
+    }
+
     async fn on_var_form_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let index = self.var_form.as_ref().map(|f| f.selected);
+            if let Some(i) = index {
+                if self.open_select_picker(super::path_picker::PickerTarget::VarForm(i)) {
+                    return;
+                }
+            }
+        }
         match key.code {
             KeyCode::Enter => self.submit_var_form().await,
             KeyCode::Esc => self.cancel_var_form(),
@@ -1707,11 +1828,11 @@ impl App {
             // Ctrl-O: browse for the focused `dir`/`file` field.
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.var_form.as_ref().and_then(|vf| {
-                    matches!(vf.decls[vf.selected].var_type, VarType::Dir | VarType::File)
+                    super::date_picker::has_picker(vf.decls[vf.selected].var_type)
                         .then_some(super::path_picker::PickerTarget::VarForm(vf.selected))
                 });
                 if let Some(target) = target {
-                    self.open_path_picker(target).await;
+                    self.open_picker(target).await;
                 }
             }
             // Ctrl-S: toggle "save" on the focused `secret` field.
@@ -1736,10 +1857,7 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
-                    if matches!(
-                        vf.decls[i].var_type,
-                        VarType::String | VarType::Int | VarType::Dir | VarType::File
-                    ) {
+                    if !matches!(vf.decls[i].var_type, VarType::Bool | VarType::Select) {
                         vf.inputs[i].pop();
                     }
                 }
@@ -1748,7 +1866,11 @@ impl App {
                 if let Some(vf) = &mut self.var_form {
                     let i = vf.selected;
                     let allowed = match vf.decls[i].var_type {
-                        VarType::String | VarType::Dir | VarType::File => true,
+                        VarType::String
+                        | VarType::Dir
+                        | VarType::File
+                        | VarType::Date
+                        | VarType::DateTime => true,
                         // A leading `+`/`-` (once, only as the very first
                         // character — same grammar `i64::from_str` itself
                         // accepts, see `meshfox_core::validate_value`)
@@ -1803,7 +1925,12 @@ impl App {
                 let next = (current + dir).rem_euclid(len) as usize;
                 vf.inputs[i] = choices[next].clone();
             }
-            VarType::String | VarType::Int | VarType::Dir | VarType::File => {}
+            VarType::String
+            | VarType::Int
+            | VarType::Dir
+            | VarType::File
+            | VarType::Date
+            | VarType::DateTime => {}
         }
     }
 
@@ -1932,6 +2059,16 @@ impl App {
             return;
         };
         let send_idx = form.fields.len();
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let index = self.active_inline_form.as_ref().map(|f| f.selected);
+            if let Some(i) = index {
+                if self.open_select_picker(super::path_picker::PickerTarget::InlineForm(i)) {
+                    return;
+                }
+            }
+        }
         match key.code {
             KeyCode::Enter => self.submit_inline_form().await,
             KeyCode::Esc => {
@@ -1963,12 +2100,11 @@ impl App {
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.active_inline_form.as_ref().and_then(|form| {
                     let i = form.selected;
-                    (i < form.decls.len()
-                        && matches!(form.decls[i].var_type, VarType::Dir | VarType::File))
-                    .then_some(super::path_picker::PickerTarget::InlineForm(i))
+                    (i < form.decls.len() && super::date_picker::has_picker(form.decls[i].var_type))
+                        .then_some(super::path_picker::PickerTarget::InlineForm(i))
                 });
                 if let Some(target) = target {
-                    self.open_path_picker(target).await;
+                    self.open_picker(target).await;
                 }
                 self.render_current_document();
             }
@@ -1976,10 +2112,7 @@ impl App {
                 if let Some(form) = &mut self.active_inline_form {
                     let i = form.selected;
                     if i < form.decls.len()
-                        && matches!(
-                            form.decls[i].var_type,
-                            VarType::String | VarType::Int | VarType::Dir | VarType::File
-                        )
+                        && !matches!(form.decls[i].var_type, VarType::Bool | VarType::Select)
                     {
                         form.inputs[i].pop();
                     }
@@ -1991,7 +2124,11 @@ impl App {
                     let i = form.selected;
                     if i < form.decls.len() {
                         let allowed = match form.decls[i].var_type {
-                            VarType::String | VarType::Dir | VarType::File => true,
+                            VarType::String
+                            | VarType::Dir
+                            | VarType::File
+                            | VarType::Date
+                            | VarType::DateTime => true,
                             VarType::Int => {
                                 c.is_ascii_digit()
                                     || ((c == '-' || c == '+') && form.inputs[i].is_empty())
@@ -2044,7 +2181,12 @@ impl App {
                 let next = (current + dir).rem_euclid(len) as usize;
                 form.inputs[i] = choices[next].clone();
             }
-            VarType::String | VarType::Int | VarType::Dir | VarType::File => {}
+            VarType::String
+            | VarType::Int
+            | VarType::Dir
+            | VarType::File
+            | VarType::Date
+            | VarType::DateTime => {}
         }
     }
 
@@ -2068,6 +2210,9 @@ impl App {
         if self.foreground_run_in_progress() {
             self.status = "meshfox: a run is in progress — wait for it to finish (or stop it) before sending the form".into();
             return;
+        }
+        if let Some(form) = &mut self.active_inline_form {
+            normalize_date_inputs(&form.decls, &mut form.inputs);
         }
         {
             let Some(form) = &self.active_inline_form else {
@@ -2224,6 +2369,35 @@ impl App {
     /// already reflects `fullscreen` (`ui::compute_layout`), so a collapsed
     /// pane's own `point_in` checks below simply never match.
     pub async fn on_mouse(&mut self, mouse: MouseEvent) {
+        if let Some(picker) = &mut self.select_picker {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.on_select_picker_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                }
+                MouseEventKind::ScrollDown => {
+                    self.on_select_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if picker
+                        .rows
+                        .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    {
+                        let index = picker.offset + (mouse.row - picker.rows.y) as usize;
+                        if index < picker.choices.len() {
+                            picker.selected = index;
+                            self.on_select_picker_key(KeyEvent::new(
+                                KeyCode::Enter,
+                                KeyModifiers::NONE,
+                            ));
+                        }
+                    } else {
+                        self.select_picker = None;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.run_confirmation.is_some() {
             return;
         }
@@ -2245,6 +2419,10 @@ impl App {
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let area = Rect::new(0, 0, cols, rows);
+        if self.date_picker.is_some() {
+            self.on_date_picker_mouse(mouse, area);
+            return;
+        }
         if self.path_picker.is_some() {
             self.on_path_picker_mouse(mouse, area).await;
             return;
@@ -2630,6 +2808,7 @@ impl App {
                         form.editing = true;
                     }
                 }
+                self.open_select_picker(super::path_picker::PickerTarget::InlineForm(field_index));
                 self.render_current_document();
             }
             ClickTarget::FormSend {
@@ -2649,10 +2828,7 @@ impl App {
                 self.ensure_inline_form_open(&node_id, &block_name);
                 let usable = self.active_inline_form.as_mut().is_some_and(|form| {
                     let ok = field_index < form.decls.len()
-                        && matches!(
-                            form.decls[field_index].var_type,
-                            VarType::Dir | VarType::File
-                        );
+                        && super::date_picker::has_picker(form.decls[field_index].var_type);
                     if ok {
                         form.selected = field_index;
                         form.editing = true;
@@ -2660,10 +2836,8 @@ impl App {
                     ok
                 });
                 if usable {
-                    self.open_path_picker(super::path_picker::PickerTarget::InlineForm(
-                        field_index,
-                    ))
-                    .await;
+                    self.open_picker(super::path_picker::PickerTarget::InlineForm(field_index))
+                        .await;
                 }
                 self.render_current_document();
             }
@@ -2932,6 +3106,39 @@ impl App {
                     .map(|()| "moved down".to_string()),
                 None => Err("already the last sibling".to_string()),
             },
+            CommandId::MovePosition => {
+                let Some(node) = self.canvas.node(&id) else {
+                    self.status = "selected node no longer exists".into();
+                    return;
+                };
+                let siblings: Vec<_> = self
+                    .canvas
+                    .nodes
+                    .iter()
+                    .filter(|n| n.parent == node.parent)
+                    .collect();
+                let position = text
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n >= 1 && n <= siblings.len());
+                match position {
+                    None => Err(format!(
+                        "enter a sibling position from 1 to {}",
+                        siblings.len()
+                    )),
+                    Some(position) => {
+                        let target = siblings[position - 1].id.clone();
+                        let current = siblings.iter().position(|n| n.id == id).unwrap();
+                        if target == id {
+                            Ok(format!("already at position {position}"))
+                        } else {
+                            move_sibling(port, &id, &target, position - 1 < current)
+                                .await
+                                .map(|()| format!("moved to position {position}"))
+                        }
+                    }
+                }
+            }
             CommandId::MoveTo => {
                 // `reparent_node` only promotes an existing extra-parent
                 // edge, so declare one first (as `meshfox node mv` does).
@@ -3073,6 +3280,141 @@ impl App {
         }
     }
 
+    /// `Ctrl-O` / the marker click on a field: the calendar for a `date`/
+    /// `datetime` field, the path browser for a `dir`/`file` one.
+    async fn open_picker(&mut self, target: super::path_picker::PickerTarget) {
+        use super::path_picker::PickerTarget;
+        let var_type = match target {
+            PickerTarget::VarForm(i) => self.var_form.as_ref().map(|f| f.decls[i].var_type),
+            PickerTarget::InlineForm(i) => self
+                .active_inline_form
+                .as_ref()
+                .map(|f| f.decls[i].var_type),
+        };
+        match var_type {
+            Some(VarType::Date | VarType::DateTime) => self.open_date_picker(target),
+            Some(_) => self.open_path_picker(target).await,
+            None => {}
+        }
+    }
+
+    fn open_date_picker(&mut self, target: super::path_picker::PickerTarget) {
+        use super::path_picker::PickerTarget;
+        let (decl, current) = match target {
+            PickerTarget::VarForm(i) => match &self.var_form {
+                Some(vf) => (vf.decls[i].clone(), vf.inputs[i].clone()),
+                None => return,
+            },
+            PickerTarget::InlineForm(i) => match &self.active_inline_form {
+                Some(f) => (f.decls[i].clone(), f.inputs[i].clone()),
+                None => return,
+            },
+        };
+        self.date_picker = Some(super::date_picker::DatePickerState::new(
+            target,
+            decl.var_type,
+            &decl.prompt,
+            &current,
+        ));
+    }
+
+    fn on_date_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = &mut self.date_picker else {
+            return;
+        };
+        let action = picker.on_key(key);
+        self.apply_date_action(action);
+    }
+
+    fn apply_date_action(&mut self, action: super::date_picker::DateAction) {
+        use super::date_picker::DateAction;
+        use super::path_picker::PickerTarget;
+        match action {
+            DateAction::Stay => {}
+            DateAction::Cancel => self.date_picker = None,
+            DateAction::Choose(value) => {
+                let Some(picker) = self.date_picker.take() else {
+                    return;
+                };
+                match picker.target {
+                    PickerTarget::VarForm(i) => {
+                        if let Some(slot) = self.var_form.as_mut().and_then(|f| f.inputs.get_mut(i))
+                        {
+                            *slot = value;
+                        }
+                    }
+                    PickerTarget::InlineForm(i) => {
+                        if let Some(slot) = self
+                            .active_inline_form
+                            .as_mut()
+                            .and_then(|f| f.inputs.get_mut(i))
+                        {
+                            *slot = value;
+                        }
+                        self.render_current_document();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mouse for the open calendar: a click on a day selects it (a second
+    /// click on the selected day chooses it, like `Enter`), the arrows in
+    /// the month header and the wheel page months, a click on a time field
+    /// focuses it. Geometry is `ui::date_picker_layout`'s own.
+    fn on_date_picker_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        let Some(picker) = &mut self.date_picker else {
+            return;
+        };
+        let layout = ui::date_picker_layout(area, picker.with_time);
+        let inside = |r: Rect| {
+            mouse.column >= r.x
+                && mouse.column < r.x + r.width
+                && mouse.row >= r.y
+                && mouse.row < r.y + r.height
+        };
+        let action = match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                picker.shift_months(-1);
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                picker.shift_months(1);
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if inside(layout.header) {
+                    if mouse.column < layout.header.x + 4 {
+                        picker.shift_months(-1);
+                    } else if mouse.column + 4 >= layout.header.x + layout.header.width {
+                        picker.shift_months(1);
+                    }
+                    None
+                } else if inside(layout.grid) {
+                    let col = (mouse.column - layout.grid.x) / ui::DATE_CELL_WIDTH;
+                    let row = mouse.row - layout.grid.y;
+                    picker
+                        .cell_date(row as usize * 7 + col as usize)
+                        .map(|date| picker.click_date(date))
+                        .filter(|confirmed| *confirmed)
+                        .map(|_| super::date_picker::DateAction::Choose(picker.value()))
+                } else if layout.time.is_some_and(inside) {
+                    let time = layout.time.unwrap();
+                    if let Some(focus) = ui::date_picker_time_hit(time, mouse.column) {
+                        picker.focus = focus;
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.apply_date_action(action);
+        }
+    }
+
     async fn open_path_picker(&mut self, target: super::path_picker::PickerTarget) {
         use super::path_picker::{PathPickerState, PickerTarget};
         let (decl, current) = match target {
@@ -3200,24 +3542,37 @@ impl App {
         if let Some(vf) = &mut self.var_form {
             let list_rect = ui::var_form_list_rect(area, vf.decls.len());
             let mut browse = None;
-            if mouse.row >= list_rect.y && mouse.row < list_rect.y + list_rect.height {
+            let mut select = None;
+            if mouse.column >= list_rect.x
+                && mouse.column < list_rect.right()
+                && mouse.row >= list_rect.y
+                && mouse.row < list_rect.y + list_rect.height
+            {
                 let idx = ui::var_form_offset(list_rect, vf.selected)
                     + (mouse.row - list_rect.y) as usize / 2;
                 if idx < vf.decls.len() {
                     vf.selected = idx;
+                    if vf.decls[idx].var_type == VarType::Select {
+                        select = Some(idx);
+                    }
                     // The right-aligned "[Browse… ^o]" strip of a
                     // `dir`/`file` row (see `render_var_form`).
-                    let marker = super::path_picker::BROWSE_MARKER.chars().count() as u16;
-                    let on_marker = (mouse.row - list_rect.y) % 2 == 1
+                    let marker = super::date_picker::marker_for(vf.decls[idx].var_type)
+                        .map_or(0, |m| m.chars().count() as u16);
+                    let on_marker = marker > 0
+                        && (mouse.row - list_rect.y) % 2 == 1
                         && mouse.column + marker >= list_rect.x + list_rect.width
                         && mouse.column < list_rect.x + list_rect.width;
-                    if on_marker && matches!(vf.decls[idx].var_type, VarType::Dir | VarType::File) {
+                    if on_marker {
                         browse = Some(idx);
                     }
                 }
             }
+            if let Some(idx) = select {
+                self.open_select_picker(super::path_picker::PickerTarget::VarForm(idx));
+            }
             if let Some(idx) = browse {
-                self.open_path_picker(super::path_picker::PickerTarget::VarForm(idx))
+                self.open_picker(super::path_picker::PickerTarget::VarForm(idx))
                     .await;
             }
         } else if let Some(bp) = &mut self.block_picker {
@@ -4684,11 +5039,14 @@ impl App {
             } => {
                 if let (Ok(statuses), Some(form)) = (result, self.active_inline_form.as_mut()) {
                     if form.node_id == node_id && form.block_name == block {
-                        for (decl, input) in form.decls.iter().zip(form.inputs.iter_mut()) {
+                        for (decl, input) in form.decls.iter_mut().zip(form.inputs.iter_mut()) {
                             // Only fields still showing the untouched default.
                             let untouched = !self.session_vars.contains_key(&decl.name)
                                 && *input == coerce_field_input(decl, decl.default.as_deref());
                             let resolved = statuses.iter().find(|s| s.var.name == decl.name);
+                            if let Some(status) = resolved {
+                                decl.choices = status.var.choices.clone();
+                            }
                             if let (true, Some(status)) = (untouched, resolved) {
                                 *input = coerce_field_input(decl, status.var.value.as_deref());
                             }
@@ -6923,6 +7281,9 @@ impl App {
     /// focus jumps to the first offending field, so it's obvious what to
     /// fix.
     async fn submit_var_form(&mut self) {
+        if let Some(vf) = &mut self.var_form {
+            normalize_date_inputs(&vf.decls, &mut vf.inputs);
+        }
         {
             let vf = self
                 .var_form
@@ -8982,6 +9343,61 @@ mod tests {
         App::new(path, tx, None, Some(port)).await.unwrap()
     }
 
+    #[tokio::test]
+    async fn palette_moves_to_sibling_position_with_folded_subtrees() {
+        use super::super::palette::{CommandId, Request};
+        let initial = app_with_blocks(
+            "sibling-position",
+            concat!(
+                "## A\n<!-- meshfox:node id=\"a\" -->\n",
+                "### Nested\n<!-- meshfox:node id=\"nested\" -->\n",
+                "## B\n<!-- meshfox:node id=\"b\" -->\n",
+                "## C\n<!-- meshfox:node id=\"c\" -->\n",
+            ),
+        )
+        .await;
+        let path = initial.canvas_path.clone();
+        drop(initial);
+        let mut app = app_with_real_worker(path.clone()).await;
+        app.expanded.insert("root".into());
+        app.expanded.remove("a");
+        app.rebuild_rows();
+        app.selected = app.rows.iter().position(|r| r.node_id == "a").unwrap();
+        for (position, expected) in [
+            ("3", vec!["b", "c", "a"]),
+            ("2", vec!["b", "a", "c"]),
+            ("1", vec!["a", "b", "c"]),
+            ("1", vec!["a", "b", "c"]),
+        ] {
+            app.run_palette_request(Request {
+                id: CommandId::MovePosition,
+                text: Some(position.into()),
+            })
+            .await;
+            let ids: Vec<_> = app
+                .canvas
+                .children("root")
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect();
+            assert_eq!(ids, expected, "{}", app.status);
+            assert_eq!(app.rows[app.selected].node_id, "a");
+            assert_eq!(
+                app.canvas.node("nested").unwrap().parent.as_deref(),
+                Some("a")
+            );
+        }
+        for position in ["0", "4", "-1", "abc", "999999999999999999999999999999"] {
+            app.run_palette_request(Request {
+                id: CommandId::MovePosition,
+                text: Some(position.into()),
+            })
+            .await;
+            assert!(app.status.contains("from 1 to 3"), "{}", app.status);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     async fn stub_worker() -> (u16, tokio::sync::oneshot::Receiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9435,6 +9851,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_form_opens_choices_and_commits_only_on_confirmation() {
+        let mut app = app_with_blocks("select-dropdown", concat!(
+            "<!-- meshfox:var name=\"CHOICE\" type=\"select\" choices=\"one,two,three\" session -->\n\n",
+            "```form name=pick\nfield var=\"CHOICE\"\n```\n",
+        )).await;
+        app.set_focus(Focus::Document);
+        app.try_enter_inline_form();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.select_picker.as_ref().unwrap().choices,
+            ["one", "two", "three"]
+        );
+        app.on_key(key(KeyCode::Down)).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "one");
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(app.select_picker.is_none());
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        app.on_key(key(KeyCode::Down)).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "two");
+        assert!(app.session_vars.is_empty());
+        assert!(document_text(&app).contains("[ two ▾ ]"));
+        app.on_inline_form_key(key(KeyCode::Char('x'))).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "two");
+        app.on_inline_form_key(key(KeyCode::Char(' '))).await;
+        let picker = app.select_picker.as_mut().unwrap();
+        picker.rows = Rect::new(10, 5, 30, 3);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert!(app.select_picker.is_none());
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "three");
+    }
+
+    #[tokio::test]
     async fn a_form_is_framed_selectable_with_brackets_and_enter_edits_it() {
         let mut app = app_with_blocks(
             "form-select",
@@ -9510,6 +9966,110 @@ mod tests {
         assert_eq!(app.selected_block, Some(BlockAddr::new("root", "last")));
         app.on_key(key(KeyCode::Char('['))).await;
         assert_eq!(app.selected_block, Some(BlockAddr::new("root", "pick")));
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_on_a_date_field_opens_a_calendar_that_writes_the_field() {
+        let mut app = app_with_blocks(
+            "form-date-picker",
+            concat!(
+                "<!-- meshfox:var name=\"DAY\" type=\"date\" default=\"2026-10-25\" session -->\n",
+                "<!-- meshfox:var name=\"AT\" type=\"datetime\" session -->\n\n",
+                "```form name=when\nfield var=\"DAY\" label=\"Day\"\nfield var=\"AT\" label=\"At\"\n```\n",
+            ),
+        )
+        .await;
+        app.set_focus(Focus::Document);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        // Both fields carry the Pick marker (not Browse).
+        let text = document_text(&app);
+        assert_eq!(text.matches("[Pick… ^o]").count(), 2, "{text}");
+        assert!(!text.contains("[Browse… ^o]"));
+
+        app.on_key(key(KeyCode::Char(']'))).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        app.active_inline_form.as_mut().unwrap().inputs[0] = "2026-10-25".into();
+
+        app.on_key(ctrl_o).await;
+        let picker = app.date_picker.as_ref().expect("Ctrl-O opens the calendar");
+        assert!(!picker.with_time);
+        assert_eq!(
+            meshfox_core::datevars::format_date(picker.selected),
+            "2026-10-25",
+            "starts from the field's own value"
+        );
+        // While open, keys go to the calendar, not the field.
+        app.on_key(key(KeyCode::Right)).await;
+        app.on_key(key(KeyCode::Down)).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert!(app.date_picker.is_none());
+        assert_eq!(
+            app.active_inline_form.as_ref().unwrap().inputs[0],
+            "2026-11-02"
+        );
+
+        // Esc leaves the field alone.
+        app.on_key(ctrl_o).await;
+        app.on_key(key(KeyCode::Left)).await;
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(app.date_picker.is_none());
+        assert_eq!(
+            app.active_inline_form.as_ref().unwrap().inputs[0],
+            "2026-11-02"
+        );
+
+        // The datetime field: calendar plus time, chosen as canonical RFC3339.
+        app.on_key(key(KeyCode::Down)).await;
+        app.active_inline_form.as_mut().unwrap().inputs[1] = "2026-10-25T14:30:00+03:00".into();
+        app.on_key(ctrl_o).await;
+        assert!(app.date_picker.as_ref().unwrap().with_time);
+        app.on_key(key(KeyCode::Tab)).await; // hour
+        app.on_key(key(KeyCode::Up)).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.active_inline_form.as_ref().unwrap().inputs[1],
+            "2026-10-25T15:30:00+03:00"
+        );
+    }
+
+    #[test]
+    fn typed_dates_are_normalized_before_validation() {
+        let decl = |name: &str, var_type| VarDecl {
+            name: name.into(),
+            var_type,
+            prompt: name.into(),
+            default: None,
+            choices: Vec::new(),
+            secret: false,
+            required: false,
+            from: None,
+            session: false,
+            default_var: None,
+            choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
+        };
+        let decls = vec![
+            decl("D", VarType::Date),
+            decl("T", VarType::DateTime),
+            decl("S", VarType::String),
+            decl("BAD", VarType::DateTime),
+        ];
+        let mut inputs = vec![
+            " 2026-10-25 ".to_string(),
+            "2026-10-25 14:30+03:00".to_string(),
+            " untouched ".to_string(),
+            "tomorrow".to_string(),
+        ];
+        normalize_date_inputs(&decls, &mut inputs);
+        assert_eq!(inputs[0], "2026-10-25");
+        assert_eq!(inputs[1], "2026-10-25T14:30:00+03:00");
+        assert_eq!(inputs[2], " untouched ");
+        // Unintelligible text stays as typed, for validate_value to reject.
+        assert_eq!(inputs[3], "tomorrow");
+        assert!(meshfox_core::validate_value(&decls[3], &inputs[3]).is_err());
+        assert!(meshfox_core::validate_value(&decls[1], &inputs[1]).is_ok());
     }
 
     #[tokio::test]

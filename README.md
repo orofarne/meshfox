@@ -1029,6 +1029,9 @@ system — where the blocks actually run, which may not be where the UI is — a
 answers with an absolute path. SPEC.md's "File variables" and "Path pickers"
 have the details.
 
+`type="date"` and `type="datetime"` have their own recipe, "Dates, times and
+calendars", just below.
+
 A chosen path is also a *permission*: a `dir` value becomes a trusted location
 a `file` node may read below, and a `file` value one trusted file — exactly that
 one, never its folder — so `[report]($OUTPUT_DIR/probe.json)` or `[clip]($INPUT)`
@@ -1042,6 +1045,20 @@ so the example works before you pick a video of your own.
 <!-- meshfox:node id="example-11" type="file" -->
 
 [examples/ffmpeg.canvas.md](./examples/ffmpeg.canvas.md)
+
+### Dates, times and calendars
+<!-- meshfox:node id="dates-times-and-calendars" -->
+
+[examples/dates.canvas.md](./examples/dates.canvas.md) — two small calculators built on `type="date"` and `type="datetime"` variables: calendar days between two dates, and hours between two moments that each carry their own UTC offset. A `form` sets the values and the `autorun` blocks recalculate on **Apply**.
+
+A `date` is `YYYY-MM-DD`; a `datetime` is RFC3339 *with* an offset (`2026-10-25T14:30:00+03:00`). Both can be typed by hand and picked from a calendar: the browser's native date and date-time controls (the latter beside an editable UTC-offset box) in the web UI, a calendar modal on `Ctrl-O` in the terminal (`[Pick… ^o]` after the field). Because a block always receives the canonical form, plain shell parameter expansion takes it apart — the example does its arithmetic in bash without `date`, which differs between macOS and Linux.
+
+Every value is checked against its type, wherever it comes from: `--set`, prompts and forms are rejected on entry, and a bad value in the environment, the variable cache, shared config or a `from=` block's output fails the run with a message naming the variable and where the value came from (a stale cache entry is fixed with `--set`). SPEC.md's "Date and datetime variables" and "Date pickers" have the details.
+
+#### Example
+<!-- meshfox:node id="example-15" type="file" -->
+
+[examples/dates.canvas.md](./examples/dates.canvas.md)
 
 ### Calling an application in another canvas
 <!-- meshfox:node id="calling-an-application-in-another-canvas" -->
@@ -1068,6 +1085,16 @@ Static-site and PDF exports include the computed table as a snapshot of the docu
 <!-- meshfox:node id="example-13" type="file" -->
 
 [examples/constraints.canvas.md](./examples/constraints.canvas.md)
+
+### Reading a single-node canvas as a document
+<!-- meshfox:node id="reading-a-single-node-canvas-as-a-document" -->
+
+A canvas containing only its root node opens as a full-page document in the web UI's view mode: title, scrollable content and the usual runnable blocks, with the toolbar still available. Edit mode keeps the regular canvas. Adding a child restores the canvas in view mode too; folding a larger tree does not activate the document layout. No option is needed, and the root's saved position and size are preserved.
+
+#### Example
+<!-- meshfox:node id="example-14" type="file" -->
+
+[examples/single-node.canvas.md](./examples/single-node.canvas.md)
 
 ## Architecture
 <!-- meshfox:node id="architecture" -->

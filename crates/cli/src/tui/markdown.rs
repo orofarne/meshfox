@@ -1820,8 +1820,6 @@ impl<'a> Renderer<'a> {
                     let header_style = self.block_header(click_name.as_deref());
                     let editing_this = focused_index.is_some();
                     let gutter_chars = 2u16; // "│ "
-                    let browse_text = super::path_picker::BROWSE_MARKER;
-                    let browse_chars = browse_text.chars().count() as u16;
 
                     let corner = if self.focused && selected {
                         "›─"
@@ -1868,16 +1866,15 @@ impl<'a> Renderer<'a> {
                                 Some(meshfox_core::vars::VarType::Bool)
                                     | Some(meshfox_core::vars::VarType::Select)
                             );
-                        let browsable = matches!(
-                            var_type,
-                            Some(meshfox_core::vars::VarType::Dir)
-                                | Some(meshfox_core::vars::VarType::File)
-                        );
+                        let browse_text = var_type.and_then(super::date_picker::marker_for);
                         let mut shown = if value.is_empty() {
                             " ".to_string()
                         } else {
                             value
                         };
+                        if var_type == Some(meshfox_core::vars::VarType::Select) {
+                            shown = format!("[ {shown} ▾ ]");
+                        }
                         if cursor {
                             shown.push('_');
                         }
@@ -1895,15 +1892,21 @@ impl<'a> Renderer<'a> {
                                 }));
                         }
                         let mut spans = vec![Span::styled("│ ", border), label_span, value_span];
-                        if browsable {
+                        if let Some(browse_text) = browse_text {
                             let start =
                                 gutter_chars + prefix.chars().count() as u16 + shown_chars + 2;
                             spans.push(Span::raw("  "));
                             spans.push(Span::styled(browse_text, marker_style));
-                            browse_spans.push((i, start, start + browse_chars));
+                            browse_spans.push((
+                                i,
+                                start,
+                                start + browse_text.chars().count() as u16,
+                            ));
                         }
                         lines.push(Line::from(spans));
-                        col_ends.push(col_end);
+                        col_ends.push(
+                            col_end.max(gutter_chars + prefix.chars().count() as u16 + shown_chars),
+                        );
                     }
                     let send_line = format!("[{send_caption}]");
                     let send_col_end = gutter_chars + send_line.chars().count() as u16;

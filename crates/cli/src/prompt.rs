@@ -72,6 +72,25 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
                 }
             },
             VarType::String => return Ok(input),
+            VarType::Date | VarType::DateTime => {
+                let normalized = if decl.var_type == VarType::Date {
+                    meshfox_core::datevars::normalize_date_input(&input)
+                } else {
+                    meshfox_core::datevars::normalize_datetime_input(&input)
+                };
+                match normalized {
+                    Ok(v) => {
+                        if v != input {
+                            println!("→ {v}");
+                        }
+                        return Ok(v);
+                    }
+                    Err(e) => {
+                        println!("{e}");
+                        continue;
+                    }
+                }
+            }
             VarType::Dir | VarType::File => match meshfox_core::validate_value(decl, &input) {
                 Ok(()) => return Ok(input),
                 Err(e) => {
@@ -101,9 +120,14 @@ fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
             None => print!("{} (y/n): ", decl.prompt),
         }
     } else {
+        let hint = match decl.var_type {
+            VarType::Date => " (YYYY-MM-DD)",
+            VarType::DateTime => " (YYYY-MM-DD HH:MM[:SS][±HH:MM])",
+            _ => "",
+        };
         match current {
-            Some(c) => print!("{} [{c}]: ", decl.prompt),
-            None => print!("{}: ", decl.prompt),
+            Some(c) => print!("{}{hint} [{c}]: ", decl.prompt),
+            None => print!("{}{hint}: ", decl.prompt),
         }
     }
     io::stdout().flush()

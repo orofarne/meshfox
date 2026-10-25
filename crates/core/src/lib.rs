@@ -17,6 +17,7 @@ pub mod color_spans;
 pub mod comment;
 pub mod config;
 pub mod constraint;
+pub mod datevars;
 pub mod deps;
 pub mod diagnostics;
 mod dotenv;
@@ -105,10 +106,10 @@ pub use varout::{
     read_and_cleanup as read_and_cleanup_vars_out, VARS_OUT_ENV,
 };
 pub use vars::{
-    close_over_var_refs, declared_vars, map_block_env, preview_with_shared,
+    close_over_var_refs, declared_vars, invalid_vars_error, map_block_env, preview_with_shared,
     resolve as resolve_vars, resolve_block_env, resolve_block_env_with_shared, resolve_with_shared,
     validate_env_refs, validate_value, validate_var_refs, validate_var_scope, BlockEnvResolution,
-    FileMode, ResolvedVars, VarDecl, VarType, VarsError,
+    FileMode, InvalidVar, ResolvedVars, ValueSource, VarDecl, VarType, VarsError,
 };
 
 pub use attrs::UnknownAttrError;
@@ -152,6 +153,10 @@ pub enum RunError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Deps(#[from] DepsError),
+    /// A supplied variable value (environment, cache, shared config) does
+    /// not satisfy its declared `type=` — see `vars::ResolvedVars::invalid`.
+    #[error("{0}")]
+    InvalidVariables(String),
 }
 
 /// Resolve `path` + `block_name` to a `BlockAddr`, then, if `with_deps` is

@@ -20,6 +20,7 @@ pub enum CommandId {
     MoveTo,
     MoveUp,
     MoveDown,
+    MovePosition,
     AddEdge,
     RemoveEdge,
     Delete,
@@ -110,6 +111,12 @@ const ENTRIES: &[Entry] = &[
     Entry {
         id: CommandId::MoveDown,
         title: "Move node down among siblings",
+        key: "",
+        scope: Scope::Structure,
+    },
+    Entry {
+        id: CommandId::MovePosition,
+        title: "Move node to position among siblings",
         key: "",
         scope: Scope::Structure,
     },
@@ -327,6 +334,14 @@ impl Palette {
                     query: String::new(),
                     results,
                     state,
+                };
+                Outcome::Stay
+            }
+            CommandId::MovePosition => {
+                self.step = Step::Input {
+                    id,
+                    label: "Sibling position (1-based)",
+                    value: String::new(),
                 };
                 Outcome::Stay
             }
@@ -650,6 +665,24 @@ mod tests {
             .results
             .iter()
             .any(|&i| ENTRIES[i].scope == Scope::Editor));
+    }
+
+    #[test]
+    fn sibling_position_is_entered_and_can_be_cancelled() {
+        let mut p = Palette::new(false, "Node".into(), "node".into(), vec![], vec![]);
+        type_text(&mut p, "move position");
+        assert_eq!(p.chosen().unwrap().id, CommandId::MovePosition);
+        assert!(matches!(p.on_key(key(KeyCode::Enter)), Outcome::Stay));
+        type_text(&mut p, "12");
+        assert!(matches!(p.on_key(key(KeyCode::Esc)), Outcome::Stay));
+        p.on_key(key(KeyCode::Enter));
+        assert!(matches!(p.on_key(key(KeyCode::Enter)), Outcome::Stay));
+        type_text(&mut p, "3");
+        assert!(
+            matches!(p.on_key(key(KeyCode::Enter)), Outcome::Run(Request {
+            id: CommandId::MovePosition, text: Some(text),
+        }) if text == "3")
+        );
     }
 
     #[test]

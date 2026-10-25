@@ -3932,14 +3932,7 @@ async fn preflight_worker_vars(
 fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
     VarDecl {
         name: status.name.clone(),
-        var_type: match status.var_type.as_str() {
-            "int" => VarType::Int,
-            "bool" => VarType::Bool,
-            "select" => VarType::Select,
-            "dir" => VarType::Dir,
-            "file" => VarType::File,
-            _ => VarType::String,
-        },
+        var_type: VarType::parse(&status.var_type).unwrap_or(VarType::String),
         prompt: status.prompt.clone(),
         default: None,
         choices: status.choices.clone(),
@@ -8056,6 +8049,29 @@ mod set_override_tests {
             ("NAME".to_string(), "anything".to_string()),
         ]);
         assert!(validate_set_overrides(&decls, &overrides).is_ok());
+    }
+
+    #[test]
+    fn set_for_date_and_datetime_variables_must_be_canonical() {
+        let decls = vec![
+            decl("DAY", meshfox_core::VarType::Date, &[]),
+            decl("AT", meshfox_core::VarType::DateTime, &[]),
+        ];
+        let ok = HashMap::from([
+            ("DAY".to_string(), "2026-10-25".to_string()),
+            ("AT".to_string(), "2026-10-25T14:30:00+03:00".to_string()),
+        ]);
+        assert!(validate_set_overrides(&decls, &ok).is_ok());
+        for (name, value) in [
+            ("DAY", "2026-02-30"),
+            ("DAY", "25.10.2026"),
+            ("AT", "2026-10-25T14:30:00"),
+            ("AT", "2026-10-25 14:30:00+03:00"),
+        ] {
+            let bad = HashMap::from([(name.to_string(), value.to_string())]);
+            let err = validate_set_overrides(&decls, &bad).unwrap_err();
+            assert!(err.contains(name), "unexpected error: {err}");
+        }
     }
 
     #[test]

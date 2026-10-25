@@ -11,6 +11,7 @@
 
 mod ansi;
 mod app;
+mod date_picker;
 mod document_layout;
 mod external_editor;
 mod image_metrics;

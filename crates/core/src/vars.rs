@@ -28,6 +28,10 @@ pub enum VarType {
     /// supplied or confirmed, becomes a trusted root consisting of exactly
     /// that file (never its directory) for `file` nodes.
     File,
+    /// A calendar day, `YYYY-MM-DD` (SPEC.md, "Date and datetime variables").
+    Date,
+    /// An instant, RFC3339 with an offset (`2026-10-25T14:30:00+03:00`).
+    DateTime,
 }
 
 /// `mode=` of a `type="file"` variable.
@@ -58,7 +62,7 @@ impl FileMode {
 }
 
 impl VarType {
-    fn parse(s: &str) -> Option<VarType> {
+    pub fn parse(s: &str) -> Option<VarType> {
         match s {
             "string" => Some(VarType::String),
             "int" => Some(VarType::Int),
@@ -66,6 +70,8 @@ impl VarType {
             "select" => Some(VarType::Select),
             "dir" => Some(VarType::Dir),
             "file" => Some(VarType::File),
+            "date" => Some(VarType::Date),
+            "datetime" => Some(VarType::DateTime),
             _ => None,
         }
     }
@@ -78,6 +84,8 @@ impl VarType {
             VarType::Select => "select",
             VarType::Dir => "dir",
             VarType::File => "file",
+            VarType::Date => "date",
+            VarType::DateTime => "datetime",
         }
     }
 }
@@ -164,7 +172,7 @@ pub enum VarsError {
     EnvNameTemplate(String, String, String),
     #[error("a meshfox:var comment is missing its required name= attribute")]
     MissingName,
-    #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, select, dir, or file)")]
+    #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, select, dir, file, date, or datetime)")]
     UnknownType(String, String),
     #[error("meshfox:var {0:?} has mode= or ext= but type={1:?} (expected file)")]
     FileAttrRequiresFile(String, String),
@@ -347,16 +355,14 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
 /// the CLI prompt's own y/n handling); `select` must be exactly one of
 /// `choices`.
 ///
-/// Deliberately *not* called anywhere in `resolve`/`resolve_block_env`
-/// themselves (see their own doc comments) — an already-cached, `--set`,
-/// or process-environment value can predate a stricter `type=`/
-/// `choices=` edit to the declaration, and resolution silently breaking
-/// every run over that would be worse than just using the stale value.
-/// This is for whoever is about to *accept a new answer* — an
-/// interactive prompt, `--set`, a submitted form/API request — to check
-/// before saving it, catching a bypass of a UI's own control (a `select`
-/// answered via a raw `--set REGION=mars` or a direct API call, say)
-/// that the control itself would never have produced.
+/// Called at every point a value enters: a new answer (an interactive
+/// prompt, `--set`, a submitted form/API request) before it is saved —
+/// catching a bypass of a UI's own control (a `select` answered via a raw
+/// `--set REGION=mars` or a direct API call, say) — and, in `resolve`, on
+/// every supplied value (override, process environment, cache, shared
+/// config), so a value that predates a stricter declaration fails loudly
+/// (`ResolvedVars::invalid`) instead of reaching a block. A `from=` value is
+/// checked when its source block's output is read back.
 /// A `dir` value is `@tmp`, `@tmp/...`, `~`/`~/...`, or an absolute or
 /// canvas-relative path. `@tmp/..` is rejected outright; an existing
 /// non-directory is rejected, a missing path is fine (a block may create it).
@@ -439,6 +445,22 @@ pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
             .parse::<i64>()
             .map(|_| ())
             .map_err(|_| format!("{:?} expects an integer, got {value:?}", decl.name)),
+        VarType::Date => crate::datevars::parse_date(value)
+            .map(|_| ())
+            .ok_or_else(|| {
+                format!(
+                    "{:?} expects a date as YYYY-MM-DD, got {value:?}",
+                    decl.name
+                )
+            }),
+        VarType::DateTime => crate::datevars::parse_datetime(value)
+            .map(|_| ())
+            .ok_or_else(|| {
+                format!(
+                    "{:?} expects a date and time with an offset (RFC3339, e.g. 2026-10-25T14:30:00+03:00), got {value:?}",
+                    decl.name
+                )
+            }),
         VarType::Bool => {
             if value == "true" || value == "false" {
                 Ok(())
@@ -993,6 +1015,64 @@ pub struct ResolvedVars {
     /// keychain, access denied, ...). Resolution carries on as if there were
     /// no stored value; this is so the caller can say why it's asking again.
     pub secret_errors: HashMap<String, String>,
+    /// Values that were supplied (an override, the process environment, the
+    /// cache, shared config) but do not satisfy the declaration's `type=`.
+    /// They are left out of `values` and are not offered for re-entry: a
+    /// caller must treat a non-empty list as a hard error — see
+    /// [`invalid_vars_error`].
+    pub invalid: Vec<InvalidVar>,
+}
+
+/// Where a variable's value came from, for error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueSource {
+    Override,
+    Environment,
+    Cache,
+    Shared,
+}
+
+impl ValueSource {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            ValueSource::Override => "--set or the submitted request",
+            ValueSource::Environment => "the process environment",
+            ValueSource::Cache => "the variable cache",
+            ValueSource::Shared => "shared config",
+        }
+    }
+}
+
+/// One supplied value that failed `validate_value` — see
+/// `ResolvedVars::invalid`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvalidVar {
+    pub name: String,
+    pub source: ValueSource,
+    pub message: String,
+}
+
+/// The one error a caller reports for a non-empty `invalid` list: names each
+/// variable, where its bad value came from, and how to correct it.
+pub fn invalid_vars_error(invalid: &[InvalidVar]) -> String {
+    let lines: Vec<String> = invalid
+        .iter()
+        .map(|i| {
+            let fix = match i.source {
+                ValueSource::Cache => {
+                    " — answer it again with --set, or fix/remove it in the .meshfox cache file"
+                }
+                ValueSource::Environment => " — fix or unset it in the environment",
+                ValueSource::Shared => " — fix it in the shared config",
+                ValueSource::Override => "",
+            };
+            format!("{} (from {}){fix}", i.message, i.source.describe())
+        })
+        .collect();
+    match lines.as_slice() {
+        [one] => format!("invalid variable value: {one}"),
+        _ => format!("invalid variable values:\n  {}", lines.join("\n  ")),
+    }
 }
 
 /// Resolves `decls` against, in priority order: `overrides` (explicit
@@ -1010,9 +1090,11 @@ pub struct ResolvedVars {
 /// "save (plaintext)" checkbox), so the very next lookup finds it there and
 /// resolves without prompting again. Whatever isn't resolved ends up in
 /// `missing`, for the caller to prompt for and resolve again — a
-/// variable's own type/`choices` are informational for that prompt only;
-/// nothing here validates an incoming value against them (an incoming
-/// value is just a plain string, the same as any other env var).
+/// variable's own type/`choices` drive that prompt. A value that was
+/// *supplied* (override, process environment, cache, shared config) is
+/// validated against them (`validate_value`): one that does not fit is left
+/// out of `values` and reported in `invalid`, for the caller to fail on.
+/// Defaults are taken as declared.
 ///
 /// A `from`-declared decl is never touched by any of the four steps
 /// above — not even `overrides` — since letting `--set`/a submitted form
@@ -1096,6 +1178,7 @@ pub fn resolve_with_shared(
     let mut unresolved_from = Vec::new();
     let mut origins = HashMap::new();
     let mut secret_errors = HashMap::new();
+    let mut invalid = Vec::new();
     for decl in topo_order(decls) {
         if decl.from.is_some() {
             match computed.get(&decl.name) {
@@ -1119,11 +1202,14 @@ pub fn resolve_with_shared(
         // nothing downstream needs the substituted value in the first
         // place.
         let mut shared_origin: Option<crate::shared_env::SharedOrigin> = None;
+        let mut source = ValueSource::Override;
         let already_resolved: Option<String> = if let Some(v) = overrides.get(&decl.name) {
             Some(v.clone())
         } else if let Ok(v) = std::env::var(&decl.name) {
+            source = ValueSource::Environment;
             Some(v)
         } else if !decl.session {
+            source = ValueSource::Cache;
             // `secret` does *not* skip the cache here: nothing in this
             // module ever *writes* one there (`resolve`/`resolve_with_
             // shared` only read `cache`, never mutate it), but a `secret`
@@ -1153,6 +1239,7 @@ pub fn resolve_with_shared(
             {
                 Some(v)
             } else if let Some(sv) = shared.get(&decl.name) {
+                source = ValueSource::Shared;
                 shared_origin = Some(sv.origin.clone());
                 Some(sv.value.clone())
             } else {
@@ -1161,6 +1248,7 @@ pub fn resolve_with_shared(
         } else if let Some(sv) = shared.get(&decl.name) {
             // `session` skips the cache step above entirely, but still
             // consults `shared` -- see this function's own doc comment.
+            source = ValueSource::Shared;
             shared_origin = Some(sv.origin.clone());
             Some(sv.value.clone())
         } else {
@@ -1173,6 +1261,14 @@ pub fn resolve_with_shared(
         }
         if let Some(v) = already_resolved {
             secret_errors.remove(&decl.name);
+            if let Err(message) = validate_supplied(decl, &v, &values) {
+                invalid.push(InvalidVar {
+                    name: decl.name.clone(),
+                    source,
+                    message,
+                });
+                continue;
+            }
             if let Some(origin) = shared_origin {
                 origins.insert(decl.name.clone(), origin);
             }
@@ -1253,7 +1349,41 @@ pub fn resolve_with_shared(
         unresolved_from,
         origins,
         secret_errors,
+        invalid,
     }
+}
+
+/// `validate_value` for a value that arrived from outside the declaration. A
+/// `choices_var` select is checked against the choices its referenced
+/// variable resolved to (skipped while that is unknown), and a secret's
+/// value is never echoed into the message.
+fn validate_supplied(
+    decl: &VarDecl,
+    value: &str,
+    resolved: &HashMap<String, String>,
+) -> Result<(), String> {
+    let result = match &decl.choices_var {
+        Some(reference) => match resolved.get(reference) {
+            Some(list) => {
+                let mut with_choices = decl.clone();
+                with_choices.choices = split_choices(list);
+                validate_value(&with_choices, value)
+            }
+            None => return Ok(()),
+        },
+        None => validate_value(decl, value),
+    };
+    result.map_err(|e| {
+        if decl.secret {
+            format!(
+                "{:?} does not satisfy its type {}",
+                decl.name,
+                decl.var_type.as_str()
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// Orders `decls` so that any decl named by another's `default_var`/
@@ -1316,6 +1446,8 @@ pub struct BlockEnvResolution {
     pub origins: HashMap<String, crate::shared_env::SharedOrigin>,
     /// See `ResolvedVars::secret_errors`.
     pub secret_errors: HashMap<String, String>,
+    /// See `ResolvedVars::invalid`; a caller must fail on a non-empty list.
+    pub invalid: Vec<InvalidVar>,
 }
 
 /// Resolves *only* the declared variables a single block's own `env=`
@@ -1370,6 +1502,7 @@ pub fn resolve_block_env_with_shared(
         unresolved_from: resolved.unresolved_from,
         origins: resolved.origins,
         secret_errors: resolved.secret_errors,
+        invalid: resolved.invalid,
     }
 }
 
@@ -1983,6 +2116,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_value_date_and_datetime_are_strict() {
+        let d = typed_decl("D", VarType::Date, &[]);
+        assert!(validate_value(&d, "2026-10-25").is_ok());
+        assert!(validate_value(&d, "2026-02-30").is_err());
+        assert!(validate_value(&d, "25.10.2026").is_err());
+        assert!(validate_value(&d, "2026-10-25T10:00:00Z").is_err());
+        assert!(validate_value(&d, "").is_err());
+        let t = typed_decl("T", VarType::DateTime, &[]);
+        assert!(validate_value(&t, "2026-10-25T14:30:00+03:00").is_ok());
+        assert!(validate_value(&t, "2026-10-25T14:30:00Z").is_ok());
+        assert!(validate_value(&t, "2026-10-25T14:30:00").is_err());
+        assert!(validate_value(&t, "2026-10-25 14:30:00+03:00").is_err());
+        assert!(validate_value(&t, "2026-10-25").is_err());
+        assert!(validate_value(&t, "").is_err());
+    }
+
+    #[test]
+    fn date_types_parse_and_round_trip_their_names() {
+        assert_eq!(VarType::parse("date"), Some(VarType::Date));
+        assert_eq!(VarType::parse("datetime"), Some(VarType::DateTime));
+        assert_eq!(VarType::Date.as_str(), "date");
+        assert_eq!(VarType::DateTime.as_str(), "datetime");
+    }
+
+    #[test]
     fn validate_value_bool_requires_the_canonical_true_or_false() {
         let d = typed_decl("X", VarType::Bool, &[]);
         assert!(validate_value(&d, "true").is_ok());
@@ -2023,6 +2181,163 @@ mod tests {
             Some("override-val")
         );
         assert!(resolved.missing.is_empty());
+    }
+
+    fn typed_resolve(
+        decl: &VarDecl,
+        overrides: &HashMap<String, String>,
+        cache: &VarCache,
+        shared: &crate::shared_env::SharedEnv,
+    ) -> ResolvedVars {
+        resolve_with_shared(
+            std::slice::from_ref(decl),
+            overrides,
+            cache,
+            &HashMap::new(),
+            shared,
+        )
+    }
+
+    #[test]
+    fn a_cached_value_that_does_not_fit_its_type_is_invalid_not_used_or_asked_for() {
+        let decl = typed_decl("MESHFOX_TEST_CACHED_DAY", VarType::Date, &[]);
+        let mut cache = VarCache::in_memory();
+        cache.set("MESHFOX_TEST_CACHED_DAY", "yesterday").unwrap();
+        let r = typed_resolve(
+            &decl,
+            &HashMap::new(),
+            &cache,
+            &crate::shared_env::SharedEnv::new(),
+        );
+        assert!(r.values.is_empty());
+        assert!(r.missing.is_empty());
+        assert_eq!(r.invalid.len(), 1);
+        assert_eq!(r.invalid[0].name, "MESHFOX_TEST_CACHED_DAY");
+        assert_eq!(r.invalid[0].source, ValueSource::Cache);
+        let text = invalid_vars_error(&r.invalid);
+        assert!(text.contains("yesterday"), "{text}");
+        assert!(text.contains("variable cache"), "{text}");
+        assert!(text.contains("--set"), "{text}");
+
+        // A good cached value resolves normally.
+        let mut ok = VarCache::in_memory();
+        ok.set("MESHFOX_TEST_CACHED_DAY", "2026-10-25").unwrap();
+        let r = typed_resolve(
+            &decl,
+            &HashMap::new(),
+            &ok,
+            &crate::shared_env::SharedEnv::new(),
+        );
+        assert!(r.invalid.is_empty());
+        assert_eq!(
+            r.values.get("MESHFOX_TEST_CACHED_DAY").map(String::as_str),
+            Some("2026-10-25")
+        );
+    }
+
+    #[test]
+    fn an_environment_value_that_does_not_fit_its_type_is_invalid() {
+        let decl = typed_decl("MESHFOX_TEST_ENV_COUNT", VarType::Int, &[]);
+        std::env::set_var("MESHFOX_TEST_ENV_COUNT", "many");
+        let r = typed_resolve(
+            &decl,
+            &HashMap::new(),
+            &VarCache::in_memory(),
+            &crate::shared_env::SharedEnv::new(),
+        );
+        std::env::remove_var("MESHFOX_TEST_ENV_COUNT");
+        assert!(r.values.is_empty());
+        assert_eq!(r.invalid.len(), 1);
+        assert_eq!(r.invalid[0].source, ValueSource::Environment);
+    }
+
+    #[test]
+    fn a_shared_config_value_that_does_not_fit_its_type_is_invalid() {
+        let decl = typed_decl("MESHFOX_TEST_SHARED_FLAG", VarType::Bool, &[]);
+        let mut shared = crate::shared_env::SharedEnv::new();
+        shared.insert(
+            "MESHFOX_TEST_SHARED_FLAG".into(),
+            crate::shared_env::SharedVar {
+                value: "yes".into(),
+                origin: crate::shared_env::SharedOrigin::Project,
+            },
+        );
+        let r = typed_resolve(&decl, &HashMap::new(), &VarCache::in_memory(), &shared);
+        assert!(r.values.is_empty());
+        assert_eq!(r.invalid[0].source, ValueSource::Shared);
+    }
+
+    #[test]
+    fn an_invalid_override_is_reported_and_never_falls_through() {
+        let decl = typed_decl("MESHFOX_TEST_OVERRIDE_DAY", VarType::Date, &[]);
+        let mut cache = VarCache::in_memory();
+        cache
+            .set("MESHFOX_TEST_OVERRIDE_DAY", "2026-10-25")
+            .unwrap();
+        let overrides = HashMap::from([(
+            "MESHFOX_TEST_OVERRIDE_DAY".to_string(),
+            "2026-02-30".to_string(),
+        )]);
+        let r = typed_resolve(
+            &decl,
+            &overrides,
+            &cache,
+            &crate::shared_env::SharedEnv::new(),
+        );
+        assert!(r.values.is_empty());
+        assert_eq!(r.invalid[0].source, ValueSource::Override);
+    }
+
+    #[test]
+    fn a_secrets_bad_value_is_never_echoed() {
+        let mut decl = typed_decl("MESHFOX_TEST_SECRET_N", VarType::Int, &[]);
+        decl.secret = true;
+        let mut cache = VarCache::in_memory();
+        cache.set("MESHFOX_TEST_SECRET_N", "hunter2").unwrap();
+        let r = typed_resolve(
+            &decl,
+            &HashMap::new(),
+            &cache,
+            &crate::shared_env::SharedEnv::new(),
+        );
+        assert_eq!(r.invalid.len(), 1);
+        assert!(!invalid_vars_error(&r.invalid).contains("hunter2"));
+    }
+
+    #[test]
+    fn a_choices_var_select_is_checked_against_its_resolved_choices() {
+        let mut region = typed_decl("MESHFOX_TEST_REGION", VarType::Select, &[]);
+        region.choices_var = Some("MESHFOX_TEST_REGIONS".into());
+        let list = decl("MESHFOX_TEST_REGIONS", Some("us,eu"), false);
+        let mut cache = VarCache::in_memory();
+        cache.set("MESHFOX_TEST_REGION", "mars").unwrap();
+        let r = resolve(
+            &[list.clone(), region.clone()],
+            &HashMap::new(),
+            &cache,
+            &HashMap::new(),
+        );
+        assert_eq!(r.invalid.len(), 1, "{:?}", r.invalid);
+        cache.set("MESHFOX_TEST_REGION", "eu").unwrap();
+        let r = resolve(&[list, region], &HashMap::new(), &cache, &HashMap::new());
+        assert!(r.invalid.is_empty());
+        assert_eq!(
+            r.values.get("MESHFOX_TEST_REGION").map(String::as_str),
+            Some("eu")
+        );
+    }
+
+    #[test]
+    fn untyped_strings_and_defaults_are_never_flagged() {
+        let decl = decl("MESHFOX_TEST_FREE", Some("anything at all"), false);
+        let r = resolve(
+            &[decl],
+            &HashMap::new(),
+            &VarCache::in_memory(),
+            &HashMap::new(),
+        );
+        assert!(r.invalid.is_empty());
+        assert!(r.values.contains_key("MESHFOX_TEST_FREE"));
     }
 
     #[test]

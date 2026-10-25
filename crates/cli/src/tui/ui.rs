@@ -423,7 +423,34 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_search(f, layout.footer, app);
     }
 
-    if let Some(pp) = &app.path_picker {
+    if let Some(picker) = &mut app.select_picker {
+        let width = area.width.min(60);
+        let height = area.height.min((picker.choices.len() + 4) as u16);
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Choose · Enter select · Esc cancel ");
+        picker.rows = block.inner(popup);
+        let mut state = ListState::default();
+        state.select(Some(picker.selected));
+        *state.offset_mut() = picker
+            .selected
+            .saturating_sub(picker.rows.height.saturating_sub(1) as usize);
+        let list = List::new(picker.choices.iter().map(|c| ListItem::new(c.as_str())))
+            .block(block)
+            .highlight_style(Style::default().bg(ACCENT).fg(Color::Black))
+            .highlight_symbol("› ");
+        f.render_stateful_widget(list, popup, &mut state);
+        picker.offset = state.offset();
+    } else if let Some(dp) = &app.date_picker {
+        render_date_picker(f, area, dp);
+    } else if let Some(pp) = &app.path_picker {
         render_path_picker(f, area, pp);
     } else if let Some(bp) = &app.block_picker {
         render_block_picker(f, area, bp);
@@ -1763,8 +1790,14 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             // rather than a text input. `String`/`Int` keep the plain
             // text-cursor look, shown only on the focused row.
             let value = match decl.var_type {
-                VarType::Bool | VarType::Select => format!("‹ {shown} ›"),
-                VarType::String | VarType::Int | VarType::Dir | VarType::File => {
+                VarType::Bool => format!("‹ {shown} ›"),
+                VarType::Select => format!("[ {shown} ▾ ]"),
+                VarType::String
+                | VarType::Int
+                | VarType::Dir
+                | VarType::File
+                | VarType::Date
+                | VarType::DateTime => {
                     format!("{shown}{}", if i == vf.selected { "_" } else { "" })
                 }
             };
@@ -1812,8 +1845,10 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             // A `dir`/`file` field ends in a right-aligned, clickable
             // "[Browse… ^o]" (`App::on_modal_mouse` hit-tests the same
             // `BROWSE_MARKER`-wide strip at the row's right edge).
-            let browse_width = if matches!(decl.var_type, VarType::Dir | VarType::File) {
-                super::path_picker::BROWSE_MARKER.chars().count() + 2
+            let marker = super::date_picker::marker_for(decl.var_type);
+            let marker_chars = marker.map_or(0, |m| m.chars().count());
+            let browse_width = if marker.is_some() {
+                marker_chars + 2
             } else {
                 0
             };
@@ -1835,11 +1870,10 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                     + value.chars().count()
                     + save_tag.chars().count()
                     + error_tag.chars().count();
-                let pad = (inner.width as usize)
-                    .saturating_sub(used + super::path_picker::BROWSE_MARKER.chars().count());
+                let pad = (inner.width as usize).saturating_sub(used + marker_chars);
                 spans.push(Span::raw(" ".repeat(pad.max(2))));
                 spans.push(Span::styled(
-                    super::path_picker::BROWSE_MARKER,
+                    marker.unwrap_or_default(),
                     Style::default()
                         .fg(ACCENT)
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -1866,14 +1900,16 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     } else {
         "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter confirm all · esc cancel run"
     };
-    let browse = vf
-        .decls
-        .get(vf.selected)
-        .is_some_and(|d| matches!(d.var_type, VarType::Dir | VarType::File));
-    let esc_hint = if browse {
-        format!("^o browse · {esc_hint}")
-    } else {
-        esc_hint.to_string()
+    let esc_hint = match vf.decls.get(vf.selected).map(|d| d.var_type) {
+        Some(VarType::Select) => {
+            format!("enter/space choices · ctrl-enter submit all · {esc_hint}")
+        }
+        Some(VarType::Dir | VarType::File) => format!("^o browse · {esc_hint}"),
+        Some(VarType::Date) => format!("YYYY-MM-DD · ^o calendar · {esc_hint}"),
+        Some(VarType::DateTime) => {
+            format!("YYYY-MM-DD HH:MM[:SS][±HH:MM] · ^o calendar · {esc_hint}")
+        }
+        _ => esc_hint.to_string(),
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -1882,6 +1918,189 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         ))),
         rows[1],
     );
+}
+
+/// Width of one day cell of the calendar grid (`" 25 "`).
+pub(super) const DATE_CELL_WIDTH: u16 = 4;
+
+/// Every rect of the calendar modal, shared by `render_date_picker` and
+/// `App::on_date_picker_mouse` so a click can't drift from what is drawn.
+pub(super) struct DatePickerLayout {
+    pub outer: Rect,
+    /// `‹  October 2026  ›` — the first and last four columns are the arrows.
+    pub header: Rect,
+    pub weekdays: Rect,
+    /// 6 weeks × 7 cells of [`DATE_CELL_WIDTH`].
+    pub grid: Rect,
+    /// `HH : MM : SS   ±HH:MM` — `datetime` only.
+    pub time: Option<Rect>,
+    pub footer: Rect,
+}
+
+pub(super) fn date_picker_layout(area: Rect, with_time: bool) -> DatePickerLayout {
+    let content_width = 7 * DATE_CELL_WIDTH;
+    let height = 2 + 1 + 1 + 6 + if with_time { 2 } else { 0 } + 2;
+    // Wider than the grid so the two-line key hint fits under it.
+    let outer = centered_rect(content_width + 22, height, area);
+    let inner = Block::default().borders(Borders::ALL).inner(outer);
+    let x = inner.x + inner.width.saturating_sub(content_width) / 2;
+    let width = content_width.min(inner.width);
+    let bottom = inner.y + inner.height;
+    let mut y = inner.y;
+    let mut take = |x: u16, width: u16, h: u16| {
+        let r = Rect::new(x, y.min(bottom), width, h.min(bottom.saturating_sub(y)));
+        y += h;
+        r
+    };
+    let header = take(x, width, 1);
+    let weekdays = take(x, width, 1);
+    let grid = take(x, width, 6);
+    let time = with_time.then(|| {
+        take(x, width, 1); // spacer
+        take(x, width, 1)
+    });
+    let footer = take(inner.x + 1, inner.width.saturating_sub(2), 2);
+    DatePickerLayout {
+        outer,
+        header,
+        weekdays,
+        grid,
+        time,
+        footer,
+    }
+}
+
+/// Which time field a click at `column` lands on in the time row `time`
+/// (`  HH : MM : SS   ±HH:MM`, with a column of slack either side).
+pub(super) fn date_picker_time_hit(
+    time: Rect,
+    column: u16,
+) -> Option<super::date_picker::DateFocus> {
+    use super::date_picker::DateFocus;
+    let rel = column.checked_sub(time.x)?;
+    match rel {
+        1..=4 => Some(DateFocus::Hour),
+        6..=9 => Some(DateFocus::Minute),
+        11..=14 => Some(DateFocus::Second),
+        16..=23 => Some(DateFocus::Offset),
+        _ => None,
+    }
+}
+
+/// The `Ctrl-O` calendar — see `super::date_picker`.
+fn render_date_picker(f: &mut Frame, area: Rect, dp: &super::date_picker::DatePickerState) {
+    use super::date_picker::{DateFocus, WEEKDAYS};
+    let layout = date_picker_layout(area, dp.with_time);
+    f.render_widget(Clear, layout.outer);
+    let what = if dp.with_time {
+        "date and time"
+    } else {
+        "date"
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(format!(" {} — choose {what} ", dp.title)),
+        layout.outer,
+    );
+    let dim = Style::default().fg(Color::DarkGray);
+    let arrow = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+
+    let (year, month) = dp.view();
+    let title = format!("{month} {year}");
+    let width = layout.header.width as usize;
+    let middle = width.saturating_sub(8);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ‹  ", arrow),
+            Span::styled(
+                format!("{title:^middle$}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  › ", arrow),
+        ])),
+        layout.header,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            WEEKDAYS
+                .iter()
+                .map(|w| format!(" {w} "))
+                .collect::<String>(),
+            dim,
+        ))),
+        layout.weekdays,
+    );
+
+    let today = meshfox_core::datevars::today_local();
+    let calendar_focus = dp.focus == DateFocus::Calendar;
+    let lines: Vec<Line> = (0..6)
+        .map(|row| {
+            Line::from(
+                (0..7)
+                    .map(|col| {
+                        let Some(date) = dp.cell_date(row * 7 + col) else {
+                            return Span::raw("    ");
+                        };
+                        let mut style = if date.month() == month {
+                            Style::default()
+                        } else {
+                            dim
+                        };
+                        if date == today {
+                            style = style.fg(ACCENT).add_modifier(Modifier::UNDERLINED);
+                        }
+                        if date == dp.selected {
+                            style = style.add_modifier(Modifier::BOLD);
+                            if calendar_focus {
+                                style = style.add_modifier(Modifier::REVERSED);
+                            } else {
+                                style = style.add_modifier(Modifier::UNDERLINED);
+                            }
+                        }
+                        Span::styled(format!(" {:>2} ", date.day()), style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), layout.grid);
+
+    if let Some(time) = layout.time {
+        let field = |text: String, focus: DateFocus| {
+            let style = if dp.focus == focus {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::LightGreen)
+            };
+            Span::styled(text, style)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                field(format!("{:02}", dp.hour), DateFocus::Hour),
+                Span::styled(" : ", dim),
+                field(format!("{:02}", dp.minute), DateFocus::Minute),
+                Span::styled(" : ", dim),
+                field(format!("{:02}", dp.second), DateFocus::Second),
+                Span::raw("   "),
+                field(
+                    meshfox_core::datevars::format_offset(dp.offset),
+                    DateFocus::Offset,
+                ),
+            ])),
+            time,
+        );
+    }
+
+    let hint = if calendar_focus {
+        let tab = if dp.with_time { "tab time · " } else { "" };
+        format!("←↑↓→ day · pgup/pgdn month · t today\n{tab}enter choose · esc cancel")
+    } else {
+        "↑/↓ change · pgup/pgdn ±10 · ←/→ field\ntab next · n now · enter choose".to_string()
+    };
+    f.render_widget(Paragraph::new(Text::styled(hint, dim)), layout.footer);
 }
 
 /// Every rect of the path picker modal, shared by `render_path_picker` and
@@ -2735,8 +2954,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "                (unavailable on a read-only canvas, like H below)",
         "i               (Document focus) open/focus this node's own form —",
         "                tab/down next field, shift-tab/up previous, left/right",
-        "                toggle a bool or cycle a select, enter submits the whole",
-        "                form, esc stops editing (leaves it open, still visible)",
+        "                toggle bool/cycle select · enter/space opens select · ctrl-enter sends",
+        "                form · enter on Send submits · esc stops editing",
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
@@ -3266,6 +3485,117 @@ mod tests {
         assert!(plain_row.contains("→ Target"), "{plain_row}");
         assert!(!plain_row.contains("[]"), "{plain_row}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn render_date_picker_text(
+        picker: &crate::tui::date_picker::DatePickerState,
+        w: u16,
+        h: u16,
+    ) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| render_date_picker(f, Rect::new(0, 0, w, h), picker))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_calendar_draws_the_month_and_its_geometry_matches_the_hit_rects() {
+        use crate::tui::date_picker::{DateFocus, DatePickerState, PickerTarget};
+        let picker = DatePickerState::new(
+            PickerTarget::VarForm(0),
+            VarType::DateTime,
+            "When",
+            "2026-10-25T14:30:00+03:00",
+        );
+        let rows = render_date_picker_text(&picker, 80, 24);
+        let text = rows.join("\n");
+        assert!(text.contains("When — choose date and time"), "{text}");
+        assert!(text.contains("October 2026"), "{text}");
+        assert!(text.contains("Mo  Tu  We  Th  Fr  Sa  Su"), "{text}");
+        assert!(text.contains("14 : 30 : 00   +03:00"), "{text}");
+        assert!(
+            text.contains("tab time · enter choose · esc cancel"),
+            "{text}"
+        );
+
+        let layout = date_picker_layout(Rect::new(0, 0, 80, 24), true);
+        // 2026-10-01 is a Thursday: the first grid row is Sep 28 .. Oct 4.
+        let first_row = &rows[layout.grid.y as usize];
+        let at = |col: u16| {
+            first_row
+                .chars()
+                .skip((layout.grid.x + col * DATE_CELL_WIDTH) as usize)
+                .take(DATE_CELL_WIDTH as usize)
+                .collect::<String>()
+        };
+        assert_eq!(at(0).trim(), "28");
+        assert_eq!(at(3).trim(), "1");
+        assert_eq!(at(6).trim(), "4");
+        // The 25th sits in grid row 3, column 6 (Sunday).
+        let row = &rows[(layout.grid.y + 3) as usize];
+        let cell: String = row
+            .chars()
+            .skip((layout.grid.x + 6 * DATE_CELL_WIDTH) as usize)
+            .take(DATE_CELL_WIDTH as usize)
+            .collect();
+        assert_eq!(cell.trim(), "25");
+        assert_eq!(picker.cell_date(3 * 7 + 6), Some(picker.selected));
+
+        // The time row's hit-test lands on the digits it drew.
+        let time = layout.time.unwrap();
+        let time_row = &rows[time.y as usize];
+        let col_of = |needle: &str| {
+            time_row[..]
+                .find(needle)
+                .map(|b| time_row[..b].chars().count() as u16)
+                .unwrap()
+        };
+        assert_eq!(
+            date_picker_time_hit(time, col_of("14")),
+            Some(DateFocus::Hour)
+        );
+        assert_eq!(
+            date_picker_time_hit(time, col_of("30")),
+            Some(DateFocus::Minute)
+        );
+        assert_eq!(
+            date_picker_time_hit(time, col_of("00")),
+            Some(DateFocus::Second)
+        );
+        assert_eq!(
+            date_picker_time_hit(time, col_of("+03")),
+            Some(DateFocus::Offset)
+        );
+
+        // A plain `date` picker has no time row and is shorter.
+        let day =
+            DatePickerState::new(PickerTarget::VarForm(0), VarType::Date, "Day", "2026-10-25");
+        assert!(date_picker_layout(Rect::new(0, 0, 80, 24), false)
+            .time
+            .is_none());
+        let text = render_date_picker_text(&day, 80, 24).join("\n");
+        assert!(text.contains("Day — choose date "), "{text}");
+        assert!(!text.contains(" : "), "{text}");
+    }
+
+    #[test]
+    fn the_calendar_still_fits_a_small_terminal() {
+        use crate::tui::date_picker::{DatePickerState, PickerTarget};
+        let picker = DatePickerState::new(
+            PickerTarget::VarForm(0),
+            VarType::DateTime,
+            "When",
+            "2026-10-25T14:30:00Z",
+        );
+        // Must not panic even when the modal is taller than the screen.
+        let _ = render_date_picker_text(&picker, 40, 10);
+        let _ = render_date_picker_text(&picker, 20, 5);
     }
 
     #[test]

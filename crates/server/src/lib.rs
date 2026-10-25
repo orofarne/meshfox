@@ -4383,7 +4383,7 @@ impl From<RunError> for ApiError {
     fn from(err: RunError) -> Self {
         let status = match &err {
             RunError::Tree(_) | RunError::BlockNotFound(_, _) => StatusCode::NOT_FOUND,
-            RunError::Deps(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            RunError::Deps(_) | RunError::InvalidVariables(_) => StatusCode::UNPROCESSABLE_ENTITY,
             RunError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError(status, err.to_string())
@@ -9965,6 +9965,12 @@ async fn force_start_service(
             &HashMap::new(),
             &shared,
         );
+        if !resolved.invalid.is_empty() {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                meshfox_core::invalid_vars_error(&resolved.invalid),
+            ));
+        }
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
@@ -10164,6 +10170,12 @@ async fn debug_start(
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
     let resolved =
         meshfox_core::resolve_with_shared(&relevant, &req.vars, &cache, &HashMap::new(), &shared);
+    if !resolved.invalid.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            meshfox_core::invalid_vars_error(&resolved.invalid),
+        ));
+    }
     if !resolved.missing.is_empty() {
         let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
         return Err(ApiError(
@@ -18758,6 +18770,52 @@ mod vars_endpoint_tests {
             serde_json::from_str(&body).expect("valid VarStatus JSON");
         assert_eq!(statuses[0]["resolved"], true);
         assert_eq!(statuses[0]["value"], "/opt/confirmed");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    const DAY_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"DAY\" type=\"date\" -->\n\n",
+        "```bash name=\"show\" env=\"$DAY\"\necho \"day is $DAY\"\n```\n",
+    );
+
+    #[tokio::test]
+    async fn a_cached_value_that_does_not_fit_its_type_fails_the_run_preparation() {
+        let canvas_path = write_test_canvas(DAY_CANVAS);
+        let mut cache = VarCache::load(&canvas_path).expect("load cache");
+        cache.set("DAY", "yesterday").expect("seed cache");
+
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let (status, body) = get(addr, "/api/vars?block=show").await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("yesterday"), "{body}");
+        assert!(body.contains("variable cache"), "{body}");
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    #[tokio::test]
+    async fn a_from_value_that_does_not_fit_its_type_stops_the_chain() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"DAY\" type=\"date\" from=\"produce\" -->\n\n",
+            "```bash name=\"produce\"\nprintf 'DAY=2026-02-30\\n' > \"$MESHFOX_VARS_OUT\"\n```\n\n",
+            "```bash name=\"show\" env=\"$DAY\"\necho \"day is $DAY\"\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let events = run_ws_events(addr, &[("block", "show")]).await;
+        let text = serde_json::to_string(&events).unwrap();
+        assert!(
+            text.contains("computed variable") && text.contains("2026-02-30"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("day is"),
+            "the dependent block must not run: {text}"
+        );
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));

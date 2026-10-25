@@ -124,6 +124,69 @@ fn move_down_swaps_the_node_with_its_next_sibling() {
 
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn move_to_position_accepts_a_number_and_preserves_the_selected_subtree() {
+    let mut fixture = TWO_LEAVES.replace(
+        "## Beta",
+        "### Nested\n<!-- meshfox:node id=\"nested\" parent=\"alpha\" -->\n\n## Beta",
+    );
+    // Twelve siblings exercise multi-digit input and a move across many nodes.
+    for n in 3..=12 {
+        fixture.push_str(&format!(
+            "## Sibling {n}\n<!-- meshfox:node id=\"sibling-{n}\" parent=\"root\" -->\n\n"
+        ));
+    }
+    let (canvas, dir) = fixtures::write_fixture(&fixture);
+    let mut session = TuiSession::spawn(&canvas, dir, 30, 100);
+    session
+        .wait_for("Sibling 12", Duration::from_secs(5))
+        .expect("the tree should list all siblings");
+    session.send_keys("j"); // Alpha; subsequent commands must keep selecting it.
+
+    for position in [12, 2, 1] {
+        open_palette(&mut session, "move position");
+        session
+            .wait_for("Sibling position (1-based):", Duration::from_secs(5))
+            .expect("the command should ask for a position");
+        session.send_keys(&position.to_string());
+        session.send_keys("\r");
+        wait_for_file(&canvas, "Alpha at the requested sibling position", |raw| {
+            let Ok(doc) = meshfox_core::mdcanvas::parse(raw) else {
+                return false;
+            };
+            doc.children("root")
+                .get(position - 1)
+                .map(|n| n.id.as_str())
+                == Some("alpha")
+                && doc.node("nested").and_then(|n| n.parent.as_deref()) == Some("alpha")
+        });
+        session
+            .wait_for(
+                &format!("moved to position {position}"),
+                Duration::from_secs(5),
+            )
+            .expect("the TUI should finish reloading before the next command");
+    }
+
+    let before = std::fs::read_to_string(&canvas).unwrap();
+    for invalid in ["0", "13", "abc"] {
+        open_palette(&mut session, "move position");
+        session
+            .wait_for("Sibling position (1-based):", Duration::from_secs(5))
+            .unwrap();
+        session.send_keys(invalid);
+        session.send_keys("\r");
+        session
+            .wait_for(
+                "enter a sibling position from 1 to 12",
+                Duration::from_secs(5),
+            )
+            .expect("invalid positions should report the allowed range");
+        assert_eq!(std::fs::read_to_string(&canvas).unwrap(), before);
+    }
+}
+
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
 fn change_id_rewrites_the_nodes_id() {
     let (mut session, canvas) = spawn_two();
     session.send_keys("j");
