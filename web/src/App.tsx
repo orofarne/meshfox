@@ -1588,6 +1588,13 @@ export default function App() {
               // (for example while resolving artifact inputs). The error
               // terminates that step even though no process exit code exists.
               if (activeStep) {
+                const failedStep = activeStep;
+                setNodes((nds) => nds.map((n) => {
+                  if (n.id !== failedStep.nodeId) return n;
+                  const prev = n.data.liveBlocks[failedStep.block] ?? { status: "running" as const, text: "" };
+                  const next = appendOutputLine(prev, { stream: "stderr", text: event.message });
+                  return { ...n, data: { ...n.data, liveBlocks: { ...n.data.liveBlocks, [failedStep.block]: next } } };
+                }));
                 patchLiveBlock(activeStep.nodeId, activeStep.block, {
                   status: "done",
                   exitCode: undefined,

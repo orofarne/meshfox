@@ -21,11 +21,11 @@ function block(page: Page, nodeId: string, blockName: string): Locator {
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
-  await page.waitForSelector(".mesh-node");
-  await clickFitViewAndWait(page);
+  await expect(block(page, "root", "long-task")).toBeVisible();
+  if (await page.locator(".mesh-node").count()) await clickFitViewAndWait(page);
 });
 
-test("a preparation error after step-start clears the running indicator", async ({ page }) => {
+test("a preparation error after step-start displays the error and clears the running indicator", async ({ page }) => {
   await page.routeWebSocket(/\/api\/run\?/, ws => {
     ws.send(JSON.stringify({ type: "started", runId: "preparation-error" }));
     ws.send(JSON.stringify({ type: "step-start", nodeId: "root", block: "long-task" }));
@@ -35,7 +35,8 @@ test("a preparation error after step-start clears the running indicator", async 
   });
   const task = block(page, "root", "long-task");
   await task.getByRole("button", { name: "run long-task" }).click();
-  await expect(page.getByText("Cannot resolve artifact inputs", { exact: true })).toBeVisible();
+  await expect(task.locator(".mesh-code-output")).toContainText("Cannot resolve artifact inputs");
+  await expect(task.locator(".mesh-code-output-head")).toContainText("failed to run");
   await expect(task.locator('[data-exit="fail"]')).toBeVisible();
   await expect(task.getByRole("button", { name: "run long-task" })).toBeEnabled();
   await expect(task.getByRole("button", { name: "running long-task…" })).toHaveCount(0);
@@ -55,8 +56,8 @@ test("reloading mid-run keeps the already-printed output and resumes the live ta
   await expect(output).not.toContainText("line 6");
 
   await page.reload();
-  await page.waitForSelector(".mesh-node");
-  await clickFitViewAndWait(page);
+  await expect(block(page, "root", "long-task")).toBeVisible();
+  if (await page.locator(".mesh-node").count()) await clickFitViewAndWait(page);
 
   const taskAfterReload = block(page, "root", "long-task");
   const outputAfterReload = taskAfterReload.locator(".mesh-code-output");

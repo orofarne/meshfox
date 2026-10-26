@@ -29,7 +29,7 @@ case "${MESHFOX_BLOCK_LANG:-text}" in
   *) echo "@python_venv: expected a text or toml block, got ${MESHFOX_BLOCK_LANG}" >&2; exit 2 ;;
 esac
 
-venv_dir="${MESHFOX_VENV_DIR:-.venv}"
+venv_dir="${MESHFOX_VENV_DIR:-.venv${MESHFOX_ENVIRONMENT_NAME:+/.named/$MESHFOX_ENVIRONMENT_NAME}}"
 mkdir -p "$venv_dir"
 venv_dir="$(cd "$venv_dir" && pwd)"
 [[ -x "$venv_dir/bin/python3" ]] || python3 -m venv "$venv_dir"
@@ -49,5 +49,5 @@ exec "$venv_dir/bin/python3" "\$@"
 LAUNCHER
 chmod +x "$launcher.$$"
 mv -f "$launcher.$$" "$launcher"
-echo "PYTHON=$launcher" >> "$MESHFOX_VARS_OUT"
+echo "${MESHFOX_ENVIRONMENT_VAR:-PYTHON}=$launcher" >> "$MESHFOX_VARS_OUT"
 echo "venv ready: $launcher"

@@ -50,9 +50,53 @@ fn lookup(name: &str) -> Option<&'static Builtin> {
     BUILTINS.iter().find(|b| b.name == name)
 }
 
-/// If `spec` names a builtin (`@name`, exactly — no arguments; a builtin's
-/// own knobs come from config, not from text in the fence's own
-/// `interpreter=` attribute), materializes its script to a stable on-disk
+/// Parse the optional, deliberately small environment-builtin option surface.
+fn environment_options(spec: &str) -> io::Result<(String, Option<String>, Option<String>)> {
+    let words = shlex::split(spec).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid builtin interpreter quoting",
+        )
+    })?;
+    let mut words = words.into_iter();
+    let base = words.next().unwrap_or_default();
+    let mut name = None;
+    let mut var = None;
+    for word in words {
+        let (slot, value, variable) = match word.split_once('=') {
+            Some(("name", value)) => (&mut name, value, false),
+            Some(("var", value)) => (&mut var, value, true),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "builtin options must be name=NAME or var=VARIABLE",
+                ))
+            }
+        };
+        if base != "@python_venv" && base != "@node_env" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only environment builtins accept name= and var=",
+            ));
+        }
+        let valid = !value.is_empty()
+            && value.bytes().enumerate().all(|(i, c)| {
+                c.is_ascii_alphabetic()
+                    || c == b'_'
+                    || (i > 0 && (c.is_ascii_digit() || (!variable && c == b'-')))
+            });
+        if !valid || slot.replace(value.to_string()).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid or duplicate builtin option: {word}"),
+            ));
+        }
+    }
+    Ok((base, name, var))
+}
+
+/// If `spec` names a builtin (environment builtins also accept `name=`
+/// and `var=` options), materializes its script to a stable on-disk
 /// path (a no-op if already there from an earlier call with the same
 /// binary) and returns that path — ready to be handed to
 /// `crate::exec::split_interpreter` as an ordinary `interpreter=` value,
@@ -62,6 +106,13 @@ fn lookup(name: &str) -> Option<&'static Builtin> {
 /// an error, not a silent pass-through (there's no real program named
 /// `@whatever` it could otherwise fall back to trying).
 pub fn resolve_builtin_spec(spec: &str) -> io::Result<Option<String>> {
+    if !shlex::split(spec)
+        .and_then(|words| words.into_iter().next())
+        .is_some_and(|word| word.starts_with('@'))
+    {
+        return Ok(None);
+    }
+    let (spec, _, _) = environment_options(spec)?;
     if spec == "@service" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -119,12 +170,13 @@ pub fn resolve_with_env(
     let Some(interpreter_path) = resolve_builtin_spec(spec)? else {
         return Ok(None);
     };
+    let (spec, environment_name, output_var) = environment_options(spec)?;
     let mut envs = Vec::new();
     let config = crate::config::load(cwd.unwrap_or_else(|| Path::new(".")));
     envs.extend(crate::config::flatten_to_env(&config));
     // The two environment builtins: both get the fence kind, and — when the
     // canvas's own path is known — a directory keyed by that path.
-    let environment = match spec {
+    let environment = match spec.as_str() {
         "@python_venv" => Some(("MESHFOX_VENV_DIR", "venv")),
         "@node_env" => Some(("MESHFOX_NODE_DIR", "node")),
         _ => None,
@@ -136,9 +188,22 @@ pub fn resolve_with_env(
         if let Some(canvas_path) = canvas_path {
             envs.push((
                 dir_var.to_string(),
-                canvas_state_dir(canvas_path, suffix).display().to_string(),
+                {
+                    let base = canvas_state_dir(canvas_path, suffix);
+                    environment_name
+                        .as_deref()
+                        .map_or_else(|| base.clone(), |name| base.join(".named").join(name))
+                }
+                .display()
+                .to_string(),
             ));
         }
+    }
+    if let Some(name) = environment_name {
+        envs.push(("MESHFOX_ENVIRONMENT_NAME".to_string(), name.to_string()));
+    }
+    if let Some(var) = output_var {
+        envs.push(("MESHFOX_ENVIRONMENT_VAR".to_string(), var.to_string()));
     }
     envs.push(("MESHFOX_ENV_NAMES".to_string(), env_names.join(",")));
     Ok(Some((interpreter_path, envs)))
@@ -210,6 +275,9 @@ pub fn read_only_temp_root(absolute: &Path) -> PathBuf {
 /// for a caller that wants to check without also materializing a script to
 /// disk (e.g. deciding whether to bother loading config at all).
 pub fn is_builtin(spec: &str) -> bool {
+    let Ok((spec, _, _)) = environment_options(spec) else {
+        return false;
+    };
     spec == "@service"
         || spec
             .strip_prefix('@')
@@ -282,6 +350,7 @@ fn materialize_in(name: &str, script: &str, dir: &Path) -> io::Result<PathBuf> {
 /// Execution identity of a builtin, excluding unrelated machine settings.
 /// Pure counterpart used by tests without reading the developer's config.
 pub fn execution_identity(spec: &str, config: &toml::Table) -> Option<String> {
+    let (spec, _, _) = environment_options(spec).ok()?;
     let builtin = lookup(spec.strip_prefix('@')?)?;
     let mut hash = blake3::Hasher::new();
     hash.update(builtin.script.as_bytes());
@@ -316,6 +385,50 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_environments_are_isolated_and_validate_options() {
+        let canvas = std::env::temp_dir().join("named-environments.canvas.md");
+        for (builtin, directory, suffix) in [
+            ("@python_venv", "MESHFOX_VENV_DIR", "venv"),
+            ("@node_env", "MESHFOX_NODE_DIR", "node"),
+        ] {
+            let spec = format!("{builtin} name=xls var=XLS_RUNTIME");
+            let spec = crate::exec::resolve_interpreter(&spec, &Default::default());
+            assert!(is_builtin(&spec));
+            assert!(execution_identity(&spec, &toml::Table::new()).is_some());
+            let (_, env) = resolve_with_env(&spec, Some("text"), None, Some(&canvas), &[])
+                .unwrap()
+                .unwrap();
+            let env: std::collections::HashMap<_, _> = env.into_iter().collect();
+            assert_eq!(
+                env[directory],
+                canvas_state_dir(&canvas, suffix)
+                    .join(".named")
+                    .join("xls")
+                    .display()
+                    .to_string()
+            );
+            assert_eq!(env["MESHFOX_ENVIRONMENT_VAR"], "XLS_RUNTIME");
+            let (_, plain) = resolve_with_env(builtin, None, None, Some(&canvas), &[])
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                plain.iter().find(|(key, _)| key == directory).unwrap().1,
+                env[directory]
+            );
+        }
+        for spec in [
+            "@python_venv name=../oops",
+            "@python_venv var=X-Y",
+            "@python_venv name=",
+            "@python_venv name=a name=b",
+            "@python_venv unknown=x",
+            "@agent name=x",
+        ] {
+            assert!(resolve_builtin_spec(spec).is_err(), "{spec}");
+        }
+    }
 
     #[test]
     fn resolve_builtin_spec_is_none_for_a_non_builtin_spec() {
@@ -709,6 +822,20 @@ mod tests {
             std::fs::metadata(&launcher).unwrap().permissions().mode() & 0o111 != 0,
             "launcher is executable"
         );
+        let renamed = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(&requirements)
+            .env("MESHFOX_BLOCK_LANG", "text")
+            .env("MESHFOX_VENV_DIR", dir.join("venv"))
+            .env("MESHFOX_ENVIRONMENT_VAR", "XLS_PYTHON")
+            .env("MESHFOX_VARS_OUT", &vars)
+            .env("PIP_CALLS", &calls)
+            .output()
+            .unwrap();
+        assert!(renamed.status.success());
+        assert!(std::fs::read_to_string(&vars)
+            .unwrap()
+            .contains(&format!("XLS_PYTHON={}\n", launcher.display())));
         // The launcher puts the caller's cwd on PYTHONPATH and runs the venv python.
         let probe = dir.join("probe");
         std::fs::create_dir_all(&probe).unwrap();

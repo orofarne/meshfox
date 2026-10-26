@@ -34,7 +34,7 @@ esac
 command -v npm >/dev/null || { echo "@node_env: npm is not installed" >&2; exit 1; }
 command -v node >/dev/null || { echo "@node_env: node is not installed" >&2; exit 1; }
 
-node_dir="${MESHFOX_NODE_DIR:-.node-env}"
+node_dir="${MESHFOX_NODE_DIR:-.node-env${MESHFOX_ENVIRONMENT_NAME:+/.named/$MESHFOX_ENVIRONMENT_NAME}}"
 mkdir -p "$node_dir"
 node_dir="$(cd "$node_dir" && pwd)"
 
@@ -109,5 +109,5 @@ for f in hooks.mjs register.mjs anchor.mjs node; do
   mv -f "$node_dir/$f.$$" "$node_dir/$f"
 done
 
-echo "NODE=$node_dir/node" >> "$MESHFOX_VARS_OUT"
+echo "${MESHFOX_ENVIRONMENT_VAR:-NODE}=$node_dir/node" >> "$MESHFOX_VARS_OUT"
 echo "node env ready: $node_dir/node"

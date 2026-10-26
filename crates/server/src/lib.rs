@@ -8356,6 +8356,7 @@ async fn run_block_impl_sized(
             ) {
                 Ok(p) => p,
                 Err(e) => {
+                    final_exit_code = 1;
                     if let Some(id) = held_locks.remove(&(addr.node_id.clone(), addr.block_name.clone())) {
                         let _ = state.run_ledger.finish(id, run_ledger::FinishOutcome::Killed);
                     }

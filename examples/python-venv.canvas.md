@@ -127,3 +127,42 @@ Python: `/Users/orofarne/sources/meshfox/examples/.meshfox/python-venv.canvas.md
 
 <!-- /meshfox:output -->
 
+## An independent XLS environment
+<!-- meshfox:node id="an-independent-xls-environment" -->
+
+The default environment above exports `PYTHON`. A second setup can install
+spreadsheet dependencies independently, without changing that variable or
+adding packages to the default environment. `name=xls` selects
+`.meshfox/python-venv.canvas.md.venv/.named/xls/`; `var=XLS_PYTHON` selects
+the output key. Both options are optional and independent: changing only
+`var=` still uses the default environment. Reusing the same `name=` shares
+an environment between setup blocks.
+
+<!-- meshfox:var name="XLS_PYTHON" from="xls-setup" -->
+
+```text name="xls-setup" interpreter="@python_venv name=xls var=XLS_PYTHON" cache
+python-calamine
+```
+
+This consumer automatically runs `xls-setup` through the computed variable.
+It imports the XLS reader and prints its separate environment path; no
+spreadsheet fixture is needed. To read a real workbook, use
+`CalamineWorkbook.from_path("report.xls")`.
+
+```python name="xls-demo" interpreter="$XLS_PYTHON -u" cache
+import sys
+from pathlib import Path
+
+from python_calamine import CalamineWorkbook
+
+assert Path(sys.prefix).name == "xls"
+assert Path(sys.prefix).parent.name == ".named"
+print(f"XLS environment: {sys.prefix}")
+print(f"Reader ready: {CalamineWorkbook.__name__}")
+```
+
+The original consumers keep using `interpreter="$PYTHON -u"`. The two
+interpreters now point to distinct environments with separate installed
+packages. `@node_env` supports the same `name=` and `var=` options, with
+`NODE` as the default output key.
+

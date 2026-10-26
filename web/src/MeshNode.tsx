@@ -2214,7 +2214,7 @@ function LiveRunOutput({
       <>started</>
     ) : (
       <>
-        output · exit {live.exitCode}
+        {live.exitCode === undefined ? "output · failed to run" : `output · exit ${live.exitCode}`}
         {duration}
       </>
     );

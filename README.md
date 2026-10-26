@@ -770,6 +770,29 @@ shell script of your own to keep in sync. `PYTHON` points at a small launcher,
 directory added to `PYTHONPATH` — so a block can `import` a module that sits
 next to its canvas without a `sys.path.insert(0, os.getcwd())` of its own.
 
+For independent environments in the same canvas, set `name=` and `var=`
+inside the interpreter specification. Both are optional: `name=` selects a
+subdirectory of the canvas's usual venv, and `var=` changes the exported
+variable name (default `PYTHON`). The same name shares an environment;
+different names isolate installed packages. For example:
+
+````markdown
+<!-- meshfox:var name="XLS_PYTHON" from="xls-setup" -->
+
+```text name="xls-setup" interpreter="@python_venv name=xls var=XLS_PYTHON" cache
+python-calamine
+```
+
+```python name="read-xls" interpreter="$XLS_PYTHON -u"
+from python_calamine import CalamineWorkbook
+```
+````
+
+Names must start with an ASCII letter or underscore, followed by ASCII
+letters, digits, underscores or hyphens. Output variable names follow the
+same rules without hyphens. `@node_env` accepts the same options, with
+`NODE` as its default output variable.
+
 Node has the same shape: [examples/node-env.canvas.md](./examples/node-env.canvas.md)
 uses `interpreter="@node_env"` — a `text` fence of npm packages (or a `json`
 fence holding a `package.json`) is installed into a canvas-local

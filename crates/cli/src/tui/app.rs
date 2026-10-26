@@ -5919,6 +5919,21 @@ impl App {
                 touched = Some(addr);
             }
             RunEvent::Error { message } => {
+                run.lines.push(format!("meshfox: {message}"));
+                if let Some(addr) = run.chain.last() {
+                    if let Some(output) = self
+                        .step_output
+                        .get_mut(addr)
+                        .filter(|output| output.running)
+                    {
+                        output.running = false;
+                        output.exit_code = -1;
+                        output.duration_ms = run.step_started.elapsed().as_millis() as u64;
+                        output.text.push_str(&format!("{message}\n"));
+                        output.stderr.push_str(&format!("{message}\n"));
+                        touched = Some(addr.clone());
+                    }
+                }
                 run.had_failure = true;
                 run.finished = true;
                 run.http_rx = None;
@@ -8695,6 +8710,42 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn preparation_error_settles_live_output_and_displays_message() {
+        use crate::worker_client::RunEvent;
+        let mut app =
+            app_with_blocks("preparation-error", "```sh name=build\necho build\n```\n").await;
+        app.run = Some(RunState {
+            chain: Vec::new(),
+            idx: 0,
+            http_rx: None,
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        app.on_run_event(Some(RunEvent::StepStart {
+            node_id: "root".into(),
+            block: "build".into(),
+        }))
+        .await;
+        app.on_run_event(Some(RunEvent::Error {
+            message: "unknown builtin interpreter".into(),
+        }))
+        .await;
+        let output = &app.step_output[&BlockAddr::new("root", "build")];
+        assert!(!output.running);
+        assert_ne!(output.exit_code, 0);
+        assert!(output.stderr.contains("unknown builtin interpreter"));
+        assert!(document_text(&app).contains("unknown builtin interpreter"));
+        assert!(app.run.as_ref().unwrap().finished);
     }
 
     #[tokio::test]

@@ -2032,6 +2032,25 @@ Attributes:
   never cached, defaulted, or prompted for. `type`/`choices` still apply,
   validated against whatever the source block actually produced.
 
+### Named environment builtins
+
+`@python_venv` and `@node_env` accept optional whitespace-separated
+`name=NAME` and `var=VARIABLE` options inside `interpreter=` (each at most
+once), for example `interpreter="@python_venv name=xls var=XLS_PYTHON"`.
+`name` selects `.named/NAME` under the usual canvas-local environment directory;
+without it the existing directory is used. With no canvas path the fallback
+is `.venv/.named/NAME` or `.node-env/.named/NAME`. This also applies to read-only temporary
+environments. Names match `[A-Za-z_][A-Za-z0-9_-]*`; paths are not accepted.
+`var` selects the key written to `MESHFOX_VARS_OUT`, defaulting to `PYTHON`
+or `NODE`, and matches `[A-Za-z_][A-Za-z0-9_]*`. Declare a matching computed
+`meshfox:var from=` to consume that output. The two options are independent;
+changing `var` alone does not isolate packages. Unknown, duplicate or invalid
+options fail resolution before launching the script. Other builtins accept
+no options. The resolver passes the selected directory through
+`MESHFOX_VENV_DIR` / `MESHFOX_NODE_DIR` and the output key through
+`MESHFOX_ENVIRONMENT_VAR`; normal computed-variable dependency planning
+and interpreter substitution apply.
+
 ### Consumption (`env=`)
 
 A `meshfox:var` declaration on its own does nothing to any block — it's
