@@ -6675,7 +6675,7 @@ async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response
 
 /// Who is asking `open_node_file` to open something — decides *where* the
 /// target gets opened. Required on every call (no default): a client that
-/// forgot to say would silently get the old "ask this worker's coordinator"
+/// forgot to say would silently get the "ask this worker's coordinator"
 /// behavior, which is exactly wrong for a client the coordinator can't
 /// reach (a VS Code tab served by an external coordinator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -6690,9 +6690,6 @@ enum OpenContext {
     /// A VS Code webview: this worker opens nothing itself, the extension
     /// does, from the returned action.
     Vscode,
-    /// The pre-`context` behavior: this worker asks its own coordinator
-    /// (`Open`/`OpenFile`) to do everything, entirely its decision.
-    Delegate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6729,7 +6726,7 @@ enum OpenAction {
 /// the editor the click came from). `web` on a canvas target gets the
 /// target worker's port (`GetPort`: get-or-spawn, no browser tab opened by
 /// the coordinator) for the page to open in a new tab of its own browser;
-/// `web` on a plain file, and `delegate` on anything, hand the target to
+/// `web` on a plain file hands the target to
 /// this worker's coordinator (`watcher_protocol::request_open`/
 /// `request_open_file`: get-or-spawn-and-show for a canvas, "open however
 /// this coordinator opens plain files" for anything else — the OS's
@@ -16748,7 +16745,7 @@ mod run_file_tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
         );
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, body) = post(addr, "/api/nodes/root/open?context=delegate").await;
+        let (status, body) = post(addr, "/api/nodes/root/open?context=web").await;
         assert_eq!(status, 422);
         assert!(body.contains("not a file node"), "unexpected body: {body}");
         let _ = std::fs::remove_file(&canvas_path);
@@ -16760,7 +16757,7 @@ mod run_file_tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
         );
         let addr = spawn_test_server(canvas_path.clone()).await;
-        let (status, _) = post(addr, "/api/nodes/nope/open?context=delegate").await;
+        let (status, _) = post(addr, "/api/nodes/nope/open?context=web").await;
         assert_eq!(status, 404);
         let _ = std::fs::remove_file(&canvas_path);
     }
@@ -16840,10 +16837,10 @@ mod run_file_tests {
     }
 
     #[tokio::test]
-    async fn open_node_file_web_and_delegate_need_a_watcher() {
+    async fn open_node_file_web_and_tui_need_a_watcher() {
         let (dir, canvas_path) = open_fixture("./other.canvas.md");
         let addr = spawn_test_server(canvas_path).await;
-        for context in ["web", "delegate", "tui"] {
+        for context in ["web", "tui"] {
             let (status, _) = post(addr, &format!("/api/nodes/f/open?context={context}")).await;
             assert_eq!(status, 503, "context={context}");
         }
@@ -16926,21 +16923,6 @@ mod run_file_tests {
         assert_eq!(json["fragment"], "o");
         let request: serde_json::Value = serde_json::from_str(&coordinator.await.unwrap()).unwrap();
         assert_eq!(request["op"], "get_port");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn open_node_file_delegate_hands_a_plain_file_to_the_coordinator() {
-        let (dir, canvas_path) = open_fixture("./note.txt");
-        let socket = short_socket_path();
-        let coordinator = fake_coordinator(&socket, "{}\n");
-        let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
-        let (status, body) = post(addr, "/api/nodes/f/open?context=delegate").await;
-        assert_eq!(status, 200, "unexpected body: {body}");
-        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["action"], "done");
-        let request: serde_json::Value = serde_json::from_str(&coordinator.await.unwrap()).unwrap();
-        assert_eq!(request["op"], "open_file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

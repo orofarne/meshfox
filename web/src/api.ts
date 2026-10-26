@@ -1159,7 +1159,7 @@ type OpenAction =
  *   and a plain file goes to the OS's default application via the server's
  *   coordinator (`done`: nothing left to do here).
  * Rejects (thrown error) for a non-file node, a node with no target, a
- * target outside the canvas directory, (web/delegate) no coordinator to ask
+ * target outside the canvas directory, (web) no coordinator to ask
  * at all, or a popup blocker refusing the new tab.
  */
 export async function openNodeFile(nodeId: string): Promise<void> {
