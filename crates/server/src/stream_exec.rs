@@ -212,6 +212,32 @@ fn spawn_bash_command(mut command: Command) -> io::Result<SpawnedProcess> {
 /// `interpreter target` (see `meshfox_core::Node::is_runnable_file`),
 /// where `target` is a plain path string that has no business being
 /// interpreted by a shell.
+/// Starts `argv` in the background for "open this file": no terminal, not
+/// waited for by the caller, in its own process group. Runs with the same
+/// environment a block gets (`process_env::prepare`, so `[[env]]` in the
+/// config applies), from `cwd`. Refused on a `--no-exec` core.
+pub fn spawn_detached(argv: &[String], cwd: &Path) -> io::Result<()> {
+    meshfox_core::capabilities::require_exec()?;
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    apply_run_env(
+        &mut command,
+        meshfox_core::process_env::prepare(Some(cwd), [] as [(&str, &str); 0], &[]),
+    );
+    let mut child = command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    // Reaped, so a long-lived worker doesn't collect zombies.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(())
+}
+
 pub fn spawn_process<I, S>(program: &str, args: I, cwd: Option<&Path>) -> io::Result<SpawnedProcess>
 where
     I: IntoIterator<Item = S>,

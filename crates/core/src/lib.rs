@@ -32,6 +32,7 @@ pub mod locate;
 mod markdown_fragment;
 pub mod mdcanvas;
 pub mod merge;
+pub mod open_rules;
 pub mod options;
 pub mod output;
 pub mod process_env;

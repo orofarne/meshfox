@@ -709,6 +709,11 @@ pub struct App {
     worker_refresh_inflight: bool,
     pub pending_child_canvas: Option<PendingChildCanvas>,
     pub pending_external_editor: Option<PendingExternalEditor>,
+    /// A `[tui.open]` command waiting for the event loop to hand it the
+    /// terminal.
+    pub pending_open_tty: Option<super::open_file::PendingTty>,
+    /// Where `.meshfox/config.toml` is looked up from for this canvas.
+    canvas_root: PathBuf,
     /// `[tui] editor` in `.meshfox/config.toml`: when set, `e` edits the
     /// source in that program instead of the built-in editor.
     pub external_editor: Option<String>,
@@ -1287,6 +1292,8 @@ impl App {
             worker_refresh_inflight: false,
             pending_child_canvas: None,
             pending_external_editor: None,
+            pending_open_tty: None,
+            canvas_root: syntax_root.clone(),
             external_editor,
             block_picker: None,
             var_form: None,
@@ -4155,6 +4162,9 @@ impl App {
         };
         match crate::worker_client::open_node_file(port, &node_id).await {
             Ok(crate::worker_client::OpenAction::Done) => self.status = "opened".into(),
+            Ok(crate::worker_client::OpenAction::OpenFile { path }) => {
+                self.open_plain_file(&path).await
+            }
             Ok(crate::worker_client::OpenAction::OpenCanvas {
                 path,
                 fragment,
@@ -4167,6 +4177,52 @@ impl App {
                 });
             }
             Err(e) => self.status = format!("failed to open: {e}"),
+        }
+    }
+
+    /// Opens a plain file the way `[tui.open]` says (see
+    /// `meshfox_core::open_rules`), defaulting to the OS application. A
+    /// core started with `--no-exec` never starts a configured command: the
+    /// file goes to the OS application as if nothing were configured.
+    async fn open_plain_file(&mut self, path: &Path) {
+        use meshfox_core::open_rules::{Action, Client, Mode};
+        let action = match meshfox_core::open_rules::for_file(&self.canvas_root, Client::Tui, path)
+        {
+            Ok(action) => action,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let action = match action {
+            Action::Exec { .. } if self.no_exec => {
+                self.status =
+                    "--no-exec: ignoring the [tui.open] command, using the system default".into();
+                Action::System
+            }
+            action => action,
+        };
+        match action {
+            Action::System => {
+                if let Err(e) = super::open_file::open_with_system(path).await {
+                    self.status = format!("failed to open: {e}");
+                } else if !self.status.starts_with("--no-exec") {
+                    self.status = "opened".into();
+                }
+            }
+            Action::Exec {
+                argv,
+                mode: Mode::Tty,
+            } => self.pending_open_tty = Some(super::open_file::PendingTty { argv }),
+            Action::Exec {
+                argv,
+                mode: Mode::Detach,
+            } => {
+                self.status = match super::open_file::spawn_detached(&argv) {
+                    Ok(()) => format!("opened with {}", argv[0]),
+                    Err(e) => format!("couldn't run {}: {e}", argv[0]),
+                };
+            }
         }
     }
 

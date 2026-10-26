@@ -40,11 +40,31 @@ pub fn load(canvas_root: &Path) -> toml::Table {
 /// used to, and would spuriously fail on a developer's own machine that
 /// has one — see that test's own doc comment).
 fn load_from(global_path: Option<&Path>, canvas_root: &Path) -> toml::Table {
-    let mut merged = global_path.map(read_table).unwrap_or_default();
-    for path in ancestor_config_paths(canvas_root, global_path) {
-        deep_merge(&mut merged, read_table(&path));
+    let mut merged = toml::Table::new();
+    for layer in layers_from(global_path, canvas_root) {
+        deep_merge(&mut merged, layer);
     }
     merged
+}
+
+/// The configuration files `load` merges, one table each, farthest first
+/// (global, then every ancestor down to the canvas directory). For a
+/// setting whose entries must be compared across files instead of merged
+/// key by key (`crate::open_rules`).
+pub fn load_layers(canvas_root: &Path) -> Vec<toml::Table> {
+    layers_from(global_config_path().as_deref(), canvas_root)
+}
+
+fn layers_from(global_path: Option<&Path>, canvas_root: &Path) -> Vec<toml::Table> {
+    global_path
+        .map(read_table)
+        .into_iter()
+        .chain(
+            ancestor_config_paths(canvas_root, global_path)
+                .iter()
+                .map(|path| read_table(path)),
+        )
+        .collect()
 }
 
 /// Parent configurations, from filesystem root to the canvas directory.

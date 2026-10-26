@@ -6726,7 +6726,8 @@ enum OpenAction {
 /// the editor the click came from). `web` on a canvas target gets the
 /// target worker's port (`GetPort`: get-or-spawn, no browser tab opened by
 /// the coordinator) for the page to open in a new tab of its own browser;
-/// `web` on a plain file hands the target to
+/// `tui` on a plain file gets [`OpenAction::OpenFile`] too, and runs
+/// whatever its own `[tui.open]` configuration says; `web` on a plain file hands the target to
 /// this worker's coordinator (`watcher_protocol::request_open`/
 /// `request_open_file`: get-or-spawn-and-show for a canvas, "open however
 /// this coordinator opens plain files" for anything else — the OS's
@@ -6773,6 +6774,37 @@ async fn open_node_file(
         } else {
             OpenAction::OpenFile { path }
         }));
+    }
+
+    // The terminal client opens plain files itself: which program to run
+    // comes from its own configuration, so the worker only vouches for the
+    // path.
+    if query.context == OpenContext::Tui && !is_canvas {
+        return Ok(Json(OpenAction::OpenFile { path }));
+    }
+
+    // The web has no client of its own to run anything, so this worker runs a
+    // configured `[web.open]` command; no match (or a `--no-exec` core) falls
+    // through to the coordinator's OS default.
+    if query.context == OpenContext::Web && !is_canvas && !state.no_exec {
+        let root = canvas_root_dir(&state.canvas_path);
+        match meshfox_core::open_rules::for_file(
+            root,
+            meshfox_core::open_rules::Client::Web,
+            &resolved,
+        ) {
+            Err(e) => return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, e)),
+            Ok(meshfox_core::open_rules::Action::Exec { argv, .. }) => {
+                stream_exec::spawn_detached(&argv, root).map_err(|e| {
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("couldn't run {}: {e}", argv[0]),
+                    )
+                })?;
+                return Ok(Json(OpenAction::Done));
+            }
+            Ok(meshfox_core::open_rules::Action::System) => {}
+        }
     }
 
     let socket = state.watcher_socket.as_deref().ok_or_else(|| {
@@ -16927,12 +16959,85 @@ mod run_file_tests {
     }
 
     #[tokio::test]
-    async fn open_node_file_tui_hands_a_plain_file_to_the_coordinator() {
+    async fn open_node_file_tui_gets_a_plain_file_back_to_open_itself() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        // No watcher at all: nothing here is the coordinator's business.
+        let addr = spawn_test_server(canvas_path).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=tui").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "open_file");
+        assert!(json["path"].as_str().unwrap().ends_with("note.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[web.open]` for a throwaway extension, running a script that records
+    /// how it was started in `dir/ran.log`.
+    fn configure_web_open(dir: &std::path::Path, value: &str) {
+        std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+        std::fs::write(
+            dir.join(".meshfox/config.toml"),
+            format!("[web.open]\nmfxtest = {value}\n"),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_node_file_web_runs_a_configured_command_without_a_coordinator() {
+        let (dir, canvas_path) = open_fixture("./note.mfxtest");
+        std::fs::write(dir.join("note.mfxtest"), "x").unwrap();
+        let log = dir.join("ran.log");
+        configure_web_open(
+            &dir,
+            &format!(
+                "\"sh -c 'echo \\\"$0 $PWD\\\" > \\\"{0}\\\"' {{file}}\"",
+                log.display()
+            ),
+        );
+        // No watcher: a configured command is this worker's own business.
+        let addr = spawn_test_server(canvas_path).await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=web").await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "done");
+        for _ in 0..100 {
+            if log.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ran = std::fs::read_to_string(&log).unwrap();
+        // Compared by tail: macOS reaches the temp dir as `/var` and `/private/var`.
+        let (file, cwd) = ran.trim().split_once(' ').unwrap();
+        let dir_name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(file.ends_with(&format!("{dir_name}/note.mfxtest")), "{ran}");
+        assert!(cwd.ends_with(dir_name), "{ran}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_web_reports_a_bad_rule_and_a_missing_program() {
+        let (dir, canvas_path) = open_fixture("./note.mfxtest");
+        std::fs::write(dir.join("note.mfxtest"), "x").unwrap();
+        let addr = spawn_test_server(canvas_path).await;
+        configure_web_open(&dir, "false");
+        let (status, body) = post(addr, "/api/nodes/f/open?context=web").await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("disabled"), "{body}");
+        configure_web_open(&dir, "\"meshfox-no-such-program\"");
+        let (status, body) = post(addr, "/api/nodes/f/open?context=web").await;
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("meshfox-no-such-program"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_web_hands_a_plain_file_to_the_coordinator() {
         let (dir, canvas_path) = open_fixture("./note.txt");
         let socket = short_socket_path();
         let coordinator = fake_coordinator(&socket, "{}\n");
         let addr = spawn_test_server_with_watcher(canvas_path, socket).await;
-        let (status, body) = post(addr, "/api/nodes/f/open?context=tui").await;
+        let (status, body) = post(addr, "/api/nodes/f/open?context=web").await;
         assert_eq!(status, 200, "unexpected body: {body}");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["action"], "done");

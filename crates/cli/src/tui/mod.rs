@@ -17,6 +17,7 @@ mod external_editor;
 mod image_metrics;
 mod image_render;
 mod markdown;
+mod open_file;
 mod palette;
 mod path_picker;
 mod search;
@@ -510,6 +511,13 @@ async fn main_loop(
             continue;
         }
 
+        if let Some(pending) = app.pending_open_tty.take() {
+            app.status =
+                hand_terminal_over(terminal, input_paused, open_file::run_tty(pending.argv))
+                    .await?;
+            continue;
+        }
+
         if let Some(pending) = app.pending_external_editor.take() {
             let outcome =
                 run_external_editor_handoff(terminal, input_paused, pending.request).await?;
@@ -646,6 +654,17 @@ async fn run_external_editor_handoff(
     input_paused: &Arc<AtomicBool>,
     request: external_editor::Request,
 ) -> io::Result<external_editor::Outcome> {
+    hand_terminal_over(terminal, input_paused, external_editor::run(request)).await
+}
+
+/// Leaves raw mode and the alternate screen for the duration of `program`,
+/// which owns the terminal meanwhile, then takes everything back. The common
+/// part of the editor and `[tui.open]` handoffs.
+async fn hand_terminal_over<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    input_paused: &Arc<AtomicBool>,
+    program: impl std::future::Future<Output = T>,
+) -> io::Result<T> {
     input_paused.store(true, Ordering::Release);
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -655,7 +674,7 @@ async fn run_external_editor_handoff(
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
-    let outcome = external_editor::run(request).await;
+    let outcome = program.await;
 
     enable_raw_mode()?;
     #[cfg(unix)]

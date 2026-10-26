@@ -9,6 +9,7 @@
 //! The scratch file is always named `*.canvas.md`, whatever the edited file
 //! is called, so editors recognise it and apply the meshfox syntax.
 
+use meshfox_core::open_rules::split_words;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -179,69 +180,6 @@ fn build_argv(template: &str, file: &Path, line: usize, col: usize) -> Result<Ve
     Ok(argv)
 }
 
-/// Splits on whitespace with shell-style quoting: `'…'` is literal, `"…"`
-/// honours `\"` and `\\`, and a backslash outside quotes escapes the next
-/// character. No expansion of any kind.
-fn split_words(s: &str) -> Result<Vec<String>, String> {
-    let mut words = Vec::new();
-    let mut cur = String::new();
-    let mut in_word = false;
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            c if c.is_whitespace() => {
-                if in_word {
-                    words.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
-            '\'' => {
-                in_word = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(c) => cur.push(c),
-                        None => return Err("unterminated ' quote".into()),
-                    }
-                }
-            }
-            '"' => {
-                in_word = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(c @ ('"' | '\\')) => cur.push(c),
-                            Some(c) => {
-                                cur.push('\\');
-                                cur.push(c);
-                            }
-                            None => return Err("unterminated \" quote".into()),
-                        },
-                        Some(c) => cur.push(c),
-                        None => return Err("unterminated \" quote".into()),
-                    }
-                }
-            }
-            '\\' => {
-                in_word = true;
-                match chars.next() {
-                    Some(c) => cur.push(c),
-                    None => return Err("trailing backslash".into()),
-                }
-            }
-            c => {
-                in_word = true;
-                cur.push(c);
-            }
-        }
-    }
-    if in_word {
-        words.push(cur);
-    }
-    Ok(words)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,14 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn quoting_follows_the_shell_without_expanding_anything() {
-        assert_eq!(
-            split_words(r#"a "b \"c\" $HOME" 'd e' f\ g ''"#).unwrap(),
-            ["a", "b \"c\" $HOME", "d e", "f g", ""]
-        );
-        assert!(split_words("a 'b").is_err());
-        assert!(split_words("a \"b").is_err());
-        assert!(split_words("a\\").is_err());
+    fn an_empty_template_is_rejected() {
         assert!(build_argv("  ", Path::new("f"), 1, 1).is_err());
     }
 

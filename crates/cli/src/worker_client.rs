@@ -1009,6 +1009,10 @@ pub async fn get_node_file_content(port: u16, node_id: &str) -> Result<(String, 
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum OpenAction {
     Done,
+    /// A plain file for the TUI to open itself (`[tui.open]`).
+    OpenFile {
+        path: std::path::PathBuf,
+    },
     OpenCanvas {
         path: std::path::PathBuf,
         fragment: Option<String>,

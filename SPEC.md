@@ -252,12 +252,19 @@ an optional `#node-id` fragment deep-linking to a node in it.
 
 WebUI and TUI open file nodes through `POST /api/nodes/:id/open` with
 `context=web` or `context=tui`. The worker resolves the target and checks
-file access and existence; clients display API failures. Plain files open
-through the coordinator. For canvas targets the coordinator gets or starts
+file access and existence; clients display API failures. For a plain file
+the TUI gets `open_file` with the checked path and opens it itself, as
+`[tui.open]` / `[open]` in `.meshfox/config.toml` say (an extension/glob key
+list per command, trailing `&` to detach, `system` for the OS default; most
+specific entry wins) and ignoring those commands on a `--no-exec` core. For
+the WebUI the worker itself starts a matching `[web.open]` / `[open]` command
+in the background (same environment as a block; a bad rule is a 422, a program
+that cannot start a 500); with no match, or on a `--no-exec` core, the plain
+file opens through the coordinator. For canvas targets the coordinator gets or starts
 the target worker, and the API returns its port and optional node fragment.
 WebUI opens a browser tab; TUI enters a nested API client and returns to the
 parent canvas on `q`, without reading the target or spawning another TUI.
-Opening requires a coordinator; an unavailable coordinator is an API error.
+Opening a canvas, or a plain file without a configured command from the WebUI, requires a coordinator; an unavailable coordinator is an API error.
 
 ## Includes
 
