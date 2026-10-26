@@ -764,6 +764,18 @@ pub fn closure_fingerprint_with(
 pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
     crate::artifacts::validate(canvas)?;
     let decls = crate::vars::declared_vars(canvas)?;
+    // A `meshfox:var from=` is an implicit dependency edge too: a dangling
+    // one (e.g. left behind by a rename) must not pass validation.
+    for decl in &decls {
+        if let Some(from) = &decl.from {
+            if let Some(node_id) = &from.node_id {
+                find_block(
+                    canvas,
+                    &BlockAddr::new(node_id.clone(), from.block_name.clone()),
+                )?;
+            }
+        }
+    }
     for node in &canvas.nodes {
         for block in crate::fence::scan_render_blocks(&node.text) {
             if let Some(error) = block.error {

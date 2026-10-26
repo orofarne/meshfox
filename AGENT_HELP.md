@@ -32,7 +32,7 @@ Map your intent to a subcommand instead:
 - Move a node to a new parent → `meshfox node mv <id> <new-parent-id>`
 - Rename a node's heading text → `meshfox node rename <id> <title>`
 - Change a node's stable id (updates every reference: `parent=`, `meshfox:edge
-  from=`, best-effort `deps=`) → `meshfox node set-id <id> <new-id>`
+  from=`, best-effort `deps=` and `meshfox:var from=`) → `meshfox node set-id <id> <new-id>`
 - Replace a node's body → `meshfox node body <id> --base-rev <rev> --file
   <path>` (or pipe to stdin; `--file -` is stdin too). `--base-rev` is required: the `body-rev:` line
   `meshfox node show <id>` prints. If the body changed since you read it

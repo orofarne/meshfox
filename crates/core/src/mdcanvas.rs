@@ -1572,7 +1572,8 @@ pub enum RenameIdError {
 /// present once a subtree is past CommonMark's level-6 heading ceiling —
 /// see `insert_child_node`) and `meshfox:edge from="old_id"` line that
 /// reference it. Also best-effort rewrites `deps="old_id/..."` fence
-/// references anywhere in the document (`rewrite_deps_node_id`) — those
+/// references anywhere in the document (`rewrite_deps_node_id`), plus
+/// `meshfox:var from="old_id/..."` (`vars::rewrite_from_node_id`) — those
 /// aren't structurally validated by `parse` (see `crate::deps`), so this
 /// step can't itself fail; a reference that was already stale before the
 /// rename stays stale, surfaced separately by `deps::validate`/`meshfox
@@ -1650,6 +1651,7 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
     }
 
     result = rewrite_deps_node_id(&result, old_id, new_id);
+    result = crate::vars::rewrite_from_node_id(&result, old_id, new_id);
 
     Ok(result)
 }
@@ -5591,6 +5593,22 @@ Reused from Tests as well.
         let updated = rename_node_id(&doc, &n6, "n6-renamed").unwrap();
         let c = parse(&updated).unwrap();
         assert_eq!(c.node(&n7).unwrap().parent.as_deref(), Some("n6-renamed"));
+    }
+
+    #[test]
+    fn rename_node_id_sweeps_var_from_references() {
+        let doc = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"TODAY\" from=\"date-node/today\" -->\n",
+            "<!-- meshfox:var name=\"BARE\" from=\"today\" -->\n\n",
+            "```text\n<!-- meshfox:var name=\"X\" from=\"date-node/today\" -->\n```\n\n",
+            "## Date\n<!-- meshfox:node id=\"date-node\" -->\n\n",
+            "```bash name=\"today\"\necho x\n```\n",
+        );
+        let updated = rename_node_id(doc, "date-node", "today-node").unwrap();
+        assert!(updated.contains(r#"name="TODAY" from="today-node/today""#));
+        assert!(updated.contains(r#"name="BARE" from="today""#));
+        assert!(updated.contains(r#"name="X" from="date-node/today""#));
     }
 
     #[test]

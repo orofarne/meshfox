@@ -49,3 +49,4 @@ memory.canvas.md
 # `examples/tables.canvas.md`'s own generated demo data (a million rows) —
 # made by its `generate`/`to-parquet` blocks, never committed.
 examples/tables-data/events.*
+/.wrangler
