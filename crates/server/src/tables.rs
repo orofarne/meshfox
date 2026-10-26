@@ -563,6 +563,9 @@ impl DuckProc {
         loop {
             match self.stdout.next_line().await {
                 Ok(Some(line)) if line == end_row => break,
+                // In jsonlines mode DuckDB prints a blank line for an empty
+                // result set. It is not a row (JSON strings escape newlines).
+                Ok(Some(line)) if line.trim().is_empty() => continue,
                 Ok(Some(line)) => out.push(line),
                 Ok(None) => return Err(self.died("duckdb exited unexpectedly".into()).await),
                 Err(e) => return Err(self.died(format!("read from duckdb failed: {e}")).await),
@@ -1610,6 +1613,17 @@ mod tests {
         let page = s.rows(searched, 0, 100).await.unwrap();
         assert_eq!(page.matched_rows, Some(1));
         assert_eq!(page.rows[0][1].as_deref(), Some("multi\nline"));
+
+        // An unsuccessful search emits a blank line from the DuckDB CLI.
+        let no_matches = ViewSpec {
+            search: Some("no-such-item".into()),
+            ..Default::default()
+        };
+        let page = s.rows(no_matches, 0, 100).await.unwrap();
+        assert_eq!(page.matched_rows, Some(0));
+        assert!(page.rows.is_empty());
+        let page = s.rows(ViewSpec::default(), 501, 10).await.unwrap();
+        assert!(page.rows.is_empty());
 
         // A value the column can't hold is the client's error, not a crash,
         // and the session keeps working afterwards.
