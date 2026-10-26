@@ -18,6 +18,35 @@ Install on Linux/macOS in one line:
 curl -fsSL https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/install.sh | sh
 ```
 
+Or install the Meshfox CLI on macOS or Linux with Homebrew (Apple Silicon/ARM64
+and Intel/x86-64):
+
+```sh
+brew install orofarne/tap/meshfox
+```
+
+Update a Homebrew installation with:
+
+```sh
+brew update
+brew upgrade orofarne/tap/meshfox
+```
+
+Use Homebrew to update this installation rather than `meshfox check-updates`.
+The formula installs the CLI, including its terminal and web interfaces.
+
+Package maintainers can disable self-updating without rebuilding the binary:
+install a marker at `<prefix>/share/meshfox/install-method` alongside
+`<prefix>/bin/meshfox`. Its contents may be `homebrew`, `deb`, or `pacman` for
+an update hint. `meshfox check-updates` (including `--yes`) then reports that
+the installation is managed by a package manager and exits without contacting
+GitHub or replacing the executable. Empty, unknown, or unreadable markers also
+disable self-updating. The prefix comes from the executable's actual path after
+resolving symlinks; no global marker directories are searched. A standalone
+installation without a marker keeps its normal self-update behavior. Include
+the marker in the package so it is installed and removed together with the
+binary; do not include it in the standalone release archive.
+
 <!-- meshfox:var name="INSTALL_PATH" prompt="Install prefix?" default="/usr/local/bin" -->
 
 [VS Code extension](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode)

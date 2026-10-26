@@ -41,6 +41,7 @@ mod stats_cmd;
 mod syntax_registry;
 mod terminal_status;
 mod tui;
+mod update_policy;
 mod watcher;
 mod worker_client;
 
@@ -705,6 +706,8 @@ enum Command {
     /// than this binary and, if one exists, offer to download and install
     /// it in place (replacing the running executable). A CLI bundled in
     /// Meshfox.app is updated with the whole app via Meshfox.pkg instead.
+    /// Package-managed installations must be updated through their package
+    /// manager; --yes does not override this restriction.
     /// A no-op if this
     /// build wasn't made from a release tag (e.g. a local/dev build) —
     /// there's no version to compare against a release with, so it just
@@ -1871,10 +1874,20 @@ fn main() {
 /// release, so that's what distinguishes the two here rather than trying
 /// to parse `commit ...` as a non-version and fall through.
 fn check_updates(yes: bool) {
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox check-updates: cannot locate the running executable: {e}");
+            std::process::exit(1);
+        });
+    if let Some(message) = update_policy::package_manager_message(&exe) {
+        println!("{message}");
+        return;
+    }
     // A package-managed macOS app must be updated as a whole. Replacing just
     // its embedded CLI would either fail on /Applications permissions or
     // invalidate the bundle's code signature.
-    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
+    {
         let macos_dir = exe.parent();
         let contents_dir = macos_dir.and_then(Path::parent);
         let app_dir = contents_dir.and_then(Path::parent);
