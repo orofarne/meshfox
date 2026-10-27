@@ -982,6 +982,25 @@ sessions use for their persistent memory, outside the chat window itself.
 
 [examples/second-brain.canvas.md](./examples/second-brain.canvas.md)
 
+### Summarizing a chat as a canvas (Claude skill)
+<!-- meshfox:node id="summarizing-a-chat-as-a-canvas" -->
+
+A skill for regular Claude (claude.ai / desktop — not Claude Code): ask it
+to "summarize this conversation as a meshfox canvas" and it answers with a
+ready `.canvas.md` file — decisions, open questions, risks and action items
+as small nodes, with edges for cross-links. Download
+[`summary-to-canvas.zip`](https://github.com/orofarne/meshfox/releases/latest/download/summary-to-canvas.zip)
+from the latest release and upload it under *Settings → Capabilities →
+Skills*, then check what it wrote with `meshfox validate <file>` and open it
+with `meshfox view <file>`. The zip is built from
+[skills/summary-to-canvas](./skills/summary-to-canvas/) by the release
+workflow; that folder's own README has the build block and install steps.
+
+#### Example
+<!-- meshfox:node id="example-summary-to-canvas" type="file" -->
+
+[skills/summary-to-canvas/README.canvas.md](./skills/summary-to-canvas/README.canvas.md)
+
 ### Navigating between canvases
 <!-- meshfox:node id="navigating-between-canvases" -->
 

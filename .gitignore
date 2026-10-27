@@ -50,3 +50,5 @@ memory.canvas.md
 # made by its `generate`/`to-parquet` blocks, never committed.
 examples/tables-data/events.*
 /.wrangler
+# Built skill archives (see skills/*/README.canvas.md) — regenerated, never committed.
+/skills/*.zip

@@ -81,14 +81,30 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: dist
 
+      - name: Package Claude skills
+        run: |
+          set -euo pipefail
+          # Same layout as the "Build the zip" block in
+          # skills/summary-to-canvas/README.canvas.md: claude.ai wants the
+          # skill folder at the archive's top level.
+          cd skills
+          zip -X ../summary-to-canvas.zip \
+            summary-to-canvas/SKILL.md \
+            summary-to-canvas/example.canvas.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: dist/*/*.tar.gz
+          files: |
+            dist/*/*.tar.gz
+            summary-to-canvas.zip
           draft: false
           generate_release_notes: true
