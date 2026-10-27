@@ -1,0 +1,5 @@
+# Not served by `meshfox serve --http` (see "Serving canvases over HTTP" in README.md):
+# build output and dependencies. Walking them through a Docker bind mount takes
+# tens of seconds.
+target/
+node_modules/

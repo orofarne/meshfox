@@ -5,7 +5,8 @@
 //! - `hash` is 8 base32 characters (40 bits of blake3) of the canvas path
 //!   *relative to the served root*, so the same canvas keeps its slug wherever
 //!   the root is mounted;
-//! - `prefix` is the file name without `.canvas.md`, squeezed to `[a-z0-9-]`.
+//! - `prefix` is the file name without `.canvas.md` (or `.md`: a `README.md`
+//!   can be a canvas), squeezed to `[a-z0-9-]`.
 //!   It is derived from the same path, so it carries no information of its
 //!   own: a URL whose prefix disagrees with the hash is a typo or tampering,
 //!   and [`verify`] rejects it.
@@ -89,7 +90,10 @@ pub fn verify(rel: &Path, segment: &str) -> bool {
 }
 
 fn prefix_of(file_name: &str) -> String {
-    let stem = file_name.strip_suffix(CANVAS_SUFFIX).unwrap_or(file_name);
+    let stem = file_name
+        .strip_suffix(CANVAS_SUFFIX)
+        .or_else(|| file_name.strip_suffix(".md"))
+        .unwrap_or(file_name);
     let mut out = String::new();
     let mut pending_dash = false;
     for c in stem.chars().flat_map(char::to_lowercase) {
@@ -189,6 +193,14 @@ mod tests {
         // Cutting must not leave a dangling dash.
         let cut = format!("{}-b.canvas.md", "a".repeat(PREFIX_MAX - 1));
         assert_eq!(prefix_of(&cut), "a".repeat(PREFIX_MAX - 1));
+    }
+
+    #[test]
+    fn a_plain_md_name_loses_its_extension_too() {
+        assert_eq!(prefix_of("README.md"), "readme");
+        assert_eq!(prefix_of("my notes.md"), "my-notes");
+        // Only one extension goes: the canvas one wins when both would fit.
+        assert_eq!(prefix_of("a.canvas.md"), "a");
     }
 
     #[test]

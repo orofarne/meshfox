@@ -78,6 +78,10 @@ document.querySelectorAll('li.row').forEach(li=>{li.hidden=q&&!li.dataset.path.i
 document.querySelectorAll('details').forEach(d=>{d.hidden=q&&!d.querySelector('li.row:not([hidden])');if(q)d.open=true});});}";
 
 fn page(title: &str, body: &str, script: &str) -> String {
+    page_with_head(title, "", body, script)
+}
+
+fn page_with_head(title: &str, head: &str, body: &str, script: &str) -> String {
     let script = if script.is_empty() {
         String::new()
     } else {
@@ -86,14 +90,15 @@ fn page(title: &str, body: &str, script: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{}</title><style>{STYLE}</style></head><body><main>{body}</main>{script}</body></html>",
+         {head}<title>{}</title><style>{STYLE}</style></head><body><main>{body}</main>{script}</body></html>",
         esc(title)
     )
 }
 
 fn row_html(row: &Row, label: &str) -> String {
     let mut out = format!(
-        "<li class=\"row\" data-path=\"{}\"><a href=\"{}\">{}</a>",
+        // A new tab: the index stays where it is, ready for the next canvas.
+        "<li class=\"row\" data-path=\"{}\"><a href=\"{}\" target=\"_blank\" rel=\"noopener\">{}</a>",
         esc(&row.path.to_lowercase()),
         esc(&row.url()),
         esc(label)
@@ -144,9 +149,24 @@ fn dir_html(dir: &Dir<'_>, out: &mut String) {
     }
 }
 
+/// Where the index is in its life: the first scan of a big tree can take a
+/// while, and a root that cannot be read is not the same as an empty one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexStatus {
+    /// The first scan has not finished: there is nothing to list yet.
+    pub building: bool,
+    /// Why the root could not be scanned.
+    pub error: Option<String>,
+}
+
 /// The index page. `rows` must be sorted by path; at most [`MAX_LISTED`] are
 /// shown. `more` is true when the scan itself stopped early.
+#[cfg(test)]
 pub fn index_html(rows: &[Row], more: bool) -> String {
+    index_html_with(rows, more, &IndexStatus::default())
+}
+
+pub fn index_html_with(rows: &[Row], more: bool, status: &IndexStatus) -> String {
     let shown = &rows[..rows.len().min(MAX_LISTED)];
     let cut = rows.len() > MAX_LISTED || more;
     let mut body = String::from("<h1>meshfox</h1>");
@@ -162,9 +182,20 @@ pub fn index_html(rows: &[Row], more: bool) -> String {
         body.push_str("</ul>");
     }
     body.push_str("<h2>Canvases</h2>");
-    if shown.is_empty() {
+    if let Some(error) = &status.error {
+        let _ = write!(
+            body,
+            "<p class=\"err\">Cannot read the served root: {}</p>",
+            esc(error)
+        );
+    } else if status.building {
         body.push_str(
-            "<p class=\"dim\">No <code>.canvas.md</code> files under the served root.</p>",
+            "<p class=\"note\">Scanning the served root for canvases. This page reloads by itself.</p>",
+        );
+    } else if shown.is_empty() {
+        body.push_str(
+            "<p class=\"dim\">No canvases under the served root: a <code>*.canvas.md</code> file, or a \
+             <code>.md</code> file whose first line is <code>&lt;!-- meshfox:canvas --&gt;</code>.</p>",
         );
     } else {
         dir_html(&build_tree(shown), &mut body);
@@ -176,13 +207,25 @@ pub fn index_html(rows: &[Row], more: bool) -> String {
             shown.len()
         );
     }
-    page("meshfox", &body, FILTER_SCRIPT)
+    let refresh = if status.building && status.error.is_none() {
+        "<meta http-equiv=\"refresh\" content=\"2\">"
+    } else {
+        ""
+    };
+    page_with_head("meshfox", refresh, &body, FILTER_SCRIPT)
 }
 
 /// Machine-readable twin of the index page (`GET /_/index.json`).
+#[cfg(test)]
 pub fn index_json(rows: &[Row], truncated: bool) -> serde_json::Value {
+    index_json_with(rows, truncated, &IndexStatus::default())
+}
+
+pub fn index_json_with(rows: &[Row], truncated: bool, status: &IndexStatus) -> serde_json::Value {
     serde_json::json!({
         "truncated": truncated,
+        "indexing": status.building,
+        "error": status.error,
         "canvases": rows.iter().map(|r| serde_json::json!({
             "path": r.path,
             "slug": r.slug,
@@ -238,7 +281,7 @@ mod tests {
     fn shows_names_with_extension_and_relative_links() {
         let html = index_html(&[row("notes/todo.canvas.md", false)], false);
         assert!(html.contains(">todo.canvas.md</a>"));
-        assert!(html.contains("href=\"c/x-20/\""));
+        assert!(html.contains("href=\"c/x-20/\" target=\"_blank\" rel=\"noopener\""));
         assert!(html.contains("<summary>notes/</summary>"));
         assert!(!html.contains("href=\"/"));
     }
@@ -259,7 +302,8 @@ mod tests {
     #[test]
     fn empty_root_says_so_and_has_no_running_block() {
         let html = index_html(&[], false);
-        assert!(html.contains("No <code>.canvas.md</code> files"));
+        assert!(html.contains("No canvases under the served root"));
+        assert!(html.contains("<code>*.canvas.md</code>"));
         assert!(!html.contains("<h2>Running</h2>"));
     }
 
@@ -272,6 +316,37 @@ mod tests {
         assert_eq!(html.matches("class=\"row\"").count(), MAX_LISTED);
         assert!(html.contains(&format!("Showing the first {MAX_LISTED} canvases")));
         assert!(index_html(&rows[..2], true).contains("there are more"));
+    }
+
+    #[test]
+    fn a_first_scan_still_running_says_so_and_reloads_by_itself() {
+        let status = IndexStatus {
+            building: true,
+            error: None,
+        };
+        let html = index_html_with(&[], false, &status);
+        assert!(html.contains("Scanning the served root"));
+        assert!(html.contains("http-equiv=\"refresh\""));
+        // Not the "nothing here" message: that would be a lie while scanning.
+        assert!(!html.contains("No canvases under the served root"));
+        // Once built, no reload.
+        assert!(!index_html(&[], false).contains("http-equiv"));
+        assert_eq!(index_json_with(&[], false, &status)["indexing"], true);
+    }
+
+    #[test]
+    fn an_unreadable_root_is_an_error_not_an_empty_list() {
+        let status = IndexStatus {
+            building: false,
+            error: Some("Permission denied (os error 13)".to_string()),
+        };
+        let html = index_html_with(&[], false, &status);
+        assert!(html.contains("Cannot read the served root: Permission denied"));
+        assert!(!html.contains("http-equiv"));
+        assert_eq!(
+            index_json_with(&[], false, &status)["error"],
+            "Permission denied (os error 13)"
+        );
     }
 
     #[test]

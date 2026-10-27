@@ -18,6 +18,8 @@ File input/output tracking adds direct uses of `blake3` (CC0-1.0 OR Apache-2.0 O
 
 Slug generation for `meshfox serve --http` (`crates/core/src/slug.rs`) adds a direct use of `unicode-normalization` (MIT OR Apache-2.0) to put paths in NFC before hashing. It was already in Cargo.lock (transitively), so the shipped tree and the license scan do not change.
 
+The `.meshfoxignore` files of `meshfox serve --http` (`crates/core/src/canvas_index.rs`) add a direct use of `ignore` (Unlicense OR MIT, the `.gitignore` matcher from ripgrep). It was already in Cargo.lock (transitively) at the same version, so the shipped tree and the license scan do not change.
+
 `meshfox serve --http` (`crates/cli/src/gateway.rs`) also makes `axum`, `blake3` and `serde_urlencoded` direct dependencies of `crates/cli`. All three were already direct or transitive dependencies of the shipped binary at the same versions (`meshfox-server` uses `axum` with the `ws` feature; `reqwest` pulls `serde_urlencoded`), so the compiled tree and the license scan do not change.
 
 It grew by exactly 1 more once `meshfox-core` gained a line-based three-way merge (`crates/core/src/merge.rs`, used to combine two concurrent edits of one node body or file instead of rejecting the later one) — `similar` (Apache-2.0, `default-features` untouched, so only its `text` line-diff module) computes the base→mine and base→theirs line diffs; the `diff3` grouping on top of them is this repo's own code. `similar` has no dependencies of its own — it was the only new `Cargo.lock` package the change added (checked via `git diff Cargo.lock`), permissive, no new copyleft exception.
@@ -53,6 +55,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | edtui | MIT |
 | futures-util | MIT OR Apache-2.0 |
 | globset | Unlicense OR MIT |
+| ignore | Unlicense OR MIT |
 | headless_chrome | MIT |
 | image | MIT OR Apache-2.0 |
 | libc | MIT OR Apache-2.0 |

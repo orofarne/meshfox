@@ -6,7 +6,10 @@ import { problems, slugOf } from "./helpers";
 // that could leave the prefix — assets, lazy Shiki and Monaco chunks, the
 // watch socket, runs, links between canvases, files, the path picker.
 
-test("the index lists the canvases with their extension and opens one under its slug", async ({ page }) => {
+test("the index lists the canvases with their extension and opens one under its slug in a new tab", async ({
+  page,
+  context,
+}) => {
   const bad = problems(page);
   await page.goto("/");
   const link = page.getByRole("link", { name: "main.canvas.md" }).first();
@@ -15,12 +18,25 @@ test("the index lists the canvases with their extension and opens one under its 
   await expect(page.locator("a", { hasText: "other.canvas.md" })).toHaveCount(1);
   await page.getByText("sub/", { exact: true }).click();
   await expect(page.getByRole("link", { name: "other.canvas.md" })).toBeVisible();
+  // A plain .md whose first line is the marker is a canvas, as everywhere else.
+  await expect(page.getByRole("link", { name: "marked.md" }).first()).toBeVisible();
   // Relative links: the page works behind any outer prefix.
   expect(await link.getAttribute("href")).toMatch(/^c\/main-[a-z2-7]{8}\/$/);
 
-  await link.click();
-  await expect(page).toHaveURL(/\/c\/main-[a-z2-7]{8}\/$/);
-  await page.waitForSelector(".mesh-node");
+  // The index stays where it is; the canvas opens in a tab of its own.
+  const [tab] = await Promise.all([context.waitForEvent("page"), link.click()]);
+  await expect(tab).toHaveURL(/\/c\/main-[a-z2-7]{8}\/$/);
+  await tab.waitForSelector(".mesh-node");
+  await expect(page).toHaveURL(/\/$/);
+  expect(bad).toEqual([]);
+});
+
+test("a plain .md canvas opens like any other", async ({ page }) => {
+  const bad = problems(page);
+  const slug = await slugOf(page, "marked.md");
+  expect(slug).toMatch(/^marked-[a-z2-7]{8}$/);
+  await page.goto(`/c/${slug}/`);
+  await expect(page.getByText("opens with the marker is a canvas too")).toBeVisible();
   expect(bad).toEqual([]);
 });
 

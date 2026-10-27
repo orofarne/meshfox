@@ -664,3 +664,165 @@ async fn the_session_cookie_is_secure_only_when_a_trusted_proxy_says_https() {
         );
     }
 }
+
+// ---- a scan that takes forever must not take the gateway with it --------
+
+/// Stands in for a walk of a huge tree on a slow mount: blocks until released.
+struct Stuck {
+    released: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Stuck {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
+#[tokio::test]
+async fn a_scan_that_never_finishes_does_not_block_the_index_the_pings_or_other_canvases() {
+    use meshfox_core::canvas_index::{CanvasIndex, IndexCache, Lookup, ScanOptions};
+
+    ensure_crypto();
+    let root = temp_root("stuck");
+    let worker_port = start_worker(Arc::new(AtomicBool::new(false))).await;
+    let stuck = Arc::new(Stuck {
+        released: Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
+    let scanner = {
+        let (stuck, root) = (Arc::clone(&stuck), root.clone());
+        Box::new(move || {
+            let mut released = stuck.released.lock().unwrap();
+            while !*released {
+                released = stuck.cv.wait(released).unwrap();
+            }
+            CanvasIndex::scan(&root, &ScanOptions::default())
+        })
+    };
+    let index = IndexCache::with_scanner(
+        scanner,
+        Duration::ZERO,
+        Duration::from_secs(3600),
+        Duration::from_millis(300),
+    );
+    let gateway = Gateway::with_index(
+        GatewayConfig {
+            root: root.clone(),
+            token: None,
+            allowed_hosts: vec![],
+            loopback: true,
+            trust_proxy: false,
+        },
+        Arc::new(Fake {
+            port: worker_port,
+            seen: Mutex::new(Vec::new()),
+            running: vec![],
+        }),
+        Arc::clone(&index),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = gateway.router();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let slug =
+        meshfox_core::slug::slug_for_rel(std::path::Path::new("notes/todo.canvas.md")).unwrap();
+
+    // While the first scan is stuck: everything that does not need the index
+    // answers, the index page says it is scanning, and a canvas is a quick
+    // 503, not a hang.
+    let started = Instant::now();
+    assert_eq!(
+        client
+            .get(format!("{base}/_/ping"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let page = client.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    let page = page.text().await.unwrap();
+    assert!(
+        page.contains("Scanning the served root") && page.contains("http-equiv"),
+        "{page}"
+    );
+    let json: serde_json::Value = client
+        .get(format!("{base}/_/index.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(json["indexing"], true);
+    assert_eq!(json["canvases"].as_array().unwrap().len(), 0);
+    let canvas = client
+        .get(format!("{base}/c/{slug}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(canvas.status(), 503);
+    assert_eq!(canvas.headers()["retry-after"], "2");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // Many viewers at once share the one scan that is running.
+    let views: Vec<_> = (0..30)
+        .map(|_| {
+            let (client, url) = (client.clone(), format!("{base}/"));
+            tokio::spawn(async move { client.get(url).send().await.unwrap().status() })
+        })
+        .collect();
+    for view in views {
+        assert_eq!(view.await.unwrap(), 200);
+    }
+    assert_eq!(index.scans_started(), 1, "one scan, however many requests");
+
+    // Released: the index fills in and the canvas opens.
+    stuck.release();
+    let mut listed = false;
+    for _ in 0..100 {
+        let json: serde_json::Value = client
+            .get(format!("{base}/_/index.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if json["indexing"] == false && json["canvases"].as_array().unwrap().len() == 1 {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(listed, "the index never filled in");
+    let open = client
+        .get(format!("{base}/c/{slug}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open.status(), 200);
+    assert_eq!(open.text().await.unwrap(), "worker-root");
+    assert!(matches!(index.resolve(&slug), Lookup::Found(_)));
+}

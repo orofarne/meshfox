@@ -35,12 +35,21 @@ brew upgrade orofarne/tap/meshfox
 Use Homebrew to update this installation rather than `meshfox check-updates`.
 The formula installs the CLI, including its terminal and web interfaces.
 
-Or run it in Docker (`linux/amd64` and `linux/arm64`, no install; see "Docker
-image" below for the options):
+Or run it in Docker (`linux/amd64` and `linux/arm64`, nothing to install; see
+"Docker image" below for the options). There are two images. **`slim`** (the
+default) is meshfox with `bash`, `git` and DuckDB (for tables):
 
 ```sh
-docker run -d --user "$(id -u):$(id -g)" -p 127.0.0.1:4590:4590 \
+docker run --user "$(id -u):$(id -g)" -p 127.0.0.1:4590:4590 \
   -e MESHFOX_TOKEN=change-me -v "$PWD":/work ghcr.io/orofarne/meshfox
+```
+
+**`full`** adds Python 3, Node.js and Chromium (for blocks in those languages
+and for `meshfox pdf`):
+
+```sh
+docker run --user "$(id -u):$(id -g)" -p 127.0.0.1:4590:4590 \
+  -e MESHFOX_TOKEN=change-me -v "$PWD":/work ghcr.io/orofarne/meshfox:full
 ```
 
 Package maintainers can disable self-updating without rebuilding the binary:
@@ -461,7 +470,18 @@ The menu-bar app is macOS only. On Linux, `meshfox serve` is the same coordinato
 meshfox serve --socket /run/meshfox.sock --http 0.0.0.0:4590 --root /work
 ```
 
-- `/` is an index of the `*.canvas.md` files under `--root` (default: the current directory; names starting with `.` are skipped, symlinks are not followed), with the running ones on top and a filter box. `/_/index.json` is the same list as JSON.
+- `/` is an index of the canvases under `--root` (default: the current directory): every `*.canvas.md`, and every other `*.md` whose first line is the `<!-- meshfox:canvas -->` marker (a project's `README.md` can be one). The running canvases are on top, with a filter box. `/_/index.json` is the same list as JSON.
+- **What is left out.** Names starting with `.` (so `.git`, `.venv`, `.meshfox`) and symlinks, and whatever a **`.meshfoxignore`** says. Nothing else is skipped by name: `target` or `node_modules` may be exactly what you serve. The file has `.gitignore` syntax (`#` comments, `dir/`, `*.log`, `/only-at-the-top`, `**`, `!bring-back`), can sit in any directory, applies to that directory and everything below it, and a deeper file overrides a shallower one:
+
+  ```gitignore
+  # <root>/.meshfoxignore
+  node_modules/
+  target/
+  build/
+  /drafts/
+  ```
+
+- **Why it matters.** Walking a tree costs a system call per entry, and through a Docker bind mount on macOS each one is about ten times dearer than on the host (about 1.3 s for the 48 000 entries of a `node_modules`, about 30 s for the 340 000 of a Rust `target`). The tree is therefore scanned in the background, one scan at a time and for at most a minute, breadth first so shallow canvases come first: a huge directory can only make the list late or partial, never hang the gateway. The page says "Scanning…" and reloads itself until the first scan is done; a canvas opened meanwhile gets `503` with `Retry-After`. A scan that takes over 5 seconds, or is cut short, prints a hint on stderr naming the `.meshfoxignore` to write.
 - Each canvas lives at `/c/<slug>/`, started on the first request and stopped by the usual auto-exit when its last tab closes. The slug is `<file name>-<8 characters>`, e.g. `todo-k7m2q5xa`: the characters are a hash of the path **relative to `--root`**, so it is stable across restarts and across mount points. Only the hash is looked up; the readable part must match too, so a mistyped address is a 404 rather than somebody else's canvas. `/c/<slug>` without the slash redirects to the canonical address.
 - Everything the page loads is relative to its own address, so the gateway also works behind a reverse proxy that mounts it under a path prefix, as long as WebSocket upgrades pass through.
 
@@ -485,12 +505,20 @@ Not covered yet: `meshfox tui`, `run` and the MCP server still reach a coordinat
 `ghcr.io/orofarne/meshfox` runs `meshfox serve --http` (see "Serving canvases over HTTP") on Debian 13, for `linux/amd64` and `linux/arm64`. Mount the directory with your canvases at `/work`:
 
 ```sh
-docker run -d --name meshfox --user "$(id -u):$(id -g)" \
+docker run --name meshfox --user "$(id -u):$(id -g)" \
   -p 127.0.0.1:4590:4590 -e MESHFOX_TOKEN=change-me \
   -v "$PWD":/work ghcr.io/orofarne/meshfox
 ```
 
-Open `http://localhost:4590/` and sign in with the token. Without `MESHFOX_TOKEN` the container generates one and prints it once (`docker logs meshfox`). Publish the port on `127.0.0.1` unless you mean to expose it, and read the security notes above first: the token is a shell on the container.
+or, with Python, Node.js and Chromium in the image:
+
+```sh
+docker run --name meshfox --user "$(id -u):$(id -g)" \
+  -p 127.0.0.1:4590:4590 -e MESHFOX_TOKEN=change-me \
+  -v "$PWD":/work ghcr.io/orofarne/meshfox:full
+```
+
+Open `http://localhost:4590/` and sign in with the token. Without `MESHFOX_TOKEN` the container generates one and prints it once, in the output above (or in `docker logs meshfox` if you run it detached with `-d`). Publish the port on `127.0.0.1` unless you mean to expose it, and read the security notes above first: the token is a shell on the container.
 
 - **Tags.** `slim` (the default: `latest`, `X.Y.Z`, `X.Y`, `slim`) is meshfox, `bash`, `git`, `curl`, DuckDB (for `display="table"`) and `tini`. `full` (`X.Y.Z-full`, `X.Y-full`, `full`) adds Python 3 with `venv` and `pip`, Node.js with `npm`, and Chromium (for `meshfox pdf`; its sandbox is off in the image, the container is the boundary: `MESHFOX_CHROME_NO_SANDBOX=1`). A pre-release gets only its exact tags.
 - **User.** `--user "$(id -u):$(id -g)"` makes blocks write files as you. Without it the container runs as uid 1000. Nothing in the image is world-writable: the home directory (`/tmp/meshfox-home`, which holds `~/.meshfox` — config, plaintext secrets, session state) and the coordinator's socket (`/tmp/meshfox/`) are created at start by whichever uid runs it, so mount a volume at `/tmp/meshfox-home` if that state should outlive the container.

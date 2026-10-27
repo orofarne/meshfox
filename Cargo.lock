@@ -3476,6 +3476,7 @@ dependencies = [
  "blake3",
  "csv",
  "globset",
+ "ignore",
  "libc",
  "pulldown-cmark",
  "rusqlite",

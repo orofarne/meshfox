@@ -170,6 +170,26 @@ fn generate_token() -> String {
     )
 }
 
+/// A scan this slow gets a hint on stderr.
+const SLOW_SCAN: Duration = Duration::from_secs(5);
+
+fn slow_scan_hint(root: &Path, report: &meshfox_core::canvas_index::ScanReport) -> String {
+    let what = if report.truncated {
+        "stopped early, so some canvases are missing from the index"
+    } else {
+        "finished"
+    };
+    format!(
+        "meshfox serve: scanning {} {what} after {:.1}s ({} entries looked at); \
+         list directories you do not serve (build output, dependencies, data) in {} \
+         (`.gitignore` syntax, e.g. `node_modules/`) to make it quick",
+        root.display(),
+        report.duration.as_secs_f64(),
+        report.visited,
+        root.join(meshfox_core::canvas_index::IGNORE_FILE).display()
+    )
+}
+
 async fn start_gateway(
     options: HttpOptions,
     resolver: Arc<LocalResolver>,
@@ -203,6 +223,16 @@ async fn start_gateway(
         },
         Arc::clone(&resolver) as Arc<dyn CanvasResolver>,
     )?;
+    // A scan that takes long is the user's cue to exclude what they do not
+    // serve: say so once, with the file to write.
+    let hint_root = root.clone();
+    let hinted = std::sync::atomic::AtomicBool::new(false);
+    gateway.index().on_scan(move |report| {
+        let slow = report.duration >= SLOW_SCAN || report.truncated;
+        if slow && !hinted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("{}", slow_scan_hint(&hint_root, report));
+        }
+    });
     // Where a canvas "opened" by `meshfox view`/`cores open` is shown to the
     // user. A wildcard bind (a container) is reached as localhost through the
     // published port unless `--public-url` says otherwise.
@@ -313,6 +343,22 @@ mod tests {
 
     fn temp_socket(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("mfx-serve-{name}-{}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn the_slow_scan_hint_names_the_file_to_write_and_what_happened() {
+        use meshfox_core::canvas_index::ScanReport;
+        let report = |duration, truncated| ScanReport {
+            duration,
+            visited: 342_196,
+            truncated,
+            error: None,
+        };
+        let slow = slow_scan_hint(Path::new("/work"), &report(Duration::from_secs(31), false));
+        assert!(slow.contains("finished after 31.0s") && slow.contains("342196 entries"));
+        assert!(slow.contains("/work/.meshfoxignore") && slow.contains("node_modules/"));
+        let cut = slow_scan_hint(Path::new("/work"), &report(Duration::from_secs(60), true));
+        assert!(cut.contains("stopped early") && cut.contains("missing"));
     }
 
     #[tokio::test]

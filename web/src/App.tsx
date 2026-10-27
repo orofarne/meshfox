@@ -9,6 +9,7 @@ import {
   MarkerType,
   useNodesState,
   useEdgesState,
+  useUpdateNodeInternals,
   type Node,
   type Edge,
   type Connection,
@@ -94,6 +95,24 @@ import { getThemePreference, setThemePreference, type ThemePreference } from "./
 const NO_EXEC_MESSAGE = "This core was started with --no-exec: running blocks is disabled.";
 
 const nodeTypes = { mesh: MeshNode };
+
+/** Refresh ports together after visible nodes mount or their handles move. */
+function NodeHandleRefresh({ nodes }: Readonly<{ nodes: Node<MeshNodeData>[] }>) {
+  const updateNodeInternals = useUpdateNodeInternals();
+  // A fold can keep the same measured size but still move its ports.
+  // Include newly revealed children as well as changes on existing nodes.
+  const previous = useRef(new Map<string, string>());
+  useEffect(() => {
+    const current = new Map(nodes.map(node => [node.id, `${node.data.folded}:${node.data.level}`]));
+    const changed = nodes.filter(node => previous.current.get(node.id) !== current.get(node.id));
+    previous.current = current;
+    // One call schedules one animation frame and one store notification.
+    // A callback per mounted node can cascade synchronous React updates
+    // past its maximum depth when a large subtree appears at once.
+    if (changed.length) updateNodeInternals(changed.map(node => node.id));
+  }, [nodes, updateNodeInternals]);
+  return null;
+}
 // "extra" is a real `meshfox:edge`; "tree" is the structural (nesting)
 // edge, only ever registered under this type when it's actually deletable
 // (its target has another incoming edge to fall back on — see the
@@ -4091,6 +4110,7 @@ export default function App() {
             <Background />
             <Controls />
             <MiniMap />
+            <NodeHandleRefresh nodes={routeRenderNodes} />
           </ReactFlow>
           }
         />

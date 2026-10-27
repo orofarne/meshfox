@@ -152,6 +152,36 @@ fn the_gateway_serves_a_real_core_and_starts_a_new_one_after_it_is_killed() {
 }
 
 #[test]
+fn a_plain_md_that_opens_with_the_marker_is_listed_and_served() {
+    let dir = unique_dir();
+    write_canvas(&dir);
+    // What meshfox itself treats as a canvas: a README.md that starts with the
+    // marker. A plain notes file is not. Nothing is skipped by name: what is
+    // left out is what `.meshfoxignore` says (here `node_modules/`, anywhere).
+    std::fs::write(dir.join("README.md"), "<!-- meshfox:canvas -->\n# Readme\n").unwrap();
+    std::fs::write(dir.join("notes.md"), "# just notes\n").unwrap();
+    for pkg in ["node_modules/pkg", "target/doc"] {
+        std::fs::create_dir_all(dir.join(pkg)).unwrap();
+        std::fs::write(dir.join(pkg).join("README.md"), "<!-- meshfox:canvas -->\n").unwrap();
+    }
+    std::fs::write(dir.join(".meshfoxignore"), "# not served\nnode_modules/\n").unwrap();
+    let gw = start(&dir, "127.0.0.1:0", &[], &[]);
+
+    let (_, index) = gw.get("/_/index.json", None);
+    assert!(index.contains("\"path\":\"README.md\""), "{index}");
+    assert!(!index.contains("notes.md"), "{index}");
+    assert!(!index.contains("node_modules"), "{index}");
+    // `target` is a perfectly good directory name: not guessed at.
+    assert!(index.contains("target/doc/README.md"), "{index}");
+
+    let slug = gw.slug_of("README.md", None);
+    assert!(slug.starts_with("readme-"), "{slug}");
+    let (status, body) = gw.get(&format!("/c/{slug}/api/info"), None);
+    assert_eq!(status, 200, "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_token_from_the_environment_or_a_file_is_required() {
     let dir = unique_dir();
     write_canvas(&dir);

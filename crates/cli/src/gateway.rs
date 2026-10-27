@@ -46,14 +46,14 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use meshfox_core::canvas_index::{IndexCache, ScanOptions, DEFAULT_MIN_RESCAN};
+use meshfox_core::canvas_index::{IndexCache, Lookup, ScanOptions, DEFAULT_MIN_RESCAN};
 use meshfox_core::gateway_header::{encode_root, GATEWAY_HEADER_PREFIX, GATEWAY_ROOT_HEADER};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as TunCloseFrame;
 use tokio_tungstenite::tungstenite::Message as TunMessage;
 
-use crate::gateway_index::{self, Row};
+use crate::gateway_index::{self, IndexStatus, Row};
 
 const SESSION_COOKIE: &str = "mfx_session";
 const SESSION_CONTEXT: &str = "meshfox gateway session v1";
@@ -98,11 +98,20 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(cfg: GatewayConfig, resolver: Arc<dyn CanvasResolver>) -> io::Result<Arc<Self>> {
-        let index = Arc::new(IndexCache::new(
-            cfg.root.clone(),
-            ScanOptions::default(),
-            DEFAULT_MIN_RESCAN,
-        )?);
+        let index = IndexCache::new(cfg.root.clone(), ScanOptions::default(), DEFAULT_MIN_RESCAN);
+        Self::with_index(cfg, resolver, index)
+    }
+
+    /// [`Gateway::new`] with an index of the caller's making (tests give it a
+    /// scanner that is slow or stuck).
+    pub fn with_index(
+        cfg: GatewayConfig,
+        resolver: Arc<dyn CanvasResolver>,
+        index: Arc<IndexCache>,
+    ) -> io::Result<Arc<Self>> {
+        // The first scan runs in the background: the gateway answers at once,
+        // and a big or slow tree cannot keep it from starting.
+        index.ensure_fresh();
         // `no_proxy`: the upstream is always loopback and must never be sent
         // through an HTTP(S)_PROXY from the environment.
         let client = reqwest::Client::builder()
@@ -120,6 +129,11 @@ impl Gateway {
             failures: Mutex::new(HashMap::new()),
             session_value,
         }))
+    }
+
+    /// The canvas index (the caller may hook its scans, see `serve`).
+    pub fn index(&self) -> &Arc<IndexCache> {
+        &self.index
     }
 
     pub fn router(self: Arc<Self>) -> Router {
@@ -354,12 +368,18 @@ impl Gateway {
 
     // ---- pages ----------------------------------------------------------
 
-    async fn rows(&self) -> Option<(Vec<Row>, bool)> {
-        let index = Arc::clone(&self.index);
+    /// The index as last scanned, at once. Looking at it starts a rescan in
+    /// the background when it is getting old; it never waits for one.
+    async fn rows(&self) -> (Vec<Row>, bool, IndexStatus) {
+        self.index.ensure_fresh();
+        let snapshot = self.index.snapshot();
+        let status = IndexStatus {
+            building: !snapshot.built && snapshot.error.is_none(),
+            error: snapshot.error.clone().filter(|_| !snapshot.built),
+        };
         let root = self.cfg.root.clone();
         let running: Vec<PathBuf> = self.resolver.running();
-        tokio::task::spawn_blocking(move || {
-            let snapshot = index.current().ok()?;
+        let (rows, truncated) = tokio::task::spawn_blocking(move || {
             let running: std::collections::HashSet<String> = running
                 .iter()
                 .filter_map(|p| p.strip_prefix(&root).ok())
@@ -367,6 +387,7 @@ impl Gateway {
                 .collect();
             let now = SystemTime::now();
             let rows = snapshot
+                .index
                 .entries()
                 .iter()
                 .map(|e| {
@@ -382,41 +403,30 @@ impl Gateway {
                     }
                 })
                 .collect::<Vec<_>>();
-            Some((rows, snapshot.truncated))
+            (rows, snapshot.index.truncated)
         })
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_default();
+        (rows, truncated, status)
     }
 
     async fn index_page(&self) -> Response {
-        match self.rows().await {
-            Some((rows, truncated)) => {
-                html(StatusCode::OK, gateway_index::index_html(&rows, truncated))
-            }
-            None => text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "cannot read the served root",
-            ),
-        }
+        let (rows, truncated, status) = self.rows().await;
+        html(
+            StatusCode::OK,
+            gateway_index::index_html_with(&rows, truncated, &status),
+        )
     }
 
     async fn index_json(&self) -> Response {
-        match self.rows().await {
-            Some((rows, truncated)) => {
-                let body = gateway_index::index_json(&rows, truncated).to_string();
-                let mut res = Response::new(Body::from(body));
-                res.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                res
-            }
-            None => text(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "cannot read the served root",
-            ),
-        }
+        let (rows, truncated, status) = self.rows().await;
+        let body = gateway_index::index_json_with(&rows, truncated, &status).to_string();
+        let mut res = Response::new(Body::from(body));
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        res
     }
 
     // ---- proxy ----------------------------------------------------------
@@ -454,11 +464,23 @@ impl Gateway {
     async fn port_for_slug(&self, slug: &str) -> Result<u16, Response> {
         let index = Arc::clone(&self.index);
         let owned = slug.to_string();
-        let entry = tokio::task::spawn_blocking(move || index.resolve(&owned))
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(|| text(StatusCode::NOT_FOUND, "no such canvas"))?;
+        // Blocks (up to a few seconds) only while a scan that is already
+        // running finishes; never starts a second one next to it.
+        let entry = match tokio::task::spawn_blocking(move || index.resolve(&owned)).await {
+            Ok(Lookup::Found(entry)) => entry,
+            Ok(Lookup::Indexing) => {
+                let mut res = text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "still indexing the served root; try again in a moment",
+                );
+                res.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+                return Err(res);
+            }
+            Ok(Lookup::NotFound) | Err(_) => {
+                return Err(text(StatusCode::NOT_FOUND, "no such canvas"));
+            }
+        };
         let path = self.cfg.root.join(&entry.rel);
         // The file may have been swapped for a symlink since the scan.
         let real = path
