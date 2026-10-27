@@ -22,9 +22,16 @@ enter an existing release tag such as `v0.26.1`. The tag's assets must already
 be published. The token must be valid and the tap's `main` branch must allow it
 to push directly.
 
+The generator confines paths to the current workspace: archive inputs must be
+inside `release-archives/`, and the only output is
+`homebrew-tap/Formula/meshfox.rb`. Paths are resolved before access, including
+symlinks; escaping either root is rejected. Run it from the workspace containing
+these two directories, as the workflow does. Absolute paths within those roots
+also work.
+
 To generate a formula locally from downloaded release archives:
 
 ```sh
-python3 scripts/homebrew/update_formula.py v0.26.1 /path/to/archives /path/to/tap/Formula/meshfox.rb
+python3 scripts/homebrew/update_formula.py v0.26.1 release-archives homebrew-tap/Formula/meshfox.rb
 python3 -m unittest discover -s scripts/homebrew -p 'test_*.py'
 ```

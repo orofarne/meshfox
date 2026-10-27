@@ -15,13 +15,32 @@ TARGETS = (
 VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 
 
+def contained_path(path: Path, base: Path) -> Path:
+    """Resolve '..' and symlinks before enforcing a trusted filesystem root."""
+    resolved = path.resolve()
+    if not resolved.is_relative_to(base):
+        raise ValueError(f"Path {path} resolves outside allowed root {base}")
+    return resolved
+
+
 def update_formula(tag: str, archives: Path, formula: Path) -> bool:
     match = re.fullmatch("v" + VERSION, tag)
     if not match:
         raise ValueError(f"Expected a stable vX.Y.Z release tag, got {tag!r}")
     version = tuple(map(int, match.groups()))
-    if formula.exists():
-        current = re.search(r'^  version "(' + VERSION + r')"$', formula.read_text(), re.M)
+    # These roots match homebrew.yml's checkout and download destinations.
+    # Derive them from the working directory, never from CLI-controlled parents.
+    workspace = Path.cwd().resolve()
+    archives_base = contained_path(workspace / "release-archives", workspace)
+    tap_base = contained_path(workspace / "homebrew-tap", workspace)
+    archives_dir = contained_path(archives, archives_base)
+    requested_formula = contained_path(formula, tap_base)
+    formula_path = contained_path(tap_base / "Formula" / "meshfox.rb", tap_base)
+    if formula.name != "meshfox.rb" or requested_formula != formula_path:
+        raise ValueError("Formula must be homebrew-tap/Formula/meshfox.rb")
+
+    if formula_path.exists():
+        current = re.search(r'^  version "(' + VERSION + r')"$', formula_path.read_text(), re.M)
         if not current:
             raise ValueError("Cannot determine the existing tap formula's version")
         if tuple(map(int, current.groups()[1:])) > version:
@@ -33,19 +52,19 @@ def update_formula(tag: str, archives: Path, formula: Path) -> bool:
     # Read every archive before writing, so missing downloads cannot publish
     # a partially updated formula. Hash actual published bytes, not build outputs.
     for target in TARGETS:
-        archive = archives / f"meshfox-{target}.tar.gz"
+        archive = contained_path(archives_dir / f"meshfox-{target}.tar.gz", archives_dir)
         digest = hashlib.sha256()
         with archive.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
         content = content.replace(f"@SHA256_{target}@", digest.hexdigest())
 
-    if formula.exists() and formula.read_text() == content:
+    if formula_path.exists() and formula_path.read_text() == content:
         print(f"Tap formula already matches {tag}")
         return False
-    formula.parent.mkdir(parents=True, exist_ok=True)
-    formula.write_text(content)
-    print(f"Generated {formula} for {tag}")
+    formula_path.parent.mkdir(parents=True, exist_ok=True)
+    formula_path.write_text(content)
+    print(f"Generated {formula_path} for {tag}")
     return True
 
 
