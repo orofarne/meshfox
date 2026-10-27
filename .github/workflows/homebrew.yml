@@ -1,0 +1,99 @@
+name: Update Homebrew tap
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag (for example v0.26.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: macos-latest
+    # Serialize tap writes; an older queued release is also checked against
+    # the version in the tap before generating anything.
+    concurrency:
+      group: homebrew-tap-publish
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - name: Select stable releases
+        id: stable
+        shell: bash
+        run: |
+          if [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping Homebrew publication for $RELEASE_TAG"
+          fi
+
+      - name: Checkout Meshfox
+        if: steps.stable.outputs.publish == 'true'
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout tap
+        if: steps.stable.outputs.publish == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: orofarne/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download published release archives
+        if: steps.stable.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease \
+            --jq 'if .isDraft or .isPrerelease then error("Expected a published stable release") else empty end'
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'meshfox-*.tar.gz' --dir release-archives
+
+      - name: Generate formula
+        if: steps.stable.outputs.publish == 'true'
+        id: formula
+        run: |
+          python3 scripts/homebrew/update_formula.py "$RELEASE_TAG" \
+            release-archives homebrew-tap/Formula/meshfox.rb
+          if ! git -C homebrew-tap diff --quiet -- Formula/meshfox.rb || \
+             [[ -n "$(git -C homebrew-tap ls-files --others --exclude-standard -- Formula/meshfox.rb)" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test formula on macOS
+        if: steps.formula.outputs.changed == 'true'
+        run: |
+          mkdir -p "$(brew --repository)/Library/Taps/orofarne"
+          ln -s "$GITHUB_WORKSPACE/homebrew-tap" \
+            "$(brew --repository)/Library/Taps/orofarne/homebrew-tap"
+          brew style --formula orofarne/tap/meshfox
+          brew install --skip-link orofarne/tap/meshfox
+          brew test --force orofarne/tap/meshfox
+
+      - name: Commit and push formula
+        if: steps.formula.outputs.changed == 'true'
+        working-directory: homebrew-tap
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/meshfox.rb
+          git commit -m "meshfox: update to $RELEASE_TAG"
+          git push origin HEAD:main

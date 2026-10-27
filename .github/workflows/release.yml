@@ -108,3 +108,11 @@ jobs:
             summary-to-canvas.zip
           draft: false
           generate_release_notes: true
+
+  update-homebrew:
+    needs: release
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
