@@ -52,10 +52,13 @@ jobs:
       contents: read
       packages: write
     steps:
+      # The ref that started the workflow, not the release tag: `inputs.tag`
+      # only says which release binary goes in. The Dockerfile and smoke test
+      # come from here (the tag itself, when release.yml calls this; the branch
+      # it is run on, by hand), so an image can be rebuilt for an old release
+      # with a newer Dockerfile.
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.tag }}
 
       - name: Image name and version
         env:
