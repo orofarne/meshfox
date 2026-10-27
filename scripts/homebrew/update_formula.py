@@ -63,16 +63,20 @@ def update_formula(tag: str, archives: Path, formula: Path) -> bool:
         print(f"Tap formula already matches {tag}")
         return False
     # Sonar's taint analysis (pythonsecurity:S2083, "path traversal") flags the
-    # write below; marked a false positive there, and silenced here so that
-    # moving the line does not bring it back as a new issue. Why it is safe:
+    # write below; it is marked a false positive in SonarCloud. Why it is safe:
     # `formula_path` is built from the working directory and constants
     # ("homebrew-tap/Formula/meshfox.rb"), never from the `formula` argument
     # (which is only compared against it and rejected on any difference), and
     # `contained_path` resolved symlinks and '..' and checked it lies under
     # `tap_base`. `content` is the template with a validated vX.Y.Z version
     # and hex digests substituted in; it has no say in where it is written.
+    #
+    # Keep the next line's text exactly as it is: NOSONAR does not suppress
+    # taint findings, and SonarCloud matches the false-positive mark to the
+    # line by its text, so editing the line (a trailing comment included)
+    # makes it a new, open issue.
     formula_path.parent.mkdir(parents=True, exist_ok=True)
-    formula_path.write_text(content)  # NOSONAR: see the comment above
+    formula_path.write_text(content)
     print(f"Generated {formula_path} for {tag}")
     return True
 
