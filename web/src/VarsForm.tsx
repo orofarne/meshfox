@@ -133,6 +133,70 @@ export function VarsForm({
     );
   };
 
+  const renderControl = (v: VarStatus, i: number) => {
+    if (v.type === "bool") {
+      return (
+        <input
+          type="checkbox"
+          checked={values[v.name] === "true"}
+          onChange={(e) => set(v.name, e.target.checked ? "true" : "false")}
+        />
+      );
+    }
+    if (v.type === "select") {
+      return (
+        <select value={values[v.name]} onChange={(e) => set(v.name, e.target.value)} autoFocus={i === 0}>
+          {(v.choices ?? []).map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    if (v.type === "dir" || v.type === "file") {
+      return (
+        <PathField
+          kind={v.type}
+          mode={v.mode}
+          ext={v.ext}
+          value={values[v.name]}
+          onChange={(value) => set(v.name, value)}
+          label={v.prompt}
+          autoFocus={i === 0}
+        />
+      );
+    }
+    if (v.type === "date" || v.type === "datetime") {
+      return (
+        <DateField
+          kind={v.type}
+          value={values[v.name]}
+          onChange={(value) => set(v.name, value)}
+          label={v.prompt}
+          autoFocus={i === 0}
+          required
+        />
+      );
+    }
+    return (
+      <input
+        type={v.type === "int" ? "number" : v.secret ? "password" : "text"}
+        step={v.type === "int" ? 1 : undefined}
+        value={values[v.name]}
+        onChange={(e) => set(v.name, e.target.value)}
+        autoFocus={i === 0}
+        // Only `int` genuinely can't be empty (it has to parse as a
+        // whole number — see `isValidValue`/`INT_PATTERN`). A
+        // `string` field is allowed to be blank on purpose (e.g. "no
+        // fixed value" style defaults) — `meshfox_core::vars::
+        // validate_value` already accepts "" for it.
+        required={v.type === "int" && !(configure && v.secret)}
+        placeholder={configure && v.secret ? (v.stored || v.inheritedFrom ? "•••••• (unchanged)" : "") : undefined}
+      />
+    );
+  };
+
   const defaultHint = `This canvas needs a few values before it can run — answered once, then remembered${
     vars.some((v) => v.secret)
       ? " (secret ones aren't saved and are asked for again next time, unless you check \"save\")"
@@ -162,59 +226,7 @@ export function VarsForm({
                 </span>
               )}
             </span>
-            {v.type === "bool" ? (
-              <input
-                type="checkbox"
-                checked={values[v.name] === "true"}
-                onChange={(e) => set(v.name, e.target.checked ? "true" : "false")}
-              />
-            ) : v.type === "select" ? (
-              <select
-                value={values[v.name]}
-                onChange={(e) => set(v.name, e.target.value)}
-                autoFocus={i === 0}
-              >
-                {(v.choices ?? []).map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-            ) : v.type === "dir" || v.type === "file" ? (
-              <PathField
-                kind={v.type}
-                mode={v.mode}
-                ext={v.ext}
-                value={values[v.name]}
-                onChange={(value) => set(v.name, value)}
-                label={v.prompt}
-                autoFocus={i === 0}
-              />
-            ) : v.type === "date" || v.type === "datetime" ? (
-              <DateField
-                kind={v.type}
-                value={values[v.name]}
-                onChange={(value) => set(v.name, value)}
-                label={v.prompt}
-                autoFocus={i === 0}
-                required
-              />
-            ) : (
-              <input
-                type={v.type === "int" ? "number" : v.secret ? "password" : "text"}
-                step={v.type === "int" ? 1 : undefined}
-                value={values[v.name]}
-                onChange={(e) => set(v.name, e.target.value)}
-                autoFocus={i === 0}
-                // Only `int` genuinely can't be empty (it has to parse as a
-                // whole number — see `isValidValue`/`INT_PATTERN`). A
-                // `string` field is allowed to be blank on purpose (e.g. "no
-                // fixed value" style defaults) — `meshfox_core::vars::
-                // validate_value` already accepts "" for it.
-                required={v.type === "int" && !(configure && v.secret)}
-                placeholder={configure && v.secret ? (v.stored || v.inheritedFrom ? "•••••• (unchanged)" : "") : undefined}
-              />
-            )}
+            {renderControl(v, i)}
           </label>
           {v.secretError && (
             <p className="vars-modal-error" title={v.secretError}>

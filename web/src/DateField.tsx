@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { browserOffset, isValidOffset, joinDateTime, splitDateTime } from "./dateValues";
 
 interface DateFieldProps {
@@ -11,6 +11,15 @@ interface DateFieldProps {
   required?: boolean;
 }
 
+/** Focus the returned ref's element once on mount when `enabled` (stands in for `autoFocus`). */
+function useFocusOnMount(enabled: boolean | undefined) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (enabled) ref.current?.focus();
+  }, [enabled]);
+  return ref;
+}
+
 /**
  * The input of a `date`/`datetime` variable: the browser's own calendar
  * (`<input type="date">` / `type="datetime-local">`), which can also be
@@ -19,7 +28,8 @@ interface DateFieldProps {
  * the browser's own offset and the pair is always combined into the one
  * canonical RFC3339 value that is stored and sent.
  */
-export function DateField({ kind, value, onChange, label, autoFocus, required }: DateFieldProps) {
+export function DateField({ kind, value, onChange, label, autoFocus, required }: Readonly<DateFieldProps>) {
+  const dateRef = useFocusOnMount(kind === "date" && autoFocus);
   if (kind === "date") {
     return (
       <input
@@ -28,7 +38,7 @@ export function DateField({ kind, value, onChange, label, autoFocus, required }:
         value={value}
         onChange={(e) => onChange(e.target.value)}
         aria-label={label}
-        autoFocus={autoFocus}
+        ref={dateRef}
         required={required}
       />
     );
@@ -42,7 +52,8 @@ function DateTimeInputs({
   label,
   autoFocus,
   required,
-}: Omit<DateFieldProps, "kind">) {
+}: Readonly<Omit<DateFieldProps, "kind">>) {
+  const wallRef = useFocusOnMount(autoFocus);
   const parts = splitDateTime(value);
   // The wall-clock and offset the user is editing. Kept locally because a
   // half-typed datetime-local reports "" (the canonical value is then empty)
@@ -83,7 +94,7 @@ function DateTimeInputs({
           emit(nextWall, nextOffset);
         }}
         aria-label={`${label} (date and time)`}
-        autoFocus={autoFocus}
+        ref={wallRef}
         required={required}
       />
       <input

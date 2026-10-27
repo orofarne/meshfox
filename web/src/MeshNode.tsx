@@ -1981,6 +1981,64 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
     }
   };
 
+  const renderField = (f: NonNullable<typeof fields>[number], i: number) => {
+    const label = f.label ?? f.prompt;
+    const value = values[f.name] ?? "";
+    if (f.type === "bool") {
+      return (
+        <input
+          type="checkbox"
+          checked={value === "true"}
+          onChange={(e) => set(f.name, e.target.checked ? "true" : "false")}
+        />
+      );
+    }
+    if (f.type === "select") {
+      return (
+        <select value={value} onChange={(e) => set(f.name, e.target.value)} autoFocus={i === 0}>
+          {(f.choices ?? []).map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    if (f.type === "dir" || f.type === "file") {
+      return (
+        <PathField
+          kind={f.type}
+          mode={f.mode}
+          ext={f.ext}
+          value={value}
+          onChange={(next) => set(f.name, next)}
+          label={label}
+          autoFocus={i === 0}
+        />
+      );
+    }
+    if (f.type === "date" || f.type === "datetime") {
+      return (
+        <DateField
+          kind={f.type}
+          value={value}
+          onChange={(next) => set(f.name, next)}
+          label={label}
+          autoFocus={i === 0}
+        />
+      );
+    }
+    return (
+      <input
+        type={f.type === "int" ? "number" : f.secret ? "password" : "text"}
+        step={f.type === "int" ? 1 : undefined}
+        value={value}
+        onChange={(e) => set(f.name, e.target.value)}
+        autoFocus={i === 0}
+      />
+    );
+  };
+
   if (fields === null) {
     return (
       <div className="mesh-form-block" id={blockDomId({ nodeId, blockName: seg.name })}>
@@ -1995,47 +2053,7 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
       {fields.map((f, i) => (
         <label key={f.name} className="vars-modal-field">
           <span>{f.label ?? f.prompt}</span>
-          {f.type === "bool" ? (
-            <input
-              type="checkbox"
-              checked={values[f.name] === "true"}
-              onChange={(e) => set(f.name, e.target.checked ? "true" : "false")}
-            />
-          ) : f.type === "select" ? (
-            <select value={values[f.name] ?? ""} onChange={(e) => set(f.name, e.target.value)} autoFocus={i === 0}>
-              {(f.choices ?? []).map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-          ) : f.type === "dir" || f.type === "file" ? (
-            <PathField
-              kind={f.type}
-              mode={f.mode}
-              ext={f.ext}
-              value={values[f.name] ?? ""}
-              onChange={(value) => set(f.name, value)}
-              label={f.label ?? f.prompt}
-              autoFocus={i === 0}
-            />
-          ) : f.type === "date" || f.type === "datetime" ? (
-            <DateField
-              kind={f.type}
-              value={values[f.name] ?? ""}
-              onChange={(value) => set(f.name, value)}
-              label={f.label ?? f.prompt}
-              autoFocus={i === 0}
-            />
-          ) : (
-            <input
-              type={f.type === "int" ? "number" : f.secret ? "password" : "text"}
-              step={f.type === "int" ? 1 : undefined}
-              value={values[f.name] ?? ""}
-              onChange={(e) => set(f.name, e.target.value)}
-              autoFocus={i === 0}
-            />
-          )}
+          {renderField(f, i)}
         </label>
       ))}
       <button
@@ -2897,7 +2915,7 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
 }
 
 /** The same live body as a canvas card, with native page scrolling. */
-export function NodeDocumentView({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
+export function NodeDocumentView({ data, nodeId }: Readonly<{ data: MeshNodeData; nodeId: string }>) {
   const pageRef = useRef<HTMLElement | null>(null);
   useSearchHighlight(pageRef, { ...data, focused: true, folded: false }, false, true);
   return (

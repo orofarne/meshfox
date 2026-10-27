@@ -1,6 +1,6 @@
 import { canvasVersionGate } from "./canvasVersion";
 import { retainLiveBlocks } from "./liveBlockSnapshot";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   ReactFlow,
   Background,
@@ -331,6 +331,23 @@ function countOccurrences(haystack: string, needle: string): number {
     from = idx + needle.length;
   }
   return count;
+}
+
+/** Which of the canvas area's three views is showing: the source editor, a single node as a page, or the graph. */
+function CanvasView({
+  sourceMode,
+  documentNode,
+  source,
+  flow,
+}: Readonly<{
+  sourceMode: boolean;
+  documentNode: { id: string; data: MeshNodeData } | undefined;
+  source: ReactNode;
+  flow: ReactNode;
+}>) {
+  if (sourceMode) return source;
+  if (documentNode) return <NodeDocumentView nodeId={documentNode.id} data={documentNode.data} />;
+  return flow;
 }
 
 export default function App() {
@@ -3870,7 +3887,7 @@ export default function App() {
             noexec
           </span>
         )}
-        {editMode ? (
+        {editMode && (
           <>
             <span className="mode-badge mode-badge-edit">editing</span>
             {dirty && <span className="saving-indicator">saving layout…</span>}
@@ -3903,16 +3920,16 @@ export default function App() {
               done
             </button>
           </>
-        ) : workerReadOnly ? (
-            <span
-              className="mode-badge"
-              title="This canvas is served read-only (not writable, or started with --read-only) — changes cannot be saved"
-            >
-              read-only
-            </span>
-        ) : (
-          <button onClick={() => setEditMode(true)}>Edit</button>
         )}
+        {!editMode && workerReadOnly && (
+          <span
+            className="mode-badge"
+            title="This canvas is served read-only (not writable, or started with --read-only) — changes cannot be saved"
+          >
+            read-only
+          </span>
+        )}
+        {!editMode && !workerReadOnly && <button onClick={() => setEditMode(true)}>Edit</button>}
         {hasConfigurableVars && (
           <button
             className="deps-toggle"
@@ -4011,16 +4028,18 @@ export default function App() {
     <div className="app">
       {toolbar}
       <div className="canvas-area">
-        {sourceMode ? (
-          <CanvasSourceEditor
-            initialInclude={sourceInitialInclude}
-            onSaved={handleSourceSaved}
-            onClose={() => setSourceMode(false)}
-            onDirtyChange={setSourceDirty}
-          />
-        ) : documentNode ? (
-          <NodeDocumentView nodeId={documentNode.id} data={documentNode.data} />
-        ) : (
+        <CanvasView
+          sourceMode={sourceMode}
+          documentNode={documentNode}
+          source={
+            <CanvasSourceEditor
+              initialInclude={sourceInitialInclude}
+              onSaved={handleSourceSaved}
+              onClose={() => setSourceMode(false)}
+              onDirtyChange={setSourceDirty}
+            />
+          }
+          flow={
           <ReactFlow
             nodes={routeRenderNodes}
             edges={routedVisibleEdges}
@@ -4073,7 +4092,8 @@ export default function App() {
             <Controls />
             <MiniMap />
           </ReactFlow>
-        )}
+          }
+        />
         {searchOpen && (
           <div className="search-bar" role="search">
             <input
