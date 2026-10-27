@@ -3,7 +3,7 @@ import { isVSCodeHost, vscodeApi } from "./vscodeHost";
 import { isEmptyView, type TableMeta, type TableRowsPage, type ViewSpec } from "./tableView";
 
 export async function fetchCanvas(): Promise<CanvasDoc> {
-  const res = await fetch("/api/canvas");
+  const res = await fetch("api/canvas");
   if (!res.ok) throw new Error(`GET /api/canvas: ${res.status}`);
   return res.json();
 }
@@ -16,7 +16,7 @@ export async function fetchCanvas(): Promise<CanvasDoc> {
  * `--no-exec`: editing works, but every run is refused.
  */
 export async function fetchWorkerInfo(): Promise<{ readOnly: boolean; noExec: boolean }> {
-  const res = await fetch("/api/info");
+  const res = await fetch("api/info");
   if (!res.ok) throw new Error(`GET /api/info: ${res.status}`);
   const info = await res.json();
   return { readOnly: info.readOnly === true, noExec: info.noExec === true };
@@ -33,7 +33,7 @@ export async function fetchWorkerInfo(): Promise<{ readOnly: boolean; noExec: bo
  */
 export async function fetchVars(path: string[], block: string, withDeps: boolean): Promise<VarStatus[]> {
   const params = new URLSearchParams({ path: path.join(","), block, noDeps: String(!withDeps) });
-  const res = await fetch(`/api/vars?${params}`);
+  const res = await fetch(`api/vars?${params}`);
   if (!res.ok) throw new Error(`GET /api/vars: ${res.status}`);
   return res.json();
 }
@@ -47,7 +47,7 @@ export async function fetchVars(path: string[], block: string, withDeps: boolean
  * overrides), same as `fetchVars`.
  */
 export async function fetchConfigureVars(): Promise<VarStatus[]> {
-  const res = await fetch("/api/vars/configure");
+  const res = await fetch("api/vars/configure");
   if (!res.ok) throw new Error(`GET /api/vars/configure: ${res.status}`);
   return res.json();
 }
@@ -65,7 +65,7 @@ export async function saveConfigureVars(
   secrets: Record<string, string> = {},
   clear: string[] = [],
 ): Promise<void> {
-  const res = await fetch("/api/vars/configure", {
+  const res = await fetch("api/vars/configure", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ vars: answers, secrets, clear }),
@@ -86,7 +86,7 @@ export async function fetchFsList(
   hidden: boolean,
 ): Promise<FsListing> {
   const params = new URLSearchParams({ path, kind, hidden: String(hidden) });
-  const res = await fetch(`/api/fs/list?${params}`);
+  const res = await fetch(`api/fs/list?${params}`);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/fs/list: ${res.status}`);
@@ -117,7 +117,7 @@ export async function fetchFormFields(
   block: string,
 ): Promise<{ send: string; fields: FormFieldStatus[] }> {
   const params = new URLSearchParams({ nodeId, block });
-  const res = await fetch(`/api/form/fields?${params}`);
+  const res = await fetch(`api/form/fields?${params}`);
   if (!res.ok) throw new Error(`GET /api/form/fields: ${res.status}`);
   return res.json();
 }
@@ -134,7 +134,7 @@ export async function fetchFormFields(
  * server just started in the background — pass each to `subscribeRun`
  * (or fold into `liveBlocks` the same way, see `App.tsx`'s
  * `watchAutorunBlock`) to watch it without waiting on a `"run-started"`
- * `/api/watch` event, which exists for a passive tab that didn't submit
+ * `api/watch` event, which exists for a passive tab that didn't submit
  * this form itself.
  */
 export async function submitForm(
@@ -148,7 +148,7 @@ export async function submitForm(
    * by the watch socket's `"tty-started"` and joined by attaching. */
   autorunTriggered: { nodeId: string; block: string; tty?: boolean }[];
 }> {
-  const res = await fetch("/api/form/submit", {
+  const res = await fetch("api/form/submit", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ nodeId, block, values }),
@@ -169,7 +169,7 @@ export async function submitForm(
  * for, so there's no reason not to let the UI toggle it directly.
  */
 export async function updateOptions(options: string[]): Promise<CanvasDoc> {
-  const res = await fetch("/api/options", {
+  const res = await fetch("api/options", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ options }),
@@ -208,7 +208,7 @@ export async function saveLayout(
   nodes: NodeBox[],
   layoutHints?: Record<string, { x: number; y: number }>,
 ): Promise<void> {
-  const res = await fetch("/api/canvas", {
+  const res = await fetch("api/canvas", {
     method: "PUT",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ nodes, layoutHints: layoutHints ?? {} }),
@@ -229,7 +229,7 @@ export interface IncludeManifestEntry {
 }
 
 export async function fetchIncludes(): Promise<IncludeManifestEntry[]> {
-  const res = await fetch("/api/includes");
+  const res = await fetch("api/includes");
   if (!res.ok) throw new Error(`GET /api/includes: ${res.status}`);
   return res.json();
 }
@@ -240,7 +240,7 @@ export async function fetchIncludes(): Promise<IncludeManifestEntry[]> {
  * `IncludeManifestEntry`'s `nodeId` (from `fetchIncludes`) to read that
  * include's own target file instead. */
 export async function fetchCanvasSource(includeNodeId?: string): Promise<{ text: string; rev: string; readOnly: boolean }> {
-  const url = includeNodeId ? `/api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "/api/canvas/raw";
+  const url = includeNodeId ? `api/canvas/raw?include=${encodeURIComponent(includeNodeId)}` : "api/canvas/raw";
   const res = await fetch(url);
   if (!res.ok) throw new Error(`GET /api/canvas/raw: ${res.status}`);
   return { text: await res.text(), rev: res.headers.get("ETag") ?? "", readOnly: res.headers.get("x-meshfox-read-only") === "true" };
@@ -306,7 +306,7 @@ export async function saveCanvasSource(
   if (includeNodeId) params.set("include", includeNodeId);
   if (merge && !includeNodeId) params.set("merge", "1");
   const query = params.toString();
-  const url = query ? `/api/canvas/raw?${query}` : "/api/canvas/raw";
+  const url = query ? `api/canvas/raw?${query}` : "api/canvas/raw";
   const res = await fetch(url, {
     method: "PUT",
     headers: { "content-type": "text/plain", "if-match": rev },
@@ -338,7 +338,7 @@ export async function saveCanvasSource(
  * directly.
  */
 export async function createNode(parentId: string, title: string): Promise<CanvasDoc> {
-  const res = await fetch("/api/nodes", {
+  const res = await fetch("api/nodes", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ parentId, title }),
@@ -519,7 +519,7 @@ export interface NodePatch {
  * thrown error carrying the server's message, same as `saveLayout`.
  */
 export async function updateNode(id: string, patch: NodePatch): Promise<CanvasDoc> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}`, {
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(patch),
@@ -614,7 +614,7 @@ export type SaveTextOutcome =
  */
 export async function deleteNode(id: string, mode: "subtree" | "reparent" = "subtree"): Promise<CanvasDoc> {
   const params = mode === "reparent" ? "?children=reparent" : "";
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}${params}`, { method: "DELETE" });
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}${params}`, { method: "DELETE" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `DELETE /api/nodes/${id}: ${res.status}`);
@@ -638,7 +638,7 @@ export interface NodeFileContent {
  * one of those cases.
  */
 export async function fetchNodeFileContent(id: string): Promise<NodeFileContent> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/file-content`);
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/file-content`);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/file-content: ${res.status}`);
@@ -655,7 +655,7 @@ export async function fetchNodeFileContent(id: string): Promise<NodeFileContent>
  * missing file, or a target outside the canvas directory.
  */
 export async function fetchTableMeta(id: string, signal?: AbortSignal): Promise<TableMeta> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/table`, { signal });
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/table`, { signal });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/table: ${res.status}`);
@@ -675,7 +675,7 @@ export async function fetchTableRows(
 ): Promise<TableRowsPage> {
   const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   if (!isEmptyView(view)) params.set("view", JSON.stringify(view));
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/table/rows?${params}`, { signal });
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/table/rows?${params}`, { signal });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/table/rows: ${res.status}`);
@@ -699,14 +699,14 @@ export interface SyntaxGrammarEntry {
  * register anything Shiki's own bundled language set doesn't already cover.
  */
 export async function fetchSyntaxList(): Promise<SyntaxGrammarEntry[]> {
-  const res = await fetch("/api/syntax");
+  const res = await fetch("api/syntax");
   if (!res.ok) throw new Error(`GET /api/syntax: ${res.status}`);
   return res.json();
 }
 
 /** Raw content (JSON or YAML text) of one entry from `fetchSyntaxList`. */
 export async function fetchSyntaxGrammar(name: string): Promise<string> {
-  const res = await fetch(`/api/syntax/${encodeURIComponent(name)}`);
+  const res = await fetch(`api/syntax/${encodeURIComponent(name)}`);
   if (!res.ok) throw new Error(`GET /api/syntax/${name}: ${res.status}`);
   return res.text();
 }
@@ -726,7 +726,7 @@ export interface LinkPreview {
  * itself).
  */
 export async function fetchLinkPreview(url: string): Promise<LinkPreview | null> {
-  const res = await fetch(`/api/link-preview?url=${encodeURIComponent(url)}`);
+  const res = await fetch(`api/link-preview?url=${encodeURIComponent(url)}`);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/link-preview: ${res.status}`);
@@ -744,7 +744,7 @@ export async function fetchLinkPreview(url: string): Promise<LinkPreview | null>
  * being the root (see `mdcanvas::reparent_node`).
  */
 export async function reparentNode(id: string, newParentId: string): Promise<CanvasDoc> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/reparent`, {
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/reparent`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ newParentId }),
@@ -765,7 +765,7 @@ export async function reparentNode(id: string, newParentId: string): Promise<Can
  * for a node that actually has a position to clear.
  */
 export async function clearNodeLayout(id: string): Promise<CanvasDoc> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/clear-layout`, { method: "POST" });
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/clear-layout`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${id}/clear-layout: ${res.status}`);
@@ -785,7 +785,7 @@ export async function moveSibling(
   id: string,
   target: { before: string } | { after: string },
 ): Promise<CanvasDoc> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/move`, {
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/move`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(target),
@@ -806,7 +806,7 @@ export async function moveSibling(
  * node — nothing is written in any of those cases.
  */
 export async function renameNodeId(id: string, newId: string): Promise<CanvasDoc> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/rename-id`, {
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/rename-id`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ newId }),
@@ -831,7 +831,7 @@ export async function renameNodeId(id: string, newId: string): Promise<CanvasDoc
  * to know for sure rather than assume.
  */
 export async function clearNodeId(id: string): Promise<{ id: string; doc: CanvasDoc }> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(id)}/clear-id`, { method: "POST" });
+  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/clear-id`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${id}/clear-id: ${res.status}`);
@@ -925,7 +925,7 @@ export async function runBlockStream(
     vars: JSON.stringify(vars ?? {}),
     saveSecrets: JSON.stringify(saveSecrets ?? []),
   });
-  await openEventSocket(wsUrl(`/api/run?${params}`), onEvent);
+  await openEventSocket(wsUrl(`api/run?${params}`), onEvent);
 }
 
 /** Builds a WebSocket URL against the worker serving this document.
@@ -1074,7 +1074,7 @@ export async function forceRun(
     forceNodeId: force.nodeId,
     forceBlock: force.block,
   });
-  await openEventSocket(wsUrl(`/api/run/force?${params}`), onEvent);
+  await openEventSocket(wsUrl(`api/run/force?${params}`), onEvent);
 }
 
 /** One line of `subscribeRun`'s own streamed NDJSON response — a much
@@ -1106,7 +1106,7 @@ export async function subscribeRun(
 ): Promise<void> {
   const params = new URLSearchParams({ nodeId, block, sinceSeq: String(sinceSeq) });
   if (runId !== undefined) params.set("runId", String(runId));
-  await openEventSocket(wsUrl(`/api/run/subscribe?${params}`), onEvent);
+  await openEventSocket(wsUrl(`api/run/subscribe?${params}`), onEvent);
 }
 
 /** One finished run of a block, as `GET /api/run/history` lists it (see
@@ -1133,7 +1133,7 @@ export interface RunHistoryEntry {
  * `id` as `subscribeRun`'s `runId` to replay its output. */
 export async function fetchRunHistory(nodeId: string, block: string): Promise<RunHistoryEntry[]> {
   const params = new URLSearchParams({ nodeId, block });
-  const res = await fetch(`/api/run/history?${params}`);
+  const res = await fetch(`api/run/history?${params}`);
   if (!res.ok) throw new Error(`GET /api/run/history: ${res.status}`);
   return res.json();
 }
@@ -1164,7 +1164,7 @@ type OpenAction =
  */
 export async function openNodeFile(nodeId: string): Promise<void> {
   const context = isVSCodeHost ? "vscode" : "web";
-  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open?context=${context}`, {
+  const res = await fetch(`api/nodes/${encodeURIComponent(nodeId)}/open?context=${context}`, {
     method: "POST",
   });
   if (!res.ok) {
@@ -1197,7 +1197,7 @@ export async function openNodeFile(nodeId: string): Promise<void> {
  * containing folder rather than the target itself.
  */
 export async function openNodeFileFolder(nodeId: string): Promise<void> {
-  const res = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}/open-folder`, { method: "POST" });
+  const res = await fetch(`api/nodes/${encodeURIComponent(nodeId)}/open-folder`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${nodeId}/open-folder: ${res.status}`);
@@ -1208,14 +1208,14 @@ export async function openNodeFileFolder(nodeId: string): Promise<void> {
  * Cancels an in-flight run — either by `runId` (from `runBlockStream`'s own
  * `"started"` event, the connection that actually started it) or by
  * address (`{nodeId, block}`, for a tab that only ever knew about it via
- * `/api/run/subscribe`/`/api/run/tty/attach` and so never had a `runId` to
+ * `api/run/subscribe`/`api/run/tty/attach` and so never had a `runId` to
  * begin with — see `crates/server/src/lib.rs`'s own `KillRequest`). A 404
  * (already finished, or an unknown id/address) is treated the same as
  * success: either way, there's nothing left to kill.
  */
 export async function killRun(target: string | { nodeId: string; block: string }): Promise<void> {
   const body = typeof target === "string" ? { runId: target } : { nodeId: target.nodeId, block: target.block };
-  const res = await fetch("/api/kill", {
+  const res = await fetch("api/kill", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -1232,7 +1232,7 @@ export async function killRun(target: string | { nodeId: string; block: string }
  * SPEC.md's "Service blocks (experimental)".
  */
 export async function fetchServices(): Promise<ServiceStatusDto[]> {
-  const res = await fetch("/api/services");
+  const res = await fetch("api/services");
   if (!res.ok) throw new Error(`GET /api/services: ${res.status}`);
   return res.json();
 }
@@ -1265,7 +1265,7 @@ export interface ActiveRunDto {
  * `crates/server/src/lib.rs`'s own `get_active_runs`.
  */
 export async function fetchActiveRuns(): Promise<ActiveRunDto[]> {
-  const res = await fetch("/api/runs");
+  const res = await fetch("api/runs");
   if (!res.ok) throw new Error(`GET /api/runs: ${res.status}`);
   return res.json();
 }
@@ -1275,7 +1275,7 @@ export async function fetchServiceLog(
   block: string,
 ): Promise<{ stream: "stdout" | "stderr"; text: string }[]> {
   const params = new URLSearchParams({ nodeId, block });
-  const res = await fetch(`/api/services/log?${params}`);
+  const res = await fetch(`api/services/log?${params}`);
   if (!res.ok) throw new Error(`GET /api/services/log: ${res.status}`);
   return res.json();
 }
@@ -1283,7 +1283,7 @@ export async function fetchServiceLog(
 /** Awaits graceful service shutdown before releasing its ledger address —
  * the registry entry itself stays (now `"stopped"`), not removed. */
 export async function stopService(nodeId: string, block: string): Promise<void> {
-  const res = await fetch("/api/services/stop", {
+  const res = await fetch("api/services/stop", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ nodeId, block }),
@@ -1295,7 +1295,7 @@ export async function stopService(nodeId: string, block: string): Promise<void> 
  * parameters it was last started with — "local only", never touches
  * anything that depends on this service. */
 export async function restartService(nodeId: string, block: string, confirm = false): Promise<{ pid: number }> {
-  const res = await fetch("/api/services/restart", {
+  const res = await fetch("api/services/restart", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ nodeId, block, confirm }),
@@ -1314,7 +1314,7 @@ export async function forceStartService(
   vars?: Record<string, string>,
   confirm = false,
 ): Promise<{ pid: number }> {
-  const res = await fetch("/api/services/force-start", {
+  const res = await fetch("api/services/force-start", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ path, block, vars: vars ?? {}, confirm }),
@@ -1335,7 +1335,7 @@ export async function forceStartService(
  * persisted `<!-- meshfox:output ... -->` cache — those are unaffected.
  */
 export async function resetSession(): Promise<void> {
-  const res = await fetch("/api/session/reset", { method: "POST" });
+  const res = await fetch("api/session/reset", { method: "POST" });
   if (!res.ok) {
     throw new Error(`POST /api/session/reset: ${res.status}`);
   }
@@ -1349,7 +1349,7 @@ export async function resetSession(): Promise<void> {
  * ready to `setCanvas` with directly.
  */
 export async function clearLayout(): Promise<CanvasDoc> {
-  const res = await fetch("/api/canvas/clear-layout", { method: "POST" });
+  const res = await fetch("api/canvas/clear-layout", { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/canvas/clear-layout: ${res.status}`);
@@ -1374,7 +1374,7 @@ export interface UndoRedoResult extends CanvasDoc {
  * agent). A no-op (`changed: false`), not a thrown error, when there's
  * nothing left to undo. */
 export async function undo(): Promise<UndoRedoResult> {
-  const res = await fetch("/api/undo", { method: "POST" });
+  const res = await fetch("api/undo", { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/undo: ${res.status}`);
@@ -1384,7 +1384,7 @@ export async function undo(): Promise<UndoRedoResult> {
 
 /** The mirror image of {@link undo}. */
 export async function redo(): Promise<UndoRedoResult> {
-  const res = await fetch("/api/redo", { method: "POST" });
+  const res = await fetch("api/redo", { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/redo: ${res.status}`);
@@ -1401,7 +1401,7 @@ export async function redo(): Promise<UndoRedoResult> {
  * doc comment) — irrelevant here since only the two booleans are read,
  * but worth knowing this isn't "no history at all". */
 export async function fetchUndoState(): Promise<{ canUndo: boolean; canRedo: boolean }> {
-  const res = await fetch("/api/history?limit=0");
+  const res = await fetch("api/history?limit=0");
   if (!res.ok) throw new Error(`GET /api/history: ${res.status}`);
   return res.json();
 }
@@ -1409,8 +1409,8 @@ export async function fetchUndoState(): Promise<{ canUndo: boolean; canRedo: boo
 /** One entry in `GET /api/history`'s own `entries` list — see
  * `crates/server/src/lib.rs`'s `HistoryEntryResponse`/
  * `describe_history_entry`. `applied: true` means `seq <= cursor` (an
- * `/api/undo` would revert it); `false` means it's sitting in the redo
- * tail (an `/api/redo`, or a `historyGoto` to this same `seq`, would
+ * `api/undo` would revert it); `false` means it's sitting in the redo
+ * tail (an `api/redo`, or a `historyGoto` to this same `seq`, would
  * reapply it). */
 export interface HistoryEntry {
   seq: number;
@@ -1437,7 +1437,7 @@ export interface HistoryResponse {
 export const HISTORY_FETCH_LIMIT = 50;
 
 export async function fetchHistory(limit: number): Promise<HistoryResponse> {
-  const res = await fetch(`/api/history?limit=${limit}`);
+  const res = await fetch(`api/history?limit=${limit}`);
   if (!res.ok) throw new Error(`GET /api/history: ${res.status}`);
   return res.json();
 }
@@ -1447,7 +1447,7 @@ export async function fetchHistory(limit: number): Promise<HistoryResponse> {
  * current cursor, in one step rather than one `undo`/`redo` call per
  * step. Same response shape as {@link undo}/{@link redo}. */
 export async function historyGoto(seq: number): Promise<UndoRedoResult> {
-  const res = await fetch("/api/history/goto", {
+  const res = await fetch("api/history/goto", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ seq }),
@@ -1460,7 +1460,7 @@ export async function historyGoto(seq: number): Promise<UndoRedoResult> {
 }
 
 /**
- * Delays (ms) between reconnect attempts after `/api/watch` drops — see
+ * Delays (ms) between reconnect attempts after `api/watch` drops — see
  * `watchChanges` below. Cumulative sum (~9.6s) deliberately lands just under
  * the server's own `AUTO_EXIT_GRACE` (10s, see server's `lib.rs`): as long
  * as reconnecting succeeds within that window, the server never even
@@ -1469,7 +1469,7 @@ export async function historyGoto(seq: number): Promise<UndoRedoResult> {
 const WATCH_RECONNECT_DELAYS_MS = [200, 400, 800, 1600, 3200, 3200];
 
 /**
- * Opens a long-lived WebSocket to `/api/watch` for as long as this tab stays
+ * Opens a long-lived WebSocket to `api/watch` for as long as this tab stays
  * open, transparently reconnecting (see `WATCH_RECONNECT_DELAYS_MS`)
  * whenever the connection drops. The server counts each open connection as
  * one open tab and, once every one of them has stayed gone past its own
@@ -1555,8 +1555,8 @@ export function watchChanges(
    * at all yet. */
   onNodeOp?: (op: NodeOpEvent) => void,
   /** `"undo-state-changed"` — pushed after *any* successful save (this
-   * tab's own, another tab's, the CLI's, MCP's) and after `/api/undo`/
-   * `/api/redo` themselves, so the toolbar's own buttons stay accurate
+   * tab's own, another tab's, the CLI's, MCP's) and after `api/undo`/
+   * `api/redo` themselves, so the toolbar's own buttons stay accurate
    * without polling — most importantly, so this tab notices its own
    * `canRedo` getting cleared the moment *any* client makes a fresh edit
    * on top of an undo, not just when this tab is the one doing it (see
@@ -1594,7 +1594,7 @@ export function watchChanges(
 
   const socketUrl = () => {
     const since = lastSeq !== undefined ? `?since=${lastSeq}` : "";
-    return wsUrl(`/api/watch${since}`);
+    return wsUrl(`api/watch${since}`);
   };
 
   const connectOnce = (onEstablished: () => void): Promise<void> =>
@@ -1714,7 +1714,7 @@ export async function prepareArguments(path: string[], block: string, args: Reco
   fields: (VarStatus & { required: boolean })[];
   block: string | null;
 }> {
-  const res = await fetch("/api/args", {
+  const res = await fetch("api/args", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, block, args, noDeps: !withDeps }),
   });

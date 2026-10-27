@@ -149,7 +149,7 @@ function ThemedImg({ src, ...props }: React.ImgHTMLAttributes<HTMLImageElement>)
   }, [src, dark]);
   // Relative URLs are served by this worker. Remote and inline images
   // keep their own caching semantics. Preserve query parameters and fragments.
-  return <img {...props} alt={props.alt ?? ""} src={refreshImageUrl(themed, refresh, window.location.href)} />;
+  return <img {...props} alt={props.alt ?? ""} src={refreshImageUrl(themed, refresh, document.baseURI)} />;
 }
 
 /**

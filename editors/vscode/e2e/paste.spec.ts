@@ -85,7 +85,7 @@ test.describe.serial("real VS Code paste", () => {
     await page.keyboard.press("Meta+KeyV");
 
     await expect(body).toContainText(marker);
-    await frame.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+    await frame.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
   });
 
   test("node body editor's title <input>: real Cmd+V paste lands the real clipboard's content", async () => {
@@ -105,7 +105,7 @@ test.describe.serial("real VS Code paste", () => {
     // landed in the field, not about leaving a renamed node behind for
     // the next test.
     await page.keyboard.press("Escape");
-    await frame.locator(".mesh-text-editor-actions button", { hasText: "done" }).click();
+    await frame.locator(".mesh-text-editor-actions button", { hasText: "Save & close" }).click();
   });
 
   test("NodeSettings' ID <input>: real Cmd+V paste lands the real clipboard's content", async () => {

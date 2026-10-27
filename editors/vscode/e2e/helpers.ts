@@ -74,11 +74,21 @@ export async function launchVSCode(fixtureName: string, envOverrides: NodeJS.Pro
     join(workspaceDir, ".vscode", "settings.json"),
     JSON.stringify({ "meshfox.executablePath": MESHFOX_BIN }, null, 2),
   );
+  // The developer's own `~/.meshfox/config.toml` may name a real
+  // `server_socket` (their installed daemon). An empty local value disables
+  // it for this workspace, so a test starts from "no coordinator" instead of
+  // talking to that daemon (an env override alone doesn't reach the extension
+  // host, so the local config is what actually does it). A suite that wants a
+  // coordinator overwrites this file.
+  mkdirSync(join(workspaceDir, ".meshfox"), { recursive: true });
+  writeFileSync(join(workspaceDir, ".meshfox", "config.toml"), 'server_socket = ""\n');
   cpSync(join(__dirname, "fixtures", fixtureName), join(workspaceDir, fixtureName));
 
   const app = await electron.launch({
     executablePath: findVSCodeBinary(),
-    env: { ...process.env, ...envOverrides },
+    // Same reason as the workspace config above, for the processes that read
+    // the environment (the `meshfox` worker the extension spawns).
+    env: { ...process.env, MESHFOX_SERVER_SOCKET: "", ...envOverrides },
     args: [
       `--extensionDevelopmentPath=${join(__dirname, "..")}`,
       `--user-data-dir=${userDataDir}`,

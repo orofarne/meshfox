@@ -77,10 +77,12 @@ function fetchRaw(page: Page): Promise<string> {
   return page.evaluate(() => fetch("/api/canvas/raw").then((r) => r.text()));
 }
 
+// The fixture is a single root, which the web UI shows as a full-page
+// document with no canvas; Edit mode brings the canvas (and its nodes) back.
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
-  await page.waitForSelector(".mesh-node");
   await page.getByRole("button", { name: "Edit" }).click();
+  await page.waitForSelector(".mesh-node");
 });
 
 test("pasting an image into a node's body editor embeds it as base64 and renders it live", async ({

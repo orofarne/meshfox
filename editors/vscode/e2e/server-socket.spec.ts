@@ -1,7 +1,6 @@
 import { test, expect, type Frame, type Page } from "@playwright/test";
 import { type ChildProcess, execSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { launchVSCode, openMeshfoxCanvas } from "./helpers";
@@ -28,7 +27,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..", "..");
 const MESHFOX_BIN = join(REPO_ROOT, "target", "debug", "meshfox");
 const DAEMON_BIN = join(REPO_ROOT, "macos", "MeshfoxDaemon", ".build", "debug", "MeshfoxDaemon");
-const DAEMON_SOCKET = join(homedir(), "Library", "Application Support", "meshfox", "daemon.sock");
+// A throwaway socket, never the developer's real `daemon.sock`: the daemon
+// unlinks whatever sits at its path when it starts and again when it exits,
+// which would take the installed LaunchAgent's socket away from it. Short
+// and /tmp-rooted for macOS's ~104-byte `sockaddr_un` limit.
+const DAEMON_SOCKET = join("/tmp", `mfx-e2e-daemon-${process.pid}.sock`);
 
 let daemon: ChildProcess;
 let session: Awaited<ReturnType<typeof launchVSCode>>;
@@ -38,7 +41,7 @@ let frame: Frame;
 test.describe.serial("VS Code as a server_socket client of the real macOS daemon", () => {
   test.beforeAll(async () => {
     daemon = spawn(DAEMON_BIN, [], {
-      env: { ...process.env, MESHFOX_BIN },
+      env: { ...process.env, MESHFOX_BIN, MESHFOX_DAEMON_SOCKET: DAEMON_SOCKET },
       stdio: ["ignore", "pipe", "pipe"],
     });
     // No IPC handshake to await — the socket file's own appearance is the
@@ -53,7 +56,7 @@ test.describe.serial("VS Code as a server_socket client of the real macOS daemon
       }
     }
 
-    session = await launchVSCode("daemon-coordinator.canvas.md");
+    session = await launchVSCode("daemon-coordinator.canvas.md", { MESHFOX_SERVER_SOCKET: DAEMON_SOCKET });
     // `launchVSCode` only copies the named fixture file itself — the
     // `server_socket` config has to be dropped into the workspace
     // separately, before the canvas is actually opened (`getOrSpawnWorker`

@@ -16,3 +16,9 @@ test("external URLs, anchors and root URLs keep their meaning", () => {
   for (const href of [undefined, "", "#part", "?view=x", "/api/test", "//example.org/x", "https://example.org/x", "data:image/png;base64,AA"])
     assert.equal(resolveAssetHref(href), href);
 });
+
+test("asset links stay under a path prefix the page is served from", () => {
+  const url = new URL(resolveAssetHref("../a.pdf#p=1"), "http://proxy.example/c/abc/");
+  assert.equal(url.pathname, "/c/abc/api/asset");
+  assert.equal(url.hash, "#p=1");
+});

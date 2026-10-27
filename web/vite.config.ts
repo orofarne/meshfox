@@ -5,6 +5,11 @@ import react from "@vitejs/plugin-react";
 // dev` works standalone; in production meshfoxd serves this app's build
 // output directly, same-origin.
 export default defineConfig({
+  // Relative asset URLs: the built app works at the server root and behind
+  // a proxy that mounts it under a path prefix (`/c/<id>/`), as long as the
+  // page itself is opened with a trailing slash. Every runtime request is
+  // relative to `document.baseURI` for the same reason (no leading `/`).
+  base: "./",
   plugins: [react()],
   build: {
     // Monaco's core (~2.5 MB) and a few on-demand Shiki grammars (cpp,

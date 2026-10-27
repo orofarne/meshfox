@@ -1,5 +1,4 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
 
 // Drives web/e2e/fixtures/path-picker.canvas.md — the "Browse…" file/
 // directory chooser of `type="file"`/`type="dir"` form fields. It browses
@@ -18,10 +17,11 @@ function entry(page: Page, name: string): Locator {
   return picker(page).locator(".path-picker-entry", { hasText: name });
 }
 
+// The fixture is a single root, which the web UI shows as a full-page
+// document (no canvas to fit), so the form is usable as soon as it renders.
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await page.waitForSelector(".mesh-form-block .path-field");
-  await clickFitViewAndWait(page);
 });
 
 test("an open-mode file field picks an existing file, hints by extension, and hides dotfiles", async ({ page }) => {

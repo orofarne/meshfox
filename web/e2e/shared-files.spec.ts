@@ -11,7 +11,7 @@ test("parent config permits ordinary Markdown images, includes and links", async
   }
   const link = page.getByRole("link", { name: "datasheet", exact: true });
   const href = await link.getAttribute("href");
-  expect(href).toContain("/api/asset?");
+  expect(href).toContain("api/asset?");
   const response = await request.get(href!);
   expect(response.status()).toBe(200);
   expect(await response.text()).toBe("shared datasheet");

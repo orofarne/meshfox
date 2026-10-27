@@ -207,11 +207,12 @@ export function TtyPanel({
     // relative resource/fetch/XHR URLs at the server (see that file's own
     // doc comment). In a plain browser tab there's no `<base>` tag, so
     // `document.baseURI` is just the page's own URL — same behavior as
-    // before.
-    const base = new URL(document.baseURI);
-    const proto = base.protocol === "https:" ? "wss:" : "ws:";
-    const endpoint = attachTo ? "/api/run/tty/attach" : "/api/run/tty";
-    const ws = new WebSocket(`${proto}//${base.host}${endpoint}?${params}`);
+    // before. The endpoint is relative so a path prefix in front of the
+    // worker (a reverse proxy mounting it under `/c/<id>/`) is kept.
+    const endpoint = attachTo ? "api/run/tty/attach" : "api/run/tty";
+    const url = new URL(`${endpoint}?${params}`, document.baseURI);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
     // The worker sends a heartbeat even while the shell is quiet; nothing at

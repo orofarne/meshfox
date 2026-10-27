@@ -6,6 +6,6 @@ export function resolveAssetHref(href: string | undefined, assetBase: string | u
   const fragment = fragmentAt < 0 ? "" : href.slice(fragmentAt);
   const file = fragmentAt < 0 ? href : href.slice(0, fragmentAt);
   const dir = assetBase ? `&dir=${encodeURIComponent(assetBase)}` : "";
-  return `/api/asset?file=${encodeURIComponent(file)}${dir}${fragment}`;
+  return `api/asset?file=${encodeURIComponent(file)}${dir}${fragment}`;
 }
 
