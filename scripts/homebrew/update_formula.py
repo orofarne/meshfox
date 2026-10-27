@@ -71,10 +71,10 @@ def update_formula(tag: str, archives: Path, formula: Path) -> bool:
     # `tap_base`. `content` is the template with a validated vX.Y.Z version
     # and hex digests substituted in; it has no say in where it is written.
     #
-    # Keep the next line's text exactly as it is: NOSONAR does not suppress
-    # taint findings, and SonarCloud matches the false-positive mark to the
-    # line by its text, so editing the line (a trailing comment included)
-    # makes it a new, open issue.
+    # Keep the next line's text exactly as it is: inline suppression comments
+    # do not apply to taint findings, and SonarCloud matches the
+    # false-positive mark to the line by its text, so editing the line (a
+    # trailing comment included) makes it a new, open issue.
     formula_path.parent.mkdir(parents=True, exist_ok=True)
     formula_path.write_text(content)
     print(f"Generated {formula_path} for {tag}")
