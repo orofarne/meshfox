@@ -71,6 +71,7 @@ This document is itself a valid meshfox canvas — every `##` section here is a 
 Rough checklist for what's needed before a 1.0.0 release:
 
 - [x] Linux server support (`meshfox serve` under `systemd --user` socket activation, see "macOS menu-bar app" below)
+- [x] Serving canvases to a browser over HTTP (`meshfox serve --http`, see "Serving canvases over HTTP")
 - [x] Persistent sessions (runs/services/tty survive a core restart)
 - [x] Undo/redo
 - [x] Full canvas-geometry support in the TUI
@@ -1320,6 +1321,33 @@ export FORCE_COLOR=1
 cd web && npm run test:unit
 ```
 
+### Serving canvases over HTTP (`meshfox serve --http`)
+<!-- meshfox:node id="serve-http" -->
+
+`meshfox serve --http [ADDR]` puts a small HTTP gateway in front of the coordinator, so a browser can reach canvases on a machine it has no direct line to — typically a container with the working directory mounted. The workers stay on `127.0.0.1:<random port>`; the gateway is the only thing that listens on a fixed port (`ADDR`, default `127.0.0.1:4590`). The unix socket keeps working next to it.
+
+```sh
+meshfox serve --socket /run/meshfox.sock --http 0.0.0.0:4590 --root /work
+```
+
+- `/` is an index of the `*.canvas.md` files under `--root` (default: the current directory; names starting with `.` are skipped, symlinks are not followed), with the running ones on top and a filter box. `/_/index.json` is the same list as JSON.
+- Each canvas lives at `/c/<slug>/`, started on the first request and stopped by the usual auto-exit when its last tab closes. The slug is `<file name>-<8 characters>`, e.g. `todo-k7m2q5xa`: the characters are a hash of the path **relative to `--root`**, so it is stable across restarts and across mount points. Only the hash is looked up; the readable part must match too, so a mistyped address is a 404 rather than somebody else's canvas. `/c/<slug>` without the slash redirects to the canonical address.
+- Everything the page loads is relative to its own address, so the gateway also works behind a reverse proxy that mounts it under a path prefix, as long as WebSocket upgrades pass through.
+
+**The token is the security boundary, and it is root-equivalent on that machine.** Blocks run code, so anyone who can open a canvas can run commands as the user the gateway runs as; treat the token like an SSH key.
+
+- On a loopback `ADDR` (the default) no token is needed. On any other address one is required: `MESHFOX_TOKEN`, or the first line of `--token-file FILE` (the environment wins). With neither, `serve` generates a random one and prints it once at startup. The token is never taken from the command line.
+- A browser signs in at `/` (a form that sets an `HttpOnly`, `SameSite=Strict` session cookie, which the watch WebSocket uses too); scripts send `Authorization: Bearer <token>`. After ten failed attempts from one address in a minute the gateway answers `429`.
+- The `Host` header must be a loopback name (on a loopback bind), or one of `--allowed-host HOST` (repeatable; with none given a non-loopback bind accepts any host), and an `Origin`, when sent, must be the page's own address.
+- There is no TLS in the gateway: terminate it in a reverse proxy and pass `--trust-proxy` so failed sign-ins are counted per client (the last `X-Forwarded-For` entry) instead of against the proxy, and the cookie gets `Secure` from `X-Forwarded-Proto: https`. Use `--trust-proxy` only behind a proxy that sets both headers itself.
+- `--public-url URL` is the address users reach it at. It is only used for the link printed (or opened) by `meshfox view` and `meshfox cores open`: on a loopback bind they open it in a local browser, otherwise they print `meshfox serve: open <url>` — there is no browser to open in a container. Without it the bound address is used, with `localhost` for a wildcard bind.
+
+Through the gateway the page knows it is remote (`GET /api/info` says `"remote": true`) and behaves accordingly: a `file` node that links to another canvas opens that canvas's own gateway address in a new tab; one that links to any other file is an ordinary link to the file, and the "open in the default application" and "show folder" buttons are hidden, since they would act on the server's machine. The file/directory pickers browse the served tree only: a path outside `--root` (absolute, `..`, a symlink out, `~`) opens the root instead, and the root has no "parent" or "home". That is navigation, not a sandbox — a block can still run anything, and a `type="dir"` variable can point anywhere.
+
+`--no-exec` and `--read-only` (the global flags) are handed on to every core `serve` starts, so `meshfox --no-exec serve --http …` is a gateway to a viewer-and-editor that never runs anything, and `--read-only` one that never writes; the token then protects documents rather than a shell.
+
+Not covered yet: `meshfox tui`, `run` and the MCP server still reach a coordinator through its unix socket, so from outside a container they cannot drive it over HTTP. The macOS menu-bar app does not run a gateway.
+
 ### End-to-end tests
 <!-- meshfox:node id="e2e-tests" -->
 
@@ -1340,6 +1368,8 @@ npm run test:e2e
 ```
 
 `display="table"` has its own opt-in suite, `cd web && npm run test:table` (`web/table.playwright.config.ts`, `web/e2e/table.spec.ts`): one real worker over a generated 400,000-row CSV, driving sorting, filters, search, scrolling to the very end through the capped scroll track, cell selection and the expanded window. It needs the `duckdb` CLI on the machine (the spec skips itself when there isn't one) and, like `test:arguments`, isn't part of the main `playwright.config.ts` run.
+
+`meshfox serve --http` has its own, much smaller suite, `cd web && npm run test:e2e:gateway` (`web/playwright.gateway.config.ts`, `web/e2e-gateway/`): two real gateways (open and token-protected) and a real browser, covering the page, assets, the lazy Shiki and Monaco chunks, the watch socket, runs, links between canvases, files, the path picker, the sign-in form and the session cookie. `crates/cli/tests/serve_http_cmd.rs` covers the processes: tokens, options, the printed address and a core killed under a live gateway.
 
 For interactive debugging instead of a one-shot run, use `npm run test:e2e:ui` (opens Playwright's UI mode — not runnable here, since it doesn't exit on its own).
 

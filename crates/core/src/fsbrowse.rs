@@ -129,6 +129,22 @@ pub fn list(
     show_hidden: bool,
     canvas_path: &Path,
 ) -> Result<FsListing, FsError> {
+    list_within(requested, kind, show_hidden, canvas_path, None)
+}
+
+/// [`list`], but never above `root` (a canonical directory) when one is
+/// given: a request that resolves outside it — an absolute path, `..`, a
+/// symlink that leaves, `~`, `@tmp` — opens `root` itself instead, and the
+/// listing has no parent at `root` and no home shortcut. This is what a page
+/// reached through the gateway gets, so a remote user browses the served
+/// tree and not the server's whole file system.
+pub fn list_within(
+    requested: &str,
+    kind: PickKind,
+    show_hidden: bool,
+    canvas_path: &Path,
+    root: Option<&Path>,
+) -> Result<FsListing, FsError> {
     let target = locate(requested, canvas_path);
     let mut selected = None;
     let mut dir = target.clone();
@@ -165,9 +181,15 @@ pub fn list(
     if selected.is_some() && target.parent() != Some(dir.as_path()) {
         selected = None;
     }
-    let canonical = dir
+    let mut canonical = dir
         .canonicalize()
         .map_err(|e| FsError::Read(dir.clone(), e))?;
+    if let Some(root) = root {
+        if !canonical.starts_with(root) {
+            canonical = root.to_path_buf();
+            selected = None;
+        }
+    }
     let read = std::fs::read_dir(&canonical).map_err(|e| FsError::Read(canonical.clone(), e))?;
 
     let mut entries = Vec::new();
@@ -206,9 +228,15 @@ pub fn list(
     let canvas_dir = canvas_dir_of(canvas_path);
     let canvas_dir = canvas_dir.canonicalize().unwrap_or(canvas_dir);
     Ok(FsListing {
-        parent: canonical.parent().map(|p| p.to_string_lossy().into_owned()),
+        parent: canonical
+            .parent()
+            .filter(|_| root.is_none_or(|r| canonical != r))
+            .map(|p| p.to_string_lossy().into_owned()),
         path: canonical.to_string_lossy().into_owned(),
-        home: std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned()),
+        home: root
+            .is_none()
+            .then(|| std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned()))
+            .flatten(),
         canvas_dir: canvas_dir.to_string_lossy().into_owned(),
         selected,
         entries,
@@ -252,6 +280,65 @@ mod tests {
 
         let l = list(d.to_str().unwrap(), PickKind::File, true, &canvas).unwrap();
         assert!(names(&l).contains(&".hidden"));
+    }
+
+    #[test]
+    fn within_a_root_nothing_above_it_is_ever_listed() {
+        let outer = tmp("within");
+        let root = outer.join("root");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/in.txt"), "").unwrap();
+        fs::write(outer.join("secret.txt"), "").unwrap();
+        let canvas = root.join("c.canvas.md");
+        let at = |req: &str| list_within(req, PickKind::File, false, &canvas, Some(&root)).unwrap();
+
+        // Inside: normal, and `..` from a subdirectory stops at the root.
+        let inside = at(root.join("sub").to_str().unwrap());
+        assert_eq!(names(&inside), ["in.txt"]);
+        assert_eq!(inside.parent.as_deref(), root.to_str());
+        assert!(inside.home.is_none());
+
+        // At the root there is no way up.
+        let top = at("");
+        assert_eq!(top.path, root.to_str().unwrap());
+        assert_eq!(top.parent, None);
+
+        // Everything that resolves outside lands on the root.
+        for outside in [
+            outer.to_str().unwrap(),
+            "..",
+            "../..",
+            "/",
+            "/etc/passwd",
+            "~",
+            "@tmp",
+            outer.join("secret.txt").to_str().unwrap(),
+        ] {
+            let l = at(outside);
+            assert_eq!(l.path, root.to_str().unwrap(), "{outside}");
+            assert_eq!(l.parent, None, "{outside}");
+            assert_eq!(l.selected, None, "{outside}");
+            assert!(!names(&l).contains(&"secret.txt"), "{outside}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn within_a_root_a_symlink_that_leaves_it_opens_the_root() {
+        let outer = tmp("within-link");
+        let root = outer.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outer.join("far")).unwrap();
+        std::os::unix::fs::symlink(outer.join("far"), root.join("out")).unwrap();
+        let l = list_within(
+            root.join("out").to_str().unwrap(),
+            PickKind::Dir,
+            false,
+            &root.join("c.canvas.md"),
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(l.path, root.to_str().unwrap());
     }
 
     #[test]

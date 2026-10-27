@@ -1,6 +1,7 @@
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, FsListing, NodeType, ServiceStatusDto, VarStatus } from "./types";
 import { isVSCodeHost, vscodeApi } from "./vscodeHost";
 import { isEmptyView, type TableMeta, type TableRowsPage, type ViewSpec } from "./tableView";
+import { canvasOpenUrl } from "./openUrl";
 
 export async function fetchCanvas(): Promise<CanvasDoc> {
   const res = await fetch("api/canvas");
@@ -13,13 +14,17 @@ export async function fetchCanvas(): Promise<CanvasDoc> {
  * `readOnly` — it serves its canvas read-only (the canvas or its directory
  * isn't writable, or `--read-only`): blocks still run, but nothing can be
  * edited, so the toolbar offers no "Edit"; `noExec` — it was started with
- * `--no-exec`: editing works, but every run is refused.
+ * `--no-exec`: editing works, but every run is refused. `remote` is about
+ * *this page* rather than the worker: it was reached through the gateway
+ * (`meshfox serve --http`), so anything that opens a file on the server's
+ * machine (the OS default application, the file manager) does nothing
+ * useful and the page doesn't offer it.
  */
-export async function fetchWorkerInfo(): Promise<{ readOnly: boolean; noExec: boolean }> {
+export async function fetchWorkerInfo(): Promise<{ readOnly: boolean; noExec: boolean; remote: boolean }> {
   const res = await fetch("api/info");
   if (!res.ok) throw new Error(`GET /api/info: ${res.status}`);
   const info = await res.json();
-  return { readOnly: info.readOnly === true, noExec: info.noExec === true };
+  return { readOnly: info.readOnly === true, noExec: info.noExec === true, remote: info.remote === true };
 }
 
 /**
@@ -1145,7 +1150,14 @@ export async function fetchRunHistory(nodeId: string, block: string): Promise<Ru
 type OpenAction =
   | { action: "done" }
   | { action: "open_file"; path: string }
-  | { action: "open_canvas"; path: string; fragment: string | null; port: number | null };
+  | {
+      action: "open_canvas";
+      path: string;
+      fragment: string | null;
+      port: number | null;
+      /** Behind the gateway: the target page relative to this one (`../<slug>/`). */
+      url: string | null;
+    };
 
 /**
  * Opens a `file` node's target — the web UI's "↗ open" button. The server
@@ -1179,9 +1191,9 @@ export async function openNodeFile(nodeId: string): Promise<void> {
     vscodeApi.postMessage({ type: "meshfox.open", ...action });
     return;
   }
-  if (action.action === "open_canvas" && action.port !== null) {
+  if (action.action === "open_canvas" && (action.url !== null || action.port !== null)) {
     const hash = action.fragment ? `#${encodeURIComponent(action.fragment)}` : "";
-    const url = `${window.location.protocol}//${window.location.hostname}:${action.port}/${hash}`;
+    const url = canvasOpenUrl(action, window.location, document.baseURI) + hash;
     if (!window.open(url, "_blank")) {
       throw new Error(`The browser blocked the new tab — open ${url} manually.`);
     }

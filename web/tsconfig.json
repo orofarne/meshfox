@@ -13,5 +13,5 @@
     "strict": true,
     "useDefineForClassFields": true
   },
-  "include": ["src", "vite.config.ts", "e2e", "playwright.config.ts"]
+  "include": ["src", "vite.config.ts", "e2e", "e2e-gateway", "playwright.config.ts", "playwright.gateway.config.ts"]
 }

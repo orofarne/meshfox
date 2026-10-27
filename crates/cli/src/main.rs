@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 mod console_cmd;
 mod coordinator;
 mod cores_cmd;
+mod gateway;
+mod gateway_index;
 mod logs_cmd;
 mod lsp;
 mod mcp;
@@ -312,11 +314,51 @@ enum Command {
     /// `server_socket` points at (or `--socket`; or the one systemd hands
     /// over under socket activation), gets-or-spawns a core per canvas and
     /// is controlled with `meshfox cores list|open|kill`.
+    ///
+    /// With `--http` it also serves the canvases under `--root` to a browser:
+    /// an index at `/` and each canvas at `/c/<slug>/`. The access token
+    /// (`MESHFOX_TOKEN` or `--token-file`) is root-equivalent on this
+    /// machine — blocks run code — so treat it like an SSH key; it is
+    /// required unless the address is loopback (one is generated and printed
+    /// if none is given). There is no TLS: put a reverse proxy in front and
+    /// pass `--trust-proxy`.
     Serve {
         /// Socket path to listen on; defaults to `server_socket` from the
         /// config. Ignored under systemd socket activation.
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
+        /// Also serve the canvases over HTTP on ADDR (default
+        /// `127.0.0.1:4590`): an index at `/` and every canvas under
+        /// `/c/<slug>/`, started on demand. A non-loopback ADDR needs a
+        /// token (`MESHFOX_TOKEN` or `--token-file`).
+        #[arg(
+            long,
+            value_name = "ADDR",
+            num_args = 0..=1,
+            default_missing_value = "127.0.0.1:4590"
+        )]
+        http: Option<String>,
+        /// Directory whose canvases `--http` serves; defaults to the current
+        /// directory. Nothing outside it is reachable.
+        #[arg(long, value_name = "DIR", requires = "http")]
+        root: Option<PathBuf>,
+        /// File holding the access token for `--http` (first line).
+        #[arg(long, value_name = "FILE", requires = "http")]
+        token_file: Option<PathBuf>,
+        /// Extra `Host` name `--http` accepts (repeatable).
+        #[arg(long, value_name = "HOST", requires = "http")]
+        allowed_host: Vec<String>,
+        /// Address users reach `--http` at, for the links printed or opened
+        /// by `meshfox view`/`cores open` (e.g. `https://notes.example`);
+        /// defaults to the bound address.
+        #[arg(long, value_name = "URL", requires = "http")]
+        public_url: Option<String>,
+        /// A reverse proxy terminates TLS in front of `--http`: believe its
+        /// `X-Forwarded-For` (failed-login limit per client) and
+        /// `X-Forwarded-Proto` (`Secure` cookie). Only behind a proxy that
+        /// sets both; otherwise any client could forge them.
+        #[arg(long, requires = "http")]
+        trust_proxy: bool,
     },
     /// Inspect and control the cores (per-canvas workers) of the persistent
     /// coordinator `server_socket` points at: `ls`, `open`, `kill`.
@@ -1527,7 +1569,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Serve { socket } => {
+        Command::Serve {
+            socket,
+            http,
+            root,
+            token_file,
+            allowed_host,
+            public_url,
+            trust_proxy,
+        } => {
             let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
                 eprintln!("failed to start async runtime: {e}");
                 std::process::exit(1);
@@ -1536,7 +1586,18 @@ fn main() {
                 eprintln!("meshfox serve: couldn't resolve this binary's own path: {e}");
                 std::process::exit(1);
             });
-            if let Err(e) = runtime.block_on(serve::run(exe, socket)) {
+            if let Err(e) = runtime.block_on(serve::run(
+                exe,
+                socket,
+                http.map(|addr| serve::HttpOptions {
+                    addr,
+                    root,
+                    token_file,
+                    allowed_hosts: allowed_host,
+                    public_url,
+                    trust_proxy,
+                }),
+            )) {
                 eprintln!("meshfox serve: {e}");
                 std::process::exit(1);
             }

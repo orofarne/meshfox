@@ -16,6 +16,10 @@ It grew by 5 more once undo/redo gained its own per-canvas history log (`crates/
 
 File input/output tracking adds direct uses of `blake3` (CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception) and `globset` (Unlicense OR MIT). Both were already in Cargo.lock. The macOS normal-edge count was refreshed from `cargo metadata --filter-platform aarch64-apple-darwin`; the license scan found no additional mandatory copyleft requirement beyond the existing MPL exceptions. Alternative-license crates retain a permissive option.
 
+Slug generation for `meshfox serve --http` (`crates/core/src/slug.rs`) adds a direct use of `unicode-normalization` (MIT OR Apache-2.0) to put paths in NFC before hashing. It was already in Cargo.lock (transitively), so the shipped tree and the license scan do not change.
+
+`meshfox serve --http` (`crates/cli/src/gateway.rs`) also makes `axum`, `blake3` and `serde_urlencoded` direct dependencies of `crates/cli`. All three were already direct or transitive dependencies of the shipped binary at the same versions (`meshfox-server` uses `axum` with the `ws` feature; `reqwest` pulls `serde_urlencoded`), so the compiled tree and the license scan do not change.
+
 It grew by exactly 1 more once `meshfox-core` gained a line-based three-way merge (`crates/core/src/merge.rs`, used to combine two concurrent edits of one node body or file instead of rejecting the later one) — `similar` (Apache-2.0, `default-features` untouched, so only its `text` line-diff module) computes the base→mine and base→theirs line diffs; the `diff3` grouping on top of them is this repo's own code. `similar` has no dependencies of its own — it was the only new `Cargo.lock` package the change added (checked via `git diff Cargo.lock`), permissive, no new copyleft exception.
 
 The TUI Unicode palette adds `unicode_names2` 3.1.0 ((MIT OR Apache-2.0) AND Unicode-DFS-2016), with `unicode_names2_generator` (MIT OR Apache-2.0) used at build time. Unicode data attribution is covered by the crate's bundled Unicode license. The macOS normal-edge shipped dependency count was refreshed to 627 using Cargo metadata; no new copyleft obligations were found.
@@ -75,6 +79,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | serde | MIT OR Apache-2.0 |
 | serde_json | MIT OR Apache-2.0 |
 | serde_norway | MIT OR Apache-2.0 |
+| serde_urlencoded | MIT OR Apache-2.0 |
 | shlex | MIT OR Apache-2.0 |
 | similar | Apache-2.0 |
 | starlark | Apache-2.0 |
@@ -88,6 +93,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | tokio-tungstenite | MIT |
 | toml | MIT OR Apache-2.0 |
 | tower-http | MIT |
+| unicode-normalization | MIT OR Apache-2.0 |
 | unicode_names2 | (MIT OR Apache-2.0) AND Unicode-DFS-2016 |
 | uuid | Apache-2.0 OR MIT |
 

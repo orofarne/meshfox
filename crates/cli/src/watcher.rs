@@ -35,7 +35,7 @@ use meshfox_server::watcher_protocol::{
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -67,6 +67,21 @@ struct Entry {
     kill: Option<oneshot::Sender<()>>,
 }
 
+/// How `serve --http` shows a canvas to the user: at
+/// `<base>/c/<slug>/[#fragment]`, since a worker's own loopback port is not
+/// reachable from where the user's browser is (a container, another
+/// machine).
+pub(crate) struct Announce {
+    /// Public address of the gateway, no trailing slash.
+    pub base: String,
+    /// The gateway's root; canvases outside it have no gateway URL.
+    pub root: PathBuf,
+    /// Hand the URL to this machine's browser. False when the gateway is
+    /// not loopback-only: the browser is elsewhere, so the URL is only
+    /// printed.
+    pub open_locally: bool,
+}
+
 /// Shared state the accept loop and every per-worker watch task touch.
 /// Never holds a `Child` — each worker's own task owns it exclusively
 /// (needed to both `.wait()` on it *and* `.start_kill()` it from the same
@@ -87,6 +102,12 @@ pub(crate) struct Registry {
     /// `open::that` call so tests can substitute a recorder — otherwise
     /// every `cargo test` run pops real browser tabs.
     tab_opener: Box<dyn Fn(String) + Send + Sync>,
+    /// Set by `serve --http`: canvases are then shown at their gateway URL
+    /// rather than on the worker's loopback port (see [`Announce`]).
+    announce: OnceLock<Announce>,
+    /// Where a link nobody can open for the user is shown (stderr; a test
+    /// recorder).
+    notice: Box<dyn Fn(String) + Send + Sync>,
     /// A persistent coordinator (`meshfox serve`) as opposed to a private
     /// per-`view` watcher: answers `ListCores` and `Kill` instead of
     /// rejecting them (`GetPort` is answered by both).
@@ -111,19 +132,41 @@ impl Registry {
             empty: Notify::new(),
             shutdown,
             tab_opener,
+            announce: OnceLock::new(),
+            notice: Box::new(|message| eprintln!("{message}")),
             persistent: false,
         }
     }
 
-    /// Opens a browser tab on `127.0.0.1:<port>` (plus `#fragment`), via
-    /// this registry's `tab_opener`.
-    fn open_browser_tab(&self, port: u16, fragment: Option<&str>) {
-        let mut url = format!("http://127.0.0.1:{port}/");
-        if let Some(fragment) = fragment {
-            url.push('#');
-            url.push_str(fragment);
+    /// Switches this registry to gateway URLs (`serve --http`). Once only.
+    pub(crate) fn set_announce(&self, announce: Announce) {
+        let _ = self.announce.set(announce);
+    }
+
+    /// Shows `canvas` (served by the worker on `port`) to the user: opens a
+    /// browser tab, via this registry's `tab_opener`, on `127.0.0.1:<port>`
+    /// plus `#fragment`. Under `serve --http` it is the gateway URL instead,
+    /// opened the same way if the gateway is loopback-only and otherwise
+    /// just printed.
+    fn open_browser_tab(&self, canvas: &Path, port: u16, fragment: Option<&str>) {
+        let fragment = fragment.map(|f| format!("#{f}")).unwrap_or_default();
+        if let Some(announce) = self.announce.get() {
+            let url = canvas
+                .strip_prefix(&announce.root)
+                .ok()
+                .and_then(|rel| meshfox_core::slug::slug_for_rel(rel).ok())
+                .map(|slug| format!("{}/c/{slug}/{fragment}", announce.base));
+            match url {
+                Some(url) if announce.open_locally => (self.tab_opener)(url),
+                Some(url) => (self.notice)(format!("meshfox serve: open {url}")),
+                None => (self.notice)(format!(
+                    "meshfox serve: {} is outside the served root, so it has no http address",
+                    canvas.display()
+                )),
+            }
+            return;
         }
-        (self.tab_opener)(url);
+        (self.tab_opener)(format!("http://127.0.0.1:{port}/{fragment}"));
     }
 
     fn is_empty(&self) -> bool {
@@ -131,7 +174,7 @@ impl Registry {
     }
 
     /// Every tracked worker, ordered by canvas path.
-    fn list_cores(&self) -> Vec<CoreInfo> {
+    pub(crate) fn list_cores(&self) -> Vec<CoreInfo> {
         let entries = self.entries.lock().unwrap();
         let mut cores: Vec<CoreInfo> = entries
             .iter()
@@ -193,7 +236,7 @@ impl Registry {
             )
         };
         if let Some(fragment) = pending_open {
-            self.open_browser_tab(port, fragment.as_deref());
+            self.open_browser_tab(path, port, fragment.as_deref());
         }
         for waiter in waiters {
             let _ = waiter.send(Ok(()));
@@ -584,7 +627,7 @@ async fn handle_connection(
 /// this request's own fragment) and wait alongside whoever else is waiting;
 /// never seen → spawn it (`port: 0`, `auto_exit: true` — the same defaults
 /// every navigated-to worker has always had) and wait the same way.
-async fn ensure_core(
+pub(crate) async fn ensure_core(
     registry: &Arc<Registry>,
     exe: &Path,
     socket_path: &Path,
@@ -614,7 +657,7 @@ async fn ensure_core(
     let rx = match action {
         Action::Ready(port) => {
             if let Some(fragment) = &open {
-                registry.open_browser_tab(port, fragment.as_deref());
+                registry.open_browser_tab(&canonical, port, fragment.as_deref());
             }
             return Ok(port);
         }
@@ -800,6 +843,66 @@ mod tests {
         let registry =
             Registry::with_tab_opener(Box::new(move |url| sink.lock().unwrap().push(url)));
         (opened, registry)
+    }
+
+    type Recorded = Arc<Mutex<Vec<String>>>;
+
+    fn announcing(root: &str, open_locally: bool) -> (Recorded, Recorded, Registry) {
+        let (opened, mut registry) = recording_registry();
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&notices);
+        registry.notice = Box::new(move |m| sink.lock().unwrap().push(m));
+        registry.set_announce(Announce {
+            base: "http://gw.example:4590".to_string(),
+            root: PathBuf::from(root),
+            open_locally,
+        });
+        (opened, notices, registry)
+    }
+
+    #[test]
+    fn without_a_gateway_a_tab_opens_on_the_workers_loopback_port() {
+        let (opened, registry) = recording_registry();
+        registry.open_browser_tab(Path::new("/srv/a.canvas.md"), 4242, Some("node"));
+        registry.open_browser_tab(Path::new("/srv/a.canvas.md"), 4242, None);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            ["http://127.0.0.1:4242/#node", "http://127.0.0.1:4242/"]
+        );
+    }
+
+    #[test]
+    fn under_a_loopback_gateway_the_gateway_url_opens_in_the_local_browser() {
+        let (opened, notices, registry) = announcing("/srv", true);
+        registry.open_browser_tab(Path::new("/srv/sub/a.canvas.md"), 4242, Some("n"));
+        let slug = meshfox_core::slug::slug_for_rel(Path::new("sub/a.canvas.md")).unwrap();
+        assert_eq!(
+            *opened.lock().unwrap(),
+            [format!("http://gw.example:4590/c/{slug}/#n")]
+        );
+        assert!(notices.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn under_a_reachable_gateway_the_url_is_only_printed() {
+        let (opened, notices, registry) = announcing("/srv", false);
+        registry.open_browser_tab(Path::new("/srv/a.canvas.md"), 4242, None);
+        let slug = meshfox_core::slug::slug_for_rel(Path::new("a.canvas.md")).unwrap();
+        assert!(opened.lock().unwrap().is_empty(), "no browser to open here");
+        assert_eq!(
+            *notices.lock().unwrap(),
+            [format!(
+                "meshfox serve: open http://gw.example:4590/c/{slug}/"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_canvas_outside_the_gateway_root_is_reported_not_opened_on_a_dead_port() {
+        let (opened, notices, registry) = announcing("/srv", true);
+        registry.open_browser_tab(Path::new("/elsewhere/a.canvas.md"), 4242, None);
+        assert!(opened.lock().unwrap().is_empty());
+        assert!(notices.lock().unwrap()[0].contains("outside the served root"));
     }
 
     #[tokio::test]

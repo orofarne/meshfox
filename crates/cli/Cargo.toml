@@ -100,6 +100,11 @@ tokio-tungstenite = "0.30.0"
 # bytes_stream()` needs `StreamExt` to poll; already a real dependency of
 # `meshfox-server` at this same version, reused rather than re-pinned.
 futures-util = "0.3.33"
+# `serve --http`: the gateway in front of the workers (`gateway.rs`). Both
+# are already in the tree via `meshfox-server` / `reqwest`; same versions.
+axum = { version = "0.7", features = ["ws"] }
+blake3 = "1"
+serde_urlencoded = "0.7"
 unicode_names2 = "3"
 lsp-server = "0.7"
 lsp-types = "0.97"

@@ -4,6 +4,7 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
+const CONTAINER: &str = "meshfox check-updates: this is a container image; pull a newer image (e.g. `docker pull ghcr.io/orofarne/meshfox`) and recreate the container instead of updating in place.";
 const MANAGED: &str = "meshfox check-updates: this installation is managed by a package manager; use your package manager to update meshfox.";
 
 /// `exe` must be canonicalized so a Homebrew bin symlink resolves into the
@@ -23,6 +24,9 @@ pub fn package_manager_message(exe: &Path) -> Option<String> {
     }
     let method = std::fs::read_to_string(marker).unwrap_or_default();
     Some(match method.trim() {
+        // An image is replaced, not updated in place: the new version is a
+        // new tag, and the old container is kept or thrown away with it.
+        "docker" => CONTAINER.to_owned(),
         "homebrew" => format!("{MANAGED}\nRun: brew upgrade orofarne/tap/meshfox"),
         // A deb may have been installed without an apt repository, and a
         // pacman package may come from the AUR rather than an official repo.
@@ -112,6 +116,18 @@ mod tests {
             assert!(message.starts_with(MANAGED));
             assert!(message.contains(hint));
         }
+    }
+
+    #[test]
+    fn a_container_image_says_to_pull_a_new_image() {
+        let scratch = Scratch::new();
+        let marker = scratch.0.join("share/meshfox/install-method");
+        let exe = scratch.0.join("bin/meshfox");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "docker\n").unwrap();
+        let message = package_manager_message(&exe).unwrap();
+        assert!(message.contains("container image") && message.contains("docker pull"));
+        assert!(!message.contains("package manager"));
     }
 
     #[cfg(unix)]

@@ -45,6 +45,7 @@ import {
 import type { RenderResultDto, ConstraintStatusDto, NodeType, ServiceStatusDto } from "./types";
 
 import { resolveAssetHref } from "./assetHref";
+import { canOpenOnServer } from "./openUrl";
 
 /**
  * `react-markdown`'s own `defaultUrlTransform` strips any URL scheme
@@ -556,6 +557,10 @@ export interface MeshNodeData {
    * default file manager (the body's "show folder" icon, right after the
    * download icon). */
   onOpenFileFolder: () => void;
+  /** The page was reached through the gateway: a file node whose target
+   * isn't a canvas has no server-side "open" to offer (see
+   * `canOpenOnServer`). */
+  remote: boolean;
   /** Opens this node's body in a floating window (`NodeExpandPanel`) — same
    * live content (run/kill buttons, streaming output) as the inline box,
    * just bigger and not at the mercy of the canvas's current pan/zoom.
@@ -2774,6 +2779,11 @@ function RunnableFileBlock({ data, nodeId }: Readonly<{ data: MeshNodeData; node
  * plus, for a `file`, the download and show-in-folder buttons. */
 function FileTargetRow({ data }: { data: MeshNodeData }) {
   const isFile = data.nodeType === "file";
+  // Through the gateway a plain file can only be fetched, not opened on the
+  // server: its name becomes an ordinary link to the file, like a `link`
+  // node's. The show-folder icon is gone for every file there (a folder on
+  // the server's machine is never reachable), canvases included.
+  const serverOpen = isFile && canOpenOnServer(data.target, data.remote);
   return data.target ? (
       <div className="mesh-node-target-row">
         {/* A `file` node's own link now behaves exactly like the title
@@ -2800,7 +2810,7 @@ function FileTargetRow({ data }: { data: MeshNodeData }) {
          * browser tab straight at the file's server URL from VS
          * Code's own interception). A `<button>` has no `href` at all
          * for that interception to ever find. */}
-        {isFile ? (
+        {serverOpen ? (
           <button type="button" className="mesh-node-open-link nodrag" onClick={data.onOpenFile}>
             {data.target}
           </button>
@@ -2819,14 +2829,16 @@ function FileTargetRow({ data }: { data: MeshNodeData }) {
             >
               <DownloadIcon />
             </a>
-            <button
-              type="button"
-              className="mesh-node-icon-button mesh-node-inline-icon nodrag"
-              onClick={data.onOpenFileFolder}
-              title="Show this file's containing folder"
-            >
-              <FolderIcon />
-            </button>
+            {serverOpen && !data.remote && (
+              <button
+                type="button"
+                className="mesh-node-icon-button mesh-node-inline-icon nodrag"
+                onClick={data.onOpenFileFolder}
+                title="Show this file's containing folder"
+              >
+                <FolderIcon />
+              </button>
+            )}
           </>
         )}
       </div>
@@ -3108,7 +3120,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunAutoclose = quickRunBlock?.autoclose ?? false;
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
-  const canOpenFile = data.nodeType === "file" && !!data.target;
+  const canOpenFile =
+    data.nodeType === "file" && !!data.target && canOpenOnServer(data.target, data.remote);
   // A `link` node's own title-bar "↗ open" button — same spot/icon as a
   // `file` node's (`canOpenFile` above), just opening the URL directly in a
   // new tab (no OS-level app to hand it off to, unlike a file) rather than

@@ -40,10 +40,22 @@ const PX_PER_IN: f64 = 96.0;
 /// not needed for realistic hand-placed canvases).
 const MAX_DIMENSION_IN: f64 = 200.0 / 2.54;
 
+/// Chromium's own sandbox needs user namespaces, which an unprivileged
+/// container (the `meshfox:full` image) does not have: it refuses to start
+/// ("No usable sandbox!"). `MESHFOX_CHROME_NO_SANDBOX=1` turns it off; the
+/// container is then the isolation boundary. Anything but unset, empty or
+/// `0` counts as set.
+fn sandbox_enabled(no_sandbox: Option<&std::ffi::OsStr>) -> bool {
+    no_sandbox.is_none_or(|v| v.is_empty() || v == "0")
+}
+
 pub fn launch() -> Result<Browser, String> {
     let path = headless_chrome::browser::default_executable().ok();
     let launch_options = LaunchOptions::default_builder()
         .path(path)
+        .sandbox(sandbox_enabled(
+            std::env::var_os("MESHFOX_CHROME_NO_SANDBOX").as_deref(),
+        ))
         .build()
         .map_err(|e| format!("chrome launch options: {e}"))?;
     Browser::new(launch_options)
@@ -171,5 +183,20 @@ pub fn document_options() -> PrintToPdfOptions {
         prefer_css_page_size: Some(true),
         print_background: Some(true),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sandbox_enabled;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn the_sandbox_stays_on_unless_explicitly_turned_off() {
+        assert!(sandbox_enabled(None));
+        assert!(sandbox_enabled(Some(OsStr::new(""))));
+        assert!(sandbox_enabled(Some(OsStr::new("0"))));
+        assert!(!sandbox_enabled(Some(OsStr::new("1"))));
+        assert!(!sandbox_enabled(Some(OsStr::new("yes"))));
     }
 }

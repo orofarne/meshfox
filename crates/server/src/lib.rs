@@ -1998,8 +1998,14 @@ async fn api_ping() -> &'static str {
 /// `GET /api/info` — what a client needs to know about this worker's canvas
 /// before it offers anything: whether it's read-only and where `secret` answers are stored (see
 /// `AppState::read_only`), so the web UI can hide Edit and the TUI/MCP can
-/// say why an edit is refused. Fixed for the worker's whole lifetime.
-async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+/// say why an edit is refused. All of it is fixed for the worker's whole
+/// lifetime except `remote`, which is about *this request*: true when it came
+/// through the gateway (`serve --http`), where opening files on the server's
+/// machine makes no sense, so the page hides those buttons.
+async fn api_info(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<serde_json::Value> {
     let keychain = state.vars_cache.lock().unwrap().secret_store_kind()
         == meshfox_core::secret_store::SecretStoreKind::Keychain;
     let (image_protocol, image_protocol_error) =
@@ -2008,7 +2014,7 @@ async fn api_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
             Err(error) => (None, Some(error)),
         };
     Json(
-        serde_json::json!({ "readOnly": state.read_only, "noExec": state.no_exec, "secretStore": if keychain { "keychain" } else { "plaintext" },
+        serde_json::json!({ "readOnly": state.read_only, "noExec": state.no_exec, "remote": gateway_root(&headers).is_some(), "secretStore": if keychain { "keychain" } else { "plaintext" },
         "tuiImageProtocol": image_protocol, "tuiImageProtocolError": image_protocol_error }),
     )
 }
@@ -6714,7 +6720,30 @@ enum OpenAction {
         path: String,
         fragment: Option<String>,
         port: Option<u16>,
+        /// Reached through the gateway (`serve --http`): the target's URL
+        /// relative to this page (`../<slug>/`), to open instead of a port
+        /// the browser cannot reach. `port` is absent then.
+        url: Option<String>,
     },
+}
+
+/// The gateway root this request announced
+/// (`meshfox_core::gateway_header`), if it came through the gateway at all.
+/// Per request, not per worker: the same worker is also reachable directly.
+fn gateway_root(headers: &axum::http::HeaderMap) -> Option<std::path::PathBuf> {
+    headers
+        .get(meshfox_core::gateway_header::GATEWAY_ROOT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(meshfox_core::gateway_header::decode_root)
+}
+
+/// What a request that came through the gateway gets for anything that would
+/// open a file on the server's machine.
+fn not_through_gateway() -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "opening files on the server's machine isn't available through the gateway".to_string(),
+    )
 }
 
 /// Opens a `file` node's target — the web UI's "↗ open" button — in the
@@ -6739,6 +6768,7 @@ async fn open_node_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(query): Query<OpenNodeFileQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<OpenAction>, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
@@ -6770,9 +6800,32 @@ async fn open_node_file(
                 path,
                 fragment,
                 port: None,
+                url: None,
             }
         } else {
             OpenAction::OpenFile { path }
+        }));
+    }
+
+    // Reached through the gateway: a canvas is another page of the same
+    // gateway, named by slug (the gateway starts its worker on the first
+    // request, so nothing is asked of the coordinator); anything else would
+    // open on the server's machine, where nobody is looking.
+    if let Some(root) = gateway_root(&headers).filter(|_| query.context == OpenContext::Web) {
+        if !is_canvas {
+            return Err(not_through_gateway());
+        }
+        let url = meshfox_core::gateway_header::canvas_url(&root, &resolved).ok_or_else(|| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{path} is outside the served root, so the gateway cannot open it"),
+            )
+        })?;
+        return Ok(Json(OpenAction::OpenCanvas {
+            path,
+            fragment,
+            port: None,
+            url: Some(url),
         }));
     }
 
@@ -6829,6 +6882,7 @@ async fn open_node_file(
             path,
             fragment,
             port: Some(port),
+            url: None,
         }));
     }
 
@@ -6865,7 +6919,11 @@ async fn open_node_file(
 async fn open_node_file_folder(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
+    if gateway_root(&headers).is_some() {
+        return Err(not_through_gateway());
+    }
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
     let canvas = parse_or_error(&located.raw)?;
@@ -10903,8 +10961,11 @@ async fn get_fs_list(
         })?,
     };
     let canvas_path = state.canvas_path.clone();
+    // Through the gateway the page browses the served tree, not the server's
+    // whole file system. (The gateway has already vouched for the caller.)
+    let root = gateway_root(&headers);
     let listing = tokio::task::spawn_blocking(move || {
-        meshfox_core::fsbrowse::list(&q.path, kind, q.hidden, &canvas_path)
+        meshfox_core::fsbrowse::list_within(&q.path, kind, q.hidden, &canvas_path, root.as_deref())
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -16831,6 +16892,127 @@ mod run_file_tests {
         }
     }
 
+    /// `post`, plus one request header.
+    async fn post_with(addr: SocketAddr, path: &str, header: (&str, &str)) -> (u16, String) {
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            header.0, header.1
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        let mut parts = response.splitn(2, "\r\n\r\n");
+        let head = parts.next().unwrap_or_default();
+        let body = parts.next().unwrap_or_default().to_string();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        (status, body)
+    }
+
+    fn gateway_header(root: &std::path::Path) -> (&'static str, String) {
+        (
+            meshfox_core::gateway_header::GATEWAY_ROOT_HEADER,
+            meshfox_core::gateway_header::encode_root(root),
+        )
+    }
+
+    #[tokio::test]
+    async fn open_node_file_through_the_gateway_returns_a_relative_canvas_url() {
+        let (dir, canvas_path) = open_fixture("./other.canvas.md#o");
+        // No watcher: the gateway starts the target's worker itself.
+        let addr = spawn_test_server(canvas_path).await;
+        let root = dir.canonicalize().unwrap();
+        let (name, value) = gateway_header(&root);
+        let (status, body) = post_with(addr, "/api/nodes/f/open?context=web", (name, &value)).await;
+        assert_eq!(status, 200, "unexpected body: {body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["action"], "open_canvas");
+        assert_eq!(json["fragment"], "o");
+        assert!(json["port"].is_null());
+        let slug =
+            meshfox_core::slug::slug_for_rel(std::path::Path::new("other.canvas.md")).unwrap();
+        assert_eq!(json["url"], format!("../{slug}/").as_str());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_node_file_through_the_gateway_refuses_files_and_targets_outside_the_root() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        let addr = spawn_test_server(canvas_path).await;
+        let root = dir.canonicalize().unwrap();
+        let (name, value) = gateway_header(&root);
+        let (status, body) = post_with(addr, "/api/nodes/f/open?context=web", (name, &value)).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(body.contains("through the gateway"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, canvas_path) = open_fixture("./other.canvas.md");
+        let addr = spawn_test_server(canvas_path).await;
+        let elsewhere = std::path::Path::new("/nonexistent/served/root");
+        let (name, value) = gateway_header(elsewhere);
+        let (status, body) = post_with(addr, "/api/nodes/f/open?context=web", (name, &value)).await;
+        assert_eq!(status, 422, "{body}");
+        assert!(body.contains("outside the served root"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_gateway_header_changes_nothing_for_vscode_and_a_malformed_one_is_ignored() {
+        let (dir, canvas_path) = open_fixture("./other.canvas.md");
+        let addr = spawn_test_server(canvas_path).await;
+        let root = dir.canonicalize().unwrap();
+        let (name, value) = gateway_header(&root);
+        let (status, body) =
+            post_with(addr, "/api/nodes/f/open?context=vscode", (name, &value)).await;
+        assert_eq!(status, 200, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["url"].is_null() && json["port"].is_null());
+        // A relative "root" is not a gateway: the normal path (no watcher → 503).
+        let (status, _) = post_with(
+            addr,
+            "/api/nodes/f/open?context=web",
+            (
+                meshfox_core::gateway_header::GATEWAY_ROOT_HEADER,
+                "relative",
+            ),
+        )
+        .await;
+        assert_eq!(status, 503);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn show_folder_is_refused_through_the_gateway_and_info_says_remote() {
+        let (dir, canvas_path) = open_fixture("./note.txt");
+        let addr = spawn_test_server(canvas_path).await;
+        let root = dir.canonicalize().unwrap();
+        let (name, value) = gateway_header(&root);
+        let (status, body) = post_with(addr, "/api/nodes/f/open-folder", (name, &value)).await;
+        assert_eq!(status, 503, "{body}");
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let info = |remote: bool| {
+            let mut req = client.get(format!("http://{addr}/api/info"));
+            if remote {
+                req = req.header(name, value.clone());
+            }
+            async move {
+                let body = req.send().await.unwrap().text().await.unwrap();
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+                json["remote"].clone()
+            }
+        };
+        assert_eq!(info(true).await, true);
+        assert_eq!(info(false).await, false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn open_node_file_requires_a_context() {
         let (dir, canvas_path) = open_fixture("./note.txt");
@@ -17557,6 +17739,68 @@ mod session_skip_tests {
         // Bad kind.
         let (status, _) = request_with_headers(addr, "/api/fs/list?kind=socket", &host, None).await;
         assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn fs_list_through_the_gateway_never_leaves_the_served_root() {
+        let data = outside_dir_with("clip.mp4", "x");
+        let path = dir_var_canvas("", &[]);
+        let root = path.parent().unwrap().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        let addr = spawn_test_server(path).await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::new();
+        let list = |requested: String, via_gateway: bool| {
+            let query = {
+                let mut q = String::from("kind=file&path=");
+                for b in requested.bytes() {
+                    if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+                        q.push(char::from(b));
+                    } else {
+                        q.push_str(&format!("%{b:02X}"));
+                    }
+                }
+                q
+            };
+            let mut req = client.get(format!("http://{addr}/api/fs/list?{query}"));
+            if via_gateway {
+                req = req.header(
+                    meshfox_core::gateway_header::GATEWAY_ROOT_HEADER,
+                    meshfox_core::gateway_header::encode_root(&root),
+                );
+            }
+            async move {
+                let body = req.send().await.unwrap().text().await.unwrap();
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        // Directly (the local UI) the picker may go anywhere...
+        let direct = list(data.display().to_string(), false).await;
+        assert_eq!(
+            direct["path"],
+            data.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(direct["parent"].is_string() && direct["home"].is_string());
+
+        // ...through the gateway an outside path opens the root, which has
+        // no parent and no home shortcut; the tree below it is still there.
+        for outside in [
+            data.display().to_string(),
+            "/".to_string(),
+            "..".to_string(),
+        ] {
+            let l = list(outside.clone(), true).await;
+            assert_eq!(l["path"], root.to_str().unwrap(), "{outside}");
+            assert!(
+                l["parent"].is_null() && l["home"].is_null(),
+                "{outside}: {l}"
+            );
+            assert!(!l.to_string().contains("clip.mp4"), "{outside}");
+        }
+        let inner = list(root.join("inner").display().to_string(), true).await;
+        assert_eq!(inner["path"], root.join("inner").to_str().unwrap());
+        assert_eq!(inner["parent"], root.to_str().unwrap());
     }
 
     #[tokio::test]
@@ -22907,12 +23151,12 @@ mod tui_image_config_tests {
         )
         .unwrap();
         let state = build_state(path, false, None).await.unwrap();
-        let Json(info) = api_info(State(state.clone())).await;
+        let Json(info) = api_info(State(state.clone()), axum::http::HeaderMap::new()).await;
         assert_eq!(info["tuiImageProtocol"], "sixel");
         assert!(info["tuiImageProtocolError"].is_null());
         assert!(!info.to_string().contains("not-for-clients"));
         std::fs::write(&config, "[tui]\nimage_protocol = 7").unwrap();
-        let Json(info) = api_info(State(state)).await;
+        let Json(info) = api_info(State(state), axum::http::HeaderMap::new()).await;
         assert!(info["tuiImageProtocol"].is_null());
         assert!(info["tuiImageProtocolError"]
             .as_str()

@@ -457,15 +457,21 @@ export default function App() {
   // refused. A browser can't read the reason off a refused WebSocket, so
   // the run handlers say it themselves instead of attempting the run.
   const [workerNoExec, setWorkerNoExec] = useState(false);
+  // This page was reached through the gateway (`meshfox serve --http`):
+  // opening a file on the server's machine does nothing useful, so the file
+  // nodes don't offer it (see `canOpenOnServer`).
+  const [workerRemote, setWorkerRemote] = useState(false);
   useEffect(() => {
     fetchWorkerInfo()
       .then((info) => {
         setWorkerReadOnly(info.readOnly);
         setWorkerNoExec(info.noExec);
+        setWorkerRemote(info.remote);
       })
       .catch(() => {
         setWorkerReadOnly(false);
         setWorkerNoExec(false);
+        setWorkerRemote(false);
       });
   }, []);
   // True while the toolbar's "Source" toggle has swapped the graph view for
@@ -2581,6 +2587,7 @@ export default function App() {
             },
             onOpenFile: () => handleOpenFile(n.id),
             onOpenFileFolder: () => handleOpenFileFolder(n.id),
+            remote: workerRemote,
             onAddChild: () => handleAddChild(n.id),
             onFitSize: size => fitNodeSizeRef.current(n.id, size),
             onMoveUp:
@@ -2835,7 +2842,7 @@ export default function App() {
     // Deliberately excludes handleRun/handleKill/setNodes/setEdges: this effect should
     // only re-run when a fresh canvas doc arrives.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvas]);
+  }, [canvas, workerRemote]);
 
   // Keeps `measuredHeightsRef` current — cheap (a ref write, no state) so
   // this can safely depend on `nodes` directly, unlike the canvas-load

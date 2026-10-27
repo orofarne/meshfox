@@ -13,6 +13,10 @@
 //! 2. `--socket PATH`, or `server_socket` from the config — bound here, with
 //!    mode `0600` (the socket permissions are the whole access control,
 //!    `Kill` included), and unlinked again on exit.
+//!
+//! With `--http ADDR` the same process also runs the gateway
+//! (`crate::gateway`): an index of the canvases under `--root` and a reverse
+//! proxy to their cores, behind an access token unless ADDR is loopback.
 
 use std::io;
 use std::os::fd::FromRawFd;
@@ -22,7 +26,8 @@ use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::watcher::{accept_loop, wait_for_terminate, Registry};
+use crate::gateway::{CanvasResolver, Gateway, GatewayConfig, PortFuture};
+use crate::watcher::{accept_loop, ensure_core, wait_for_terminate, Announce, Registry};
 
 /// First file descriptor systemd passes (`SD_LISTEN_FDS_START`).
 const SD_LISTEN_FDS_START: i32 = 3;
@@ -34,7 +39,48 @@ enum Acquired {
     Bound(UnixListener, PathBuf),
 }
 
-pub async fn run(exe: PathBuf, socket: Option<PathBuf>) -> io::Result<()> {
+/// `meshfox serve --http`, as parsed from the command line.
+pub struct HttpOptions {
+    pub addr: String,
+    pub root: Option<PathBuf>,
+    pub token_file: Option<PathBuf>,
+    pub allowed_hosts: Vec<String>,
+    pub public_url: Option<String>,
+    pub trust_proxy: bool,
+}
+
+/// The gateway's view of this process's own registry.
+struct LocalResolver {
+    registry: Arc<Registry>,
+    exe: PathBuf,
+    socket_path: PathBuf,
+}
+
+impl CanvasResolver for LocalResolver {
+    fn port_for(&self, canvas: PathBuf) -> PortFuture<'_> {
+        Box::pin(ensure_core(
+            &self.registry,
+            &self.exe,
+            &self.socket_path,
+            canvas,
+            None,
+        ))
+    }
+
+    fn running(&self) -> Vec<PathBuf> {
+        self.registry
+            .list_cores()
+            .into_iter()
+            .map(|core| core.canvas_path)
+            .collect()
+    }
+}
+
+pub async fn run(
+    exe: PathBuf,
+    socket: Option<PathBuf>,
+    http: Option<HttpOptions>,
+) -> io::Result<()> {
     let (listener, socket_path, owned) = match acquire(socket).await? {
         Acquired::Inherited(listener) => {
             let path = listener
@@ -53,6 +99,19 @@ pub async fn run(exe: PathBuf, socket: Option<PathBuf>) -> io::Result<()> {
     };
 
     let registry = Arc::new(Registry::new_persistent());
+    // Set up the gateway before accepting anything, so a bad `--http`
+    // (non-existent root, port taken) fails the whole start.
+    let gateway_task = match http {
+        Some(options) => {
+            let resolver = Arc::new(LocalResolver {
+                registry: Arc::clone(&registry),
+                exe: exe.clone(),
+                socket_path: socket_path.clone(),
+            });
+            Some(start_gateway(options, resolver).await?)
+        }
+        None => None,
+    };
     let accept_task = tokio::spawn(accept_loop(
         listener,
         Arc::clone(&registry),
@@ -69,10 +128,110 @@ pub async fn run(exe: PathBuf, socket: Option<PathBuf>) -> io::Result<()> {
     // Best-effort: give every worker task a moment to kill and reap its child.
     let _ = tokio::time::timeout(Duration::from_secs(5), registry.wait_until_empty()).await;
     accept_task.abort();
+    if let Some(task) = gateway_task {
+        task.abort();
+    }
     if owned {
         let _ = std::fs::remove_file(&socket_path);
     }
     Ok(())
+}
+
+/// Where the access token comes from: `MESHFOX_TOKEN`, then `--token-file`
+/// (first line). `None` when neither is set.
+fn configured_token(token_file: Option<&Path>) -> io::Result<Option<String>> {
+    if let Some(token) = std::env::var("MESHFOX_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(Some(token));
+    }
+    let Some(file) = token_file else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| io::Error::other(format!("cannot read {}: {e}", file.display())))?;
+    match text.lines().next().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(token) => Ok(Some(token.to_string())),
+        None => Err(io::Error::other(format!(
+            "{} has no token on its first line",
+            file.display()
+        ))),
+    }
+}
+
+/// 256 bits from the OS, as hex.
+fn generate_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+async fn start_gateway(
+    options: HttpOptions,
+    resolver: Arc<LocalResolver>,
+) -> io::Result<tokio::task::JoinHandle<()>> {
+    let root = options.root.unwrap_or_else(|| PathBuf::from("."));
+    let root = root
+        .canonicalize()
+        .map_err(|e| io::Error::other(format!("--root {}: {e}", root.display())))?;
+    let listener = tokio::net::TcpListener::bind(&options.addr)
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("--http {}: {e}", options.addr)))?;
+    let local = listener.local_addr()?;
+    let loopback = local.ip().is_loopback();
+
+    let mut token = configured_token(options.token_file.as_deref())?;
+    if token.is_none() && !loopback {
+        // A reachable gateway runs code for whoever holds the token, so it
+        // is never started open: make one and say so.
+        let generated = generate_token();
+        eprintln!("meshfox serve: generated access token (set MESHFOX_TOKEN to choose your own):");
+        eprintln!("  {generated}");
+        token = Some(generated);
+    }
+    let gateway = Gateway::new(
+        GatewayConfig {
+            root: root.clone(),
+            token,
+            allowed_hosts: options.allowed_hosts,
+            loopback,
+            trust_proxy: options.trust_proxy,
+        },
+        Arc::clone(&resolver) as Arc<dyn CanvasResolver>,
+    )?;
+    // Where a canvas "opened" by `meshfox view`/`cores open` is shown to the
+    // user. A wildcard bind (a container) is reached as localhost through the
+    // published port unless `--public-url` says otherwise.
+    let base = options
+        .public_url
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| {
+            if local.ip().is_unspecified() {
+                format!("http://localhost:{}", local.port())
+            } else {
+                format!("http://{local}")
+            }
+        });
+    resolver.registry.set_announce(Announce {
+        base,
+        root: root.clone(),
+        open_locally: loopback,
+    });
+    eprintln!(
+        "meshfox serve: http on http://{local}/ (root {})",
+        root.display()
+    );
+    let app = gateway.router();
+    Ok(tokio::spawn(async move {
+        let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        if let Err(e) = axum::serve(listener, service).await {
+            eprintln!("meshfox serve: http server stopped: {e}");
+        }
+    }))
 }
 
 async fn acquire(socket: Option<PathBuf>) -> io::Result<Acquired> {

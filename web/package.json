@@ -28,6 +28,8 @@
     "test:table-view": "node --test scripts/table-view.test.mjs",
     "pretest:e2e": "npm run build && cargo build --manifest-path ../Cargo.toml -p meshfox-cli && ../scripts/run-signed.sh --sign-only \"${CARGO_TARGET_DIR:-../target}/debug/meshfox\"",
     "test:e2e": "playwright test",
+    "pretest:e2e:gateway": "npm run build && cargo build --manifest-path ../Cargo.toml -p meshfox-cli && ../scripts/run-signed.sh --sign-only \"${CARGO_TARGET_DIR:-../target}/debug/meshfox\"",
+    "test:e2e:gateway": "playwright test -c playwright.gateway.config.ts",
     "test:e2e:ui": "playwright test --ui"
   },
   "dependencies": {
