@@ -1,0 +1,196 @@
+name: Docker image
+
+# Publishes ghcr.io/<owner>/meshfox. The image wraps the binary from the GitHub
+# release of the same tag (see docker/Dockerfile), so a release has to exist
+# first: release.yml calls this after its `release` job. By hand, run it with
+# `push` off for a dry run that builds and smoke-tests everything and pushes
+# nothing.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.27.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build the image for, e.g. v0.27.0
+        required: true
+        type: string
+      push:
+        description: "Push to GHCR (off means: build and smoke-test only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # workflow_call has no `push` input: a call from release.yml always pushes.
+  PUSH: ${{ inputs.push == null && 'true' || inputs.push }}
+
+jobs:
+  build:
+    name: ${{ matrix.variant }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [slim, full]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    # Native runners for both architectures: nothing runs under emulation, which
+    # matters for `full` (Chromium, Node and Python from apt).
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Image name and version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          case "$tag" in v[0-9]*) ;; *) echo "not a release tag: $tag" >&2; exit 1 ;; esac
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
+          # GHCR names must be lowercase.
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/meshfox" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker
+          file: docker/Dockerfile
+          target: ${{ matrix.variant }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: MESHFOX_VERSION=${{ env.VERSION }}
+          load: true
+          tags: meshfox:smoke
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Smoke test
+        run: docker/smoke.sh meshfox:smoke "${{ matrix.variant }}" "$VERSION"
+
+      # Pushed by digest (no tag): the tags go on the multi-arch manifest in
+      # the `manifest` job once both architectures of a variant are in.
+      - name: Push by digest
+        if: env.PUSH == 'true'
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker
+          file: docker/Dockerfile
+          target: ${{ matrix.variant }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: MESHFOX_VERSION=${{ env.VERSION }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Export digest
+        if: env.PUSH == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: env.PUSH == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: manifest ${{ matrix.variant }}
+    needs: build
+    if: inputs.push == null || inputs.push
+    strategy:
+      matrix:
+        variant: [slim, full]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Image name and tags
+        id: tags
+        env:
+          TAG: ${{ inputs.tag }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          version="${tag#v}"
+          minor="${version%.*}"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/meshfox" >> "$GITHUB_ENV"
+          # `slim` is the default image: it owns the bare version, `X.Y` and
+          # `latest`. `full` is always spelled out. Pre-releases (1.0.0-rc.1)
+          # get their own exact tag only: they never move a moving tag.
+          list=""
+          add() { list="$list $1"; }
+          if [ "$VARIANT" = slim ]; then
+            add "$version"; add "$version-slim"
+            case "$version" in *-*) ;; *) add "$minor"; add "$minor-slim"; add latest; add slim ;; esac
+          else
+            add "$version-full"
+            case "$version" in *-*) ;; *) add "$minor-full"; add full ;; esac
+          fi
+          echo "list=${list# }" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.variant }}-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          args=()
+          for t in ${{ steps.tags.outputs.list }}; do args+=(-t "$IMAGE:$t"); done
+          docker buildx imagetools create "${args[@]}" $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Inspect
+        run: |
+          set -euo pipefail
+          first=$(echo "${{ steps.tags.outputs.list }}" | cut -d' ' -f1)
+          docker buildx imagetools inspect "$IMAGE:$first"

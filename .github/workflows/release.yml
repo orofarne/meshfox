@@ -109,6 +109,15 @@ jobs:
           draft: false
           generate_release_notes: true
 
+  image:
+    needs: release
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: ${{ github.ref_name }}
+    permissions:
+      contents: read
+      packages: write
+
   update-homebrew:
     needs: release
     uses: ./.github/workflows/homebrew.yml

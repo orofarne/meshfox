@@ -1,0 +1,2 @@
+# The Linux binaries a local image build copies in (see Dockerfile).
+bin/

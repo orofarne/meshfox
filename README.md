@@ -1348,6 +1348,28 @@ Through the gateway the page knows it is remote (`GET /api/info` says `"remote":
 
 Not covered yet: `meshfox tui`, `run` and the MCP server still reach a coordinator through its unix socket, so from outside a container they cannot drive it over HTTP. The macOS menu-bar app does not run a gateway.
 
+### Docker image
+<!-- meshfox:node id="docker-image" -->
+
+`ghcr.io/orofarne/meshfox` runs `meshfox serve --http` (see "Serving canvases over HTTP") on Debian 13, for `linux/amd64` and `linux/arm64`. Mount the directory with your canvases at `/work`:
+
+```sh
+docker run -d --name meshfox --user "$(id -u):$(id -g)" \
+  -p 127.0.0.1:4590:4590 -e MESHFOX_TOKEN=change-me \
+  -v "$PWD":/work ghcr.io/orofarne/meshfox
+```
+
+Open `http://localhost:4590/` and sign in with the token. Without `MESHFOX_TOKEN` the container generates one and prints it once (`docker logs meshfox`). Publish the port on `127.0.0.1` unless you mean to expose it, and read the security notes above first: the token is a shell on the container.
+
+- **Tags.** `slim` (the default: `latest`, `X.Y.Z`, `X.Y`, `slim`) is meshfox, `bash`, `git`, `curl`, DuckDB (for `display="table"`) and `tini`. `full` (`X.Y.Z-full`, `X.Y-full`, `full`) adds Python 3 with `venv` and `pip`, Node.js with `npm`, and Chromium (for `meshfox pdf`; its sandbox is off in the image, the container is the boundary: `MESHFOX_CHROME_NO_SANDBOX=1`). A pre-release gets only its exact tags.
+- **User.** `--user "$(id -u):$(id -g)"` makes blocks write files as you. Without it the container runs as uid 1000. Home (`/home/meshfox`) is writable for any uid.
+- **Driving it from the host.** `MESHFOX_SERVER_SOCKET` is set inside the image, so `docker exec -it meshfox meshfox tui /work/notes.canvas.md`, `… run …` and `… cores ls` talk to the `serve` that is already running instead of starting their own. Paths are the container's (`/work/...`). Mount the directory at the path you use on the host if you want the two to match.
+- **Opening canvases.** `meshfox view` / `cores open` inside the container print the address (`meshfox serve: open http://localhost:4590/c/<slug>/`), since there is no browser. Pass `--public-url` (after the image name) when you reach it by another address.
+- **Behind a reverse proxy,** add `--trust-proxy` and `--allowed-host` to the command: `docker run … ghcr.io/orofarne/meshfox serve --http 0.0.0.0:4590 --root /work --trust-proxy --allowed-host notes.example`.
+- **Updating** means pulling a newer image and recreating the container: `meshfox check-updates` says so instead of replacing the binary.
+
+The image wraps the binary from the GitHub release of the same tag. To build one yourself: `docker build -f docker/Dockerfile --build-arg MESHFOX_VERSION=0.27.0 --target slim -t meshfox:slim docker/` (or `--target full`); `docker/smoke.sh <image> slim|full <version>` runs the checks CI runs before it pushes. The Debian base has to be at least as new as the release runners' glibc (2.39), which is why it is 13 (trixie) and not 12. `.github/workflows/docker.yml` builds both variants natively on both architectures and publishes the multi-arch manifests after a release; run it by hand with `push` off for a dry run.
+
 ### End-to-end tests
 <!-- meshfox:node id="e2e-tests" -->
 
