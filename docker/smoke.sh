@@ -66,22 +66,22 @@ step "healthy"
 status=starting
 for _ in $(seq 60); do
   status=$(docker inspect -f '{{.State.Health.Status}}' "$name")
-  [ "$status" = healthy ] && break
+  [[ "$status" = healthy ]] && break
   sleep 1
 done
-[ "$status" = healthy ] || fail "container is $status"
+[[ "$status" = healthy ]] || fail "container is $status"
 
 step "version is v$version"
 expect_output "v$version" meshfox --version
 
 step "the gateway wants the token and accepts it"
 code=$(in_container curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4590/_/index.json)
-[ "$code" = 401 ] || fail "anonymous index answered $code, expected 401"
+[[ "$code" = 401 ]] || fail "anonymous index answered $code, expected 401"
 expect_output smoke.canvas.md curl -fsS -H 'Authorization: Bearer smoke' http://127.0.0.1:4590/_/index.json
 
 step "a block runs through the container's coordinator, as the mounted directory's owner"
 expect_output "hello from $(id -u)" meshfox /work/smoke.canvas.md run greet
-[ -f "$work/made-by-block.txt" ] || fail "the block's file did not reach the mounted directory"
+[[ -f "$work/made-by-block.txt" ]] || fail "the block's file did not reach the mounted directory"
 expect_output smoke.canvas.md meshfox cores ls
 
 step "check-updates says to pull a new image"
@@ -92,13 +92,13 @@ index=$(in_container curl -fsS -H 'Authorization: Bearer smoke' http://127.0.0.1
 slug=$(python3 -c "import sys,json; print([c['slug'] for c in json.load(sys.stdin)['canvases'] if c['path']=='table.canvas.md'][0])" <<<"$index")
 expect_output '"name":"a"' curl -fsS -H 'Authorization: Bearer smoke' "http://127.0.0.1:4590/c/$slug/api/nodes/tbl/table"
 
-if [ "$variant" = full ]; then
+if [[ "$variant" = full ]]; then
   step "full: python, node, chromium, pdf"
   in_container python3 -c 'import venv, sys; print(sys.version)' >/dev/null || fail "python3"
   in_container node --version >/dev/null || fail "node"
   in_container chromium --version >/dev/null || fail "chromium"
   in_container meshfox /work/smoke.canvas.md pdf -o /work/smoke.pdf >/dev/null || fail "meshfox pdf"
-  [ -s "$work/smoke.pdf" ] || fail "no PDF was written"
+  [[ -s "$work/smoke.pdf" ]] || fail "no PDF was written"
 fi
 
 step "ok"

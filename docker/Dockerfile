@@ -35,7 +35,7 @@ RUN test -n "${MESHFOX_VERSION}" || { echo "set --build-arg MESHFOX_VERSION=<rel
         arm64) triple=aarch64-unknown-linux-gnu ;; \
         *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
- && curl -fsSL "https://github.com/orofarne/meshfox/releases/download/v${MESHFOX_VERSION}/meshfox-${triple}.tar.gz" \
+ && curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/orofarne/meshfox/releases/download/v${MESHFOX_VERSION}/meshfox-${triple}.tar.gz" \
     | tar -xz -C /tmp "${triple}/meshfox" \
  && install -m 0755 "/tmp/${triple}/meshfox" /meshfox
 
@@ -66,7 +66,7 @@ ARG DUCKDB_VERSION=v2.0.0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends bash ca-certificates curl git tini \
  && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb-cli-linux-${TARGETARCH}.tar.gz" \
+ && curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb-cli-linux-${TARGETARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin duckdb \
  && duckdb --version
 
@@ -75,21 +75,26 @@ COPY --from=binary --chmod=0755 /meshfox /usr/local/bin/meshfox
 # `install-method` makes `meshfox check-updates` say "pull a newer image"
 # instead of replacing the binary inside a container.
 #
-# Home, the coordinator's socket directory and /work are world-writable (with
-# the sticky bit where they are shared): the image is meant to run as whatever
-# uid owns the mounted directory (`--user "$(id -u):$(id -g)"`), which has no
-# passwd entry and no home of its own.
+# The image is meant to run as whatever uid owns the mounted directory
+# (`--user "$(id -u):$(id -g)"`), which has no passwd entry and no home of its
+# own. Nothing here is made world-writable for that: home and the
+# coordinator's socket directory are created at start, under /tmp (writable
+# for everyone by the base image), by the entrypoint and by `serve`. /work is
+# where a directory is mounted.
 RUN useradd --uid 1000 --user-group --home-dir /home/meshfox --create-home --shell /bin/bash meshfox \
- && chmod 1777 /home/meshfox \
- && install -d -m 1777 /run/meshfox /work \
+ && install -d -o meshfox -g meshfox /work \
  && install -d /usr/local/share/meshfox \
  && echo docker > /usr/local/share/meshfox/install-method
 
-ENV HOME=/home/meshfox \
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# HOME holds `~/.meshfox` (config, plaintext secrets, session state); keep it
+# with a volume mounted here if it should outlive the container.
+ENV HOME=/tmp/meshfox-home \
     LANG=C.UTF-8 \
     # `docker exec … meshfox tui|run|view` talks to the `serve` running in
     # this container (the coordinator) instead of starting a private core.
-    MESHFOX_SERVER_SOCKET=/run/meshfox/meshfox.sock
+    MESHFOX_SERVER_SOCKET=/tmp/meshfox/meshfox.sock
 
 WORKDIR /work
 USER meshfox
@@ -100,7 +105,7 @@ EXPOSE 4590
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
     CMD curl -fsS http://127.0.0.1:4590/_/ping || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--", "meshfox"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve", "--http", "0.0.0.0:4590", "--root", "/work"]
 
 # ---- full: slim plus the interpreters and tools blocks commonly use ----------
