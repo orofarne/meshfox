@@ -86,8 +86,10 @@ test.beforeEach(async ({ page }) => {
   // accepts it instead.
   page.on("dialog", (dialog) => dialog.accept());
   await page.goto("/");
-  await page.waitForSelector(".mesh-node");
+  // The fixture is a single root, which the web UI shows as a full-page
+  // document with no canvas; Edit brings the canvas (and its nodes) back.
   await page.getByRole("button", { name: "Edit" }).click();
+  await page.waitForSelector(".mesh-node");
 });
 
 test("keyboard copy in the whole-document source editor and keyboard paste in the node body editor round-trip the real clipboard", async ({

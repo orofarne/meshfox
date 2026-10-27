@@ -34,22 +34,38 @@ import fs from "node:fs";
 // directly) — this spec is the one exception, so it needs a path stable
 // across reloads. See `playwright.config.ts`'s own `EXTERNAL_EDIT_DIR`
 // comment.
-const CANVAS_PATH = process.env.MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH;
-if (!CANVAS_PATH) {
-  throw new Error(
-    "MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH is unset — playwright.config.ts should have set it " +
-      "before this spec file ever runs; see its own EXTERNAL_EDIT_PORT comment.",
-  );
+// Firefox has its own server and its own copy of the file
+// (`MESHFOX_E2E_EXTERNAL_EDIT_FIREFOX_CANVAS_PATH`): both tests rewrite the
+// file, so two browsers on one file would race, and whichever ran second
+// would find the first one's edit already in place.
+function canvasPath(browserName: string): string {
+  const name =
+    browserName === "firefox"
+      ? "MESHFOX_E2E_EXTERNAL_EDIT_FIREFOX_CANVAS_PATH"
+      : "MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH";
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(
+      `${name} is unset — playwright.config.ts should have set it before this spec file ever runs; ` +
+        "see its own EXTERNAL_EDIT_PORT comment.",
+    );
+  }
+  return value;
 }
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
+  // The fixture is a single root, which the web UI shows as a full-page
+  // document with no canvas; Edit brings the canvas (and its nodes) back.
+  await page.getByRole("button", { name: "Edit" }).click();
   await page.waitForSelector(".mesh-node");
 });
 
 test("a direct on-disk edit (no MCP, no CLI, no API call) shows up in an already-open tab without a reload", async ({
   page,
+  browserName,
 }) => {
+  const CANVAS_PATH = canvasPath(browserName);
   const rootTitle = page.locator(
     '.react-flow__node[data-id="root"] .mesh-node-title-text, ' +
       '.react-flow__node[data-id="root"] .mesh-node-title-centered-text',
@@ -79,7 +95,8 @@ test("a direct on-disk edit (no MCP, no CLI, no API call) shows up in an already
 // this test never shares with the heading test above (see the fixture's
 // own "Body marker" line) so the two tests stay order-independent even
 // though they run against the same on-disk file/server.
-test("a direct on-disk edit to a node's body text also shows up live, without a reload", async ({ page }) => {
+test("a direct on-disk edit to a node's body text also shows up live, without a reload", async ({ page, browserName }) => {
+  const CANVAS_PATH = canvasPath(browserName);
   const rootBody = page.locator('.react-flow__node[data-id="root"] .mesh-node-body');
   await expect(rootBody).toContainText("Body marker: BEFORE-BODY-EDIT.");
 

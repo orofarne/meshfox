@@ -65,6 +65,10 @@ function firefoxFixtureCopy(name: string): string {
 }
 const DEPS_FIREFOX_FIXTURE = firefoxFixtureCopy("deps");
 const QUICK_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("quick-run");
+// reload-live-run.spec.ts runs real blocks and the server remembers their output
+// (a second browser would load the first one's finished runs).
+const RELOAD_LIVE_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("reload-live-run");
+const RELOAD_LIVE_RUN_FIREFOX_PORT = 4633;
 const FORM_AUTORUN_OUTPUT_FIREFOX_FIXTURE = firefoxFixtureCopy("form-autorun-output");
 const UNDO_REDO_FIREFOX_FIXTURE = firefoxFixtureCopy("undo-redo");
 // clear-node-layout.spec.ts rewrites its fixture (↺ clears authored x/y/w/h, then
@@ -246,6 +250,16 @@ fs.copyFileSync(
   path.join(EXTERNAL_EDIT_DIR, "external-edit.canvas.md"),
 );
 process.env.MESHFOX_E2E_EXTERNAL_EDIT_CANVAS_PATH = path.join(EXTERNAL_EDIT_DIR, "external-edit.canvas.md");
+// Firefox's own server, port and copy (see `firefoxFixtureCopy`): both tests
+// rewrite the file on disk, so two browsers on one file raced.
+const EXTERNAL_EDIT_FIREFOX_PORT = 4634;
+const EXTERNAL_EDIT_FIREFOX_DIR = path.join(os.tmpdir(), "meshfox-e2e-external-edit-firefox-fixture");
+fs.mkdirSync(EXTERNAL_EDIT_FIREFOX_DIR, { recursive: true });
+fs.copyFileSync(
+  path.join(import.meta.dirname, "e2e/fixtures/external-edit.canvas.md"),
+  path.join(EXTERNAL_EDIT_FIREFOX_DIR, "external-edit.canvas.md"),
+);
+process.env.MESHFOX_E2E_EXTERNAL_EDIT_FIREFOX_CANVAS_PATH = path.join(EXTERNAL_EDIT_FIREFOX_DIR, "external-edit.canvas.md");
 
 const MCP_LIVE_PORT = 4619;
 const MCP_LIVE_FIREFOX_PORT = 4620;
@@ -482,7 +496,7 @@ export default defineConfig({
     {
       name: `${browser}-reload-live-run`,
       testMatch: /(^|\/)reload-live-run\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${RELOAD_LIVE_RUN_PORT}` },
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? RELOAD_LIVE_RUN_FIREFOX_PORT : RELOAD_LIVE_RUN_PORT}` },
     },
     {
       name: `${browser}-drag-reorder`,
@@ -496,7 +510,7 @@ export default defineConfig({
     {
       name: `${browser}-external-edit`,
       testMatch: /(^|\/)external-edit\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}` },
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? EXTERNAL_EDIT_FIREFOX_PORT : EXTERNAL_EDIT_PORT}` },
     },
     {
       name: `${browser}-mcp-live`,
@@ -714,6 +728,12 @@ export default defineConfig({
       timeout: 60_000,
     },
     {
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/${RELOAD_LIVE_RUN_FIREFOX_FIXTURE}.canvas.md --port ${RELOAD_LIVE_RUN_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${RELOAD_LIVE_RUN_FIREFOX_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
       command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/drag-reorder.canvas.md --port ${DRAG_REORDER_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${DRAG_REORDER_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
@@ -728,6 +748,12 @@ export default defineConfig({
     {
       command: `${MESHFOX_VIEW} ${EXTERNAL_EDIT_DIR}/external-edit.canvas.md --port ${EXTERNAL_EDIT_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${EXTERNAL_EDIT_PORT}/api/canvas`,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+    {
+      command: `${MESHFOX_VIEW} ${EXTERNAL_EDIT_FIREFOX_DIR}/external-edit.canvas.md --port ${EXTERNAL_EDIT_FIREFOX_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${EXTERNAL_EDIT_FIREFOX_PORT}/api/canvas`,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
