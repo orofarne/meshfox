@@ -1,0 +1,64 @@
+# Built-in theme after Gruvbox dark (medium contrast): https://github.com/morhetz/gruvbox
+
+name = "gruvbox-dark"
+extends = "darkfox"
+
+[ui]
+accent = "#fe8019"      # focused border, popups, selection fill
+dep = "#d3869b"
+fail = "#fb4934"
+ok = "#b8bb26"
+border = "#928374"
+fg = "#ebdbb2"
+bg = "#282828"
+svg_border = "#665c54"
+
+muted = "#928374"
+value = "#fabd2f"
+tag = "#8ec07c"
+warn = "#fabd2f"
+error = "#fb4934"
+on_accent = "#282828"
+link = "#83a598"
+
+search_match_bg = "#fabd2f"
+search_other_bg = "#fe8019"
+search_fg = "#282828"
+
+code_bg = "#3c3836"
+code_fg = "#fe8019"
+table_stripe_bg = "#3c3836"
+
+map_node_bg = "#3c3836"
+map_selected_bg = "#504945"
+map_node_fg = "#ebdbb2"
+
+callout_note = "#83a598"
+callout_tip = "#b8bb26"
+callout_important = "#d3869b"
+callout_warning = "#fabd2f"
+callout_caution = "#fb4934"
+
+heading_1 = "#fe8019"
+heading_2 = "#fabd2f"
+heading_3 = "#b8bb26"
+heading_4 = "#8ec07c"
+heading_5 = "#83a598"
+heading_6 = "#d3869b"
+
+[editor]
+fg = "#ebdbb2"
+bg = "#282828"
+selection = "#504945"
+comment = "#928374"
+keyword = "#fb4934"
+string = "#b8bb26"
+number = "#d3869b"
+constant = "#d3869b"
+function = "#b8bb26"
+type = "#fabd2f"
+operator = "#fe8019"
+variable = "#83a598"
+meshfox_keyword = "#fe8019"
+meshfox_attr = "#fabd2f"
+meshfox_value = "#b8bb26"

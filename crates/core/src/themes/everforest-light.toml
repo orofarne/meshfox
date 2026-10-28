@@ -1,0 +1,64 @@
+# Built-in theme after Everforest light (medium contrast): https://github.com/sainnhe/everforest
+
+name = "everforest-light"
+extends = "darkfox"
+
+[ui]
+accent = "#8da101"      # focused border, popups, selection fill
+dep = "#df69ba"
+fail = "#f85552"
+ok = "#8da101"
+border = "#939f91"
+fg = "#5c6a72"
+bg = "#fdf6e3"
+svg_border = "#bdc3af"
+
+muted = "#829181"
+value = "#dfa000"
+tag = "#35a77c"
+warn = "#dfa000"
+error = "#f85552"
+on_accent = "#fdf6e3"
+link = "#3a94c5"
+
+search_match_bg = "#dfa000"
+search_other_bg = "#f57d26"
+search_fg = "#5c6a72"
+
+code_bg = "#efebd4"
+code_fg = "#f57d26"
+table_stripe_bg = "#f4f0d9"
+
+map_node_bg = "#f4f0d9"
+map_selected_bg = "#e0dcc7"
+map_node_fg = "#5c6a72"
+
+callout_note = "#3a94c5"
+callout_tip = "#8da101"
+callout_important = "#df69ba"
+callout_warning = "#dfa000"
+callout_caution = "#f85552"
+
+heading_1 = "#f57d26"
+heading_2 = "#dfa000"
+heading_3 = "#8da101"
+heading_4 = "#35a77c"
+heading_5 = "#3a94c5"
+heading_6 = "#df69ba"
+
+[editor]
+fg = "#5c6a72"
+bg = "#fdf6e3"
+selection = "#e0dcc7"
+comment = "#939f91"
+keyword = "#f85552"
+string = "#8da101"
+number = "#df69ba"
+constant = "#df69ba"
+function = "#8da101"
+type = "#dfa000"
+operator = "#f57d26"
+variable = "#3a94c5"
+meshfox_keyword = "#f57d26"
+meshfox_attr = "#dfa000"
+meshfox_value = "#8da101"

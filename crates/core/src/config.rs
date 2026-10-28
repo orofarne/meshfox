@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn tui_protocol_uses_merged_config_and_validates_values() {
         let mut global: toml::Table =
-            "[tui]\nimage_protocol = \"sixel\"\neditor_theme = \"base16-mocha.dark\""
+            "[tui]\nimage_protocol = \"sixel\"\ntheme = \"base16-mocha.dark\""
                 .parse()
                 .unwrap();
         let local: toml::Table = "[tui]\nimage_protocol = \"iterm2\"".parse().unwrap();
@@ -539,10 +539,7 @@ mod tests {
             tui_image_protocol_from_table(&global).unwrap().as_deref(),
             Some("iterm2")
         );
-        assert_eq!(
-            global["tui"]["editor_theme"].as_str(),
-            Some("base16-mocha.dark")
-        );
+        assert_eq!(global["tui"]["theme"].as_str(), Some("base16-mocha.dark"));
         assert_eq!(
             tui_image_protocol_from_table(&toml::Table::new()).unwrap(),
             None
@@ -808,18 +805,18 @@ mod tests {
         let global = dir.join("global.toml");
         std::fs::write(
             &global,
-            "[tui]\neditor_theme = \"global\"\n[files]\nallow = [\"/global\"]\n",
+            "[tui]\ntheme = \"global\"\n[files]\nallow = [\"/global\"]\n",
         )
         .unwrap();
         std::fs::write(
             project.join(".meshfox/config.toml"),
-            "[tui]\neditor_theme = \"parent\"\n[files]\nallow = [\"docs\"]\n",
+            "[tui]\ntheme = \"parent\"\n[files]\nallow = [\"docs\"]\n",
         )
         .unwrap();
         let local = child.join(".meshfox/config.toml");
         std::fs::write(&local, "[tui]\nimage_protocol = \"sixel\"\n").unwrap();
         let merged = load_from(Some(&global), &child);
-        assert_eq!(merged["tui"]["editor_theme"].as_str(), Some("parent"));
+        assert_eq!(merged["tui"]["theme"].as_str(), Some("parent"));
         assert_eq!(merged["tui"]["image_protocol"].as_str(), Some("sixel"));
         assert_eq!(
             file_roots_from(Some(&global), &child).unwrap(),

@@ -1,0 +1,64 @@
+# Built-in theme after Monokai: the classic Sublime Text palette
+
+name = "monokai"
+extends = "darkfox"
+
+[ui]
+accent = "#a6e22e"      # focused border, popups, selection fill
+dep = "#ae81ff"
+fail = "#f92672"
+ok = "#a6e22e"
+border = "#90908a"
+fg = "#f8f8f2"
+bg = "#272822"
+svg_border = "#75715e"
+
+muted = "#90908a"
+value = "#e6db74"
+tag = "#66d9ef"
+warn = "#e6db74"
+error = "#f92672"
+on_accent = "#272822"
+link = "#66d9ef"
+
+search_match_bg = "#e6db74"
+search_other_bg = "#fd971f"
+search_fg = "#272822"
+
+code_bg = "#3e3d32"
+code_fg = "#fd971f"
+table_stripe_bg = "#3e3d32"
+
+map_node_bg = "#3e3d32"
+map_selected_bg = "#49483e"
+map_node_fg = "#f8f8f2"
+
+callout_note = "#66d9ef"
+callout_tip = "#a6e22e"
+callout_important = "#ae81ff"
+callout_warning = "#e6db74"
+callout_caution = "#f92672"
+
+heading_1 = "#a6e22e"
+heading_2 = "#e6db74"
+heading_3 = "#66d9ef"
+heading_4 = "#fd971f"
+heading_5 = "#ae81ff"
+heading_6 = "#f92672"
+
+[editor]
+fg = "#f8f8f2"
+bg = "#272822"
+selection = "#49483e"
+comment = "#90908a"
+keyword = "#f92672"
+string = "#e6db74"
+number = "#ae81ff"
+constant = "#ae81ff"
+function = "#a6e22e"
+type = "#66d9ef"
+operator = "#f92672"
+variable = "#fd971f"
+meshfox_keyword = "#fd971f"
+meshfox_attr = "#e6db74"
+meshfox_value = "#a6e22e"

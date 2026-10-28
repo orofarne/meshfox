@@ -16,7 +16,7 @@ use pulldown_cmark::{
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
 
 /// Width-independent document blocks. Styled text keeps logical lines;
@@ -151,10 +151,7 @@ impl Highlighter {
     /// outside tests, so this is `cfg(test)` rather than plain `pub`.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_syntax_set(
-            SyntaxSet::load_defaults_newlines(),
-            crate::tui::ui::SOURCE_EDITOR_THEME,
-        )
+        Self::with_syntax_set(SyntaxSet::load_defaults_newlines())
     }
 
     /// Same as `new`, but the `SyntaxSet` also includes whatever custom
@@ -162,31 +159,14 @@ impl Highlighter {
     /// `canvas_root` (locally, `.meshfox/syntax/`) or `~/.meshfox/syntax/`
     /// (globally) — the constructor the real app uses; `new` stays
     /// defaults-only for tests that don't care about local grammars.
-    /// `theme_name` is `crate::syntax_registry::resolve_editor_theme`'s own
-    /// result — same theme the full-screen source editor uses (`tui::ui`),
-    /// so this read-only preview pane and that editor read as one product,
-    /// not two independently-themed surfaces.
-    pub fn with_extra_syntaxes(canvas_root: &Path, theme_name: &str) -> Self {
-        Self::with_syntax_set(
-            crate::syntax_registry::build_syntax_set(canvas_root),
-            theme_name,
-        )
+    /// The theme is the active TUI theme's `[editor]` palette — same one the
+    /// full-screen source editor uses (`tui::ui`), so the two read as one product.
+    pub fn with_extra_syntaxes(canvas_root: &Path) -> Self {
+        Self::with_syntax_set(crate::syntax_registry::build_syntax_set(canvas_root))
     }
 
-    fn with_syntax_set(syntax_set: SyntaxSet, theme_name: &str) -> Self {
-        let theme_set = ThemeSet::load_defaults();
-        let theme = theme_set
-            .themes
-            .get(theme_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                theme_set
-                    .themes
-                    .values()
-                    .next()
-                    .cloned()
-                    .expect("syntect ships at least one theme")
-            });
+    fn with_syntax_set(syntax_set: SyntaxSet) -> Self {
+        let theme = crate::syntax_registry::syntect_theme();
         Highlighter {
             syntax_set: Arc::new(syntax_set),
             theme,
@@ -289,26 +269,17 @@ fn translate_style(style: syntect::highlighting::Style) -> Style {
     out
 }
 
-const HEADING_COLORS: [Color; 6] = [
-    Color::LightCyan,
-    Color::LightBlue,
-    Color::LightGreen,
-    Color::LightYellow,
-    Color::LightMagenta,
-    Color::Gray,
-];
-
 /// Icon, label, and terminal color for a GFM alert blockquote's title
 /// line (`Tag::BlockQuote(Some(kind))`) — same five roles and, loosely,
 /// the same colors as `site-template/style.css`'s own `--alert-*`
 /// variables, so the type reads the same way across every renderer.
 fn alert_style(kind: BlockQuoteKind) -> (&'static str, &'static str, Color) {
     match kind {
-        BlockQuoteKind::Note => ("ℹ", "Note", Color::LightBlue),
-        BlockQuoteKind::Tip => ("💡", "Tip", Color::LightGreen),
-        BlockQuoteKind::Important => ("❗", "Important", Color::LightMagenta),
-        BlockQuoteKind::Warning => ("⚠", "Warning", Color::LightYellow),
-        BlockQuoteKind::Caution => ("🛑", "Caution", Color::LightRed),
+        BlockQuoteKind::Note => ("ℹ", "Note", super::theme::callout_note()),
+        BlockQuoteKind::Tip => ("💡", "Tip", super::theme::callout_tip()),
+        BlockQuoteKind::Important => ("❗", "Important", super::theme::callout_important()),
+        BlockQuoteKind::Warning => ("⚠", "Warning", super::theme::callout_warning()),
+        BlockQuoteKind::Caution => ("🛑", "Caution", super::theme::callout_caution()),
     }
 }
 
@@ -332,7 +303,7 @@ fn footnote_reference_marker(label: &str) -> String {
 fn heading_style(level: HeadingLevel) -> Style {
     let idx = (level as usize).saturating_sub(1).min(5);
     let mut style = Style::default()
-        .fg(HEADING_COLORS[idx])
+        .fg(super::theme::heading(idx))
         .add_modifier(Modifier::BOLD);
     if level == HeadingLevel::H1 {
         style = style.add_modifier(Modifier::UNDERLINED);
@@ -734,7 +705,7 @@ struct TableState {
 /// State inside a `<!-- meshfox:output name="..." ... --> ... <!--
 /// /meshfox:output -->` region — an `output="markdown"` block's own real
 /// result gets its own purple frame, same color identity as its source
-/// block's (`theme::DEP` — see `dep_lines`), so it reads as visually
+/// block's (`theme::dep()` — see `dep_lines`), so it reads as visually
 /// grouped with it instead of blending into surrounding prose.
 /// `render_output_block_markdown` (`crates/core/src/output.rs`) always
 /// writes stderr, if any, first, as its own `` ```text `` fence, *before*
@@ -823,17 +794,17 @@ impl<'a> Renderer<'a> {
             .and_then(|name| self.live_output.get(name))
             .is_some_and(|output| output.running)
         {
-            return Style::default().fg(super::theme::OK);
+            return Style::default().fg(super::theme::ok());
         }
         let selected = name.is_some() && name == self.selected_block.as_deref();
         Style::default().fg(if selected {
             if self.focused {
-                super::theme::ACCENT
+                super::theme::accent()
             } else {
-                Color::DarkGray
+                super::theme::muted()
             }
         } else {
-            super::theme::DEP
+            super::theme::dep()
         })
     }
 
@@ -841,9 +812,9 @@ impl<'a> Renderer<'a> {
         let border = self.block_border(name);
         if name.is_some() && name == self.selected_block.as_deref() {
             border.add_modifier(Modifier::BOLD).bg(if self.focused {
-                super::theme::MAP_SELECTED_BG
+                super::theme::map_selected_bg()
             } else {
-                super::theme::MAP_NODE_BG
+                super::theme::map_node_bg()
             })
         } else {
             border
@@ -877,10 +848,10 @@ impl<'a> Renderer<'a> {
                 Inline::Strong => style.add_modifier(Modifier::BOLD),
                 Inline::Strikethrough => style.add_modifier(Modifier::CROSSED_OUT),
                 Inline::Code => style
-                    .bg(Color::Rgb(40, 42, 54))
-                    .fg(Color::Rgb(255, 184, 108)),
+                    .bg(super::theme::code_bg())
+                    .fg(super::theme::code_fg()),
                 Inline::Link => style
-                    .fg(Color::LightBlue)
+                    .fg(super::theme::link())
                     .add_modifier(Modifier::UNDERLINED),
             };
         }
@@ -1081,7 +1052,7 @@ impl<'a> Renderer<'a> {
             // Markdown, so it stays visibly apart from the rendered part
             // instead of running straight into the last table row.
             if !live.stderr.trim().is_empty() {
-                let muted = Style::default().fg(super::theme::BORDER);
+                let muted = Style::default().fg(super::theme::border());
                 for line in super::ansi::lines(&live.stderr) {
                     let mut spans = vec![Span::styled("│ ", border)];
                     spans.extend(line.spans.into_iter().map(|mut s| {
@@ -1339,7 +1310,7 @@ impl<'a> Renderer<'a> {
                 self.flush_paragraph();
                 self.push_segment(Segment::Text(vec![Line::from(Span::styled(
                     "─".repeat(60),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(super::theme::muted()),
                 ))]));
             }
             // Fires right after `Start(Item)` for a task-list item — same
@@ -1349,7 +1320,7 @@ impl<'a> Renderer<'a> {
             // text`) rather than replacing the bullet outright.
             Event::TaskListMarker(checked) => {
                 let (text, style) = if checked {
-                    ("[x] ", Style::default().fg(Color::LightGreen))
+                    ("[x] ", Style::default().fg(super::theme::value()))
                 } else {
                     ("[ ] ", Style::default())
                 };
@@ -1365,7 +1336,7 @@ impl<'a> Renderer<'a> {
             // `[note]` rather than a silently-dropped reference.
             Event::FootnoteReference(label) => {
                 let marker = footnote_reference_marker(&label);
-                self.push_text(&marker, Style::default().fg(Color::Cyan));
+                self.push_text(&marker, Style::default().fg(super::theme::tag()));
             }
             // meshfox's own bookkeeping (`meshfox:node`/`meshfox:output`/...)
             // lives entirely in HTML comments — invisible in any normal
@@ -1387,7 +1358,7 @@ impl<'a> Renderer<'a> {
                 self.inline_stack.push(Inline::Strong); // reuse bold path, style below overrides
                 self.current.push(Span::styled(
                     format!("{} ", "#".repeat(level as usize)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(super::theme::muted()),
                 ));
                 self.inline_stack.pop();
                 self.pending_heading_style = Some(heading_style(level));
@@ -1429,7 +1400,7 @@ impl<'a> Renderer<'a> {
                 self.lines.push(Line::from(Span::styled(
                     format!("[{label}]"),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(super::theme::tag())
                         .add_modifier(Modifier::BOLD),
                 )));
             }
@@ -1519,7 +1490,7 @@ impl<'a> Renderer<'a> {
                     self.push_segment(Segment::Text(vec![Line::from(Span::styled(
                         format!("[image: {dest_url}]"),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(super::theme::muted())
                             .add_modifier(Modifier::ITALIC),
                     ))]));
                 } else if dest_url.starts_with("data:") {
@@ -1632,7 +1603,7 @@ impl<'a> Renderer<'a> {
         {
             self.block_border(owner)
         } else {
-            Style::default().fg(super::theme::DEP)
+            Style::default().fg(super::theme::dep())
         };
         let click_style = style.add_modifier(Modifier::UNDERLINED);
         let row = |prefix: String, label: String, node_id: String| {
@@ -1710,10 +1681,10 @@ impl<'a> Renderer<'a> {
                         header,
                         if self.selected_block.as_deref() == Some(&key) && self.focused {
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(super::theme::tag())
                                 .add_modifier(Modifier::REVERSED)
                         } else {
-                            Style::default().fg(Color::Cyan)
+                            Style::default().fg(super::theme::tag())
                         },
                     ))]));
                     self.click_regions.push(ClickRegion {
@@ -1742,7 +1713,7 @@ impl<'a> Renderer<'a> {
                                 .map(|l| {
                                     Line::from(Span::styled(
                                         l.to_owned(),
-                                        Style::default().fg(Color::Red),
+                                        Style::default().fg(super::theme::error()),
                                     ))
                                 })
                                 .collect(),
@@ -1786,12 +1757,12 @@ impl<'a> Renderer<'a> {
                     let fields =
                         meshfox_core::parse_form_body(&form_name, &code).unwrap_or_default();
                     let send_caption = send_raw.unwrap_or_else(|| "Send".to_string());
-                    let label_style = Style::default().fg(super::theme::DEP);
+                    let label_style = Style::default().fg(super::theme::dep());
                     let value_style = Style::default()
-                        .fg(super::theme::ACCENT)
+                        .fg(super::theme::accent())
                         .add_modifier(Modifier::UNDERLINED);
                     let marker_style = Style::default()
-                        .fg(super::theme::ACCENT)
+                        .fg(super::theme::accent())
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     // Which row (a field, by index, or the virtual Send row
                     // at `fields.len()`) is actually focused right now, if
@@ -2017,13 +1988,16 @@ impl<'a> Renderer<'a> {
                         interpreter.as_deref(),
                     ) {
                         for span in &mut line.spans {
-                            span.style = span.style.fg(Color::DarkGray);
+                            span.style = span.style.fg(super::theme::muted());
                         }
                         dep_clicks.push((lines.len(), clicks));
                         lines.push(line);
                     }
                     lines.extend(details.into_iter().map(|detail| {
-                        Line::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray))
+                        Line::styled(
+                            format!("  {detail}"),
+                            Style::default().fg(super::theme::muted()),
+                        )
                     }));
                     if !lines.is_empty() {
                         // Adjacent semantic segment: no blank separator between
@@ -2497,9 +2471,9 @@ mod tests {
                 .find(|line| line.to_string().contains("deps: build"))
                 .unwrap();
             let expected = if running {
-                super::super::theme::OK
+                super::super::theme::ok()
             } else {
-                super::super::theme::DEP
+                super::super::theme::dep()
             };
             assert!(line
                 .spans
@@ -3646,7 +3620,7 @@ mod tests {
             caption_span.style.bg, None,
             "unselected buttons have no fill"
         );
-        assert_eq!(caption_span.style.fg, Some(crate::tui::theme::ACCENT));
+        assert_eq!(caption_span.style.fg, Some(crate::tui::theme::accent()));
         assert!(caption_span.style.add_modifier.contains(Modifier::BOLD));
         assert!(!caption_span
             .style
@@ -3660,7 +3634,7 @@ mod tests {
             .iter()
             .find(|s| s.content.contains('▶'))
             .expect("▶ marker span");
-        assert_eq!(marker_span.style.fg, Some(crate::tui::theme::ACCENT));
+        assert_eq!(marker_span.style.fg, Some(crate::tui::theme::accent()));
     }
     #[test]
     fn dependency_rows_keep_distinct_click_positions_for_code_and_buttons() {

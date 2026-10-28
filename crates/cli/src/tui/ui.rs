@@ -19,7 +19,6 @@ use super::markdown::Segment;
 use super::source_editor::SourceEditorState;
 use super::spatial;
 use super::table;
-use super::theme::{ACCENT, BORDER, DEP, FAIL, MAP_NODE_BG, MAP_NODE_FG, MAP_SELECTED_BG, OK};
 use super::tree::TreeRow;
 use crate::pdf::render::resolve_color_hex;
 use meshfox_core::{NodeType, VarType};
@@ -99,12 +98,17 @@ fn tree_row_words(
     if let Some(reference) = &row.reference {
         let mut words = Vec::new();
         if let Some(label) = reference.label.as_deref().filter(|label| !label.is_empty()) {
-            words.push((format!("[{label}]"), Style::default().fg(ACCENT)));
+            words.push((
+                format!("[{label}]"),
+                Style::default().fg(super::theme::accent()),
+            ));
         }
         words.extend(row.title.split_whitespace().map(|word| {
             (
                 word.to_string(),
-                Style::default().fg(DEP).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(super::theme::dep())
+                    .add_modifier(Modifier::ITALIC),
             )
         }));
         return words;
@@ -118,29 +122,29 @@ fn tree_row_words(
         Some(RunRowState::Running) => {
             words.push((
                 spinner_frame(spinner_tick).to_string(),
-                Style::default().fg(ACCENT),
+                Style::default().fg(super::theme::accent()),
             ));
         }
         Some(RunRowState::Failed) => {
-            words.push(("✗".to_string(), Style::default().fg(FAIL)));
+            words.push(("✗".to_string(), Style::default().fg(super::theme::fail())));
         }
         None => {}
     }
     match row.constraint_ok {
-        Some(true) => words.push(("✓".to_string(), Style::default().fg(OK))),
-        Some(false) => words.push(("✗".to_string(), Style::default().fg(FAIL))),
+        Some(true) => words.push(("✓".to_string(), Style::default().fg(super::theme::ok()))),
+        Some(false) => words.push(("✗".to_string(), Style::default().fg(super::theme::fail()))),
         None => {}
     }
     if row.has_service {
         let (glyph, color) = match service {
-            Some(ServiceRowState::Running) => ("●service", OK),
-            Some(ServiceRowState::Crashed) => ("⚠service", FAIL),
-            None => ("○service", Color::DarkGray),
+            Some(ServiceRowState::Running) => ("●service", super::theme::ok()),
+            Some(ServiceRowState::Crashed) => ("⚠service", super::theme::fail()),
+            None => ("○service", super::theme::muted()),
         };
         words.push((glyph.to_string(), Style::default().fg(color)));
     }
     for tag in &row.tags {
-        words.push((format!("#{tag}"), Style::default().fg(Color::Cyan)));
+        words.push((format!("#{tag}"), Style::default().fg(super::theme::tag())));
     }
     let mut flags = Vec::new();
     if row.runnable_count > 0 {
@@ -153,7 +157,10 @@ fn tree_row_words(
         flags.push("tty");
     }
     if !flags.is_empty() {
-        words.push((format!("[{}]", flags.join(",")), Style::default().fg(OK)));
+        words.push((
+            format!("[{}]", flags.join(",")),
+            Style::default().fg(super::theme::ok()),
+        ));
     }
     words
 }
@@ -201,33 +208,6 @@ fn wrap_word_indices(
     result
 }
 
-/// Theme/language edtui's own bundled `syntect` highlighting uses for the
-/// source editor — always Markdown, since that's what every file this
-/// editor can open (a canvas or a plain-Markdown include target) actually
-/// is. Same `"base16-ocean.dark"` the read-only preview pane's own
-/// highlighter already uses (`markdown.rs`), so both panes read as the
-/// same product. This used to be `"dracula"` — edtui's own docs/examples
-/// default to that name, but it's *not* one of the themes `syntect::
-/// highlighting::ThemeSet::load_defaults()` actually bundles (confirmed
-/// directly: `["InspiredGitHub", "Solarized (dark)", "Solarized (light)",
-/// "base16-eighties.dark", "base16-mocha.dark", "base16-ocean.dark",
-/// "base16-ocean.light"]`, no "dracula" anywhere in it) — the lookup
-/// always silently missed and fell through to `crate::syntax_registry::
-/// with_meshfox_scope_colors`'s caller's own `.or_else(|| ...values()
-/// .next()...)` fallback, landing on *whichever* bundled theme happened to
-/// be first in the `HashMap`'s own (arbitrary, unspecified) iteration
-/// order — never a deliberate choice at all. See that same module's
-/// `with_meshfox_scope_colors` for the other half of this fix (forcing a
-/// legible base/default foreground regardless of which theme ends up
-/// loaded).
-///
-/// This is only the *default* now — `App::editor_theme`
-/// (`crate::syntax_registry::resolve_editor_theme`) picks a
-/// user-configured `[tui] editor_theme` override when one is set and
-/// actually valid, falling back to this constant otherwise; `render`
-/// threads `App::editor_theme` into `render_source_editor` rather than
-/// this constant being read directly there anymore.
-pub(crate) const SOURCE_EDITOR_THEME: &str = "base16-ocean.dark";
 /// Falls back to plain `"md"` (`find_syntax_by_token`, extension-based) only
 /// if `crate::syntax_registry::MESHFOX_MARKDOWN_SYNTAX_NAME` somehow isn't
 /// registered — never actually expected (it's bundled into the binary, see
@@ -266,7 +246,11 @@ fn fullscreen_icon_title(app: &App, pane: Focus) -> Line<'static> {
     } else {
         FULLSCREEN_ICON_EXPAND
     };
-    Line::from(Span::styled(icon, Style::default().fg(ACCENT))).right_aligned()
+    Line::from(Span::styled(
+        icon,
+        Style::default().fg(super::theme::accent()),
+    ))
+    .right_aligned()
 }
 
 /// The three panes' rects for a given terminal size — computed once here
@@ -376,6 +360,11 @@ pub fn compute_layout(
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
+    render_screen(f, app);
+    super::theme::apply_canvas(f.buffer_mut());
+}
+
+fn render_screen(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     // The source editor is a genuine full-terminal takeover, not an
@@ -383,7 +372,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // own module docs.
     if let Some(se) = &mut app.source_editor {
         let syntax_set = Arc::clone(app.highlighter.syntax_set());
-        render_source_editor(f, area, se, &syntax_set, &app.editor_theme);
+        render_source_editor(f, area, se, &syntax_set);
         if let Some(palette) = &mut app.palette {
             palette.render(f, area);
         }
@@ -444,7 +433,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .saturating_sub(picker.rows.height.saturating_sub(1) as usize);
         let list = List::new(picker.choices.iter().map(|c| ListItem::new(c.as_str())))
             .block(block)
-            .highlight_style(Style::default().bg(ACCENT).fg(Color::Black))
+            .highlight_style(
+                Style::default()
+                    .bg(super::theme::accent())
+                    .fg(super::theme::on_accent()),
+            )
             .highlight_symbol("› ");
         f.render_stateful_widget(list, popup, &mut state);
         picker.offset = state.offset();
@@ -487,7 +480,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn pane_border(focused: bool) -> Style {
-    Style::default().fg(if focused { ACCENT } else { BORDER })
+    Style::default().fg(if focused {
+        super::theme::accent()
+    } else {
+        super::theme::border()
+    })
 }
 
 fn render_search(f: &mut Frame, area: Rect, app: &App) {
@@ -523,7 +520,7 @@ fn render_search(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(format!(
             "{prefix}{input} · Enter next · Shift+Enter/Tab prev · Esc close"
         ))
-        .style(Style::default().fg(ACCENT)),
+        .style(Style::default().fg(super::theme::accent())),
         area,
     );
 }
@@ -862,11 +859,11 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
                 let highlighted = marked != ' ';
                 if highlighted != run_selected && !run.is_empty() {
                     let color = if run_selected {
-                        ACCENT
+                        super::theme::accent()
                     } else if app.show_all_map_edges && !overview {
-                        Color::DarkGray
+                        super::theme::muted()
                     } else {
-                        BORDER
+                        super::theme::border()
                     };
                     spans.push(Span::styled(
                         std::mem::take(&mut run),
@@ -878,11 +875,11 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
             }
             if !run.is_empty() {
                 let color = if run_selected {
-                    ACCENT
+                    super::theme::accent()
                 } else if app.show_all_map_edges && !overview {
-                    Color::DarkGray
+                    super::theme::muted()
                 } else {
-                    BORDER
+                    super::theme::border()
                 };
                 spans.push(Span::styled(run, Style::default().fg(color)));
             }
@@ -897,13 +894,17 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
             .display_canvas
             .node(&node.id)
             .and_then(|n| tree_row_color(n.effective_color.as_deref()))
-            .unwrap_or(MAP_NODE_FG);
+            .unwrap_or(super::theme::map_node_fg());
         let bg = if selected_node {
-            MAP_SELECTED_BG
+            super::theme::map_selected_bg()
         } else {
-            MAP_NODE_BG
+            super::theme::map_node_bg()
         };
-        let border = if selected_node { ACCENT } else { BORDER };
+        let border = if selected_node {
+            super::theme::accent()
+        } else {
+            super::theme::border()
+        };
         let text = map_title_lines(&node.title, node.rect.width.saturating_sub(2) as usize);
         let card = Block::default()
             .borders(Borders::ALL)
@@ -936,7 +937,7 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
     let status =
         format!(" {visible_count}/{total} nodes · ←{incoming} →{outgoing}{hidden} · {mode} ");
     f.render_widget(
-        Paragraph::new(status).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(status).style(Style::default().fg(super::theme::muted())),
         Rect::new(inner.x, inner.y + inner.height - 2, inner.width, 1),
     );
     let details = if edge_details.is_empty() {
@@ -945,7 +946,7 @@ fn render_spatial_parent(f: &mut Frame, area: Rect, app: &mut App, group_id: &st
         format!(" labels: {} ", edge_details.join(" · "))
     };
     f.render_widget(
-        Paragraph::new(details).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(details).style(Style::default().fg(super::theme::muted())),
         Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
     );
 }
@@ -1101,14 +1102,14 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
                         spans.push(Span::raw(indent.clone()));
                         spans.push(Span::styled(
                             disclosure,
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(super::theme::muted()),
                         ));
                         spans.push(Span::styled(
                             type_mark,
                             Style::default().fg(if row.reference.is_some() {
-                                DEP
+                                super::theme::dep()
                             } else {
-                                Color::DarkGray
+                                super::theme::muted()
                             }),
                         ));
                     } else {
@@ -1461,12 +1462,12 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     Some(p) => render_document_image(p, skip, rect, f.buffer_mut()),
                     None if app.image_pending.contains(path) => f.render_widget(
                         Paragraph::new(format!("[image loading: {alt}]"))
-                            .style(Style::default().fg(Color::DarkGray)),
+                            .style(Style::default().fg(super::theme::muted())),
                         rect,
                     ),
                     None => f.render_widget(
                         Paragraph::new(format!("[image failed to load: {alt}]"))
-                            .style(Style::default().fg(FAIL)),
+                            .style(Style::default().fg(super::theme::fail())),
                         rect,
                     ),
                 }
@@ -1535,7 +1536,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(""));
             lines.push(Line::styled(
                 "── rendered markdown ──",
-                Style::default().fg(super::theme::DEP),
+                Style::default().fg(super::theme::dep()),
             ));
             let base_dir = app
                 .canvas_path
@@ -1586,12 +1587,12 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     } else if !app.status.is_empty() {
         Text::from(Line::from(Span::styled(
             app.status.as_str(),
-            Style::default().fg(ACCENT),
+            Style::default().fg(super::theme::accent()),
         )))
     } else {
         Text::from(Line::from(Span::styled(
             "select a node and press r to run its block (R to run without deps)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         )))
     };
     // `output_hscroll` counts columns scrolled right (see its own doc
@@ -1646,18 +1647,24 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some((total, failed)) = app.constraint_stats {
         let (text, color) = if failed > 0 {
-            (format!("{failed}/{total} constraints failing"), FAIL)
+            (
+                format!("{failed}/{total} constraints failing"),
+                super::theme::fail(),
+            )
         } else {
             (
                 format!(
                     "all {total} constraint{} pass",
                     if total == 1 { "" } else { "s" }
                 ),
-                OK,
+                super::theme::ok(),
             )
         };
         spans.push(Span::styled(text, Style::default().fg(color)));
-        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "  ·  ",
+            Style::default().fg(super::theme::muted()),
+        ));
     }
     // **Experimental**, see SPEC.md's "Service blocks (experimental)" —
     // recomputed by `App::tick_services`, not derived here (unlike
@@ -1665,14 +1672,23 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     // just on a document reload).
     if let Some((running, crashed)) = app.service_stats {
         let (text, color) = if crashed > 0 {
-            (format!("{crashed} service(s) crashed"), FAIL)
+            (
+                format!("{crashed} service(s) crashed"),
+                super::theme::fail(),
+            )
         } else {
-            (format!("{running} service(s) running"), OK)
+            (format!("{running} service(s) running"), super::theme::ok())
         };
         spans.push(Span::styled(text, Style::default().fg(color)));
-        spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "  ·  ",
+            Style::default().fg(super::theme::muted()),
+        ));
     }
-    spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        hint,
+        Style::default().fg(super::theme::muted()),
+    ));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1759,7 +1775,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(title);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -1861,9 +1877,12 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             let value = tail_fit(&value, value_budget.max(8));
             let mut spans = vec![
                 Span::raw(prefix),
-                Span::styled(value.clone(), Style::default().fg(Color::LightGreen)),
-                Span::styled(save_tag.clone(), Style::default().fg(Color::DarkGray)),
-                Span::styled(error_tag.clone(), Style::default().fg(Color::Red)),
+                Span::styled(value.clone(), Style::default().fg(super::theme::value())),
+                Span::styled(save_tag.clone(), Style::default().fg(super::theme::muted())),
+                Span::styled(
+                    error_tag.clone(),
+                    Style::default().fg(super::theme::error()),
+                ),
             ];
             if browse_width > 0 {
                 let used = prefix.chars().count()
@@ -1875,14 +1894,14 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                 spans.push(Span::styled(
                     marker.unwrap_or_default(),
                     Style::default()
-                        .fg(ACCENT)
+                        .fg(super::theme::accent())
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 ));
             }
             ListItem::new(vec![
                 Line::from(vec![
                     Span::raw(decl.prompt.clone()),
-                    Span::styled(origin_tag, Style::default().fg(Color::DarkGray)),
+                    Span::styled(origin_tag, Style::default().fg(super::theme::muted())),
                 ]),
                 Line::from(spans),
             ])
@@ -1914,7 +1933,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             esc_hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         rows[1],
     );
@@ -2000,12 +2019,14 @@ fn render_date_picker(f: &mut Frame, area: Rect, dp: &super::date_picker::DatePi
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(super::theme::accent()))
             .title(format!(" {} — choose {what} ", dp.title)),
         layout.outer,
     );
-    let dim = Style::default().fg(Color::DarkGray);
-    let arrow = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(super::theme::muted());
+    let arrow = Style::default()
+        .fg(super::theme::accent())
+        .add_modifier(Modifier::BOLD);
 
     let (year, month) = dp.view();
     let title = format!("{month} {year}");
@@ -2049,7 +2070,9 @@ fn render_date_picker(f: &mut Frame, area: Rect, dp: &super::date_picker::DatePi
                             dim
                         };
                         if date == today {
-                            style = style.fg(ACCENT).add_modifier(Modifier::UNDERLINED);
+                            style = style
+                                .fg(super::theme::accent())
+                                .add_modifier(Modifier::UNDERLINED);
                         }
                         if date == dp.selected {
                             style = style.add_modifier(Modifier::BOLD);
@@ -2072,7 +2095,7 @@ fn render_date_picker(f: &mut Frame, area: Rect, dp: &super::date_picker::DatePi
             let style = if dp.focus == focus {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
-                Style::default().fg(Color::LightGreen)
+                Style::default().fg(super::theme::value())
             };
             Span::styled(text, style)
         };
@@ -2171,14 +2194,14 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(format!(" {} — choose {what} ", pp.title));
     f.render_widget(block, layout.outer);
 
     let location = pp.listing.as_ref().map(|l| l.path.as_str()).unwrap_or("…");
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("in ", Style::default().fg(Color::DarkGray)),
+            Span::styled("in ", Style::default().fg(super::theme::muted())),
             Span::styled(
                 tail_fit(
                     location,
@@ -2192,7 +2215,7 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
 
     let on_off = |b: bool| if b { "on" } else { "off" };
     let mut flags = vec![
-        Span::styled("/ filter: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("/ filter: ", Style::default().fg(super::theme::muted())),
         Span::styled(
             if pp.focus == PickerFocus::Filter {
                 format!("{}_", pp.filter)
@@ -2201,17 +2224,17 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
             } else {
                 pp.filter.clone()
             },
-            Style::default().fg(Color::LightGreen),
+            Style::default().fg(super::theme::value()),
         ),
         Span::styled(
             format!("   . hidden: {}", on_off(pp.show_hidden)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ),
     ];
     if pp.kind == meshfox_core::fsbrowse::PickKind::File && !pp.ext.is_empty() {
         flags.push(Span::styled(
             format!("   e .{} only: {}", pp.ext.join(" ."), on_off(pp.only_ext)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(flags)), layout.flags);
@@ -2225,7 +2248,7 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
         .take(height)
         .map(|r| {
             let (marker, style) = if r.is_dir {
-                ("▸ ", Style::default().fg(ACCENT))
+                ("▸ ", Style::default().fg(super::theme::accent()))
             } else {
                 ("  ", Style::default())
             };
@@ -2240,7 +2263,7 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
             if let Some(n) = r.size {
                 spans.push(Span::styled(
                     format!("  {}", human_size(n)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(super::theme::muted()),
                 ));
             }
             ListItem::new(Line::from(spans))
@@ -2259,7 +2282,10 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
             (None, None) => "loading…".to_string(),
         };
         f.render_widget(
-            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled(
+                msg,
+                Style::default().fg(super::theme::muted()),
+            )),
             layout.list,
         );
     }
@@ -2267,14 +2293,14 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
     if let Some(name_rect) = layout.name {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("name: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("name: ", Style::default().fg(super::theme::muted())),
                 Span::styled(
                     if pp.focus == PickerFocus::Name {
                         format!("{}_", pp.name)
                     } else {
                         pp.name.clone()
                     },
-                    Style::default().fg(Color::LightGreen),
+                    Style::default().fg(super::theme::value()),
                 ),
             ])),
             name_rect,
@@ -2298,7 +2324,10 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
         _ => hint,
     };
     f.render_widget(
-        Paragraph::new(Span::styled(footer, Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Span::styled(
+            footer,
+            Style::default().fg(super::theme::muted()),
+        )),
         layout.footer,
     );
 }
@@ -2332,7 +2361,7 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(format!(" {} — which block? ", mode));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2361,7 +2390,7 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
             };
             ListItem::new(Line::from(vec![
                 Span::raw(b.name.clone()),
-                Span::styled(badge, Style::default().fg(OK)),
+                Span::styled(badge, Style::default().fg(super::theme::ok())),
             ]))
         })
         .collect();
@@ -2382,7 +2411,7 @@ fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(" reset session? ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2403,7 +2432,7 @@ fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "y/enter confirm · n/esc cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         rows[1],
     );
@@ -2418,7 +2447,7 @@ fn render_service_conflict(f: &mut Frame, area: Rect, conflict: &ServiceConflict
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(FAIL))
+        .border_style(Style::default().fg(super::theme::fail()))
         .title(" service already running ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2438,7 +2467,7 @@ fn render_service_conflict(f: &mut Frame, area: Rect, conflict: &ServiceConflict
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "y/enter kill & start · n/esc cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         rows[1],
     );
@@ -2470,14 +2499,14 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                         Span::styled(
                             format!("{} · pid {}", dto.status.replace('_', " "), dto.pid),
                             Style::default().fg(if dto.status == "stop_failed" {
-                                FAIL
+                                super::theme::fail()
                             } else {
-                                OK
+                                super::theme::ok()
                             }),
                         ),
                         Span::styled(
                             format!("  {}", dto.node_id),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(super::theme::muted()),
                         ),
                     ])
                 }
@@ -2485,19 +2514,19 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                     Span::raw(format!("{}  ", dto.block)),
                     Span::styled(
                         format!("crashed (exit {})", dto.exit_code.unwrap_or(-1)),
-                        Style::default().fg(FAIL),
+                        Style::default().fg(super::theme::fail()),
                     ),
                     Span::styled(
                         format!("  {}", dto.node_id),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(super::theme::muted()),
                     ),
                 ]),
                 _ => Line::from(vec![
                     Span::raw(format!("{}  ", dto.block)),
-                    Span::styled("stopped", Style::default().fg(Color::DarkGray)),
+                    Span::styled("stopped", Style::default().fg(super::theme::muted())),
                     Span::styled(
                         format!("  {}", dto.node_id),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(super::theme::muted()),
                     ),
                 ]),
             };
@@ -2518,7 +2547,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(" services ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2539,7 +2568,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "j/k select · s stop · r restart · q/esc close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         hint_area,
     );
@@ -2561,7 +2590,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
         f.render_widget(
             Line::from(Span::styled(
                 format!("── {} log ──", row.block_name),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(super::theme::muted()),
             )),
             log_title_area,
         );
@@ -2575,7 +2604,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                 .map(|(stream, text)| {
                     let style = match stream {
                         meshfox_server::stream_exec::OutputStream::Stderr => {
-                            Style::default().fg(FAIL)
+                            Style::default().fg(super::theme::fail())
                         }
                         meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
                     };
@@ -2610,7 +2639,7 @@ fn render_tty_sessions_view(
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(" live terminals ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2631,11 +2660,11 @@ fn render_tty_sessions_view(
                         "running · {}",
                         meshfox_core::format_duration_ms(s.uptime_ms)
                     ),
-                    Style::default().fg(OK),
+                    Style::default().fg(super::theme::ok()),
                 ),
                 Span::styled(
                     format!("  {}", s.node_id),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(super::theme::muted()),
                 ),
             ]))
         })
@@ -2648,7 +2677,7 @@ fn render_tty_sessions_view(
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "j/k select · enter attach · K kill · q/esc close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         hint_area,
     );
@@ -2686,7 +2715,7 @@ fn render_stats_view(f: &mut Frame, area: Rect, sv: &super::app::StatsViewState)
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(" statistics ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2706,7 +2735,7 @@ fn render_stats_view(f: &mut Frame, area: Rect, sv: &super::app::StatsViewState)
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "j/k scroll · PgUp/PgDn · g/G top/bottom · q/esc close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         layout[1],
     );
@@ -2718,7 +2747,7 @@ fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewSt
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(" history ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2738,12 +2767,15 @@ fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewSt
             let style = if e.applied {
                 Style::default()
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(super::theme::muted())
             };
             let time = history_time(&e.created_at);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{marker}#{:<4} {time:>8}  ", e.seq), style),
-                Span::styled(format!("{:<12} ", e.op_kind), Style::default().fg(OK)),
+                Span::styled(
+                    format!("{:<12} ", e.op_kind),
+                    Style::default().fg(super::theme::ok()),
+                ),
                 Span::styled(e.summary.clone(), style),
             ]))
         })
@@ -2759,7 +2791,7 @@ fn render_history_view(f: &mut Frame, area: Rect, hv: &super::app::HistoryViewSt
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "j/k select · enter/double-click jump here · dim = undone · q/esc close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         hint_area,
     );
@@ -2773,7 +2805,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(format!(" run history — {}/{} ", rv.node_id, rv.block));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2807,16 +2839,16 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
         .iter()
         .map(|e| {
             let dim = if e.stale {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(super::theme::muted())
             } else {
                 Style::default()
             };
             let exit_style = if e.stale {
                 dim
             } else if e.outcome == "killed" || e.exit_code != Some(0) {
-                Style::default().fg(Color::Red)
+                Style::default().fg(super::theme::error())
             } else {
-                Style::default().fg(OK)
+                Style::default().fg(super::theme::ok())
             };
             let mut spans = vec![
                 Span::styled(format!(" {:<9}", history_time(&e.started_at)), dim),
@@ -2832,7 +2864,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
                 spans.push(Span::styled(
                     " stale",
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(super::theme::muted())
                         .add_modifier(Modifier::ITALIC),
                 ));
             }
@@ -2865,7 +2897,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
         if run.stale {
             lines.push(Line::from(Span::styled(
                 " stale — the block, a dependency or a variable changed since (or the session was reset)",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default().fg(super::theme::muted()).add_modifier(Modifier::ITALIC),
             )));
         }
         f.render_widget(Paragraph::new(lines), detail[0]);
@@ -2873,7 +2905,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
     let output_lines: Vec<Line> = match &rv.output {
         None => vec![Line::from(Span::styled(
             " loading…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))],
         Some((_, lines)) if lines.is_empty() => {
             vec![Line::from(Span::styled(
@@ -2882,7 +2914,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
                 } else {
                     " no output stored for this run"
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(super::theme::muted()),
             ))]
         }
         Some((_, lines)) => {
@@ -2893,7 +2925,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
                     let style = match stream {
                         meshfox_server::stream_exec::OutputStream::Stdout => Style::default(),
                         meshfox_server::stream_exec::OutputStream::Stderr => {
-                            Style::default().fg(Color::Yellow)
+                            Style::default().fg(super::theme::warn())
                         }
                     };
                     let line = ansi.line(text, style);
@@ -2912,7 +2944,7 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "j/k select run · PgUp/PgDn (or K/J) scroll output · stderr in yellow · q/esc close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         hint_area,
     );
@@ -3037,7 +3069,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(title);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -3054,9 +3086,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
 /// bundled `ThemeSet` (zlib + bincode) and recolouring the theme for
 /// meshfox's scopes is far too slow to redo on every frame, so it is built
 /// once per theme name.
-fn editor_syntect_theme(
-    theme_name: &str,
-) -> (
+fn editor_syntect_theme() -> (
     Arc<syntect::highlighting::ThemeSet>,
     syntect::highlighting::Theme,
 ) {
@@ -3067,26 +3097,17 @@ fn editor_syntect_theme(
     );
     static CACHE: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // Keyed by the active TUI theme's name, so it is rebuilt if that changes.
+    let key = super::theme::current().name.clone();
     if let Some((name, theme_set, theme)) = cache.as_ref() {
-        if name == theme_name {
+        if *name == key {
             return (Arc::clone(theme_set), theme.clone());
         }
     }
     let theme_set = syntect::highlighting::ThemeSet::load_defaults();
-    let theme = theme_set.themes.get(theme_name).cloned();
-    let theme = theme.or_else(|| theme_set.themes.values().next().cloned());
-    let theme = theme.expect("syntect ships at least one theme");
-    // Bundled `syntect` themes have no rules at all for meshfox's own scope
-    // names — without this, a `<!-- meshfox:... -->` marker's keyword/
-    // attribute-name/attribute-value would all render in one plain color,
-    // same as any other comment text.
-    let theme = crate::syntax_registry::with_meshfox_scope_colors(theme);
+    let theme = crate::syntax_registry::syntect_theme();
     let theme_set = Arc::new(theme_set);
-    *cache = Some((
-        theme_name.to_string(),
-        Arc::clone(&theme_set),
-        theme.clone(),
-    ));
+    *cache = Some((key, Arc::clone(&theme_set), theme.clone()));
     (theme_set, theme)
 }
 
@@ -3099,7 +3120,6 @@ fn render_source_editor(
     area: Rect,
     se: &mut SourceEditorState,
     syntax_set: &Arc<SyntaxSet>,
-    theme_name: &str,
 ) {
     // A save that found the file changed and couldn't combine it with the
     // buffer: the comparison owns the whole screen until it is decided.
@@ -3129,7 +3149,7 @@ fn render_source_editor(
         ),
         Span::styled(
             format!("({kind}){dirty}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ),
     ]);
     f.render_widget(Paragraph::new(header), chunks[0]);
@@ -3142,7 +3162,7 @@ fn render_source_editor(
         .or_else(|| syntax_set.find_syntax_by_token(SOURCE_EDITOR_LANG))
         .cloned()
         .map(|syntax_ref| {
-            let (theme_set, theme) = editor_syntect_theme(theme_name);
+            let (theme_set, theme) = editor_syntect_theme();
             SyntaxHighlighter::with_sets(theme, theme_set, syntax_ref, Arc::clone(syntax_set))
         });
     let view = EditorView::new(&mut se.editor)
@@ -3156,11 +3176,11 @@ fn render_source_editor(
 
     let footer = match &se.error {
         _ if se.read_only => Line::from("Read-only canvas include · Ctrl-f switch file · Esc close · open separately to edit"),
-        Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(FAIL))),
+        Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(super::theme::fail()))),
         None => Line::from(Span::styled(
             "Ctrl-s save · Ctrl-f switch file · Ctrl-n heading→node · Ctrl-p suggest params · Ctrl-g Unicode · \
              esc close (vim keys inside the buffer)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         )),
     };
     f.render_widget(Paragraph::new(footer), chunks[2]);
@@ -3242,8 +3262,14 @@ fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             // The verdict first — a long path must not push it off-screen.
-            Span::styled(format!(" {summary} "), Style::default().fg(FAIL)),
-            Span::styled(format!("· {path}"), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(" {summary} "),
+                Style::default().fg(super::theme::fail()),
+            ),
+            Span::styled(
+                format!("· {path}"),
+                Style::default().fg(super::theme::muted()),
+            ),
         ])),
         chunks[0],
     );
@@ -3266,12 +3292,16 @@ fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 head("theirs — the file on disk now", left_w),
-                Style::default().fg(FAIL).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(super::theme::fail())
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::styled(
                 head("yours — the editor buffer", right_w),
-                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(super::theme::ok())
+                    .add_modifier(Modifier::BOLD),
             ),
         ])),
         chunks[1],
@@ -3294,14 +3324,16 @@ fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
         let (mark, mark_style) = if conflict {
             (
                 '!',
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(super::theme::accent())
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             match row.kind {
                 meshfox_core::DiffKind::Same => (' ', Style::default()),
-                meshfox_core::DiffKind::Changed => ('~', Style::default().fg(Color::Yellow)),
-                meshfox_core::DiffKind::Removed => ('-', Style::default().fg(FAIL)),
-                meshfox_core::DiffKind::Added => ('+', Style::default().fg(OK)),
+                meshfox_core::DiffKind::Changed => ('~', Style::default().fg(super::theme::warn())),
+                meshfox_core::DiffKind::Removed => ('-', Style::default().fg(super::theme::fail())),
+                meshfox_core::DiffKind::Added => ('+', Style::default().fg(super::theme::ok())),
             }
         };
         let bold = if conflict {
@@ -3322,12 +3354,12 @@ fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
         let pad = |used: usize, width: usize| " ".repeat(width.saturating_sub(used));
         let l_used = lp.len() + Span::raw(lt.clone()).width();
         lines.push(Line::from(vec![
-            Span::styled(lp, Style::default().fg(Color::DarkGray)),
-            Span::styled(lt, side_style(FAIL)),
+            Span::styled(lp, Style::default().fg(super::theme::muted())),
+            Span::styled(lt, side_style(super::theme::fail())),
             Span::raw(pad(l_used, left_w)),
             Span::styled(mark.to_string(), mark_style),
-            Span::styled(rp, Style::default().fg(Color::DarkGray)),
-            Span::styled(rt, side_style(OK)),
+            Span::styled(rp, Style::default().fg(super::theme::muted())),
+            Span::styled(rt, side_style(super::theme::ok())),
         ]));
     }
     f.render_widget(Paragraph::new(lines), chunks[2]);
@@ -3336,7 +3368,7 @@ fn render_source_diff(f: &mut Frame, area: Rect, se: &mut SourceEditorState) {
         Paragraph::new(Line::from(Span::styled(
             "t take theirs · m keep mine (overwrite) · n/N conflicts · j/k scroll · h/l pan · \
              esc back",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         ))),
         chunks[3],
     );
@@ -3354,7 +3386,7 @@ fn render_attr_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(format!(" {} attribute ", se.attr_suggest_label()));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -3385,7 +3417,7 @@ fn render_tag_suggest_popup(f: &mut Frame, area: Rect, se: &SourceEditorState) {
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(format!(" {} ", se.value_suggest_label().unwrap_or("tag")));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -3416,7 +3448,7 @@ fn render_source_file_picker(f: &mut Frame, area: Rect, se: &SourceEditorState) 
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(" switch file ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -3473,7 +3505,10 @@ mod tests {
         assert!(row.contains("→ [uses worker] Target"), "{row}");
         let label_x = row.find('[').unwrap() as u16;
         let target_x = row.find("Target").unwrap() as u16;
-        assert_eq!(buf.cell((label_x, 3)).unwrap().fg, ACCENT);
+        assert_eq!(
+            buf.cell((label_x, 3)).unwrap().fg,
+            super::super::theme::accent()
+        );
         assert!(buf
             .cell((target_x, 3))
             .unwrap()
@@ -3720,7 +3755,7 @@ mod tests {
             })
             .collect();
         assert!(
-            arrow_colors.contains(&ACCENT),
+            arrow_colors.contains(&super::super::theme::accent()),
             "selected edge should be highlighted"
         );
         assert!(
@@ -3785,13 +3820,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             buf.cell((source.rect.x + 1, source.rect.y + 1)).unwrap().bg,
-            MAP_SELECTED_BG
+            super::super::theme::map_selected_bg()
         );
         assert_eq!(
             buf.cell((destination.rect.x + 1, destination.rect.y + 1))
                 .unwrap()
                 .bg,
-            MAP_NODE_BG
+            super::super::theme::map_node_bg()
         );
         assert_eq!(
             spatial::hit_test(&app, map_area, destination.rect.x, destination.rect.y),

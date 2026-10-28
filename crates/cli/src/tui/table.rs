@@ -22,12 +22,11 @@ use std::time::Instant;
 
 use meshfox_server::tables::{Filter, FilterOp, SortKey, ViewSpec};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::theme::{ACCENT, BORDER, FAIL, OK};
 use crate::worker_client::{TableColumnDto, TableMetaDto, TableRowsDto};
 
 /// Rows per fetched block — the same figure the web grid uses.
@@ -416,8 +415,13 @@ pub fn status_text(data: &TableData) -> String {
 /// `max_width` columns (as many table columns as fit, then `…`) so the
 /// document pane never has to wrap it.
 pub fn inline_lines(data: &TableData, max_width: usize) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let err = |m: String| vec![Line::from(Span::styled(m, Style::default().fg(FAIL)))];
+    let dim = Style::default().fg(super::theme::muted());
+    let err = |m: String| {
+        vec![Line::from(Span::styled(
+            m,
+            Style::default().fg(super::theme::fail()),
+        ))]
+    };
     if let Some(e) = &data.meta_error {
         if data.meta.is_none() {
             return err(format!("table preview unavailable: {e}"));
@@ -592,11 +596,11 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
     let title = format!(" {} ", tm.title);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(super::theme::accent()))
         .title(title)
         .title_bottom(Line::from(Span::styled(
             format!(" {} ", status_text(data)),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(super::theme::muted()),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -617,7 +621,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
         (layout[0], layout[1], layout[2], layout[3]);
     tm.body_height.set(body_area.height);
 
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(super::theme::muted());
 
     // Failure and "still loading" states replace the grid.
     if let Some(meta) = &data.meta {
@@ -627,8 +631,11 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
                 .as_ref()
                 .map_or("table preview failed", |e| e.message.as_str());
             f.render_widget(
-                Paragraph::new(Span::styled(message.to_string(), Style::default().fg(FAIL)))
-                    .wrap(Wrap { trim: true }),
+                Paragraph::new(Span::styled(
+                    message.to_string(),
+                    Style::default().fg(super::theme::fail()),
+                ))
+                .wrap(Wrap { trim: true }),
                 body_area,
             );
             return;
@@ -730,7 +737,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
                 }
             );
             let style = if *i == tm.cursor_col {
-                bold.fg(ACCENT)
+                bold.fg(super::theme::accent())
             } else {
                 bold
             };
@@ -780,7 +787,7 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
                 };
                 let mut style = if null { dim } else { Style::default() };
                 if at_cursor_row {
-                    style = style.bg(Color::Rgb(0x2b, 0x2b, 0x30));
+                    style = style.bg(super::theme::table_stripe_bg());
                 }
                 if at_cursor_row && *i == tm.cursor_col {
                     style = Style::default().add_modifier(Modifier::REVERSED);
@@ -824,14 +831,17 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
             }
         };
         Line::from(vec![
-            Span::styled(format!("{label}: "), Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("{label}: "),
+                Style::default().fg(super::theme::accent()),
+            ),
             Span::raw(text.to_string()),
-            Span::styled("█", Style::default().fg(ACCENT)),
+            Span::styled("█", Style::default().fg(super::theme::accent())),
         ])
     } else if let Some(e) = &data.view_error {
         Line::from(Span::styled(
             e.replace('\n', " "),
-            Style::default().fg(FAIL),
+            Style::default().fg(super::theme::fail()),
         ))
     } else {
         let value = data
@@ -853,7 +863,10 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
 
     if let Some(notice) = &tm.notice {
         f.render_widget(
-            Paragraph::new(Span::styled(notice.clone(), Style::default().fg(OK))),
+            Paragraph::new(Span::styled(
+                notice.clone(),
+                Style::default().fg(super::theme::ok()),
+            )),
             hint_area,
         );
         draw_cell_popup(f, area, data, tm);
@@ -897,7 +910,7 @@ fn draw_cell_popup(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMode) 
                 Paragraph::new(value).wrap(Wrap { trim: false }).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(BORDER))
+                        .border_style(Style::default().fg(super::theme::border()))
                         .title(format!(
                             " row {} · {} · {} ",
                             format_count(tm.cursor_row + 1),
@@ -906,7 +919,7 @@ fn draw_cell_popup(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMode) 
                         ))
                         .title_bottom(Line::from(Span::styled(
                             " esc/enter close ",
-                            Style::default().fg(OK),
+                            Style::default().fg(super::theme::ok()),
                         ))),
                 ),
                 rect,

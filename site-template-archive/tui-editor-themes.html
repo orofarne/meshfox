@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TUI Editor Themes</title>
+<title>TUI Themes</title>
 <style>
 :root {
   --bg: #f7f6f3;
@@ -52,7 +52,7 @@ header code {
 }
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(620px, 1fr));
   gap: 20px;
 }
 .card {
@@ -63,46 +63,13 @@ header code {
   display: flex;
   flex-direction: column;
 }
-.card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-}
-.card-head h2 {
-  font-size: 0.95rem;
-  margin: 0;
-  font-weight: 600;
-}
-.badge {
-  font-size: 0.68rem;
-  color: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: 999px;
-  padding: 1px 8px;
-  white-space: nowrap;
-}
 .term {
   font-family: "SF Mono", "Menlo", "Consolas", monospace;
-  font-size: 12.5px;
-  line-height: 1.5;
-  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.15;
+  padding: 14px 16px;
   overflow-x: auto;
   white-space: pre;
-}
-.term .line { min-height: 1.5em; }
-.card-foot {
-  padding: 8px 14px;
-  border-top: 1px solid var(--border);
-  background: var(--bg);
-}
-.card-foot code {
-  font-family: "SF Mono", "Menlo", "Consolas", monospace;
-  font-size: 11.5px;
-  color: var(--muted);
-  white-space: pre;
-  line-height: 1.4;
 }
 footer {
   margin-top: 30px;
@@ -120,191 +87,209 @@ footer code {
 </head>
 <body>
 <header>
-  <h1>TUI editor themes — real rendered colors</h1>
-  <p>Every one of <code>syntect</code>'s bundled themes, run through meshfox's actual highlighting code (grammar + <code>with_meshfox_scope_colors</code>) against a sample mirroring your own canvas — meshfox marker comments, a heading, the <code>service</code>-flagged fence, a table. Colors and backgrounds below are the exact hex values that code produces, not approximations.</p>
-  <p>Pick one and set it in <code>.meshfox/config.toml</code> (local, next to the canvas) or <code>~/.meshfox/config.toml</code> (global) — each card's footer shows the exact snippet.</p>
+  <h1>TUI themes — real rendered colors</h1>
+  <p>Every available TUI theme (built in, plus any in <code>.meshfox/themes/tui/</code>), exactly as <code>meshfox theme-preview</code> paints it in a terminal: the interface colors in an unfocused frame, and the editor's highlighted sample in a focused one, built from the theme's <code>[ui]</code> and <code>[editor]</code> palettes. Colors a theme leaves as <code>ansi:…</code> are shown here as the common xterm shade; your terminal shows its own.</p>
+  <p>Pick one and set <code>[tui] theme = "…"</code> in <code>.meshfox/config.toml</code> (local, next to the canvas) or <code>~/.meshfox/config.toml</code> (global); each frame's bottom line shows the exact snippet. Regenerate this page with <code>meshfox theme-preview --html -o FILE</code>.</p>
 </header>
 
 <div class="grid">
-
     <section class="card">
-      <div class="card-head">
-        <h2>InspiredGitHub</h2>
-        
-      </div>
-      <div class="term" style="background:#ffffff">
-<div class="line"><span style="color:#a71d5d">&lt;!--</span><span style="color:#969896"> </span><span style="color:#ea580c">meshfox:canvas</span><span style="color:#969896"> </span><span style="color:#a71d5d">--&gt;</span></div>
-<div class="line"><span style="color:#a71d5d">#</span><span style="color:#201a14"> </span><span style="color:#201a14">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#a71d5d">&lt;!--</span><span style="color:#969896"> </span><span style="color:#ea580c">meshfox:node</span><span style="color:#969896"> </span><span style="color:#96660a">id</span><span style="color:#1b7a43">=&quot;root&quot;</span><span style="color:#969896"> </span><span style="color:#a71d5d">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#a71d5d">##</span><span style="color:#201a14"> </span><span style="color:#201a14">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#a71d5d">```</span><span style="color:#0086b3">bash</span><span style="color:#201a14"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#201a14">npm run start</span></div>
-<div class="line"><span style="color:#a71d5d">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> Поле </span><span style="color:#201a14">|</span><span style="color:#201a14"> Назначение </span><span style="color:#201a14">|</span></div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span></div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> status </span><span style="color:#201a14">|</span><span style="color:#201a14"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "InspiredGitHub"</code>
-      </div>
+      <div class="term" style="background:#131316;color:#f2ede6"><span style="color:#9a938c;">┌─</span><span style="color:#ff6e15;"> darkfox </span><span style="color:#9a938c;">───────────────────────────────────────────────────┐</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">accent</span>  <span style="color:#c68ae8;">dep</span>  <span style="color:#6fcf97;">ok</span>  <span style="color:#e56a6a;">fail</span>  <span style="color:#7f7f7f;">muted</span>  <span style="color:#00ff00;">value</span>  <span style="color:#00cdcd;">tag</span>  <span style="color:#cdcd00;">warn</span>  <span style="color:#cd0000;">error</span>  <span style="color:#5c5cff;">link</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#00ffff;">H1 </span><span style="color:#5c5cff;">H2 </span><span style="color:#00ff00;">H3 </span><span style="color:#ffff00;">H4 </span><span style="color:#ff00ff;">H5 </span><span style="color:#e5e5e5;">H6 </span>  <span style="color:#5c5cff;">note</span>  <span style="color:#00ff00;">tip</span>  <span style="color:#ff00ff;">important</span>  <span style="color:#ffff00;">warning</span>  <span style="color:#ff0000;">caution</span>  <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#000000;background:#ff6e15;"> selected row </span>  <span style="color:#000000;background:#00d7ff;"> match </span>  <span style="color:#ffb86c;background:#282a36;"> inline code </span>                      <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span>                                                             <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">┌─</span><span style="color:#ff6e15;"> Source </span><span style="color:#ff6e15;">────────────────────────────────────────────────┐</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#65737e;">&lt;!--</span><span style="color:#65737e;"> </span><span style="color:#ff6e15;">meshfox:canvas</span><span style="color:#65737e;"> </span><span style="color:#65737e;">--&gt;</span>                                 <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#8fa1b3;">#</span><span style="color:#8fa1b3;"> kotoprovod.gitazone.org</span>                               <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#65737e;">&lt;!--</span><span style="color:#65737e;"> </span><span style="color:#ff6e15;">meshfox:node</span><span style="color:#65737e;"> </span><span style="color:#d8b656;">id</span><span style="color:#6fcf97;">=&quot;root&quot;</span><span style="color:#65737e;"> </span><span style="color:#65737e;">--&gt;</span>                         <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span>                                                         <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#8fa1b3;">##</span><span style="color:#8fa1b3;"> Локальная разработка</span>                                 <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span>                                                         <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#b48ead;">```</span><span style="color:#d08770;">bash</span><span style="color:#f8f8f2;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span>           <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#f8f8f2;">npm run start</span>                                           <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#b48ead;">```</span>                                                     <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span>                                                         <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#f8f8f2;">| Поле   | Назначение  |</span>                                <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#f8f8f2;">| ------ | ----------- |</span>                                <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">│</span> <span style="color:#f8f8f2;">| status | catalog-new |</span>                                <span style="color:#ff6e15;">│</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">│</span> <span style="color:#ff6e15;">└─</span><span style="color:#7f7f7f;"></span><span style="color:#ff6e15;">────────────────────────────────────────────────────────┘</span> <span style="color:#9a938c;">│</span>
+<span style="color:#9a938c;">└─</span><span style="color:#7f7f7f;"> [tui] theme = &quot;darkfox&quot; </span><span style="color:#9a938c;">───────────────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#ffffff;color:#201a14"><span style="color:#a39a8e;">┌─</span><span style="color:#ea580c;"> lightfox </span><span style="color:#a39a8e;">──────────────────────────────────────────────────┐</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">accent</span>  <span style="color:#a05dd1;">dep</span>  <span style="color:#1b7a43;">ok</span>  <span style="color:#c22b2b;">fail</span>  <span style="color:#7a6f63;">muted</span>  <span style="color:#96660a;">value</span>  <span style="color:#1a7f37;">tag</span>  <span style="color:#9a6700;">warn</span>  <span style="color:#c22b2b;">error</span>  <span style="color:#0969da;">link</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#c2410c;">H1 </span><span style="color:#96660a;">H2 </span><span style="color:#1a7f37;">H3 </span><span style="color:#0969da;">H4 </span><span style="color:#8250df;">H5 </span><span style="color:#7a6f63;">H6 </span>  <span style="color:#0969da;">note</span>  <span style="color:#1a7f37;">tip</span>  <span style="color:#8250df;">important</span>  <span style="color:#9a6700;">warning</span>  <span style="color:#cf222e;">caution</span>  <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ffffff;background:#ea580c;"> selected row </span>  <span style="color:#3a2c00;background:#ffe066;"> match </span>  <span style="color:#c2410c;background:#f4ede3;"> inline code </span>                      <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span>                                                             <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">┌─</span><span style="color:#ea580c;"> Source </span><span style="color:#ea580c;">────────────────────────────────────────────────┐</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#7a6f63;background:#faf7f4;">&lt;!--</span><span style="color:#7a6f63;background:#faf7f4;"> </span><span style="color:#ea580c;background:#faf7f4;">meshfox:canvas</span><span style="color:#7a6f63;background:#faf7f4;"> </span><span style="color:#7a6f63;background:#faf7f4;">--&gt;</span><span style="background:#faf7f4;">                       </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#0969da;background:#faf7f4;">#</span><span style="color:#0969da;background:#faf7f4;"> kotoprovod.gitazone.org</span><span style="background:#faf7f4;">                     </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#7a6f63;background:#faf7f4;">&lt;!--</span><span style="color:#7a6f63;background:#faf7f4;"> </span><span style="color:#ea580c;background:#faf7f4;">meshfox:node</span><span style="color:#7a6f63;background:#faf7f4;"> </span><span style="color:#96660a;background:#faf7f4;">id</span><span style="color:#1b7a43;background:#faf7f4;">=&quot;root&quot;</span><span style="color:#7a6f63;background:#faf7f4;"> </span><span style="color:#7a6f63;background:#faf7f4;">--&gt;</span><span style="background:#faf7f4;">               </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="background:#faf7f4;">                                              </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#0969da;background:#faf7f4;">##</span><span style="color:#0969da;background:#faf7f4;"> Локальная разработка</span><span style="background:#faf7f4;">                       </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="background:#faf7f4;">                                              </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#8250df;background:#faf7f4;">```</span><span style="color:#b24a0a;background:#faf7f4;">bash</span><span style="color:#201a14;background:#faf7f4;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#faf7f4;"> </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#201a14;background:#faf7f4;">npm run start</span><span style="background:#faf7f4;">                                 </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#8250df;background:#faf7f4;">```</span><span style="background:#faf7f4;">                                           </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="background:#faf7f4;">                                              </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#201a14;background:#faf7f4;">| Поле   | Назначение  |</span><span style="background:#faf7f4;">                      </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#201a14;background:#faf7f4;">| ------ | ----------- |</span><span style="background:#faf7f4;">                      </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">│</span><span style="background:#faf7f4;"> </span><span style="color:#201a14;background:#faf7f4;">| status | catalog-new |</span><span style="background:#faf7f4;">                      </span>          <span style="color:#ea580c;">│</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">│</span> <span style="color:#ea580c;">└─</span><span style="color:#7a6f63;"></span><span style="color:#ea580c;">────────────────────────────────────────────────────────┘</span> <span style="color:#a39a8e;">│</span>
+<span style="color:#a39a8e;">└─</span><span style="color:#7a6f63;"> [tui] theme = &quot;lightfox&quot; </span><span style="color:#a39a8e;">──────────────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#2d353b;color:#d3c6aa"><span style="color:#859289;">┌─</span><span style="color:#a7c080;"> everforest </span><span style="color:#859289;">────────────────────────────────────────────────┐</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">accent</span>  <span style="color:#d699b6;">dep</span>  <span style="color:#a7c080;">ok</span>  <span style="color:#e67e80;">fail</span>  <span style="color:#859289;">muted</span>  <span style="color:#dbbc7f;">value</span>  <span style="color:#83c092;">tag</span>  <span style="color:#dbbc7f;">warn</span>  <span style="color:#e67e80;">error</span>  <span style="color:#7fbbb3;">link</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#e69875;">H1 </span><span style="color:#dbbc7f;">H2 </span><span style="color:#a7c080;">H3 </span><span style="color:#83c092;">H4 </span><span style="color:#7fbbb3;">H5 </span><span style="color:#d699b6;">H6 </span>  <span style="color:#7fbbb3;">note</span>  <span style="color:#a7c080;">tip</span>  <span style="color:#d699b6;">important</span>  <span style="color:#dbbc7f;">warning</span>  <span style="color:#e67e80;">caution</span>  <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#2d353b;background:#a7c080;"> selected row </span>  <span style="color:#2d353b;background:#dbbc7f;"> match </span>  <span style="color:#e69875;background:#343f44;"> inline code </span>                      <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span>                                                             <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">┌─</span><span style="color:#a7c080;"> Source </span><span style="color:#a7c080;">────────────────────────────────────────────────┐</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#859289;background:#2d353b;">&lt;!--</span><span style="color:#859289;background:#2d353b;"> </span><span style="color:#e69875;background:#2d353b;">meshfox:canvas</span><span style="color:#859289;background:#2d353b;"> </span><span style="color:#859289;background:#2d353b;">--&gt;</span><span style="background:#2d353b;">                       </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#a7c080;background:#2d353b;">#</span><span style="color:#a7c080;background:#2d353b;"> kotoprovod.gitazone.org</span><span style="background:#2d353b;">                     </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#859289;background:#2d353b;">&lt;!--</span><span style="color:#859289;background:#2d353b;"> </span><span style="color:#e69875;background:#2d353b;">meshfox:node</span><span style="color:#859289;background:#2d353b;"> </span><span style="color:#dbbc7f;background:#2d353b;">id</span><span style="color:#a7c080;background:#2d353b;">=&quot;root&quot;</span><span style="color:#859289;background:#2d353b;"> </span><span style="color:#859289;background:#2d353b;">--&gt;</span><span style="background:#2d353b;">               </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="background:#2d353b;">                                              </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#a7c080;background:#2d353b;">##</span><span style="color:#a7c080;background:#2d353b;"> Локальная разработка</span><span style="background:#2d353b;">                       </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="background:#2d353b;">                                              </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#e67e80;background:#2d353b;">```</span><span style="color:#d699b6;background:#2d353b;">bash</span><span style="color:#d3c6aa;background:#2d353b;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#2d353b;"> </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#d3c6aa;background:#2d353b;">npm run start</span><span style="background:#2d353b;">                                 </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#e67e80;background:#2d353b;">```</span><span style="background:#2d353b;">                                           </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="background:#2d353b;">                                              </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#d3c6aa;background:#2d353b;">| Поле   | Назначение  |</span><span style="background:#2d353b;">                      </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#d3c6aa;background:#2d353b;">| ------ | ----------- |</span><span style="background:#2d353b;">                      </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">│</span><span style="background:#2d353b;"> </span><span style="color:#d3c6aa;background:#2d353b;">| status | catalog-new |</span><span style="background:#2d353b;">                      </span>          <span style="color:#a7c080;">│</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">│</span> <span style="color:#a7c080;">└─</span><span style="color:#859289;"></span><span style="color:#a7c080;">────────────────────────────────────────────────────────┘</span> <span style="color:#859289;">│</span>
+<span style="color:#859289;">└─</span><span style="color:#859289;"> [tui] theme = &quot;everforest&quot; </span><span style="color:#859289;">────────────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#fdf6e3;color:#5c6a72"><span style="color:#939f91;">┌─</span><span style="color:#8da101;"> everforest-light </span><span style="color:#939f91;">──────────────────────────────────────────┐</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">accent</span>  <span style="color:#df69ba;">dep</span>  <span style="color:#8da101;">ok</span>  <span style="color:#f85552;">fail</span>  <span style="color:#829181;">muted</span>  <span style="color:#dfa000;">value</span>  <span style="color:#35a77c;">tag</span>  <span style="color:#dfa000;">warn</span>  <span style="color:#f85552;">error</span>  <span style="color:#3a94c5;">link</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#f57d26;">H1 </span><span style="color:#dfa000;">H2 </span><span style="color:#8da101;">H3 </span><span style="color:#35a77c;">H4 </span><span style="color:#3a94c5;">H5 </span><span style="color:#df69ba;">H6 </span>  <span style="color:#3a94c5;">note</span>  <span style="color:#8da101;">tip</span>  <span style="color:#df69ba;">important</span>  <span style="color:#dfa000;">warning</span>  <span style="color:#f85552;">caution</span>  <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#fdf6e3;background:#8da101;"> selected row </span>  <span style="color:#5c6a72;background:#dfa000;"> match </span>  <span style="color:#f57d26;background:#efebd4;"> inline code </span>                      <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span>                                                             <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">┌─</span><span style="color:#8da101;"> Source </span><span style="color:#8da101;">────────────────────────────────────────────────┐</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#939f91;background:#fdf6e3;">&lt;!--</span><span style="color:#939f91;background:#fdf6e3;"> </span><span style="color:#f57d26;background:#fdf6e3;">meshfox:canvas</span><span style="color:#939f91;background:#fdf6e3;"> </span><span style="color:#939f91;background:#fdf6e3;">--&gt;</span><span style="background:#fdf6e3;">                       </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#8da101;background:#fdf6e3;">#</span><span style="color:#8da101;background:#fdf6e3;"> kotoprovod.gitazone.org</span><span style="background:#fdf6e3;">                     </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#939f91;background:#fdf6e3;">&lt;!--</span><span style="color:#939f91;background:#fdf6e3;"> </span><span style="color:#f57d26;background:#fdf6e3;">meshfox:node</span><span style="color:#939f91;background:#fdf6e3;"> </span><span style="color:#dfa000;background:#fdf6e3;">id</span><span style="color:#8da101;background:#fdf6e3;">=&quot;root&quot;</span><span style="color:#939f91;background:#fdf6e3;"> </span><span style="color:#939f91;background:#fdf6e3;">--&gt;</span><span style="background:#fdf6e3;">               </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="background:#fdf6e3;">                                              </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#8da101;background:#fdf6e3;">##</span><span style="color:#8da101;background:#fdf6e3;"> Локальная разработка</span><span style="background:#fdf6e3;">                       </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="background:#fdf6e3;">                                              </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#f85552;background:#fdf6e3;">```</span><span style="color:#df69ba;background:#fdf6e3;">bash</span><span style="color:#5c6a72;background:#fdf6e3;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#fdf6e3;"> </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#5c6a72;background:#fdf6e3;">npm run start</span><span style="background:#fdf6e3;">                                 </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#f85552;background:#fdf6e3;">```</span><span style="background:#fdf6e3;">                                           </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="background:#fdf6e3;">                                              </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#5c6a72;background:#fdf6e3;">| Поле   | Назначение  |</span><span style="background:#fdf6e3;">                      </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#5c6a72;background:#fdf6e3;">| ------ | ----------- |</span><span style="background:#fdf6e3;">                      </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">│</span><span style="background:#fdf6e3;"> </span><span style="color:#5c6a72;background:#fdf6e3;">| status | catalog-new |</span><span style="background:#fdf6e3;">                      </span>          <span style="color:#8da101;">│</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">│</span> <span style="color:#8da101;">└─</span><span style="color:#829181;"></span><span style="color:#8da101;">────────────────────────────────────────────────────────┘</span> <span style="color:#939f91;">│</span>
+<span style="color:#939f91;">└─</span><span style="color:#829181;"> [tui] theme = &quot;everforest-light&quot; </span><span style="color:#939f91;">──────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#282828;color:#ebdbb2"><span style="color:#928374;">┌─</span><span style="color:#fe8019;"> gruvbox-dark </span><span style="color:#928374;">──────────────────────────────────────────────┐</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">accent</span>  <span style="color:#d3869b;">dep</span>  <span style="color:#b8bb26;">ok</span>  <span style="color:#fb4934;">fail</span>  <span style="color:#928374;">muted</span>  <span style="color:#fabd2f;">value</span>  <span style="color:#8ec07c;">tag</span>  <span style="color:#fabd2f;">warn</span>  <span style="color:#fb4934;">error</span>  <span style="color:#83a598;">link</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">H1 </span><span style="color:#fabd2f;">H2 </span><span style="color:#b8bb26;">H3 </span><span style="color:#8ec07c;">H4 </span><span style="color:#83a598;">H5 </span><span style="color:#d3869b;">H6 </span>  <span style="color:#83a598;">note</span>  <span style="color:#b8bb26;">tip</span>  <span style="color:#d3869b;">important</span>  <span style="color:#fabd2f;">warning</span>  <span style="color:#fb4934;">caution</span>  <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#282828;background:#fe8019;"> selected row </span>  <span style="color:#282828;background:#fabd2f;"> match </span>  <span style="color:#fe8019;background:#3c3836;"> inline code </span>                      <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span>                                                             <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">┌─</span><span style="color:#fe8019;"> Source </span><span style="color:#fe8019;">────────────────────────────────────────────────┐</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#928374;background:#282828;">&lt;!--</span><span style="color:#928374;background:#282828;"> </span><span style="color:#fe8019;background:#282828;">meshfox:canvas</span><span style="color:#928374;background:#282828;"> </span><span style="color:#928374;background:#282828;">--&gt;</span><span style="background:#282828;">                       </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#b8bb26;background:#282828;">#</span><span style="color:#b8bb26;background:#282828;"> kotoprovod.gitazone.org</span><span style="background:#282828;">                     </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#928374;background:#282828;">&lt;!--</span><span style="color:#928374;background:#282828;"> </span><span style="color:#fe8019;background:#282828;">meshfox:node</span><span style="color:#928374;background:#282828;"> </span><span style="color:#fabd2f;background:#282828;">id</span><span style="color:#b8bb26;background:#282828;">=&quot;root&quot;</span><span style="color:#928374;background:#282828;"> </span><span style="color:#928374;background:#282828;">--&gt;</span><span style="background:#282828;">               </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="background:#282828;">                                              </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#b8bb26;background:#282828;">##</span><span style="color:#b8bb26;background:#282828;"> Локальная разработка</span><span style="background:#282828;">                       </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="background:#282828;">                                              </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#fb4934;background:#282828;">```</span><span style="color:#d3869b;background:#282828;">bash</span><span style="color:#ebdbb2;background:#282828;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#282828;"> </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#ebdbb2;background:#282828;">npm run start</span><span style="background:#282828;">                                 </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#fb4934;background:#282828;">```</span><span style="background:#282828;">                                           </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="background:#282828;">                                              </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#ebdbb2;background:#282828;">| Поле   | Назначение  |</span><span style="background:#282828;">                      </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#ebdbb2;background:#282828;">| ------ | ----------- |</span><span style="background:#282828;">                      </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">│</span><span style="background:#282828;"> </span><span style="color:#ebdbb2;background:#282828;">| status | catalog-new |</span><span style="background:#282828;">                      </span>          <span style="color:#fe8019;">│</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">│</span> <span style="color:#fe8019;">└─</span><span style="color:#928374;"></span><span style="color:#fe8019;">────────────────────────────────────────────────────────┘</span> <span style="color:#928374;">│</span>
+<span style="color:#928374;">└─</span><span style="color:#928374;"> [tui] theme = &quot;gruvbox-dark&quot; </span><span style="color:#928374;">──────────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#fbf1c7;color:#3c3836"><span style="color:#7c6f64;">┌─</span><span style="color:#af3a03;"> gruvbox-light </span><span style="color:#7c6f64;">─────────────────────────────────────────────┐</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">accent</span>  <span style="color:#8f3f71;">dep</span>  <span style="color:#79740e;">ok</span>  <span style="color:#9d0006;">fail</span>  <span style="color:#7c6f64;">muted</span>  <span style="color:#b57614;">value</span>  <span style="color:#427b58;">tag</span>  <span style="color:#b57614;">warn</span>  <span style="color:#9d0006;">error</span>  <span style="color:#076678;">link</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">H1 </span><span style="color:#b57614;">H2 </span><span style="color:#79740e;">H3 </span><span style="color:#427b58;">H4 </span><span style="color:#076678;">H5 </span><span style="color:#8f3f71;">H6 </span>  <span style="color:#076678;">note</span>  <span style="color:#79740e;">tip</span>  <span style="color:#8f3f71;">important</span>  <span style="color:#b57614;">warning</span>  <span style="color:#9d0006;">caution</span>  <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#fbf1c7;background:#af3a03;"> selected row </span>  <span style="color:#fbf1c7;background:#b57614;"> match </span>  <span style="color:#af3a03;background:#ebdbb2;"> inline code </span>                      <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span>                                                             <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">┌─</span><span style="color:#af3a03;"> Source </span><span style="color:#af3a03;">────────────────────────────────────────────────┐</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#7c6f64;background:#fbf1c7;">&lt;!--</span><span style="color:#7c6f64;background:#fbf1c7;"> </span><span style="color:#af3a03;background:#fbf1c7;">meshfox:canvas</span><span style="color:#7c6f64;background:#fbf1c7;"> </span><span style="color:#7c6f64;background:#fbf1c7;">--&gt;</span><span style="background:#fbf1c7;">                       </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#79740e;background:#fbf1c7;">#</span><span style="color:#79740e;background:#fbf1c7;"> kotoprovod.gitazone.org</span><span style="background:#fbf1c7;">                     </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#7c6f64;background:#fbf1c7;">&lt;!--</span><span style="color:#7c6f64;background:#fbf1c7;"> </span><span style="color:#af3a03;background:#fbf1c7;">meshfox:node</span><span style="color:#7c6f64;background:#fbf1c7;"> </span><span style="color:#b57614;background:#fbf1c7;">id</span><span style="color:#79740e;background:#fbf1c7;">=&quot;root&quot;</span><span style="color:#7c6f64;background:#fbf1c7;"> </span><span style="color:#7c6f64;background:#fbf1c7;">--&gt;</span><span style="background:#fbf1c7;">               </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="background:#fbf1c7;">                                              </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#79740e;background:#fbf1c7;">##</span><span style="color:#79740e;background:#fbf1c7;"> Локальная разработка</span><span style="background:#fbf1c7;">                       </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="background:#fbf1c7;">                                              </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#9d0006;background:#fbf1c7;">```</span><span style="color:#8f3f71;background:#fbf1c7;">bash</span><span style="color:#3c3836;background:#fbf1c7;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#fbf1c7;"> </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#3c3836;background:#fbf1c7;">npm run start</span><span style="background:#fbf1c7;">                                 </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#9d0006;background:#fbf1c7;">```</span><span style="background:#fbf1c7;">                                           </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="background:#fbf1c7;">                                              </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#3c3836;background:#fbf1c7;">| Поле   | Назначение  |</span><span style="background:#fbf1c7;">                      </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#3c3836;background:#fbf1c7;">| ------ | ----------- |</span><span style="background:#fbf1c7;">                      </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">│</span><span style="background:#fbf1c7;"> </span><span style="color:#3c3836;background:#fbf1c7;">| status | catalog-new |</span><span style="background:#fbf1c7;">                      </span>          <span style="color:#af3a03;">│</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">│</span> <span style="color:#af3a03;">└─</span><span style="color:#7c6f64;"></span><span style="color:#af3a03;">────────────────────────────────────────────────────────┘</span> <span style="color:#7c6f64;">│</span>
+<span style="color:#7c6f64;">└─</span><span style="color:#7c6f64;"> [tui] theme = &quot;gruvbox-light&quot; </span><span style="color:#7c6f64;">─────────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#272822;color:#f8f8f2"><span style="color:#90908a;">┌─</span><span style="color:#a6e22e;"> monokai </span><span style="color:#90908a;">───────────────────────────────────────────────────┐</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">accent</span>  <span style="color:#ae81ff;">dep</span>  <span style="color:#a6e22e;">ok</span>  <span style="color:#f92672;">fail</span>  <span style="color:#90908a;">muted</span>  <span style="color:#e6db74;">value</span>  <span style="color:#66d9ef;">tag</span>  <span style="color:#e6db74;">warn</span>  <span style="color:#f92672;">error</span>  <span style="color:#66d9ef;">link</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">H1 </span><span style="color:#e6db74;">H2 </span><span style="color:#66d9ef;">H3 </span><span style="color:#fd971f;">H4 </span><span style="color:#ae81ff;">H5 </span><span style="color:#f92672;">H6 </span>  <span style="color:#66d9ef;">note</span>  <span style="color:#a6e22e;">tip</span>  <span style="color:#ae81ff;">important</span>  <span style="color:#e6db74;">warning</span>  <span style="color:#f92672;">caution</span>  <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#272822;background:#a6e22e;"> selected row </span>  <span style="color:#272822;background:#e6db74;"> match </span>  <span style="color:#fd971f;background:#3e3d32;"> inline code </span>                      <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span>                                                             <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">┌─</span><span style="color:#a6e22e;"> Source </span><span style="color:#a6e22e;">────────────────────────────────────────────────┐</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#90908a;background:#272822;">&lt;!--</span><span style="color:#90908a;background:#272822;"> </span><span style="color:#fd971f;background:#272822;">meshfox:canvas</span><span style="color:#90908a;background:#272822;"> </span><span style="color:#90908a;background:#272822;">--&gt;</span><span style="background:#272822;">                       </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#a6e22e;background:#272822;">#</span><span style="color:#a6e22e;background:#272822;"> kotoprovod.gitazone.org</span><span style="background:#272822;">                     </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#90908a;background:#272822;">&lt;!--</span><span style="color:#90908a;background:#272822;"> </span><span style="color:#fd971f;background:#272822;">meshfox:node</span><span style="color:#90908a;background:#272822;"> </span><span style="color:#e6db74;background:#272822;">id</span><span style="color:#a6e22e;background:#272822;">=&quot;root&quot;</span><span style="color:#90908a;background:#272822;"> </span><span style="color:#90908a;background:#272822;">--&gt;</span><span style="background:#272822;">               </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="background:#272822;">                                              </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#a6e22e;background:#272822;">##</span><span style="color:#a6e22e;background:#272822;"> Локальная разработка</span><span style="background:#272822;">                       </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="background:#272822;">                                              </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#f92672;background:#272822;">```</span><span style="color:#ae81ff;background:#272822;">bash</span><span style="color:#f8f8f2;background:#272822;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#272822;"> </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#f8f8f2;background:#272822;">npm run start</span><span style="background:#272822;">                                 </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#f92672;background:#272822;">```</span><span style="background:#272822;">                                           </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="background:#272822;">                                              </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#f8f8f2;background:#272822;">| Поле   | Назначение  |</span><span style="background:#272822;">                      </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#f8f8f2;background:#272822;">| ------ | ----------- |</span><span style="background:#272822;">                      </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">│</span><span style="background:#272822;"> </span><span style="color:#f8f8f2;background:#272822;">| status | catalog-new |</span><span style="background:#272822;">                      </span>          <span style="color:#a6e22e;">│</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">│</span> <span style="color:#a6e22e;">└─</span><span style="color:#90908a;"></span><span style="color:#a6e22e;">────────────────────────────────────────────────────────┘</span> <span style="color:#90908a;">│</span>
+<span style="color:#90908a;">└─</span><span style="color:#90908a;"> [tui] theme = &quot;monokai&quot; </span><span style="color:#90908a;">───────────────────────────────────┘</span>
+</div>
+    </section>
+    <section class="card">
+      <div class="term" style="background:#eff1f5;color:#4c4f69"><span style="color:#8c8fa1;">┌─</span><span style="color:#8839ef;"> catppuccin-latte </span><span style="color:#8c8fa1;">──────────────────────────────────────────┐</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">accent</span>  <span style="color:#7287fd;">dep</span>  <span style="color:#40a02b;">ok</span>  <span style="color:#d20f39;">fail</span>  <span style="color:#7c7f93;">muted</span>  <span style="color:#df8e1d;">value</span>  <span style="color:#179299;">tag</span>  <span style="color:#df8e1d;">warn</span>  <span style="color:#d20f39;">error</span>  <span style="color:#1e66f5;">link</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#d20f39;">H1 </span><span style="color:#fe640b;">H2 </span><span style="color:#df8e1d;">H3 </span><span style="color:#40a02b;">H4 </span><span style="color:#209fb5;">H5 </span><span style="color:#7287fd;">H6 </span>  <span style="color:#1e66f5;">note</span>  <span style="color:#40a02b;">tip</span>  <span style="color:#8839ef;">important</span>  <span style="color:#df8e1d;">warning</span>  <span style="color:#d20f39;">caution</span>  <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#eff1f5;background:#8839ef;"> selected row </span>  <span style="color:#eff1f5;background:#df8e1d;"> match </span>  <span style="color:#fe640b;background:#ccd0da;"> inline code </span>                      <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span>                                                             <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">┌─</span><span style="color:#8839ef;"> Source </span><span style="color:#8839ef;">────────────────────────────────────────────────┐</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#8c8fa1;background:#eff1f5;">&lt;!--</span><span style="color:#8c8fa1;background:#eff1f5;"> </span><span style="color:#fe640b;background:#eff1f5;">meshfox:canvas</span><span style="color:#8c8fa1;background:#eff1f5;"> </span><span style="color:#8c8fa1;background:#eff1f5;">--&gt;</span><span style="background:#eff1f5;">                       </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#1e66f5;background:#eff1f5;">#</span><span style="color:#1e66f5;background:#eff1f5;"> kotoprovod.gitazone.org</span><span style="background:#eff1f5;">                     </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#8c8fa1;background:#eff1f5;">&lt;!--</span><span style="color:#8c8fa1;background:#eff1f5;"> </span><span style="color:#fe640b;background:#eff1f5;">meshfox:node</span><span style="color:#8c8fa1;background:#eff1f5;"> </span><span style="color:#df8e1d;background:#eff1f5;">id</span><span style="color:#40a02b;background:#eff1f5;">=&quot;root&quot;</span><span style="color:#8c8fa1;background:#eff1f5;"> </span><span style="color:#8c8fa1;background:#eff1f5;">--&gt;</span><span style="background:#eff1f5;">               </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="background:#eff1f5;">                                              </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#1e66f5;background:#eff1f5;">##</span><span style="color:#1e66f5;background:#eff1f5;"> Локальная разработка</span><span style="background:#eff1f5;">                       </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="background:#eff1f5;">                                              </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#8839ef;background:#eff1f5;">```</span><span style="color:#fe640b;background:#eff1f5;">bash</span><span style="color:#4c4f69;background:#eff1f5;"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span><span style="background:#eff1f5;"> </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#4c4f69;background:#eff1f5;">npm run start</span><span style="background:#eff1f5;">                                 </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#8839ef;background:#eff1f5;">```</span><span style="background:#eff1f5;">                                           </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="background:#eff1f5;">                                              </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#4c4f69;background:#eff1f5;">| Поле   | Назначение  |</span><span style="background:#eff1f5;">                      </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#4c4f69;background:#eff1f5;">| ------ | ----------- |</span><span style="background:#eff1f5;">                      </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">│</span><span style="background:#eff1f5;"> </span><span style="color:#4c4f69;background:#eff1f5;">| status | catalog-new |</span><span style="background:#eff1f5;">                      </span>          <span style="color:#8839ef;">│</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">│</span> <span style="color:#8839ef;">└─</span><span style="color:#7c7f93;"></span><span style="color:#8839ef;">────────────────────────────────────────────────────────┘</span> <span style="color:#8c8fa1;">│</span>
+<span style="color:#8c8fa1;">└─</span><span style="color:#7c7f93;"> [tui] theme = &quot;catppuccin-latte&quot; </span><span style="color:#8c8fa1;">──────────────────────────┘</span>
+</div>
     </section>
 
-    <section class="card">
-      <div class="card-head">
-        <h2>Solarized (dark)</h2>
-        
-      </div>
-      <div class="term" style="background:#002b36">
-<div class="line"><span style="color:#586e75">&lt;!--</span><span style="color:#586e75"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#586e75"> </span><span style="color:#586e75">--&gt;</span></div>
-<div class="line"><span style="color:#b58900">#</span><span style="color:#b58900"> </span><span style="color:#cb4b16">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#586e75">&lt;!--</span><span style="color:#586e75"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#586e75"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#586e75"> </span><span style="color:#586e75">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#b58900">##</span><span style="color:#b58900"> </span><span style="color:#cb4b16">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#cb4b16">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
-<div class="line"><span style="color:#f8f8f2">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#657b83">---</span><span style="color:#f8f8f2">|</span><span style="color:#657b83">---</span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "Solarized (dark)"</code>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <h2>Solarized (light)</h2>
-        
-      </div>
-      <div class="term" style="background:#fdf6e3">
-<div class="line"><span style="color:#93a1a1">&lt;!--</span><span style="color:#93a1a1"> </span><span style="color:#ea580c">meshfox:canvas</span><span style="color:#93a1a1"> </span><span style="color:#93a1a1">--&gt;</span></div>
-<div class="line"><span style="color:#b58900">#</span><span style="color:#b58900"> </span><span style="color:#cb4b16">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#93a1a1">&lt;!--</span><span style="color:#93a1a1"> </span><span style="color:#ea580c">meshfox:node</span><span style="color:#93a1a1"> </span><span style="color:#96660a">id</span><span style="color:#1b7a43">=&quot;root&quot;</span><span style="color:#93a1a1"> </span><span style="color:#93a1a1">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#b58900">##</span><span style="color:#b58900"> </span><span style="color:#cb4b16">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#201a14">```</span><span style="color:#cb4b16">bash</span><span style="color:#201a14"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#201a14">npm run start</span></div>
-<div class="line"><span style="color:#201a14">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> Поле </span><span style="color:#201a14">|</span><span style="color:#201a14"> Назначение </span><span style="color:#201a14">|</span></div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#657b83">---</span><span style="color:#201a14">|</span><span style="color:#657b83">---</span><span style="color:#201a14">|</span></div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> status </span><span style="color:#201a14">|</span><span style="color:#201a14"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "Solarized (light)"</code>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <h2>base16-eighties.dark</h2>
-        
-      </div>
-      <div class="term" style="background:#2d2d2d">
-<div class="line"><span style="color:#747369">&lt;!--</span><span style="color:#747369"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#747369"> </span><span style="color:#747369">--&gt;</span></div>
-<div class="line"><span style="color:#6699cc">#</span><span style="color:#f8f8f2"> </span><span style="color:#6699cc">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#747369">&lt;!--</span><span style="color:#747369"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#747369"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#747369"> </span><span style="color:#747369">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#6699cc">##</span><span style="color:#f8f8f2"> </span><span style="color:#6699cc">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#f99157">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
-<div class="line"><span style="color:#f8f8f2">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "base16-eighties.dark"</code>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <h2>base16-mocha.dark</h2>
-        
-      </div>
-      <div class="term" style="background:#3b3228">
-<div class="line"><span style="color:#7e705a">&lt;!--</span><span style="color:#7e705a"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#7e705a"> </span><span style="color:#7e705a">--&gt;</span></div>
-<div class="line"><span style="color:#8ab3b5">#</span><span style="color:#f8f8f2"> </span><span style="color:#8ab3b5">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#7e705a">&lt;!--</span><span style="color:#7e705a"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#7e705a"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#7e705a"> </span><span style="color:#7e705a">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#8ab3b5">##</span><span style="color:#f8f8f2"> </span><span style="color:#8ab3b5">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#d28b71">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
-<div class="line"><span style="color:#f8f8f2">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "base16-mocha.dark"</code>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <h2>base16-ocean.dark</h2>
-        <span class="badge">current default</span>
-      </div>
-      <div class="term" style="background:#2b303b">
-<div class="line"><span style="color:#65737e">&lt;!--</span><span style="color:#65737e"> </span><span style="color:#ff6e15">meshfox:canvas</span><span style="color:#65737e"> </span><span style="color:#65737e">--&gt;</span></div>
-<div class="line"><span style="color:#8fa1b3">#</span><span style="color:#f8f8f2"> </span><span style="color:#8fa1b3">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#65737e">&lt;!--</span><span style="color:#65737e"> </span><span style="color:#ff6e15">meshfox:node</span><span style="color:#65737e"> </span><span style="color:#d8b656">id</span><span style="color:#6fcf97">=&quot;root&quot;</span><span style="color:#65737e"> </span><span style="color:#65737e">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#8fa1b3">##</span><span style="color:#f8f8f2"> </span><span style="color:#8fa1b3">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">```</span><span style="color:#d08770">bash</span><span style="color:#f8f8f2"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#f8f8f2">npm run start</span></div>
-<div class="line"><span style="color:#f8f8f2">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Поле </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> Назначение </span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2">---</span><span style="color:#f8f8f2">|</span></div>
-<div class="line"><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> status </span><span style="color:#f8f8f2">|</span><span style="color:#f8f8f2"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "base16-ocean.dark"</code>
-      </div>
-    </section>
-
-    <section class="card">
-      <div class="card-head">
-        <h2>base16-ocean.light</h2>
-        
-      </div>
-      <div class="term" style="background:#eff1f5">
-<div class="line"><span style="color:#a7adba">&lt;!--</span><span style="color:#a7adba"> </span><span style="color:#ea580c">meshfox:canvas</span><span style="color:#a7adba"> </span><span style="color:#a7adba">--&gt;</span></div>
-<div class="line"><span style="color:#8fa1b3">#</span><span style="color:#201a14"> </span><span style="color:#8fa1b3">kotoprovod.gitazone.org</span></div>
-<div class="line"><span style="color:#a7adba">&lt;!--</span><span style="color:#a7adba"> </span><span style="color:#ea580c">meshfox:node</span><span style="color:#a7adba"> </span><span style="color:#96660a">id</span><span style="color:#1b7a43">=&quot;root&quot;</span><span style="color:#a7adba"> </span><span style="color:#a7adba">--&gt;</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#8fa1b3">##</span><span style="color:#201a14"> </span><span style="color:#8fa1b3">Локальная разработка</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#201a14">```</span><span style="color:#d08770">bash</span><span style="color:#201a14"> name=&quot;run&quot; deps=&quot;npm-install&quot; service</span></div>
-<div class="line"><span style="color:#201a14">npm run start</span></div>
-<div class="line"><span style="color:#201a14">```</span></div>
-<div class="line">&nbsp;</div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> Поле </span><span style="color:#201a14">|</span><span style="color:#201a14"> Назначение </span><span style="color:#201a14">|</span></div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span><span style="color:#201a14">---</span><span style="color:#201a14">|</span></div>
-<div class="line"><span style="color:#201a14">|</span><span style="color:#201a14"> status </span><span style="color:#201a14">|</span><span style="color:#201a14"> catalog-new  # см. значения ниже</span></div>
-      </div>
-      <div class="card-foot">
-        <code>[tui]<br>editor_theme = "base16-ocean.light"</code>
-      </div>
-    </section>
 </div>
 
 <footer>
-  Plain prose and meshfox's own marker/attribute colors (orange keyword, yellow attribute name, green attribute value) are pinned the same across every theme by <code>with_meshfox_scope_colors</code> — what actually differs between themes here is the background, comment dimness, and heading/code-fence-language accent color.
+  Themes are TOML files; <code>extends = "darkfox"</code> lets a theme override only the colors it changes. See the README's "Terminal UI" section for the color syntax and every key.
 </footer>
 </body>
 </html>

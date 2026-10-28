@@ -168,187 +168,115 @@ pub fn build_syntax_set(canvas_root: &Path) -> SyntaxSet {
     builder.build()
 }
 
-/// Same hex values as the web side's own `--accent`/`--syntax-attr`/
-/// `--syntax-value` CSS custom properties (`web/src/meshfoxGrammar.ts`'s
-/// `MESHFOX_DARK_HEX`/`MESHFOX_LIGHT_HEX`) — picked by `theme`'s own
-/// background luminance rather than a single hardcoded set. This used to
-/// *only* have the dark-mode set, pinned unconditionally, on the reasoning
-/// that "the TUI has no light/dark toggle of its own, and every bundled
-/// theme is dark" — true when `ui::SOURCE_EDITOR_THEME` was the only theme
-/// ever in play, but no longer once `[tui] editor_theme` in
-/// `.meshfox/config.toml` (`resolve_editor_theme`) let a user pick any
-/// bundled theme, including the three light-background ones
-/// (`InspiredGitHub`, `Solarized (light)`, `base16-ocean.light`) — the
-/// dark-mode off-white/orange/yellow/green pins are all light colors,
-/// nearly invisible against a white/cream background (confirmed directly:
-/// the theme-preview artifact built to let a user compare themes showed
-/// exactly this — plain text unreadable on every light theme). Returns a
-/// modified copy — `theme` is typically a bundled `syntect` theme with no
-/// rules at all for meshfox's own scope names (`keyword.other.meshfox`/etc,
-/// from `crates/cli/src/grammars/meshfox.tmLanguage.json`), so without this
-/// a meshfox marker just renders in whatever plain-text color the theme
-/// happens to default unmatched scopes to — confirmed directly (a
-/// throwaway scratch test comparing `HighlightLines` output before/after
-/// this call, on a real `<!-- meshfox:node ... -->` line).
-pub fn with_meshfox_scope_colors(
-    mut theme: syntect::highlighting::Theme,
+/// The `syntect` theme the editor and the preview pane highlight with,
+/// built from the active TUI theme's `[editor]` palette.
+pub fn syntect_theme() -> syntect::highlighting::Theme {
+    syntect_theme_from_palette(&crate::tui::theme::current().editor)
+}
+
+/// Builds a `syntect` theme from a TUI theme's `[editor]` colors. `syntect`
+/// has no notion of terminal-decided colors, so ANSI/indexed colors are
+/// approximated (`ThemeColor::approx_rgb`); `default` leaves a color unset.
+pub fn syntect_theme_from_palette(
+    e: &meshfox_core::tui_theme::EditorColors,
 ) -> syntect::highlighting::Theme {
-    use syntect::highlighting::{Color, FontStyle, StyleModifier, ThemeItem};
-
-    // Standard relative-luminance-ish weighting (ITU-R BT.601), same
-    // formula a terminal/editor typically uses to decide "is this
-    // background light or dark" — good enough for a binary pick between
-    // two pre-built palettes below, not aiming for WCAG-precise contrast.
-    // No `background` at all (not something any bundled theme actually
-    // hits, but `Option` either way) defaults to the dark-mode palette,
-    // matching this function's own pre-light-theme behavior.
-    let is_light_bg = theme
-        .settings
-        .background
-        .map(|bg| {
-            let luminance = 0.299 * bg.r as f32 + 0.587 * bg.g as f32 + 0.114 * bg.b as f32;
-            luminance > 128.0
-        })
-        .unwrap_or(false);
-
-    let (foreground, accent, attr, value) = if is_light_bg {
-        // `web/src/index.css`'s own light-mode `--fg`/`--accent`/
-        // `--syntax-attr`/`--syntax-value`.
-        (
-            Color {
-                r: 0x20,
-                g: 0x1a,
-                b: 0x14,
-                a: 0xff,
-            },
-            Color {
-                r: 0xea,
-                g: 0x58,
-                b: 0x0c,
-                a: 0xff,
-            },
-            Color {
-                r: 0x96,
-                g: 0x66,
-                b: 0x0a,
-                a: 0xff,
-            },
-            Color {
-                r: 0x1b,
-                g: 0x7a,
-                b: 0x43,
-                a: 0xff,
-            },
-        )
-    } else {
-        // `web/src/index.css`'s own dark-mode set — this file's original
-        // pins, unchanged for every dark bundled theme (`ui::
-        // SOURCE_EDITOR_THEME`'s default included).
-        (
-            Color {
-                r: 0xf8,
-                g: 0xf8,
-                b: 0xf2,
-                a: 0xff,
-            },
-            Color {
-                r: 0xff,
-                g: 0x6e,
-                b: 0x15,
-                a: 0xff,
-            },
-            Color {
-                r: 0xd8,
-                g: 0xb6,
-                b: 0x56,
-                a: 0xff,
-            },
-            Color {
-                r: 0x6f,
-                g: 0xcf,
-                b: 0x97,
-                a: 0xff,
-            },
-        )
+    use syntect::highlighting::{
+        Color, FontStyle, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
     };
 
-    // `edtui`'s own `SyntaxHighlighter` colors *every* span from `syntect`'s
-    // per-line highlight, including plain text with no matching scope at
-    // all (`edtui::view::syntax_higlighting::highlight_line` — see its
-    // own `else` branch, only reached when highlighting fails outright,
-    // for the one case that instead uses `EditorTheme::base`) — so unlike
-    // a read-only preview pane, this editor's base/default foreground is
-    // entirely the *syntect theme's own* `settings.foreground`, not
-    // anything `theme.rs`/`EditorTheme` here controls. Every bundled
-    // `syntect` theme's own default there reads as washed-out/dim next to
-    // this file's own vivid accent/attr/value colors just below —
-    // confirmed directly (plain prose, generic YAML, attribute values all
-    // rendered noticeably dimmer than real syntax tokens in the same
-    // buffer) — so this pins a clearly legible foreground explicitly,
-    // regardless of which bundled theme (`ui::SOURCE_EDITOR_THEME`, or a
-    // config override) is actually in use — just now one of two pins
-    // (light/dark) rather than always the dark one.
-    theme.settings.foreground = Some(foreground);
-    theme.scopes.push(ThemeItem {
-        scope: "keyword.other.meshfox".parse().unwrap(),
-        style: StyleModifier {
-            foreground: Some(accent),
-            background: None,
-            font_style: Some(FontStyle::BOLD),
+    let rgb = |c: meshfox_core::tui_theme::ThemeColor| {
+        c.approx_rgb().map(|(r, g, b)| Color { r, g, b, a: 0xff })
+    };
+    let mut theme = Theme {
+        name: Some("meshfox".into()),
+        author: None,
+        settings: ThemeSettings {
+            foreground: rgb(e.fg),
+            background: rgb(e.bg),
+            selection: rgb(e.selection),
+            ..ThemeSettings::default()
         },
-    });
-    theme.scopes.push(ThemeItem {
-        scope: "entity.other.attribute-name.meshfox".parse().unwrap(),
-        style: StyleModifier {
-            foreground: Some(attr),
-            background: None,
-            font_style: None,
-        },
-    });
-    theme.scopes.push(ThemeItem {
-        scope: "string.unquoted.meshfox".parse().unwrap(),
-        style: StyleModifier {
-            foreground: Some(value),
-            background: None,
-            font_style: None,
-        },
-    });
+        scopes: Vec::new(),
+    };
+    let mut rule =
+        |scopes: &str, color: meshfox_core::tui_theme::ThemeColor, style: Option<FontStyle>| {
+            theme.scopes.push(ThemeItem {
+                scope: scopes
+                    .parse::<ScopeSelectors>()
+                    .expect("built-in scope selector is valid"),
+                style: StyleModifier {
+                    foreground: rgb(color),
+                    background: None,
+                    font_style: style,
+                },
+            });
+        };
+    rule("comment, markup.quote", e.comment, None);
+    rule("keyword, storage", e.keyword, None);
+    rule("keyword.operator", e.operator, None);
+    rule("string", e.string, None);
+    rule("constant, support.constant", e.constant, None);
+    rule("constant.numeric", e.number, None);
+    rule("variable", e.variable, None);
+    rule(
+        "entity.name.function, support.function, meta.function-call",
+        e.function,
+        None,
+    );
+    rule(
+        "entity.name.type, entity.name.class, support.type, support.class, storage.type",
+        e.r#type,
+        None,
+    );
+    // Markdown, which is what most of the editor shows.
+    rule(
+        "markup.heading, punctuation.definition.heading",
+        e.function,
+        Some(FontStyle::BOLD),
+    );
+    rule("markup.bold", e.number, Some(FontStyle::BOLD));
+    rule("markup.italic", e.r#type, Some(FontStyle::ITALIC));
+    rule("markup.raw, markup.inline.raw", e.string, None);
+    rule("markup.list", e.variable, None);
+    rule(
+        "markup.underline.link, string.other.link, meta.link",
+        e.keyword,
+        None,
+    );
+    rule(
+        "punctuation.definition.list_item, punctuation.definition.raw.code-fence, meta.separator",
+        e.keyword,
+        None,
+    );
+    push_meshfox_rules(
+        &mut theme,
+        rgb(e.meshfox_keyword),
+        rgb(e.meshfox_attr),
+        rgb(e.meshfox_value),
+    );
     theme
 }
 
-/// Picks which bundled `syntect` theme the TUI's syntax highlighting (both
-/// `tui::markdown::Highlighter`'s read-only preview and `tui::ui`'s
-/// full-screen source editor — see this module's own top-of-file doc
-/// comment) actually uses: `[tui] editor_theme = "..."` in
-/// `.meshfox/config.toml` (local, next to the canvas) or
-/// `~/.meshfox/config.toml` (global) — same `meshfox_core::config`
-/// local-wins loading every other config key already goes through (see
-/// `README.md`'s "Calling an AI agent from a block" section for the
-/// precedent, `interpreters.agent.provider`). A name that isn't actually
-/// one of `syntect::highlighting::ThemeSet::load_defaults()`'s own bundled
-/// themes (a typo, or a name from some other syntect setup entirely) is
-/// silently ignored rather than passed through — this used to be exactly
-/// how `crate::tui::ui::SOURCE_EDITOR_THEME` ended up pinned to `"dracula"`,
-/// a name that was never valid at all (see that constant's own doc
-/// comment), so an unchecked config value would just reintroduce the same
-/// bug via a different door. Unset, or invalid, falls back to
-/// `crate::tui::ui::SOURCE_EDITOR_THEME`.
-pub fn resolve_editor_theme(canvas_root: &Path) -> String {
-    let configured = meshfox_core::config::load(canvas_root)
-        .get("tui")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get("editor_theme"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    match configured {
-        Some(name)
-            if syntect::highlighting::ThemeSet::load_defaults()
-                .themes
-                .contains_key(&name) =>
-        {
-            name
-        }
-        _ => crate::tui::ui::SOURCE_EDITOR_THEME.to_string(),
+fn push_meshfox_rules(
+    theme: &mut syntect::highlighting::Theme,
+    accent: Option<syntect::highlighting::Color>,
+    attr: Option<syntect::highlighting::Color>,
+    value: Option<syntect::highlighting::Color>,
+) {
+    use syntect::highlighting::{FontStyle, StyleModifier, ThemeItem};
+    for (scope, color, font_style) in [
+        ("keyword.other.meshfox", accent, Some(FontStyle::BOLD)),
+        ("entity.other.attribute-name.meshfox", attr, None),
+        ("string.unquoted.meshfox", value, None),
+    ] {
+        theme.scopes.push(ThemeItem {
+            scope: scope.parse().expect("built-in scope selector is valid"),
+            style: StyleModifier {
+                foreground: color,
+                background: None,
+                font_style,
+            },
+        });
     }
 }
 
@@ -711,14 +639,17 @@ mod tests {
 mod meshfox_grammar_tests {
     use super::*;
 
+    fn test_theme() -> syntect::highlighting::Theme {
+        syntect_theme_from_palette(&meshfox_core::tui_theme::Theme::darkfox().editor)
+    }
+
     #[test]
     fn arg_markers_and_single_quoted_application_addresses_keep_their_colors() {
         let ss = build_syntax_set(&std::env::temp_dir().join("meshfox-arg-grammar-test"));
         let syntax = ss
             .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
             .unwrap();
-        let themes = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = with_meshfox_scope_colors(themes.themes.values().next().unwrap().clone());
+        let theme = test_theme();
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
         let ranges = hl
             .highlight_line(
@@ -763,10 +694,9 @@ mod meshfox_grammar_tests {
     /// position tie, and markdown's own HTML-comment rule was winning it
     /// outright, so the marker rendered as one plain comment with none of
     /// meshfox's own sub-scopes at all; (2) meshfox's own scope names need
-    /// explicit theme rules (`with_meshfox_scope_colors`) — a bundled
-    /// `syntect` theme has no idea what `keyword.other.meshfox` even is, so
-    /// without this the (correctly-scoped) tokens still all rendered in one
-    /// plain default color.
+    /// explicit theme rules (`push_meshfox_rules`) — a `syntect` theme has no
+    /// idea what `keyword.other.meshfox` even is, so without them the
+    /// (correctly-scoped) tokens would all render in one plain default color.
     #[test]
     fn a_meshfox_marker_comment_gets_distinct_colors_for_keyword_attr_name_and_value() {
         let root = std::env::temp_dir().join("meshfox-grammar-test-never-created");
@@ -775,14 +705,7 @@ mod meshfox_grammar_tests {
             .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
             .expect("the bundled meshfox-markdown grammar should always be present");
 
-        let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let base_theme = ts
-            .themes
-            .values()
-            .next()
-            .expect("syntect ships at least one theme")
-            .clone();
-        let theme = with_meshfox_scope_colors(base_theme);
+        let theme = test_theme();
 
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
         let ranges = hl
@@ -826,48 +749,24 @@ mod meshfox_grammar_tests {
     }
 
     /// `edtui`'s own `SyntaxHighlighter` colors *every* span (plain text
-    /// included) from `syntect`'s per-line highlight — never falls back to
-    /// `EditorTheme::base` unless highlighting fails outright (see
-    /// `with_meshfox_scope_colors`'s own doc comment on why this lives
-    /// here) — so the fullscreen source editor's own base/default text
-    /// color is entirely `theme.settings.foreground`. Every theme
-    /// `syntect::highlighting::ThemeSet::load_defaults()` actually bundles
-    /// (`crate::tui::ui::SOURCE_EDITOR_THEME` picks one of these — this
-    /// test doesn't hardcode which, precisely because that constant used
-    /// to name `"dracula"`, a theme that isn't in this bundled set at all,
-    /// and the lookup silently fell through to an arbitrary one instead of
-    /// erroring) ships a noticeably dimmer default than this fix's own
-    /// pinned value — this test proves genuinely plain text (no matching
-    /// scope at all) renders in that legible color regardless of which
-    /// bundled theme it started from, not whatever that theme's own
-    /// default happens to be.
+    /// included) from `syntect`'s per-line highlight, so the fullscreen
+    /// source editor's base text color is entirely the theme's
+    /// `settings.foreground` — i.e. the palette's `[editor] fg`.
     #[test]
-    fn plain_unscoped_text_uses_the_pinned_legible_foreground_not_a_dim_bundled_default() {
+    fn plain_unscoped_text_uses_the_palette_foreground() {
         let root = std::env::temp_dir().join("meshfox-grammar-test-never-created");
         let ss = build_syntax_set(&root);
         let syntax = ss
             .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
             .expect("the bundled meshfox-markdown grammar should always be present");
-
-        let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let base_theme = ts
-            .themes
-            .get(crate::tui::ui::SOURCE_EDITOR_THEME)
-            .unwrap_or_else(|| {
-                panic!(
-                    "{:?} should be a real bundled syntect theme",
-                    crate::tui::ui::SOURCE_EDITOR_THEME
-                )
-            })
-            .clone();
-        let theme = with_meshfox_scope_colors(base_theme);
+        let theme = test_theme();
 
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
         let ranges = hl
             .highlight_line("just plain prose, no markup at all\n", &ss)
             .unwrap();
 
-        let pinned_foreground = syntect::highlighting::Color {
+        let fg = syntect::highlighting::Color {
             r: 0xf8,
             g: 0xf8,
             b: 0xf2,
@@ -877,60 +776,7 @@ mod meshfox_grammar_tests {
             if text.trim().is_empty() {
                 continue;
             }
-            assert_eq!(
-                style.foreground, pinned_foreground,
-                "plain text {text:?} should use the pinned legible foreground, not a dim bundled default"
-            );
-        }
-    }
-
-    /// Regression test for the bug the theme-preview artifact surfaced: this
-    /// function used to pin the same near-white foreground (`0xf8f8f2`)
-    /// regardless of the bundled theme's own background, which is invisible
-    /// against a light theme's white/cream background — only ever caught
-    /// once `[tui] editor_theme` (`resolve_editor_theme`) made light bundled
-    /// themes (`InspiredGitHub`, `Solarized (light)`, `base16-ocean.light`)
-    /// actually reachable, not just the single dark default. Proves a real
-    /// light-background bundled theme gets a dark foreground instead.
-    #[test]
-    fn plain_unscoped_text_on_a_light_bundled_theme_uses_a_dark_foreground_not_the_dark_mode_pin() {
-        let root = std::env::temp_dir().join("meshfox-grammar-test-never-created");
-        let ss = build_syntax_set(&root);
-        let syntax = ss
-            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
-            .expect("the bundled meshfox-markdown grammar should always be present");
-
-        let ts = syntect::highlighting::ThemeSet::load_defaults();
-        let base_theme = ts
-            .themes
-            .get("InspiredGitHub")
-            .expect("InspiredGitHub should be a real bundled syntect theme (a light one)")
-            .clone();
-        assert!(
-            matches!(base_theme.settings.background, Some(bg) if bg.r > 200 && bg.g > 200 && bg.b > 200),
-            "InspiredGitHub should actually have a light background — otherwise this test isn't exercising the light-theme branch at all"
-        );
-        let theme = with_meshfox_scope_colors(base_theme);
-
-        let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
-        let ranges = hl
-            .highlight_line("just plain prose, no markup at all\n", &ss)
-            .unwrap();
-
-        let dark_mode_pin = syntect::highlighting::Color {
-            r: 0xf8,
-            g: 0xf8,
-            b: 0xf2,
-            a: 0xff,
-        };
-        for (style, text) in &ranges {
-            if text.trim().is_empty() {
-                continue;
-            }
-            assert_ne!(
-                style.foreground, dark_mode_pin,
-                "plain text {text:?} on a light theme should not use the near-white dark-mode pin — invisible on a light background"
-            );
+            assert_eq!(style.foreground, fg, "plain text {text:?}");
         }
     }
 
@@ -940,14 +786,7 @@ mod meshfox_grammar_tests {
         let syntax = ss
             .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
             .unwrap();
-        let themes = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = with_meshfox_scope_colors(
-            themes
-                .themes
-                .get(crate::tui::ui::SOURCE_EDITOR_THEME)
-                .unwrap()
-                .clone(),
-        );
+        let theme = test_theme();
         let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
         hl.highlight_line(line, &ss)
             .unwrap()
@@ -978,8 +817,7 @@ mod meshfox_grammar_tests {
         let syntax = ss
             .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
             .unwrap();
-        let themes = syntect::highlighting::ThemeSet::load_defaults();
-        let theme = with_meshfox_scope_colors(themes.themes.values().next().unwrap().clone());
+        let theme = test_theme();
         let highlight = || {
             let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
             hl.highlight_line(line, &ss).unwrap().len()
@@ -1045,5 +883,35 @@ mod meshfox_grammar_tests {
             spans.iter().all(|(color, _)| *color == plain),
             "unexpected emphasis: {spans:?}"
         );
+    }
+
+    /// The editor's theme comes from the active TUI theme's palette, and
+    /// meshfox's marker pieces get three distinct colors from it.
+    #[test]
+    fn a_palette_built_theme_colors_meshfox_markers_distinctly() {
+        let root = std::env::temp_dir().join("meshfox-grammar-test-never-created");
+        let ss = build_syntax_set(&root);
+        let syntax = ss
+            .find_syntax_by_name(MESHFOX_MARKDOWN_SYNTAX_NAME)
+            .expect("the bundled meshfox-markdown grammar should always be present");
+        let palette = meshfox_core::tui_theme::Theme::darkfox().editor;
+        let theme = syntect_theme_from_palette(&palette);
+
+        let mut hl = syntect::easy::HighlightLines::new(syntax, &theme);
+        let ranges = hl
+            .highlight_line("<!-- meshfox:node id=\"root\" -->\n", &ss)
+            .unwrap();
+        let color_of = |needle: &str| {
+            ranges
+                .iter()
+                .find(|(_, text)| text.contains(needle))
+                .unwrap_or_else(|| panic!("expected a range containing {needle:?}"))
+                .0
+                .foreground
+        };
+        let (kw, attr, val) = (color_of("meshfox"), color_of("id"), color_of("root"));
+        assert_eq!((kw.r, kw.g, kw.b), (0xff, 0x6e, 0x15));
+        assert_eq!((attr.r, attr.g, attr.b), (0xd8, 0xb6, 0x56));
+        assert_eq!((val.r, val.g, val.b), (0x6f, 0xcf, 0x97));
     }
 }

@@ -170,18 +170,18 @@ impl LayoutContext {
 
 fn button_lines(caption: &str, selected: bool, available: u16) -> Vec<Line<'static>> {
     let border = Style::default().fg(if selected {
-        super::theme::ACCENT
+        super::theme::accent()
     } else {
-        super::theme::BORDER
+        super::theme::border()
     });
     let text = if selected {
         Style::default()
-            .bg(super::theme::ACCENT)
-            .fg(Color::Black)
+            .bg(super::theme::accent())
+            .fg(super::theme::on_accent())
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(super::theme::ACCENT)
+            .fg(super::theme::accent())
             .add_modifier(Modifier::BOLD)
     };
     let caption = format!(
@@ -337,7 +337,10 @@ pub(super) fn render_table(t: &markdown::MarkdownTable, available: usize) -> Vec
             let mut spans = Vec::new();
             for (i, &w) in widths.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::styled(
+                        " │ ",
+                        Style::default().fg(super::theme::muted()),
+                    ));
                 }
                 let cell = cells[i].get(y).cloned().unwrap_or_default();
                 let gap = w.saturating_sub(cell.width());
@@ -366,7 +369,7 @@ pub(super) fn render_table(t: &markdown::MarkdownTable, available: usize) -> Vec
                 .join("─┼─");
             lines.push(Line::from(Span::styled(
                 rule,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(super::theme::muted()),
             )));
         }
     }
@@ -429,7 +432,7 @@ mod tests {
                 .lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .any(|span| span.style.bg == Some(super::super::theme::ACCENT)));
+                .any(|span| span.style.bg == Some(super::super::theme::accent())));
             let rects = layout.click_rects(0, 0, u16::MAX);
             assert_eq!(rects.len(), layout.rows());
             assert!(rects.iter().all(|r| usize::from(r.width) == frame_width));

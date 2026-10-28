@@ -56,6 +56,7 @@ pub mod tag_colors;
 pub mod tangle;
 pub mod timestamp;
 pub mod tree;
+pub mod tui_theme;
 pub mod varcache;
 pub mod varout;
 pub mod vars;

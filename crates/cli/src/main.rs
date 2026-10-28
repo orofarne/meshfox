@@ -42,6 +42,7 @@ mod serve;
 mod stats_cmd;
 mod syntax_registry;
 mod terminal_status;
+mod theme_cmd;
 mod tui;
 mod update_policy;
 mod watcher;
@@ -308,6 +309,24 @@ enum Command {
         /// Remove what is listed instead of only listing it.
         #[arg(long)]
         yes: bool,
+    },
+    /// Preview the available TUI themes (built-in and from
+    /// `.meshfox/themes/tui/`) in this terminal, so ANSI colors show in your
+    /// own palette; `--html` writes an HTML page instead.
+    ThemePreview {
+        /// The canvas directory whose `.meshfox/themes/tui/` to include
+        /// (default: the current one).
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
+        /// Only this theme (repeatable); default: all of them.
+        #[arg(long = "theme", short, value_name = "NAME")]
+        themes: Vec<String>,
+        /// Generate an HTML page instead of painting the terminal.
+        #[arg(long)]
+        html: bool,
+        /// With `--html`: write the page here instead of stdout.
+        #[arg(long, short, requires = "html", value_name = "FILE")]
+        out: Option<PathBuf>,
     },
     /// Run the persistent coordinator: the headless, cross-platform
     /// counterpart of the macOS menu-bar daemon. Listens on the socket
@@ -1556,6 +1575,17 @@ fn main() {
         Command::Secret { op } => {
             if let Err(e) = secret_cmd::run(op, find_canvas) {
                 eprintln!("meshfox secret: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::ThemePreview {
+            dir,
+            themes,
+            html,
+            out,
+        } => {
+            if let Err(e) = theme_cmd::run(dir, html, out, &themes) {
+                eprintln!("meshfox theme-preview: {e}");
                 std::process::exit(1);
             }
         }

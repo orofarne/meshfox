@@ -13,7 +13,7 @@
 //! terminal's actual background.
 
 use meshfox_core::image_attrs::Background;
-use meshfox_core::svg::{self, Theme};
+use meshfox_core::svg;
 use resvg::{tiny_skia, usvg};
 use std::sync::{Arc, OnceLock};
 
@@ -73,7 +73,7 @@ fn rasterize_impl(
     bg: Option<Background>,
     target: Option<(u32, u32)>,
 ) -> Option<image::DynamicImage> {
-    let theme = Theme::dark();
+    let theme = super::theme::svg();
     let themed = resolve_root_vars(&svg::resolve_vars(
         &svg::inject_theme(svg_text, &theme),
         &theme,

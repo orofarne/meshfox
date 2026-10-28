@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TUI Themes</title>
+<style>
+:root {
+  --bg: #f7f6f3;
+  --panel: #ffffff;
+  --text: #1c1c1c;
+  --muted: #6b6b6b;
+  --border: #e2ded6;
+  --accent: #b5651d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17161a;
+    --panel: #201f24;
+    --text: #eee9e2;
+    --muted: #a39d92;
+    --border: #37343a;
+    --accent: #e0975a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #17161a;
+  --panel: #201f24;
+  --text: #eee9e2;
+  --muted: #a39d92;
+  --border: #37343a;
+  --accent: #e0975a;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  padding: 32px 20px 60px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+header { margin-bottom: 28px; }
+h1 { font-size: 1.5rem; margin: 0 0 8px; }
+header p { color: var(--muted); font-size: 0.92rem; line-height: 1.55; max-width: 760px; margin: 0 0 6px; }
+header code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 0.85em;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(620px, 1fr));
+  gap: 20px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.term {
+  font-family: "SF Mono", "Menlo", "Consolas", monospace;
+  font-size: 13px;
+  line-height: 1.15;
+  padding: 14px 16px;
+  overflow-x: auto;
+  white-space: pre;
+}
+footer {
+  margin-top: 30px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+footer code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>TUI themes — real rendered colors</h1>
+  <p>Every available TUI theme (built in, plus any in <code>.meshfox/themes/tui/</code>), exactly as <code>meshfox theme-preview</code> paints it in a terminal: the interface colors in an unfocused frame, and the editor's highlighted sample in a focused one, built from the theme's <code>[ui]</code> and <code>[editor]</code> palettes. Colors a theme leaves as <code>ansi:…</code> are shown here as the common xterm shade; your terminal shows its own.</p>
+  <p>Pick one and set <code>[tui] theme = "…"</code> in <code>.meshfox/config.toml</code> (local, next to the canvas) or <code>~/.meshfox/config.toml</code> (global); each frame's bottom line shows the exact snippet. Regenerate this page with <code>meshfox theme-preview --html -o FILE</code>.</p>
+</header>
+
+<div class="grid">
+{{CARDS}}
+</div>
+
+<footer>
+  Themes are TOML files; <code>extends = "darkfox"</code> lets a theme override only the colors it changes. See the README's "Terminal UI" section for the color syntax and every key.
+</footer>
+</body>
+</html>

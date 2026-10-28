@@ -1,0 +1,64 @@
+# Built-in theme after Catppuccin Latte: https://github.com/catppuccin/catppuccin
+
+name = "catppuccin-latte"
+extends = "darkfox"
+
+[ui]
+accent = "#8839ef"      # focused border, popups, selection fill
+dep = "#7287fd"
+fail = "#d20f39"
+ok = "#40a02b"
+border = "#8c8fa1"
+fg = "#4c4f69"
+bg = "#eff1f5"
+svg_border = "#bcc0cc"
+
+muted = "#7c7f93"
+value = "#df8e1d"
+tag = "#179299"
+warn = "#df8e1d"
+error = "#d20f39"
+on_accent = "#eff1f5"
+link = "#1e66f5"
+
+search_match_bg = "#df8e1d"
+search_other_bg = "#fe640b"
+search_fg = "#eff1f5"
+
+code_bg = "#ccd0da"
+code_fg = "#fe640b"
+table_stripe_bg = "#e6e9ef"
+
+map_node_bg = "#e6e9ef"
+map_selected_bg = "#ccd0da"
+map_node_fg = "#4c4f69"
+
+callout_note = "#1e66f5"
+callout_tip = "#40a02b"
+callout_important = "#8839ef"
+callout_warning = "#df8e1d"
+callout_caution = "#d20f39"
+
+heading_1 = "#d20f39"
+heading_2 = "#fe640b"
+heading_3 = "#df8e1d"
+heading_4 = "#40a02b"
+heading_5 = "#209fb5"
+heading_6 = "#7287fd"
+
+[editor]
+fg = "#4c4f69"
+bg = "#eff1f5"
+selection = "#ccd0da"
+comment = "#8c8fa1"
+keyword = "#8839ef"
+string = "#40a02b"
+number = "#fe640b"
+constant = "#fe640b"
+function = "#1e66f5"
+type = "#df8e1d"
+operator = "#04a5e5"
+variable = "#e64553"
+meshfox_keyword = "#fe640b"
+meshfox_attr = "#df8e1d"
+meshfox_value = "#40a02b"

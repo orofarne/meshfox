@@ -82,10 +82,7 @@ pub(super) fn highlight(
     next: &mut usize,
     current: Option<usize>,
 ) -> Option<(u16, u16)> {
-    use ratatui::{
-        style::{Color, Modifier},
-        text::Span,
-    };
+    use ratatui::{style::Modifier, text::Span};
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let matches = ranges(&text, query);
     let mut target = None;
@@ -112,11 +109,13 @@ pub(super) fn highlight(
             {
                 style = if current == Some(*next + index) {
                     style
-                        .bg(Color::Rgb(0, 215, 255))
-                        .fg(Color::Black)
+                        .bg(super::theme::search_match_bg())
+                        .fg(super::theme::search_fg())
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    style.bg(Color::Yellow).fg(Color::Black)
+                    style
+                        .bg(super::theme::search_other_bg())
+                        .fg(super::theme::search_fg())
                 };
             }
             spans.push(Span::styled(

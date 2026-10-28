@@ -1,0 +1,66 @@
+# Built-in theme after the Everforest palette (dark, medium contrast):
+# https://github.com/sainnhe/everforest. Green focus and selection with
+# dark text on it, orange section titles, yellow values.
+
+name = "everforest"
+extends = "darkfox"
+
+[ui]
+accent = "#a7c080"      # focused border, popups, selection fill
+dep = "#d699b6"
+fail = "#e67e80"
+ok = "#a7c080"
+border = "#859289"
+fg = "#d3c6aa"
+bg = "#2d353b"
+svg_border = "#475258"
+
+muted = "#859289"
+value = "#dbbc7f"
+tag = "#83c092"
+warn = "#dbbc7f"
+error = "#e67e80"
+on_accent = "#2d353b"
+link = "#7fbbb3"
+
+search_match_bg = "#dbbc7f"
+search_other_bg = "#e69875"
+search_fg = "#2d353b"
+
+code_bg = "#343f44"
+code_fg = "#e69875"
+table_stripe_bg = "#343f44"
+
+map_node_bg = "#343f44"
+map_selected_bg = "#475258"
+map_node_fg = "#d3c6aa"
+
+callout_note = "#7fbbb3"
+callout_tip = "#a7c080"
+callout_important = "#d699b6"
+callout_warning = "#dbbc7f"
+callout_caution = "#e67e80"
+
+heading_1 = "#e69875"
+heading_2 = "#dbbc7f"
+heading_3 = "#a7c080"
+heading_4 = "#83c092"
+heading_5 = "#7fbbb3"
+heading_6 = "#d699b6"
+
+[editor]
+fg = "#d3c6aa"
+bg = "#2d353b"
+selection = "#475258"
+comment = "#859289"
+keyword = "#e67e80"
+string = "#a7c080"
+number = "#d699b6"
+constant = "#d699b6"
+function = "#a7c080"
+type = "#dbbc7f"
+operator = "#e69875"
+variable = "#7fbbb3"
+meshfox_keyword = "#e69875"
+meshfox_attr = "#dbbc7f"
+meshfox_value = "#a7c080"

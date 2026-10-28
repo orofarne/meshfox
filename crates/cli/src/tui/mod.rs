@@ -29,7 +29,7 @@ mod table;
 #[cfg(test)]
 mod table_layout_tests;
 mod terminal_status;
-mod theme;
+pub(crate) mod theme;
 mod tree;
 mod unicode_picker;
 // `pub(crate)` (not the default private) so `syntax_registry.rs`'s own

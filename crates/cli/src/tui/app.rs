@@ -21,7 +21,7 @@ use meshfox_core::vars::{declared_vars, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, NodeType};
 use meshfox_server::stream_exec::OutputStream;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::ListState;
 use ratatui_image::picker::cap_parser::QueryStdioOptions;
@@ -604,14 +604,6 @@ pub struct App {
     /// `on_resize_drag`, cleared on the matching `Up(Left)`.
     resize_drag: Option<ResizeDrag>,
     pub highlighter: Highlighter,
-    /// `crate::syntax_registry::resolve_editor_theme`'s result, resolved
-    /// once at startup from `[tui] editor_theme` in `.meshfox/config.toml`
-    /// (local or global) — the bundled `syntect` theme name `highlighter`
-    /// above and `ui::render_source_editor`'s own fullscreen editor both
-    /// use, so the two panes stay visually consistent. Falls back to
-    /// `ui::SOURCE_EDITOR_THEME` when unset or not an actually-bundled
-    /// theme name — see `resolve_editor_theme`'s own doc comment.
-    pub editor_theme: String,
     pub picker: Picker,
     /// The canvas worker's port. Production startup requires `Some`;
     /// `None` is used only by local TUI unit tests.
@@ -1211,7 +1203,7 @@ impl App {
         // Computed before `canvas_path` is moved into the struct literal
         // below (its `canvas_path,` shorthand field).
         let syntax_root = crate::canvas_root_dir(&canvas_path).to_path_buf();
-        let editor_theme = crate::syntax_registry::resolve_editor_theme(&syntax_root);
+        let theme_warning = super::theme::init(&syntax_root);
         let external_editor = super::external_editor::configured(&syntax_root);
         let output_height_pct = meshfox_core::config::tui_output_height_pct(&syntax_root)
             .unwrap_or(ui::DEFAULT_OUTPUT_HEIGHT_PCT);
@@ -1262,8 +1254,7 @@ impl App {
             auto_expanded_pane: None,
             output_height_pct,
             resize_drag: None,
-            highlighter: Highlighter::with_extra_syntaxes(&syntax_root, &editor_theme),
-            editor_theme,
+            highlighter: Highlighter::with_extra_syntaxes(&syntax_root),
             picker,
             worker_port,
             read_only,
@@ -1302,7 +1293,9 @@ impl App {
             select_picker: None,
             palette: None,
             select_after_reload: None,
-            status: if read_only {
+            status: if let Some(warning) = theme_warning {
+                format!("theme: {warning}")
+            } else if read_only {
                 READ_ONLY_STATUS.into()
             } else if no_exec {
                 NO_EXEC_STATUS.into()
@@ -4633,7 +4626,7 @@ impl App {
         for tag in &node.tags {
             heading.push(Span::styled(
                 format!("  #{tag}"),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(super::theme::tag()),
             ));
         }
         // Keep the heading in the document's segment stream so it wraps
@@ -4743,7 +4736,7 @@ impl App {
                             if *truncated {
                                 lines.push(Line::from(Span::styled(
                                     "preview truncated to the first part of the file",
-                                    Style::default().fg(Color::DarkGray),
+                                    Style::default().fg(super::theme::muted()),
                                 )));
                             }
                             vec![Segment::Text(lines)]
@@ -4751,12 +4744,12 @@ impl App {
                         Some(FilePreviewState::Failed(e)) => {
                             vec![Segment::Text(vec![Line::from(Span::styled(
                                 format!("failed to read {}: {e}", path.display()),
-                                Style::default().fg(Color::Red),
+                                Style::default().fg(super::theme::error()),
                             ))])]
                         }
                         _ => vec![Segment::Text(vec![Line::from(Span::styled(
                             "loading preview…",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(super::theme::muted()),
                         ))])],
                     }
                 };
@@ -4936,7 +4929,7 @@ impl App {
         if let Some(description) = &meta.description {
             lines.push(Line::from(Span::styled(
                 description.clone(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(super::theme::muted()),
             )));
         }
         if lines.len() > 1 {
@@ -8544,6 +8537,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     #[tokio::test]
     async fn canvas_search_wraps_occurrences_and_restores_only_its_own_branches() {
@@ -10289,9 +10283,9 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(other.spans[0].style.fg, Some(super::super::theme::DEP));
+            assert_eq!(other.spans[0].style.fg, Some(super::super::theme::dep()));
         };
-        check_output(&app, super::super::theme::ACCENT);
+        check_output(&app, super::super::theme::accent());
         app.on_reconciled_run_event(
             BlockAddr::new("root", "a"),
             crate::worker_client::SubscribeEvent::Line {
@@ -10301,14 +10295,14 @@ mod tests {
             },
             None,
         );
-        check_output(&app, super::super::theme::OK);
+        check_output(&app, super::super::theme::ok());
         app.set_focus(Focus::Tree);
-        check_output(&app, super::super::theme::OK);
+        check_output(&app, super::super::theme::ok());
         app.set_focus(Focus::Document);
-        check_output(&app, super::super::theme::OK);
+        check_output(&app, super::super::theme::ok());
         app.selected_block = None;
         app.render_current_document();
-        check_output(&app, super::super::theme::OK);
+        check_output(&app, super::super::theme::ok());
         let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }
 
@@ -10401,7 +10395,10 @@ mod tests {
                 _ => None,
             })
         };
-        assert_eq!(header_color(&app), Some(Some(super::super::theme::ACCENT)));
+        assert_eq!(
+            header_color(&app),
+            Some(Some(super::super::theme::accent()))
+        );
         assert!(document_text(&app).contains("›─"));
         app.set_focus(Focus::Tree);
         assert_eq!(header_color(&app), Some(Some(Color::DarkGray)));

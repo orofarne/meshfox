@@ -1,0 +1,64 @@
+# Built-in light counterpart of darkfox: the web UI's light theme (web/src/index.css).
+
+name = "lightfox"
+extends = "darkfox"
+
+[ui]
+accent = "#ea580c"      # focused border, popups, selection fill
+dep = "#a05dd1"
+fail = "#c22b2b"
+ok = "#1b7a43"
+border = "#a39a8e"
+fg = "#201a14"
+bg = "#ffffff"
+svg_border = "#e5ddd2"
+
+muted = "#7a6f63"
+value = "#96660a"
+tag = "#1a7f37"
+warn = "#9a6700"
+error = "#c22b2b"
+on_accent = "#ffffff"
+link = "#0969da"
+
+search_match_bg = "#ffe066"
+search_other_bg = "#ffd8a8"
+search_fg = "#3a2c00"
+
+code_bg = "#f4ede3"
+code_fg = "#c2410c"
+table_stripe_bg = "#f4ede3"
+
+map_node_bg = "#f4ede3"
+map_selected_bg = "#ece1d2"
+map_node_fg = "#201a14"
+
+callout_note = "#0969da"
+callout_tip = "#1a7f37"
+callout_important = "#8250df"
+callout_warning = "#9a6700"
+callout_caution = "#cf222e"
+
+heading_1 = "#c2410c"
+heading_2 = "#96660a"
+heading_3 = "#1a7f37"
+heading_4 = "#0969da"
+heading_5 = "#8250df"
+heading_6 = "#7a6f63"
+
+[editor]
+fg = "#201a14"
+bg = "#faf7f4"
+selection = "#ece1d2"
+comment = "#7a6f63"
+keyword = "#8250df"
+string = "#1a7f37"
+number = "#b24a0a"
+constant = "#b24a0a"
+function = "#0969da"
+type = "#96660a"
+operator = "#c2410c"
+variable = "#0a6c74"
+meshfox_keyword = "#ea580c"
+meshfox_attr = "#96660a"
+meshfox_value = "#1b7a43"

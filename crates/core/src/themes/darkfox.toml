@@ -1,0 +1,70 @@
+# Built-in default TUI theme. Mirrors the web UI's dark theme; colors the
+# TUI used to hardcode in `crates/cli/src/tui/` keep their ANSI names so the
+# terminal's own palette still decides their exact shade.
+#
+# Color syntax: "#rrggbb" | "ansi:<name>" | "ansi:<0-255>" | "default".
+
+name = "darkfox"
+
+[ui]
+accent = "#ff6e15"      # focused border, popups, selection fill
+dep = "#c68ae8"         # a block's dependency line
+fail = "#e56a6a"
+ok = "#6fcf97"
+border = "#9a938c"      # unfocused pane border
+fg = "default"          # screen text; "default" = the terminal's own (SVG then uses #f2ede6)
+bg = "default"          # screen background; "default" = the terminal's own (SVG then uses #131316)
+svg_border = "#7a4620"  # SVG `--mf-border`
+
+muted = "ansi:dark-gray"        # secondary text, separators, hints
+value = "ansi:light-green"      # editable values, checked boxes
+tag = "ansi:cyan"               # #tags, list markers, ids
+warn = "ansi:yellow"            # changed diff lines, pending
+error = "ansi:red"
+on_accent = "ansi:black"        # text drawn on an accent-colored fill
+link = "ansi:light-blue"
+
+search_match_bg = "#00d7ff"
+search_other_bg = "ansi:yellow"
+search_fg = "ansi:black"
+
+code_bg = "#282a36"             # inline code
+code_fg = "#ffb86c"
+table_stripe_bg = "#2b2b30"
+
+map_node_bg = "#252930"
+map_selected_bg = "#433025"
+map_node_fg = "#eee9e2"
+
+callout_note = "ansi:light-blue"
+callout_tip = "ansi:light-green"
+callout_important = "ansi:light-magenta"
+callout_warning = "ansi:light-yellow"
+callout_caution = "ansi:light-red"
+
+# Heading levels 1..6 cycle through these.
+heading_1 = "ansi:light-cyan"
+heading_2 = "ansi:light-blue"
+heading_3 = "ansi:light-green"
+heading_4 = "ansi:light-yellow"
+heading_5 = "ansi:light-magenta"
+heading_6 = "ansi:gray"
+
+# Source-editor syntax colors; `cli` builds a `syntect::Theme` from these.
+[editor]
+fg = "#f8f8f2"
+bg = "default"
+selection = "#433025"
+comment = "#65737e"
+keyword = "#b48ead"
+string = "#a3be8c"
+number = "#d08770"
+constant = "#d08770"
+function = "#8fa1b3"
+type = "#ebcb8b"
+operator = "#c0c5ce"
+variable = "#bf616a"
+# meshfox's own markers (`<!-- meshfox:node ... -->`).
+meshfox_keyword = "#ff6e15"
+meshfox_attr = "#d8b656"
+meshfox_value = "#6fcf97"

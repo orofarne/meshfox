@@ -61,7 +61,7 @@ try {
   }
   await fs.mkdir(path.join(work, '.meshfox'));
   await fs.writeFile(path.join(work, '.meshfox/config.toml'),
-    'server_socket = ""\n[tui]\neditor_theme = "base16-ocean.dark"\n');
+    'server_socket = ""\n');
   ttyd = spawn('ttyd', ['-i', '127.0.0.1', '-p', '0', '-W', '-o',
     '-t', 'enableSixel=true', '-t', 'fontSize=22', '-t', 'rendererType=canvas',
     '-t', 'disableResizeOverlay=true', binary, 'tui', 'demo.canvas.md'], {
