@@ -22,6 +22,7 @@ pub mod datevars;
 pub mod deps;
 pub mod diagnostics;
 mod dotenv;
+pub mod env_state;
 pub mod exec;
 pub mod fence;
 pub mod file_read;

@@ -2232,6 +2232,23 @@ unlockable default keyring, it fails loudly on first use. With it:
   claims to be, and a symlink is refused. It runs in the CLI's own process, not
   in a worker, since it spans every canvas in a directory, including ones that
   no longer exist. Secrets in the system store are `meshfox secret prune`'s.
+- `meshfox env list [CANVAS|DIR] [--recursive]` and `meshfox env rm CANVAS
+  [--name NAME] [--python | --node]` — the environments `@python_venv`
+  (`.meshfox/<canvas file>.venv`) and `@node_env`
+  (`.meshfox/<canvas file>.node`) build, with the named ones
+  (`.named/<name>`) inside them. `list` shows each with its kind, `name=`
+  and size, and marks one whose canvas file is gone. `rm` deletes them for a
+  canvas that still exists — the case `prune` leaves alone — so the next run
+  of the setup block builds them again, e.g. after a system Python upgrade
+  (run it with `meshfox run --fresh`: the block is usually `cache`d and
+  deleting its directory does not make it stale). Without `--name` it
+  removes the usual environment and every named one; `--name` removes just
+  that one (the name must match the `name=` option's shape, so it cannot
+  leave `.named/`); `--python`/`--node` limit the kind. It refuses while a
+  worker is running for the canvas, and when there is nothing to remove, and
+  never follows a symlink. Run history and variable caches are not touched.
+  Like `prune`, it runs in the CLI's own process. The MCP server has
+  `env_list` and `env_rm` for the same.
 - `meshfox secret set|show|rm NAME [--canvas F | --global [--path P] |
   --project DIR]` manages values; `show` prints one only with `--reveal`.
 - The keychain can't be enumerated, so every save (checkbox or `secret set`)

@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 mod console_cmd;
 mod coordinator;
 mod cores_cmd;
+mod env_cmd;
 mod gateway;
 mod gateway_index;
 mod logs_cmd;
@@ -309,6 +310,15 @@ enum Command {
         /// Remove what is listed instead of only listing it.
         #[arg(long)]
         yes: bool,
+    },
+    /// List or delete the Python and Node environments meshfox builds for a
+    /// canvas (`.meshfox/<canvas>.venv` and `.meshfox/<canvas>.node`):
+    /// `list` shows them, `rm` deletes a canvas's so the next run of its
+    /// setup block builds them again (e.g. after a Python upgrade). Unlike
+    /// `prune`, `rm` works on canvases that still exist.
+    Env {
+        #[command(subcommand)]
+        op: env_cmd::EnvOp,
     },
     /// Preview the available TUI themes (built-in and from
     /// `.meshfox/themes/tui/`) in this terminal, so ANSI colors show in your
@@ -1586,6 +1596,12 @@ fn main() {
         } => {
             if let Err(e) = theme_cmd::run(dir, html, out, &themes) {
                 eprintln!("meshfox theme-preview: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Env { op } => {
+            if let Err(e) = env_cmd::run(op) {
+                eprintln!("meshfox env: {e}");
                 std::process::exit(1);
             }
         }

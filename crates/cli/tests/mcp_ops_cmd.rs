@@ -113,6 +113,8 @@ async fn the_new_tools_are_listed_and_the_run_schema_has_detach_and_skip_fresh()
         "list",
         "render",
         "prune",
+        "env_list",
+        "env_rm",
         "cores_list",
         "cores_kill",
     ] {
@@ -585,5 +587,54 @@ async fn cores_list_and_kill_see_and_stop_the_coordinators_worker() {
 
     drop(mcp);
     terminate(&mut serve);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn env_tools_list_and_remove_a_live_canvas_environment_inside_the_root() {
+    let dir = unique_dir();
+    std::fs::write(
+        dir.join("doc.canvas.md"),
+        "<!-- meshfox:canvas -->\n# Root\n",
+    )
+    .unwrap();
+    let venv = dir.join(".meshfox/doc.canvas.md.venv");
+    std::fs::create_dir_all(venv.join("bin")).unwrap();
+    std::fs::write(venv.join("bin/python3"), "x").unwrap();
+    let mcp = start(&dir, None).await;
+
+    let (is_error, listed) = call(&mcp, "env_list", serde_json::json!({})).await.unwrap();
+    assert!(!is_error, "{listed}");
+    assert!(
+        listed.to_string().contains("doc.canvas.md.venv"),
+        "{listed}"
+    );
+
+    let err = call(
+        &mcp,
+        "env_rm",
+        serde_json::json!({ "path": "../elsewhere.canvas.md" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("outside"), "{err}");
+    let err = call(
+        &mcp,
+        "env_rm",
+        serde_json::json!({ "path": "doc.canvas.md", "kind": "ruby" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("kind"), "{err}");
+
+    let (is_error, removed) = call(
+        &mcp,
+        "env_rm",
+        serde_json::json!({ "path": "doc.canvas.md", "kind": "python" }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error, "{removed}");
+    assert!(!venv.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }

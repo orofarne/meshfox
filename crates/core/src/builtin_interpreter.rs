@@ -226,7 +226,7 @@ pub fn resolve_with_env(
 /// double-joining `examples/` onto a path already inside it). Resolved
 /// against this *process's* cwd, not the eventual child's — meshfox itself
 /// hasn't `chdir`'d by the time this runs.
-fn canvas_state_dir(canvas_path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn canvas_state_dir(canvas_path: &Path, suffix: &str) -> PathBuf {
     let absolute = if canvas_path.is_absolute() {
         canvas_path.to_path_buf()
     } else {

@@ -741,6 +741,33 @@ struct PruneParams {
     yes: bool,
 }
 
+#[derive(Deserialize, JsonSchema, Default)]
+struct EnvListParams {
+    /// A directory, or one canvas file, relative to this server's root
+    /// directory (or absolute, as long as it is under it). Default: the
+    /// root itself.
+    #[serde(default)]
+    path: Option<String>,
+    /// Also look in subdirectories (version-control and dependency
+    /// directories are always skipped).
+    #[serde(default)]
+    recursive: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EnvRmParams {
+    /// The canvas whose environments to delete, relative to this server's
+    /// root directory (or absolute, under it). The file may already be gone.
+    path: String,
+    /// Only the environment selected by this `name=` (default: the usual
+    /// environment together with every named one).
+    #[serde(default)]
+    name: Option<String>,
+    /// `python` (`@python_venv`) or `node` (`@node_env`); default: both.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct CoresKillParams {
     /// The canvas whose core to stop, relative to this server's root
@@ -2861,6 +2888,94 @@ impl MeshfoxMcpRoot {
     }
 
     #[tool(
+        description = "Lists the Python (@python_venv) and Node (@node_env) environments meshfox built under a directory or for one canvas under this server's root: .meshfox/<canvas>.venv and .meshfox/<canvas>.node, and the named ones inside them. Changes nothing."
+    )]
+    async fn env_list(
+        &self,
+        Parameters(params): Parameters<EnvListParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let target = match params.path.as_deref() {
+            Some(path) => self.resolve_under_root(path)?.0,
+            None => self.root.clone(),
+        };
+        let recursive = params.recursive;
+        let environments = tokio::task::spawn_blocking(move || {
+            if target.is_dir() {
+                meshfox_core::env_state::list(&target, recursive)
+            } else {
+                let parent = target.parent().map(Path::to_path_buf).unwrap_or_default();
+                meshfox_core::env_state::list(&parent, false)
+                    .into_iter()
+                    .filter(|e| e.canvas == target)
+                    .collect()
+            }
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("env_list failed: {e}"), None))?;
+        Ok(CallToolResult::structured(json!({
+            "environments": environments.iter().map(|e| json!({
+                "canvas": e.canvas.display().to_string(),
+                "kind": e.kind.label(),
+                "name": e.name,
+                "path": e.path.display().to_string(),
+                "bytes": e.bytes,
+                "canvas_exists": e.canvas_exists,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
+    #[tool(
+        description = "Deletes a canvas's Python/Node environments under this server's root so the next run of its setup block (run with fresh: true) builds them again — e.g. after a system Python upgrade. Without name, removes the usual environment together with every named one; kind limits it to python or node. Fails while a worker is running for the canvas, or when there is nothing to remove. Run history and variable caches are never touched. The canvas file may already be gone."
+    )]
+    async fn env_rm(
+        &self,
+        Parameters(params): Parameters<EnvRmParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use meshfox_core::env_state::Kind;
+        let kinds = match params.kind.as_deref() {
+            None => vec![Kind::Python, Kind::Node],
+            Some("python") => vec![Kind::Python],
+            Some("node") => vec![Kind::Node],
+            Some(other) => {
+                return Err(invalid_params(format!(
+                    "kind must be \"python\" or \"node\", not {other:?}"
+                )))
+            }
+        };
+        let requested = Path::new(&params.path);
+        let joined = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.root.join(requested)
+        };
+        let canvas = joined.canonicalize().unwrap_or(joined);
+        if !canvas.starts_with(&self.root)
+            || canvas
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(invalid_params(format!(
+                "{:?} is outside this server's root directory ({})",
+                params.path,
+                self.root.display()
+            )));
+        }
+        let name = params.name;
+        let removed = tokio::task::spawn_blocking(move || {
+            meshfox_core::env_state::remove(&canvas, name.as_deref(), &kinds)
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("env_rm failed: {e}"), None))?
+        .map_err(|e| invalid_params(e.to_string()))?;
+        Ok(CallToolResult::structured(json!({
+            "removed": removed.iter().map(|r| json!({
+                "path": r.path.display().to_string(),
+                "bytes": r.bytes,
+            })).collect::<Vec<_>>(),
+        })))
+    }
+
+    #[tool(
         description = "Lists the live cores (per-canvas workers) of the persistent coordinator `server_socket` points at — canvas path, port (null while starting) and pid — limited to canvases under this server's root. Fails when no `server_socket` is configured."
     )]
     async fn cores_list(
@@ -3144,6 +3259,8 @@ mod tests {
                 "canvas_list",
                 "secret_list",
                 "prune",
+                "env_list",
+                "env_rm",
                 "cores_list",
                 "cores_kill",
             ]

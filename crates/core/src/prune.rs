@@ -145,7 +145,7 @@ pub fn remove(candidate: &Candidate) -> io::Result<()> {
 
 /// `root` and, when `recursive`, every directory under it (never through a
 /// symlink, never into [`SKIPPED_DIRS`]).
-fn directories(root: &Path, recursive: bool) -> Vec<PathBuf> {
+pub(crate) fn directories(root: &Path, recursive: bool) -> Vec<PathBuf> {
     let mut found = vec![root.to_path_buf()];
     if !recursive {
         return found;
@@ -336,7 +336,7 @@ fn file_len(path: &Path) -> u64 {
 }
 
 /// Total size of the regular files under `dir`, without following symlinks.
-fn dir_size(dir: &Path) -> u64 {
+pub(crate) fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
