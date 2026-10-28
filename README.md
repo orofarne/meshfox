@@ -647,6 +647,13 @@ Every `<!-- meshfox:... -->` marker comment is also highlighted on top of the bu
 
 Prefer Neovim to the built-in editor? Edit canvases in it directly: the plugin gives marker highlighting, and `meshfox lsp` the same completion and heading-to-node action as `Ctrl-p`/`Ctrl-n` above. Or keep the TUI and set `[tui] editor = "nvim +{line} {file}"` (see "External editor").
 
+#### TUI themes: live preview
+<!-- meshfox:node id="tui-themes-live-preview" type="link" -->
+
+[Live preview of every TUI theme](https://meshfox.orofarne.net/tui-editor-themes)
+
+All built-in themes side by side, rendered in the browser from the same palettes the terminal viewer uses.
+
 ### MCP server
 <!-- meshfox:node id="mcp-server-experimental" -->
 
