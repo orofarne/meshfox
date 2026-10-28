@@ -291,6 +291,32 @@ target and therefore records separate invocation IDs. `--id` always names a
 chain, including when `--block` narrows its transcript. Historical block
 selection remains available after the block is edited or removed.
 
+### Chain status for monitoring
+
+```sh
+meshfox status                                # per-step table of the latest chain
+meshfox status --id 42                        # a particular chain
+meshfox status build --chain                  # latest chain requested for build
+meshfox status --json                         # one JSON snapshot, no ANSI
+meshfox status --watch --json                 # NDJSON events until the chain ends
+```
+
+`status` folds the saved chain history that `logs` reads into one row per step
+(`pending`, `running`, `ready` for a service that is up, `succeeded`,
+`failed`, `skipped`, `killed`, `not-started`) with durations, exit codes and test totals recognised from
+`cargo test`, Playwright and `node --test` summary lines. A failed or killed
+step also lists its failing tests and the last lines of its output. Exit code:
+0 for a running or succeeded chain, 1 for a failed, killed or interrupted one,
+2 when no chain can be read. With `--watch` it keeps polling and exits with the
+chain's code once it ends.
+
+`--json` prints no terminal formatting. Without `--watch` it is a single
+`{"type":"snapshot","run":{...},"steps":[...],"current":"node/block","failures":[...]}`
+object. With `--watch` it is NDJSON: a first `snapshot`, then a `step` line
+whenever a step changes state, a `failure` line when a step first fails (with
+`tests` and `tail`), and a final `done` line with the run and `exitCode`. Pipe
+it into a monitor instead of grepping `logs`.
+
 The default view records what happened in that invocation: output, stderr
 labels, step results, freshness skips, service startup/reuse, errors, and steps
 not reached. It does not substitute old output for a skipped step.

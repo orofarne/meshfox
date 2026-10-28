@@ -1740,6 +1740,32 @@ boundaries flush preceding output immediately. Storage errors mark a transcript
 incomplete without stopping execution. Session reset preserves transcripts. On a read-only canvas the journal
 lives in memory for the worker's lifetime, like the rest of the session DB.
 
+## Chain status (`meshfox status`)
+
+`meshfox status` is a presentation of the same saved invocation journal that
+`meshfox logs` reads, folded into one row per step of the selected chain. It
+selects a chain like `logs` does (latest, a block address, `--chain`, `--id N`)
+and goes through the worker API; it never executes blocks. The steps planned
+for the chain are known from its start, so a step that has not begun is
+`pending`; a chain that ended before reaching a step marks it `not-started`.
+A step still `running` after its chain ended is reported `killed`.
+
+Per step the report carries `node`, `block`, `state` (`pending`, `running`,
+`ready` for a service that reported readiness and has no end event of its own,
+`succeeded`, `failed`, `skipped`, `killed`, `not-started`), and when known
+`startedAt`, `durationMs`, `exitCode`, `reason` and `tests` (`passed`,
+`failed`, `ignored`, summed from `cargo test`, Playwright and `node --test`
+summary lines in the step's recorded output; absent when none were
+recognised). `failures` lists each failed or killed step with the names of
+failing tests and the last 20 output lines. Output is bounded by
+`max_chain_output_bytes`, so on a truncated transcript (`run.truncated`) test
+counts may be incomplete.
+
+`--json` prints no terminal formatting: one `snapshot` object, or with `--watch`
+newline-delimited `snapshot`, `step`, `failure` and `done` events. `--watch`
+polls until the chain ends. The exit code is 0 for a running or succeeded chain,
+1 for a failed, killed or interrupted one, and 2 when the chain cannot be read.
+
 ## Saved-journal statistics (`meshfox stats`)
 
 `meshfox stats` computes a snapshot over retained invocation journals for the

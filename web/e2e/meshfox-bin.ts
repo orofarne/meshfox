@@ -56,4 +56,20 @@ function binaryIsReady(): boolean {
   return built >= sources && !linkerSignedOnly();
 }
 
-export const MESHFOX_VIEW = binaryIsReady() ? `${MESHFOX_BIN} view` : CARGO_RUN;
+const READY = binaryIsReady();
+
+export const MESHFOX_VIEW = READY ? `${MESHFOX_BIN} view` : CARGO_RUN;
+
+/**
+ * `meshfox <args>` as a [command, args] pair, for a process a test starts
+ * itself. Same choice as `MESHFOX_VIEW`: the prebuilt binary, or `cargo run`
+ * when it can't be trusted. A test must not reach for `cargo run` on its own —
+ * it waits for the build-directory lock, so any other cargo running at the time
+ * (an editor's `cargo check`, say) eats the test's whole timeout before meshfox
+ * even starts.
+ */
+export function meshfoxCommand(args: string[]): [string, string[]] {
+  return READY
+    ? [MESHFOX_BIN, args]
+    : ["cargo", ["run", "-q", "--manifest-path", path.join(REPO, "Cargo.toml"), "-p", "meshfox-cli", "--", ...args]];
+}

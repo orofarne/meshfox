@@ -41,6 +41,7 @@ mod run_output;
 mod secret_cmd;
 mod serve;
 mod stats_cmd;
+mod status_cmd;
 mod syntax_registry;
 mod terminal_status;
 mod theme_cmd;
@@ -101,7 +102,7 @@ struct Cli {
 /// A canvas path, accepted either as a positional argument or via
 /// `--canvas` — the two are equivalent and mutually exclusive. Kept as a
 /// shared, flattened block so every subcommand that has a positional slot
-/// free for it (i.e. every one except `run`/`logs`/`stats` and `node <op>`, whose own
+/// free for it (i.e. every one except `run`/`logs`/`stats`/`status` and `node <op>`, whose own
 /// positional slot is taken by other arguments — see `splice_leading_canvas`)
 /// accepts both spellings the same way.
 #[derive(Args)]
@@ -181,6 +182,31 @@ enum Command {
         #[arg(long, conflicts_with = "id")]
         list: bool,
         /// Print newline-delimited JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Per-step status of a chain: what ran, what is running, what is still pending and what failed.
+    ///
+    /// Folds the same saved chain history `logs` reads. Exits 0 for a running or
+    /// succeeded chain, 1 for a failed, killed or interrupted one, 2 when the
+    /// chain cannot be read.
+    Status {
+        /// Block address as in run; omit to select the latest chain.
+        #[arg(num_args = 0.., conflicts_with = "id")]
+        args: Vec<String>,
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        /// Select the chain requested for this target.
+        #[arg(long)]
+        chain: bool,
+        /// Select a particular chain run.
+        #[arg(long)]
+        id: Option<i64>,
+        /// Keep going until the chain ends, reporting each step change; exits with the chain's code.
+        #[arg(long)]
+        watch: bool,
+        /// Print JSON without terminal formatting: one snapshot object, or with --watch
+        /// newline-delimited `snapshot`, `step`, `failure` and `done` events.
         #[arg(long)]
         json: bool,
     },
@@ -1293,12 +1319,12 @@ fn splice_leading_canvas(mut args: Vec<String>) -> Vec<String> {
         // No subcommand at all (`meshfox test.md`): leave it as the sole
         // argument, handled below as "open it, same as `meshfox view`".
         None => args.insert(1, canvas),
-        // `run`, `logs`, `stats` and `node <op> ...` take an explicit `--canvas` flag
+        // `run`, `logs`, `stats`, `status` and `node <op> ...` take an explicit `--canvas` flag
         // instead of their own leading positional — `run`'s own args are a
         // free-form node-path/block-name list with nothing else to anchor
         // a bare path against, and `node <op>`'s positional slot is two
         // segments in (`node add`, `node rm`, ...), not on `node` itself.
-        Some("run" | "logs" | "stats") => {
+        Some("run" | "logs" | "stats" | "status") => {
             args.insert(2, "--canvas".to_string());
             args.insert(3, canvas);
         }
@@ -1512,6 +1538,37 @@ fn main() {
             if let Err(error) = runtime.block_on(logs_cmd::run(path, options)) {
                 eprintln!("{error}");
                 std::process::exit(1);
+            }
+        }
+        Command::Status {
+            args,
+            canvas,
+            chain,
+            id,
+            watch,
+            json,
+        } => {
+            let path = canvas.unwrap_or_else(|| {
+                console_cmd::discover().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                })
+            });
+            let options = status_cmd::Options {
+                selector: args,
+                chain,
+                id,
+                watch,
+                json,
+            };
+            let runtime = tokio::runtime::Runtime::new().expect("async runtime");
+            match runtime.block_on(status_cmd::run(path, options)) {
+                Ok(0) => {}
+                Ok(code) => std::process::exit(code),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
             }
         }
         Command::Console {

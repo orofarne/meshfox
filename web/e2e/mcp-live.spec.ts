@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import path from "node:path";
+import { meshfoxCommand } from "./meshfox-bin";
 
 class McpClient {
   private nextId = 1;
@@ -29,10 +29,8 @@ class McpClient {
   }
 
   static async start(fixtureDir: string) {
-    const process = spawn("cargo", ["run", "-q", "--manifest-path", path.join(import.meta.dirname, "../../Cargo.toml"), "-p", "meshfox-cli", "--", "mcp"], {
-      cwd: fixtureDir,
-      stdio: "pipe",
-    });
+    const [command, args] = meshfoxCommand(["mcp"]);
+    const process = spawn(command, args, { cwd: fixtureDir, stdio: "pipe" });
     const client = new McpClient(process);
     await client.request("initialize", {
       protocolVersion: "2025-03-26",
