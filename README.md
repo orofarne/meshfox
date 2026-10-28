@@ -866,6 +866,25 @@ A block address selects that block's participation across chains; `--chain` sele
 
 Coverage is explicitly limited to saved journals: requesting a month does not recover rotated-out history. Skips, cancellations, interruptions, running steps and service startup/reuse are shown separately from successful executions. Median and p95 use completed success/failure durations, with chain time separate from step time. Reading statistics through the worker API executes no blocks and creates no persistent aggregates. See SPEC.md's "Saved-journal statistics" for counting and percentile rules.
 
+### Chain status (`status`)
+<!-- meshfox:node id="chain-status-status" -->
+
+`meshfox status` folds the saved chain transcript that `logs` reads into one row per step — what has finished, what is running, what is still pending and what failed — so a long chain such as a full check can be watched without scrolling its output:
+
+```text
+meshfox project.canvas.md status
+meshfox project.canvas.md status --id 42
+meshfox project.canvas.md status build --chain
+meshfox project.canvas.md status --json
+meshfox project.canvas.md status --watch --json
+```
+
+Each step is `pending`, `running`, `ready` (a service that reported readiness; it has no end of its own), `succeeded`, `failed`, `skipped`, `killed` or `not-started`, with its duration and exit code. Totals are recognised from `cargo test`, Playwright and `node --test` summary lines in the step's recorded output, so a test step reads `2228 passed, 0 failed`. A failed or killed step lists its failing tests, or the last lines of its output, under `Failed:`. It selects a chain the same way `logs` does and goes through the worker; it never runs anything.
+
+The exit code is 0 for a running or succeeded chain, 1 for a failed, killed or interrupted one and 2 when no chain can be read, so `--watch` — which keeps polling until the chain ends and then exits with its code — works as a plain shell gate.
+
+`--json` prints no terminal formatting. Without `--watch` it is one `snapshot` object (`run`, `steps`, `current`, `failures`). With `--watch` it is NDJSON: a first `snapshot`, a `step` line whenever a step changes state, a `failure` line when a step first fails (with `tests` and `tail`) and a final `done` line with the run and its `exitCode`, which suits a monitor or an agent far better than grepping `logs`. Output stored per chain is bounded by `max_chain_output_bytes`; when it was truncated (`run.truncated`) the test totals may be incomplete.
+
 ## How-to
 <!-- meshfox:node id="how-to" -->
 
