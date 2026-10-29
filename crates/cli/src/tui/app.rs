@@ -86,9 +86,80 @@ const MIN_OUTPUT_HEIGHT: u16 = ui::MIN_OUTPUT_HEIGHT;
 pub struct SelectPickerState {
     pub target: super::path_picker::PickerTarget,
     pub choices: Vec<String>,
+    pub query: String,
+    pub filtered: Vec<usize>,
     pub selected: usize,
     pub rows: Rect,
     pub offset: usize,
+}
+
+impl SelectPickerState {
+    fn filter(&mut self) {
+        let previous = self.filtered.get(self.selected).copied();
+        let query = self.query.to_lowercase();
+        self.filtered = self
+            .choices
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| choice.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = previous
+            .and_then(|i| self.filtered.iter().position(|&v| v == i))
+            .unwrap_or(0);
+        self.offset = 0;
+    }
+}
+
+/// Edit even malformed pasted numbers so validation never traps the user.
+fn edit_number(
+    input: &mut String,
+    cursor: &mut Option<(usize, usize)>,
+    field: usize,
+    key: KeyEvent,
+) -> bool {
+    let mut pos = cursor
+        .filter(|(i, _)| *i == field)
+        .map(|(_, p)| p)
+        .unwrap_or(input.len())
+        .min(input.len());
+    while !input.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let previous = input[..pos]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let next = pos + input[pos..].chars().next().map(char::len_utf8).unwrap_or(0);
+    match key.code {
+        KeyCode::Left => pos = previous,
+        KeyCode::Right => pos = next,
+        KeyCode::Home => pos = 0,
+        KeyCode::End => pos = input.len(),
+        KeyCode::Backspace => {
+            input.drain(previous..pos);
+            pos = previous;
+        }
+        KeyCode::Delete => {
+            input.drain(pos..next);
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if c.is_ascii_digit()
+                || (matches!(c, '+' | '-') && pos == 0 && !input.starts_with(['+', '-']))
+            {
+                input.insert(pos, c);
+                pos += c.len_utf8();
+            }
+        }
+        _ => return false,
+    }
+    *cursor = Some((field, pos));
+    true
 }
 
 pub struct VarFormState {
@@ -98,6 +169,8 @@ pub struct VarFormState {
     /// with `current_value` (so submitting untouched just confirms the
     /// suggestion).
     pub inputs: Vec<String>,
+    /// Numeric edit position: field index and UTF-8 byte offset; None means end.
+    pub number_cursor: Option<(usize, usize)>,
     /// Parallel to `decls`/`inputs` — `Some` when the field's `inputs`
     /// entry was pre-filled from shared/global config (see
     /// `meshfox_core::shared_env`) rather than an override/process env/the
@@ -889,6 +962,8 @@ pub struct InlineFormState {
     /// session) or else the same cache/shared/default fallback
     /// `initial_field_input` already gives `var_form`.
     pub inputs: Vec<String>,
+    /// Numeric edit position: field index and UTF-8 byte offset; None means end.
+    pub number_cursor: Option<(usize, usize)>,
     /// Which field is focused — `fields.len()` (one past the last field)
     /// means the virtual "Send" row is focused instead of any real field.
     pub selected: usize,
@@ -1088,6 +1163,7 @@ fn var_form_from_statuses(missing: Vec<crate::worker_client::VarStatus>) -> VarF
         save: vec![false; decls.len()],
         decls,
         inputs,
+        number_cursor: None,
         origins,
         errors,
         stored,
@@ -1750,6 +1826,8 @@ impl App {
         }
         self.select_picker = Some(SelectPickerState {
             target,
+            query: String::new(),
+            filtered: (0..decl.choices.len()).collect(),
             choices: decl.choices.clone(),
             selected: decl.choices.iter().position(|c| c == input).unwrap_or(0),
             rows: Rect::default(),
@@ -1763,21 +1841,39 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc => {
-                self.select_picker = None;
+            KeyCode::Esc if !picker.query.is_empty() => {
+                picker.query.clear();
+                picker.filter();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Esc => self.select_picker = None,
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.query.clear();
+                picker.filter();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                picker.query.push(c);
+                picker.filter();
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.filter();
+            }
+            KeyCode::Up if !picker.filtered.is_empty() => {
                 picker.selected =
-                    (picker.selected + picker.choices.len() - 1) % picker.choices.len()
+                    (picker.selected + picker.filtered.len() - 1) % picker.filtered.len();
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                picker.selected = (picker.selected + 1) % picker.choices.len()
+            KeyCode::Down if !picker.filtered.is_empty() => {
+                picker.selected = (picker.selected + 1) % picker.filtered.len();
             }
             KeyCode::Home => picker.selected = 0,
-            KeyCode::End => picker.selected = picker.choices.len() - 1,
-            KeyCode::Enter => {
+            KeyCode::End => picker.selected = picker.filtered.len().saturating_sub(1),
+            KeyCode::Enter if !picker.filtered.is_empty() => {
                 let picker = self.select_picker.take().unwrap();
-                let value = picker.choices[picker.selected].clone();
+                let value = picker.choices[picker.filtered[picker.selected]].clone();
                 match picker.target {
                     super::path_picker::PickerTarget::VarForm(i) => {
                         if let Some(input) =
@@ -1803,6 +1899,22 @@ impl App {
     }
 
     async fn on_var_form_key(&mut self, key: KeyEvent) {
+        if let Some(form) = &mut self.var_form {
+            let i = form.selected;
+            if i < form.decls.len()
+                && form.decls[i].var_type == VarType::Int
+                && edit_number(&mut form.inputs[i], &mut form.number_cursor, i, key)
+            {
+                self.render_current_document();
+                return;
+            }
+            if matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab
+            ) {
+                form.number_cursor = None;
+            }
+        }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -1994,6 +2106,7 @@ impl App {
             fields,
             decls,
             inputs,
+            number_cursor: None,
             selected: 0,
             editing: false,
         })
@@ -2058,6 +2171,22 @@ impl App {
     /// once, and with an extra virtual "Send" position
     /// (`selected == fields.len()`) `Tab`/arrows can land on.
     async fn on_inline_form_key(&mut self, key: KeyEvent) {
+        if let Some(form) = &mut self.active_inline_form {
+            let i = form.selected;
+            if i < form.decls.len()
+                && form.decls[i].var_type == VarType::Int
+                && edit_number(&mut form.inputs[i], &mut form.number_cursor, i, key)
+            {
+                self.render_current_document();
+                return;
+            }
+            if matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab
+            ) {
+                form.number_cursor = None;
+            }
+        }
         let Some(form) = &self.active_inline_form else {
             return;
         };
@@ -2386,7 +2515,7 @@ impl App {
                         .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                     {
                         let index = picker.offset + (mouse.row - picker.rows.y) as usize;
-                        if index < picker.choices.len() {
+                        if index < picker.filtered.len() {
                             picker.selected = index;
                             self.on_select_picker_key(KeyEvent::new(
                                 KeyCode::Enter,
@@ -4668,13 +4797,19 @@ impl App {
         // can't have navigated to a different node in the meantime), so
         // `markdown::render` can draw a visible focus indicator on it (see
         // `render`'s own `form_focus` parameter doc comment).
-        let mut form_focus: Option<(&str, usize)> = None;
+        let mut form_focus: Option<(&str, usize, Option<usize>)> = None;
         if let Some(form) = &self.active_inline_form {
             if form.editing {
                 for (field, value) in form.fields.iter().zip(form.inputs.iter()) {
                     form_values.insert(field.var.clone(), value.clone());
                 }
-                form_focus = Some((form.block_name.as_str(), form.selected));
+                form_focus = Some((
+                    form.block_name.as_str(),
+                    form.selected,
+                    form.number_cursor
+                        .filter(|(i, _)| *i == form.selected)
+                        .map(|(_, p)| p),
+                ));
             }
         }
 
@@ -8579,6 +8714,67 @@ mod tests {
     use ratatui::style::Color;
 
     #[tokio::test]
+    async fn malformed_number_can_be_corrected_in_both_forms() {
+        let mut app = app_with_blocks(
+            "number-edit",
+            concat!(
+                "<!-- meshfox:var name=\"AMOUNT\" type=\"int\" session -->\n\n",
+                "```form name=pick\nfield var=\"AMOUNT\"\n```\n",
+            ),
+        )
+        .await;
+        let mut form = app.try_build_inline_form("root", "pick").unwrap();
+        form.editing = true;
+        form.inputs[0] = "1,059.47".into();
+        let decl = form.decls[0].clone();
+        app.active_inline_form = Some(form);
+        let keys = [
+            KeyCode::Home,
+            KeyCode::Right,
+            KeyCode::Delete,
+            KeyCode::End,
+            KeyCode::Left,
+            KeyCode::Left,
+            KeyCode::Backspace,
+            KeyCode::Char('0'),
+        ];
+        for code in keys {
+            app.on_inline_form_key(key(code)).await;
+        }
+        let form = app.active_inline_form.as_ref().unwrap();
+        assert_eq!(form.inputs[0], "1059047");
+        assert!(meshfox_core::validate_value(&decl, &form.inputs[0]).is_ok());
+        assert!(document_text(&app).contains("10590_47"));
+
+        let mut vf = var_form_from_statuses(Vec::new());
+        vf.decls = vec![decl];
+        vf.inputs = vec!["1,059.47".into()];
+        app.var_form = Some(vf);
+        for code in keys {
+            app.on_var_form_key(key(code)).await;
+        }
+        assert_eq!(app.var_form.as_ref().unwrap().inputs[0], "1059047");
+    }
+
+    #[test]
+    fn number_cursor_handles_unicode_and_field_changes() {
+        let mut input = "1 234".to_string();
+        let mut cursor = None;
+        for code in [
+            KeyCode::Home,
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Backspace,
+        ] {
+            assert!(edit_number(&mut input, &mut cursor, 0, key(code)));
+        }
+        assert_eq!(input, "1234");
+        assert_eq!(cursor, Some((0, 1)));
+        edit_number(&mut input, &mut cursor, 1, key(KeyCode::Backspace));
+        assert_eq!(input, "123");
+    }
+
+    #[tokio::test]
     async fn canvas_search_wraps_occurrences_and_restores_only_its_own_branches() {
         let mut app = app_with_blocks("canvas-search", "## Alpha\n<!-- meshfox:node id=\"alpha\" -->\n\n### First\n<!-- meshfox:node id=\"first\" -->\n\nneedle NEEDLE\n\n## Beta\n<!-- meshfox:node id=\"beta\" -->\n\n### Second needle\n<!-- meshfox:node id=\"second\" -->\n\nbody\n").await;
         app.expanded.clear();
@@ -10162,6 +10358,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_search_filters_unicode_and_commits_filtered_mouse_choice() {
+        let mut app = app_with_blocks("select-search", concat!(
+            "<!-- meshfox:var name=\"CHOICE\" type=\"select\" choices=\"one,Prod,prod-eu,ПРОБА,joker\" session -->\n\n",
+            "```form name=pick\nfield var=\"CHOICE\"\n```\n",
+        )).await;
+        app.set_focus(Focus::Document);
+        app.try_enter_inline_form();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        for c in "prod".chars() {
+            app.on_key(key(KeyCode::Char(c))).await;
+        }
+        assert_eq!(app.select_picker.as_ref().unwrap().filtered, [1, 2]);
+        app.on_key(key(KeyCode::Down)).await;
+        app.on_key(key(KeyCode::Backspace)).await;
+        assert_eq!(app.select_picker.as_ref().unwrap().selected, 1);
+        app.on_key(key(KeyCode::Char('x'))).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert!(app.select_picker.as_ref().unwrap().filtered.is_empty());
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "one");
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(app.select_picker.as_ref().unwrap().query.is_empty());
+        for c in "пр".chars() {
+            app.on_key(key(KeyCode::Char(c))).await;
+        }
+        assert_eq!(app.select_picker.as_ref().unwrap().filtered, [3]);
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(key(KeyCode::Char('j'))).await;
+        assert_eq!(app.select_picker.as_ref().unwrap().filtered, [4]);
+        app.select_picker.as_mut().unwrap().rows = Rect::new(10, 5, 30, 3);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert!(app.select_picker.is_none());
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "joker");
+    }
+
+    #[tokio::test]
     async fn a_form_is_framed_selectable_with_brackets_and_enter_edits_it() {
         let mut app = app_with_blocks(
             "form-select",
@@ -10659,6 +10898,7 @@ mod tests {
             fields: Vec::new(),
             decls: Vec::new(),
             inputs: Vec::new(),
+            number_cursor: None,
             selected: 0,
             editing: true,
         });

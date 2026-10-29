@@ -2574,6 +2574,18 @@ A `date` holds one calendar day, a `datetime` one instant:
   variable form and `form` fences; `--set` and the API do not guess.
 - Starlark has no datetime type; a block's value is the canonical string.
 
+### TUI select search
+
+The `Choose` overlay in inline and modal forms filters options as you type,
+using a case-insensitive Unicode substring match and preserving option order.
+The search row shows the query and matching/total counts; matches are highlighted.
+Up/Down, Home/End navigate the filtered list; Enter or a mouse click confirms
+only the selected value. Letters including `j`/`k` are search input.
+Backspace removes a character, Ctrl-U clears the query. Esc clears a nonempty
+query, then closes on a second press without changing the field. An empty result
+shows `No matches`; Enter does nothing. Filtering preserves the highlighted
+option when it still matches, otherwise highlights the first result.
+
 ### Date pickers
 
 A `date`/`datetime` field is an ordinary text input that can also be filled

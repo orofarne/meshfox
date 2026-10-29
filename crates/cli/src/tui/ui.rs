@@ -414,7 +414,7 @@ fn render_screen(f: &mut Frame, app: &mut App) {
 
     if let Some(picker) = &mut app.select_picker {
         let width = area.width.min(60);
-        let height = area.height.min((picker.choices.len() + 4) as u16);
+        let height = area.height.min((picker.filtered.len().max(1) + 5) as u16);
         let popup = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -424,22 +424,70 @@ fn render_screen(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Choose · Enter select · Esc cancel ");
-        picker.rows = block.inner(popup);
+            .title(" Choose · Enter select · Esc cancel ")
+            .title_bottom(" Type to search · ↑/↓ move · Ctrl-U clear ");
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        let search = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+        f.render_widget(
+            Paragraph::new(format!(
+                "Search: {}  ({}/{})",
+                picker.query,
+                picker.filtered.len(),
+                picker.choices.len()
+            )),
+            search,
+        );
+        picker.rows = Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(1),
+        );
         let mut state = ListState::default();
         state.select(Some(picker.selected));
         *state.offset_mut() = picker
             .selected
             .saturating_sub(picker.rows.height.saturating_sub(1) as usize);
-        let list = List::new(picker.choices.iter().map(|c| ListItem::new(c.as_str())))
-            .block(block)
-            .highlight_style(
-                Style::default()
-                    .bg(super::theme::accent())
-                    .fg(super::theme::on_accent()),
-            )
-            .highlight_symbol("› ");
-        f.render_stateful_widget(list, popup, &mut state);
+        let query = picker.query.to_lowercase();
+        let list = List::new(picker.filtered.iter().map(|&i| {
+            let choice = &picker.choices[i];
+            // Map the lowercased match back to original character boundaries:
+            // Unicode lowercase may expand one character into several.
+            let mut spans = Vec::new();
+            let lower = choice.to_lowercase();
+            let matched = if query.is_empty() {
+                None
+            } else {
+                lower.find(&query).map(|start| start..start + query.len())
+            };
+            let mut offset = 0;
+            for c in choice.chars() {
+                let end = offset + c.to_lowercase().map(char::len_utf8).sum::<usize>();
+                let style = if matched
+                    .as_ref()
+                    .is_some_and(|r| offset < r.end && end > r.start)
+                {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                };
+                spans.push(Span::styled(c.to_string(), style));
+                offset = end;
+            }
+            ListItem::new(Line::from(spans))
+        }))
+        .highlight_style(
+            Style::default()
+                .bg(super::theme::accent())
+                .fg(super::theme::on_accent()),
+        )
+        .highlight_symbol("› ");
+        if picker.filtered.is_empty() {
+            f.render_widget(Paragraph::new("No matches"), picker.rows);
+        } else {
+            f.render_stateful_widget(list, picker.rows, &mut state);
+        }
         picker.offset = state.offset();
     } else if let Some(dp) = &app.date_picker {
         render_date_picker(f, area, dp);
@@ -1814,7 +1862,25 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
                 | VarType::File
                 | VarType::Date
                 | VarType::DateTime => {
-                    format!("{shown}{}", if i == vf.selected { "_" } else { "" })
+                    if i == vf.selected {
+                        let mut value = shown.to_string();
+                        let mut pos = vf
+                            .number_cursor
+                            .filter(|(field, _)| *field == i)
+                            .map(|(_, p)| p)
+                            .unwrap_or(input.len())
+                            .min(input.len());
+                        while !input.is_char_boundary(pos) {
+                            pos -= 1;
+                        }
+                        if decl.secret {
+                            pos = input[..pos].chars().count();
+                        }
+                        value.insert(pos, '_');
+                        value
+                    } else {
+                        shown.to_string()
+                    }
                 }
             };
             // `[shared]`/`[global]` when this field's value was inherited

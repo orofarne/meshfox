@@ -326,7 +326,7 @@ pub fn render(
     node_id: &str,
     decls: &[meshfox_core::vars::VarDecl],
     form_values: &std::collections::HashMap<String, String>,
-    form_focus: Option<(&str, usize)>,
+    form_focus: Option<(&str, usize, Option<usize>)>,
     live_output: &std::collections::HashMap<String, super::app::StepOutput>,
 ) -> (Vec<Segment>, Vec<ClickRegion>) {
     render_with_blocks(
@@ -361,7 +361,8 @@ pub fn render_with_blocks(
     // `render_var_form` (`ui.rs`) already uses for the unrelated "configure
     // variables" modal. `None` whenever this form is merely open (not
     // `editing`) or this isn't the node it belongs to — no focus to show.
-    form_focus: Option<(&str, usize)>,
+    // The third element is an optional UTF-8 byte offset for the input cursor.
+    form_focus: Option<(&str, usize, Option<usize>)>,
     // Live output from the most recent run, for whichever of this node's own
     // blocks it covers — keyed by block name (already scoped to this
     // `node_id` by the caller, see `App::render_current_document`). The TUI
@@ -408,7 +409,8 @@ pub fn render_with_computed(
     // `render_var_form` (`ui.rs`) already uses for the unrelated "configure
     // variables" modal. `None` whenever this form is merely open (not
     // `editing`) or this isn't the node it belongs to — no focus to show.
-    form_focus: Option<(&str, usize)>,
+    // The third element is an optional UTF-8 byte offset for the input cursor.
+    form_focus: Option<(&str, usize, Option<usize>)>,
     // Live output from the most recent run, for whichever of this node's own
     // blocks it covers — keyed by block name (already scoped to this
     // `node_id` by the caller, see `App::render_current_document`). The TUI
@@ -615,7 +617,7 @@ struct Renderer<'a> {
     form_values: &'a std::collections::HashMap<String, String>,
     /// `render`'s own `form_focus` parameter, threaded straight through —
     /// see that parameter's own doc comment.
-    form_focus: Option<(&'a str, usize)>,
+    form_focus: Option<(&'a str, usize, Option<usize>)>,
     /// `render`'s own `live_output` parameter, threaded straight through —
     /// see that parameter's own doc comment.
     live_output: &'a std::collections::HashMap<String, super::app::StepOutput>,
@@ -743,7 +745,7 @@ impl<'a> Renderer<'a> {
         decls: &'a [meshfox_core::vars::VarDecl],
         runnable: &'a [meshfox_core::fence::CodeBlock],
         form_values: &'a std::collections::HashMap<String, String>,
-        form_focus: Option<(&'a str, usize)>,
+        form_focus: Option<(&'a str, usize, Option<usize>)>,
         live_output: &'a std::collections::HashMap<String, super::app::StepOutput>,
     ) -> Self {
         Renderer {
@@ -1771,7 +1773,7 @@ impl<'a> Renderer<'a> {
                     // elsewhere in the same node. See `render`'s own
                     // `form_focus` doc comment.
                     let focused_index = match (self.form_focus, click_name.as_deref()) {
-                        (Some((focus_block, idx)), Some(this_block))
+                        (Some((focus_block, idx, _)), Some(this_block))
                             if focus_block == this_block =>
                         {
                             Some(idx)
@@ -1847,7 +1849,15 @@ impl<'a> Renderer<'a> {
                             shown = format!("[ {shown} ▾ ]");
                         }
                         if cursor {
-                            shown.push('_');
+                            let mut pos = self
+                                .form_focus
+                                .and_then(|(_, _, p)| p)
+                                .unwrap_or(shown.len())
+                                .min(shown.len());
+                            while !shown.is_char_boundary(pos) {
+                                pos -= 1;
+                            }
+                            shown.insert(pos, '_');
                         }
                         let shown_chars = shown.chars().count() as u16;
                         let mut value_span = Span::styled(shown, value_style);
@@ -2365,7 +2375,7 @@ mod tests {
         node: &str,
         decls: &[meshfox_core::vars::VarDecl],
         values: &std::collections::HashMap<String, String>,
-        focus: Option<(&str, usize)>,
+        focus: Option<(&str, usize, Option<usize>)>,
         live: &std::collections::HashMap<String, super::super::app::StepOutput>,
     ) -> (Vec<Segment>, Vec<ClickRegion>) {
         let (segments, clicks) = super::render(md, base, hl, node, decls, values, focus, live);
@@ -3133,7 +3143,7 @@ mod tests {
             "n",
             &decls,
             &values,
-            Some(("f", 0)),
+            Some(("f", 0, None)),
             &std::collections::HashMap::new(),
         );
 
