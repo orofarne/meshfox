@@ -100,13 +100,29 @@ pub async fn ping(port: u16) -> WorkerHealth {
     }
 }
 
+/// What [`describe`] starts a connection failure with: nothing reached the
+/// worker.
+const CONNECT_FAILED: &str = "could not connect to the worker";
+/// What [`describe`] starts the failure of a request already on its way with:
+/// the connection was open and then went away.
+const CONNECTION_DROPPED: &str = "the worker dropped the connection";
+
+/// Whether `error` (from a call here) says the worker itself went away rather
+/// than that it answered badly or slowly — what a caller whose request is safe
+/// to repeat (a read) may answer by looking for another worker.
+pub fn worker_went_away(error: &str) -> bool {
+    error.starts_with(CONNECT_FAILED) || error.starts_with(CONNECTION_DROPPED)
+}
+
 /// A transport error as text for a person: a worker that did not answer in
 /// time or could not be reached says so, rather than a bare reqwest message.
 fn describe(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "the worker did not answer in time — it may be hung".to_string()
     } else if error.is_connect() {
-        "could not connect to the worker — it may have exited".to_string()
+        format!("{CONNECT_FAILED} — it may have exited")
+    } else if error.is_request() {
+        format!("{CONNECTION_DROPPED} — it may have exited ({error})")
     } else {
         error.to_string()
     }

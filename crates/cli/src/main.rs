@@ -3057,19 +3057,35 @@ async fn run_async(
     } else {
         coordinator::get_or_spawn(canvas_path).await
     };
-    let port = worker.unwrap_or_else(|e| {
+    let mut port = worker.unwrap_or_else(|e| {
         eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
         terminal_status::exit(1);
     });
-    let initial_raw = worker_client::get_canvas_raw(port)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "failed to read {} through worker: {e}",
-                canvas_path.display()
-            );
-            terminal_status::exit(1);
-        });
+    // The worker found may be embedded in a short command (`logs`, `status`)
+    // that exits right after it was probed. This read changes nothing, so
+    // look for another worker and read again.
+    let mut retries = 0;
+    let initial_raw = loop {
+        match worker_client::get_canvas_raw(port).await {
+            Ok(raw) => break raw,
+            Err(e) if !detach && retries < 3 && worker_client::worker_went_away(&e) => {
+                retries += 1;
+                port = coordinator::get_or_spawn(canvas_path)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("failed to reach worker for {}: {e}", canvas_path.display());
+                        terminal_status::exit(1);
+                    });
+            }
+            Err(e) => {
+                eprintln!(
+                    "failed to read {} through worker: {e}",
+                    canvas_path.display()
+                );
+                terminal_status::exit(1);
+            }
+        }
+    };
 
     // `meshfox:var` only ever lives in the root node, which is always in
     // the primary document — never affected by an `include`.

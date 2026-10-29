@@ -23,6 +23,7 @@
 //! a client of, layered on top of local discovery that already existed —
 //! not a separate mechanism a caller has to special-case.
 
+use crate::worker_client::WorkerHealth;
 use meshfox_core::worker_lock::{self, Acquired, LockGuard};
 use meshfox_server::watcher_protocol;
 use std::io;
@@ -106,25 +107,43 @@ pub async fn get(canvas_path: &Path) -> io::Result<Option<u16>> {
 /// process wins the per-file lock, keep it in an embedded worker until the
 /// caller's Tokio runtime ends. A failed bind is an error, never permission
 /// to write the canvas directly.
+///
+/// A worker found in another process is probed before it is returned: one
+/// embedded in a short command (`logs --list`, `status`) goes away with that
+/// command, and a caller that wins no lock can read its port in the moment
+/// between the command finishing and the lock being released. Handing that
+/// port out makes `run` fail with "could not connect to the worker", so a
+/// worker that is already gone is looked up (or started) again instead.
 pub async fn get_or_spawn(canvas_path: &Path) -> io::Result<u16> {
-    match resolve(canvas_path).await? {
-        Resolved::Other(port) => Ok(port),
-        Resolved::Us(guard) => {
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(meshfox_server::serve_as_worker(
-                canvas_path.to_path_buf(),
-                0,
-                false,
-                None,
-                true,
-                guard,
-                Some(ready_tx),
-            ));
-            ready_rx
-                .await
-                .map_err(|_| io::Error::other("failed to start the worker"))
+    const ATTEMPTS: u32 = 40;
+    const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
+    for attempt in 1..=ATTEMPTS {
+        match resolve(canvas_path).await? {
+            Resolved::Other(port) => {
+                let gone = matches!(crate::worker_client::ping(port).await, WorkerHealth::Gone);
+                if !gone || attempt == ATTEMPTS {
+                    return Ok(port);
+                }
+                tokio::time::sleep(RETRY_AFTER).await;
+            }
+            Resolved::Us(guard) => {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(meshfox_server::serve_as_worker(
+                    canvas_path.to_path_buf(),
+                    0,
+                    false,
+                    None,
+                    true,
+                    guard,
+                    Some(ready_tx),
+                ));
+                return ready_rx
+                    .await
+                    .map_err(|_| io::Error::other("failed to start the worker"));
+            }
         }
     }
+    unreachable!("the last attempt returns")
 }
 
 /// Detached execution requires a configured external coordinator to own the core.

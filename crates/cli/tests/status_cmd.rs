@@ -157,16 +157,12 @@ fn watch_reports_each_step_change_and_ends_with_done_and_the_chains_exit_code() 
     let (dir, canvas) = setup(
         "```sh name=slow\necho STARTED\nsleep 2\n```\n\n```sh name=after deps=slow\necho FINISHED\n```\n",
     );
-    // Start the canvas's worker first. Two CLI processes that find none both
-    // start one, and the loser's `run` fails with "could not connect to the
-    // worker" — a race of its own, not what this test is about.
-    assert!(invoke(&dir, &canvas, &["logs", "--list"]).status.success());
     let mut run = Process(
         command(&dir)
             .arg(&canvas)
             .args(["run", "after"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("run.stderr")).unwrap())
             .spawn()
             .unwrap(),
     );
@@ -179,7 +175,8 @@ fn watch_reports_each_step_change_and_ends_with_done_and_the_chains_exit_code() 
         }
         assert!(
             Instant::now() < deadline,
-            "the chain never started; last `logs --list`: {listing:?}"
+            "the chain never started; last `logs --list`: {listing:?}; `run` said: {:?}",
+            std::fs::read_to_string(dir.join("run.stderr"))
         );
         std::thread::sleep(Duration::from_millis(50));
     }
