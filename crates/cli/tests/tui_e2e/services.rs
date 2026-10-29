@@ -63,14 +63,14 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
         "service should actually be running at this point"
     );
 
-    // `v` — the services view is how you actually see a daemon's own log
+    // `s` — the services view is how you actually see a daemon's own log
     // in the TUI (`ui::render_services_view`'s log pane, below the list).
     // Checking the marker text shows up *there* (not just anywhere on
     // screen) also proves the chain didn't wait for the process to exit
     // (`sleep 30`) before this — the service was already streaming real
     // captured output by the time this opens, not just "spawned, nothing
     // heard from yet".
-    session.send_keys("v");
+    session.send_keys("s");
     session
         .wait_for("srv log", Duration::from_secs(5))
         .expect("the services view's log pane should be titled after the selected service");
@@ -123,7 +123,7 @@ fn find_list_pid(screen: &str, status_word: &str) -> Option<u32> {
 
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
-fn v_opens_the_services_view_and_s_r_stop_and_restart() {
+fn s_opens_the_services_view_and_s_r_stop_and_restart() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
     session
@@ -145,7 +145,7 @@ fn v_opens_the_services_view_and_s_r_stop_and_restart() {
         .expect("service should start");
     let pid = find_service_pid(&session.screen_text()).expect("parse the service's own pid");
 
-    session.send_keys("v");
+    session.send_keys("s");
     session
         .wait_for("services", Duration::from_secs(5))
         .expect("the services view should open");

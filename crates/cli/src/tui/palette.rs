@@ -27,6 +27,9 @@ pub enum CommandId {
     DeleteKeepChildren,
     InsertUnicode,
     SuggestAttributes,
+    FocusConsole,
+    ResetSession,
+    CopySelection(Option<super::clipboard::Method>),
     Stats,
     BlockStats,
     /// Does what pressing this key in the main view does.
@@ -57,8 +60,30 @@ const ENTRIES: &[Entry] = &[
     view(CommandId::Press('r'), "Run block with its deps chain", "r"),
     view(CommandId::Press('R'), "Run only this block", "R"),
     view(CommandId::Press('K'), "Kill running block", "K"),
-    view(CommandId::Press('S'), "Reset session", "S"),
-    view(CommandId::Press('v'), "Services", "v"),
+    view(CommandId::ResetSession, "Reset session", ""),
+    view(
+        CommandId::FocusConsole,
+        "Focus console / return to previous pane",
+        "Ctrl-w",
+    ),
+    view(CommandId::Press('s'), "Services", "s"),
+    view(CommandId::Press('v'), "Select text", "v"),
+    view(CommandId::CopySelection(None), "Copy selection", "y"),
+    view(
+        CommandId::CopySelection(Some(super::clipboard::Method::Terminal)),
+        "Copy selection via terminal (OSC 52)",
+        "",
+    ),
+    view(
+        CommandId::CopySelection(Some(super::clipboard::Method::System)),
+        "Copy selection to system clipboard",
+        "",
+    ),
+    view(
+        CommandId::CopySelection(Some(super::clipboard::Method::Text)),
+        "Copy selection: show as plain text",
+        "",
+    ),
     view(CommandId::Press('t'), "Terminal sessions", "t"),
     view(CommandId::Press('H'), "Document history", "H"),
     view(CommandId::Press('L'), "Block run history", "L"),
@@ -216,6 +241,7 @@ pub struct Palette {
     state: ListState,
     /// Why the last choice was refused; shown under the list.
     pub notice: Option<String>,
+    pub copy_hint: Option<String>,
 }
 
 /// Subsequence match, case-insensitive. Lower is better: a match that
@@ -256,6 +282,7 @@ impl Palette {
             results: Vec::new(),
             state: ListState::default(),
             notice: None,
+            copy_hint: None,
         };
         palette.refresh();
         palette
@@ -354,6 +381,9 @@ impl Palette {
             | CommandId::SuggestAttributes
             | CommandId::Stats
             | CommandId::BlockStats
+            | CommandId::FocusConsole
+            | CommandId::ResetSession
+            | CommandId::CopySelection(_)
             | CommandId::Press(_) => Outcome::Run(Request { id, text: None }),
         }
     }
@@ -513,7 +543,10 @@ impl Palette {
             height,
         );
         frame.render_widget(Clear, rect);
-        let block = Block::default().borders(Borders::ALL).title(" Commands ");
+        let mut block = Block::default().borders(Borders::ALL).title(" Commands ");
+        if let Some(hint) = &self.copy_hint {
+            block = block.title_bottom(hint.clone());
+        }
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let rows = Layout::vertical([

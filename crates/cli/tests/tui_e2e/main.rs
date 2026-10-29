@@ -23,6 +23,7 @@
 mod baseline;
 mod block_controls;
 mod command_palette;
+mod copy;
 mod external_editor;
 mod file_node_run;
 mod fixtures;

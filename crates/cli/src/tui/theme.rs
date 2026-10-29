@@ -95,6 +95,15 @@ roles! {
     callout_caution,
 }
 
+/// Read-mode selection shares the editor's selection/foreground pair, so
+/// every built-in and custom theme supplies a coordinated contrast pair.
+pub fn selection_bg() -> Color {
+    to_color(current().editor.selection)
+}
+pub fn selection_fg() -> Color {
+    to_color(current().editor.fg)
+}
+
 /// Markdown heading color for 0-based level index `idx` (levels beyond 6
 /// reuse the last).
 pub fn heading(idx: usize) -> Color {

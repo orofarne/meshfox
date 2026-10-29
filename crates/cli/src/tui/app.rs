@@ -37,7 +37,7 @@ use super::source_editor::{self, SourceEditorOutcome, SourceEditorState};
 use super::table::{self, TableData, TableInput, TableMode};
 use super::tree::{self, TreeRow};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Tree,
     Document,
@@ -515,7 +515,7 @@ pub struct HttpRunRetry {
     pub is_tty: bool,
 }
 
-/// The `v` services list view — see `App::services_view`,
+/// The `s` services list view — see `App::services_view`,
 /// `App::on_services_view_key`, `ui::render_services_view`.
 /// **Experimental**, see SPEC.md's "Service blocks (experimental)".
 pub struct ServicesViewState {
@@ -567,6 +567,7 @@ pub struct App {
     /// Visible rectangles of wrapped tree items, populated by the renderer.
     pub tree_click_rows: Vec<(Rect, usize)>,
     pub focus: Focus,
+    console_return_focus: Focus,
     pub doc_segments: Vec<Segment>,
     /// Document selection is independent of pane focus; actions target it
     /// only while Document is focused. Cleared when its node/block disappears.
@@ -657,7 +658,8 @@ pub struct App {
     /// Which pane (if any) is currently expanded purely because it
     /// happened to gain focus (`Tab`/`BackTab`) while collapsed — not
     /// because anyone actually asked to see it (clicking its title bar/
-    /// collapsed handle, `z`, `f`, or a chain run actually starting).
+    /// collapsed handle, `z`, `f` on a collapsed pane, or a chain run).
+    /// Fullscreen round trips preserve an existing temporary expansion.
     /// Cleared, and that pane collapsed right back, the moment focus
     /// moves anywhere else (see `set_focus`) — the terminal equivalent of
     /// a sidebar that auto-hides again once you look away, rather than
@@ -867,7 +869,7 @@ pub struct App {
     /// render path (`ui.rs`) can show it with no changes of its own —
     /// Shared sliced protocols avoid re-encoding preview images on redraw.
     pub(super) link_preview_image: HashMap<String, Arc<DocumentImage>>,
-    /// Whether the `S` (reset session) confirm prompt is up — see `on_key`'s
+    /// Whether the palette's reset-session confirm prompt is up — see `on_key`'s
     /// early dispatch to `on_reset_session_confirm_key` and
     /// `reset_session`'s own doc comment for why this asks at all despite
     /// being purely in-memory. Same "one thing at a time" precedence as
@@ -883,7 +885,7 @@ pub struct App {
     /// A service lock conflict awaiting the user's confirm/cancel — see
     /// `ServiceConflictState`'s own doc comment.
     pub service_conflict: Option<ServiceConflictState>,
-    /// The `v` services list view (every service at once, not scoped to
+    /// The `s` services list view (every service at once, not scoped to
     /// the currently selected node) — `Some` while open. See
     /// `ServicesViewState`'s own doc comment.
     pub services_view: Option<ServicesViewState>,
@@ -916,6 +918,16 @@ pub struct App {
     /// for every later run (manual or `autorun`-triggered) within the same
     /// process to keep seeing it. Cleared by `reset_session`.
     pub session_vars: HashMap<String, String>,
+    /// Frozen read-mode selection, independent of the command palette.
+    pub text_selection: Option<super::selection::Selection>,
+    read_cursor: Option<(Focus, String, super::selection::Point)>,
+    pub copy_document_area: Rect,
+    pub copy_output_area: Rect,
+    pub copy_output_lines: Vec<ratatui::text::Line<'static>>,
+    pub copy_output_top: usize,
+    pub copy_output_left: u16,
+    pub clipboard_method: super::clipboard::Method,
+    pub pending_copy_text: Option<String>,
     /// A `form`-lang fence currently open in the Document pane — `Some`
     /// the moment a field/Send is clicked or entered via `i`, whether or
     /// not it's actively claiming the keymap right now (see `editing`).
@@ -1292,6 +1304,16 @@ impl App {
         };
         let read_only = info.read_only;
         let no_exec = info.no_exec;
+        let clipboard_method = if cfg!(test) {
+            super::clipboard::Method::Terminal
+        } else {
+            meshfox_core::config::tui_clipboard(
+                canvas_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .map_err(std::io::Error::other)?
+        };
         let mut app = App {
             canvas_path,
             raw,
@@ -1306,6 +1328,7 @@ impl App {
             list_state: ListState::default(),
             tree_click_rows: Vec::new(),
             focus: Focus::Tree,
+            console_return_focus: Focus::Document,
             doc_segments: Vec::new(),
             selected_block: None,
             block_views: HashMap::new(),
@@ -1403,6 +1426,15 @@ impl App {
             service_list: Vec::new(),
             service_log: Vec::new(),
             session_vars: HashMap::new(),
+            text_selection: None,
+            read_cursor: None,
+            copy_document_area: Rect::default(),
+            copy_output_area: Rect::default(),
+            copy_output_lines: Vec::new(),
+            copy_output_top: 0,
+            copy_output_left: 0,
+            clipboard_method,
+            pending_copy_text: None,
             active_inline_form: None,
             pending_autoruns: std::collections::VecDeque::new(),
         };
@@ -1417,6 +1449,174 @@ impl App {
         }
         app.render_current_document();
         Ok(app)
+    }
+
+    fn selection_allowed(&self) -> bool {
+        self.palette.is_none()
+            && self.date_picker.is_none()
+            && self.palette_allowed()
+            && self.source_editor.is_none()
+            && self.table_mode.is_none()
+            && !self.show_help
+            && !self.search.open
+            && !self.active_inline_form.as_ref().is_some_and(|f| f.editing)
+    }
+
+    pub fn begin_text_selection(&mut self) {
+        use super::selection::{self, Selection};
+        if !self.selection_allowed() {
+            return;
+        }
+        let (rows, area, top, left) = match self.focus {
+            Focus::Document => {
+                let area = self.copy_document_area;
+                let context = super::document_layout::LayoutContext::new(area.as_size());
+                let mut rows = Vec::new();
+                for segment in &self.doc_segments {
+                    if let Some(layout) = context.text(segment) {
+                        if matches!(segment, super::markdown::Segment::Button { .. }) {
+                            rows.extend(
+                                std::iter::repeat_with(selection::Row::blank).take(layout.rows()),
+                            );
+                        } else {
+                            rows.extend(selection::rows(
+                                &layout.lines,
+                                area.width,
+                                matches!(segment, super::markdown::Segment::Text(_)),
+                                true,
+                            ));
+                        }
+                    } else if let super::markdown::Segment::Image { path, .. } = segment {
+                        let height = self
+                            .doc_images
+                            .get(path)
+                            .and_then(|p| p.as_ref())
+                            .map(|p| p.size().height as usize)
+                            .unwrap_or(1);
+                        rows.extend(std::iter::repeat_with(selection::Row::blank).take(height));
+                    }
+                }
+                (rows, area, usize::from(self.doc_scroll), 0)
+            }
+            Focus::Output => {
+                let width = self
+                    .copy_output_lines
+                    .iter()
+                    .map(|l| l.width())
+                    .max()
+                    .unwrap_or(1)
+                    .min(u16::MAX as usize) as u16;
+                (
+                    selection::rows(&self.copy_output_lines, width, false, false),
+                    self.copy_output_area,
+                    self.copy_output_top,
+                    self.copy_output_left,
+                )
+            }
+            Focus::Tree => {
+                self.status = "focus Document or Output to select text".into();
+                return;
+            }
+        };
+        self.text_selection = Selection::new(self.focus, rows, area, top, left);
+        if let (Some(selection), Some((pane, node, point))) =
+            (&mut self.text_selection, &self.read_cursor)
+        {
+            let current = self
+                .rows
+                .get(self.selected)
+                .map(|r| r.node_id.as_str())
+                .unwrap_or("");
+            if *pane == selection.pane
+                && (selection.pane == Focus::Output || node == current)
+                && point.row >= selection.top
+                && point.row < selection.top + usize::from(selection.area.height)
+                && point.row < selection.rows.len()
+            {
+                selection.anchor = *point;
+                selection.cursor = *point;
+            }
+        }
+    }
+
+    fn finish_text_selection(&mut self) {
+        if let Some(selection) = self.text_selection.take() {
+            let node = self
+                .rows
+                .get(self.selected)
+                .map(|r| r.node_id.clone())
+                .unwrap_or_default();
+            self.read_cursor = Some((selection.pane, node, selection.cursor));
+            match selection.pane {
+                Focus::Document => self.doc_scroll = selection.top.min(u16::MAX as usize) as u16,
+                Focus::Output => {
+                    self.output_scroll = selection
+                        .rows
+                        .len()
+                        .saturating_sub(selection.top + usize::from(selection.area.height))
+                        .min(u16::MAX as usize) as u16;
+                    self.output_hscroll = selection.left;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn copy_selection(&mut self, method: Option<super::clipboard::Method>) {
+        let Some(selection) = &self.text_selection else {
+            self.status = "select text with v or drag before copying".into();
+            return;
+        };
+        let text = selection.text();
+        if text.is_empty() {
+            self.status = if selection.selecting {
+                "selection contains no text"
+            } else {
+                "Space or Shift+arrows to start selecting text"
+            }
+            .into();
+            if let Some(selection) = &mut self.text_selection {
+                selection.notice = Some(self.status.clone());
+            }
+            return;
+        }
+        self.deliver_copy(text, method.unwrap_or(self.clipboard_method))
+            .await;
+    }
+
+    async fn deliver_copy(&mut self, text: String, method: super::clipboard::Method) {
+        use super::clipboard::{self, Method};
+        let mut delivered = false;
+        match method {
+            Method::Text => {
+                self.pending_copy_text = Some(text);
+                self.status = "plain text copy view".into();
+            }
+            Method::Terminal => {
+                self.status = match clipboard::terminal(&text) {
+                    Ok(()) => {
+                        delivered = true;
+                        "selection sent to terminal clipboard (OSC 52)".into()
+                    }
+                    Err(e) => format!("clipboard: {e}; try Show selection as plain text in Ctrl-p"),
+                }
+            }
+            Method::System => {
+                self.status = match clipboard::system(&text).await {
+                    Ok(()) => {
+                        delivered = true;
+                        "copied to system clipboard on this machine".into()
+                    }
+                    Err(e) => format!("clipboard: {e}; try Show selection as plain text in Ctrl-p"),
+                }
+            }
+        }
+        if let Some(selection) = &mut self.text_selection {
+            selection.notice = Some(self.status.clone());
+            if delivered {
+                selection.flash_copy(std::time::Instant::now());
+            }
+        }
     }
 
     pub async fn on_key(&mut self, key: KeyEvent) {
@@ -1444,7 +1644,7 @@ impl App {
             return;
         }
         if self.table_mode.is_some() {
-            self.on_table_key(key);
+            self.on_table_key(key).await;
             return;
         }
         if self.select_picker.is_some() {
@@ -1572,6 +1772,37 @@ impl App {
             self.on_search_key(key);
             return;
         }
+        if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.finish_text_selection();
+            self.toggle_console_focus();
+            return;
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.finish_text_selection();
+            let target = match self.focus {
+                Focus::Tree => Focus::Document,
+                Focus::Document => Focus::Tree,
+                Focus::Output => {
+                    if key.code == KeyCode::BackTab {
+                        Focus::Tree
+                    } else {
+                        Focus::Document
+                    }
+                }
+            };
+            self.focus_read_pane(target);
+            return;
+        }
+        if self.text_selection.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('v') => self.finish_text_selection(),
+                KeyCode::Char('y') => self.copy_selection(None).await,
+                _ => {
+                    self.text_selection.as_mut().unwrap().on_key(key);
+                }
+            }
+            return;
+        }
         if key.code == KeyCode::Char('/') {
             self.search.open = true;
             self.search.cursor = self.search.query.len();
@@ -1654,33 +1885,6 @@ impl App {
                 self.show_help = true;
                 self.help_scroll = 0;
             }
-            KeyCode::Tab => {
-                let new_focus = match self.focus {
-                    Focus::Tree => Focus::Document,
-                    Focus::Document => Focus::Output,
-                    Focus::Output => Focus::Tree,
-                };
-                self.set_focus(new_focus);
-                // Gaining focus always means "I want to actually see this
-                // pane" — a collapsed Tree/Output would otherwise leave
-                // Tab cycling through a pane that's just a sliver on
-                // screen, with no visible sign anything changed. Only a
-                // *peek* though (see `peek_pane_on_focus`'s own doc
-                // comment) — `set_focus` above already collapsed whichever
-                // pane focus just left, if it was only open for the same
-                // reason.
-                self.peek_pane_on_focus(new_focus);
-            }
-            // Shift-Tab — the same cycle, backwards.
-            KeyCode::BackTab => {
-                let new_focus = match self.focus {
-                    Focus::Tree => Focus::Output,
-                    Focus::Output => Focus::Document,
-                    Focus::Document => Focus::Tree,
-                };
-                self.set_focus(new_focus);
-                self.peek_pane_on_focus(new_focus);
-            }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Tree => self.move_selection(-1),
                 Focus::Document => self.scroll_document(-1),
@@ -1716,11 +1920,12 @@ impl App {
             KeyCode::Char('r') => self.trigger_run(true).await,
             KeyCode::Char('R') => self.trigger_run(false).await,
             KeyCode::Char('K') => self.kill_running().await,
-            KeyCode::Char('S') => self.reset_session_confirm = true,
+
             // Opens the services list view — **experimental**, see
             // `open_services_view`'s own doc comment and SPEC.md's
             // "Service blocks (experimental)".
-            KeyCode::Char('v') => self.open_services_view().await,
+            KeyCode::Char('s') => self.open_services_view().await,
+            KeyCode::Char('v') => self.begin_text_selection(),
             // Opens the live-terminals view — every `tty` session the
             // shared worker currently knows about, whether started by
             // this TUI, another one, or a browser tab. See
@@ -1745,18 +1950,12 @@ impl App {
                     self.fullscreen = None;
                 } else {
                     self.fullscreen = Some(self.focus);
-                    // A collapsed pane's own render function (`ui::
-                    // render_output`/`render_tree`) checks its own
-                    // collapsed flag *before* looking at `fullscreen` — so
-                    // fullscreening a currently-collapsed pane would hide
-                    // the other two but still only show that pane's own
-                    // collapsed handle/strip, with the rest of the screen
-                    // simply blank. Expanding here is what actually makes
-                    // `f` work as "expand" from the collapsed state. This
-                    // is an explicit action, not a focus-driven peek, so
-                    // the pane stays expanded once `f` is pressed again —
-                    // no `auto_expanded_pane` bookkeeping here.
-                    self.expand_pane(self.focus);
+                    // Fullscreen needs a visible pane, but must preserve
+                    // temporary focus-driven expansion of an already open
+                    // pane. Only opening a collapsed pane explicitly pins it.
+                    if self.is_pane_collapsed(self.focus) {
+                        self.expand_pane(self.focus);
+                    }
                 }
             }
             // The keyboard counterpart to clicking a pane's own title bar
@@ -2501,6 +2700,103 @@ impl App {
     /// already reflects `fullscreen` (`ui::compute_layout`), so a collapsed
     /// pane's own `point_in` checks below simply never match.
     pub async fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.selection_allowed() && self.resize_drag.is_none() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let pane = if self
+                        .copy_document_area
+                        .contains((mouse.column, mouse.row).into())
+                    {
+                        Some(Focus::Document)
+                    } else if self
+                        .copy_output_area
+                        .contains((mouse.column, mouse.row).into())
+                    {
+                        Some(Focus::Output)
+                    } else {
+                        None
+                    };
+                    if let Some(pane) = pane {
+                        let is_double_click = matches!(self.last_click,Some((r,c,t)) if r==mouse.row && c==mouse.column && t.elapsed()<DOUBLE_CLICK_WINDOW);
+                        // Keep buttons, form controls and fold markers on their
+                        // existing immediate click path. Prose/code selects.
+                        let target = (pane == Focus::Document)
+                            .then(|| {
+                                self.doc_click_targets
+                                    .iter()
+                                    .find(|(r, _)| point_in(*r, mouse.column, mouse.row))
+                                    .map(|(_, t)| t.clone())
+                            })
+                            .flatten();
+                        let source_click = matches!(
+                            target,
+                            Some(ClickTarget::Block {
+                                action: markdown::BlockAction::Select,
+                                ..
+                            })
+                        );
+                        let control = target.is_some() && !source_click;
+                        if source_click {
+                            self.on_mouse_normal(mouse).await;
+                        }
+                        if !control {
+                            self.finish_text_selection();
+                            self.set_focus(pane);
+                            self.begin_text_selection();
+                            if let Some(selection) = &mut self.text_selection {
+                                selection.anchor = selection.point_at(mouse.column, mouse.row);
+                                selection.cursor = selection.anchor;
+                                selection.mouse_down = Some(mouse);
+                                if is_double_click {
+                                    selection.select_word();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    self.finish_text_selection();
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(selection) = &mut self.text_selection {
+                        if selection.mouse_down.is_some() {
+                            selection.drag(mouse.column, mouse.row);
+                            return;
+                        }
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(selection) = &mut self.text_selection {
+                        if let Some(down) = selection.mouse_down.take() {
+                            if selection.dragged {
+                                return;
+                            }
+                            self.finish_text_selection();
+                            self.on_mouse_normal(down).await;
+                            return;
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if self.text_selection.is_some() =>
+                {
+                    let code = if mouse.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    };
+                    self.text_selection
+                        .as_mut()
+                        .unwrap()
+                        .on_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.on_mouse_normal(mouse).await;
+    }
+
+    async fn on_mouse_normal(&mut self, mouse: MouseEvent) {
         if let Some(picker) = &mut self.select_picker {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -3015,8 +3311,6 @@ impl App {
         }
     }
 
-    /// Opens the path picker for the focused `dir`/`file` field, starting
-    /// from the text it currently holds.
     /// Whether `Ctrl-p` may open the palette right now: not over another
     /// modal, and not while a text field of the main view has the keys.
     fn palette_allowed(&self) -> bool {
@@ -3094,6 +3388,17 @@ impl App {
             parents,
             edges,
         ));
+        if let Some(selection) = &self.text_selection {
+            let method = match self.clipboard_method {
+                super::clipboard::Method::Terminal => "terminal",
+                super::clipboard::Method::System => "system",
+                super::clipboard::Method::Text => "text",
+            };
+            self.palette.as_mut().unwrap().copy_hint = Some(format!(
+                " {} chars selected · clipboard: {method} ",
+                selection.text().chars().count()
+            ));
+        }
     }
 
     async fn on_palette_key(&mut self, key: KeyEvent) {
@@ -3111,6 +3416,12 @@ impl App {
     async fn run_palette_request(&mut self, request: super::palette::Request) {
         use super::palette::CommandId;
         self.palette = None;
+        if !matches!(
+            request.id,
+            CommandId::CopySelection(_) | CommandId::Press('v')
+        ) {
+            self.finish_text_selection();
+        }
         match request.id {
             CommandId::InsertUnicode => {
                 if let Some(se) = &mut self.source_editor {
@@ -3132,7 +3443,24 @@ impl App {
                 self.open_block_view(true).await;
                 return;
             }
+            CommandId::FocusConsole => {
+                self.toggle_console_focus();
+                return;
+            }
+            CommandId::ResetSession => {
+                self.finish_text_selection();
+                self.reset_session_confirm = true;
+                return;
+            }
+            CommandId::CopySelection(method) => {
+                self.copy_selection(method).await;
+                return;
+            }
             CommandId::Press(c) => {
+                if c != 'v' {
+                    self.finish_text_selection();
+                }
+
                 // The same path the key takes, so the palette entry and its
                 // shortcut can't drift apart.
                 let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
@@ -3329,6 +3657,9 @@ impl App {
             | CommandId::SuggestAttributes
             | CommandId::Stats
             | CommandId::BlockStats
+            | CommandId::FocusConsole
+            | CommandId::ResetSession
+            | CommandId::CopySelection(_)
             | CommandId::Press(_) => return,
         };
         let focus = self
@@ -6432,6 +6763,10 @@ impl App {
     /// `BackTab`, clicking any pane, via `toggle_fullscreen_on_title_click`
     /// and the Tree/Output collapsed-handle click handlers).
     fn set_focus(&mut self, new_focus: Focus) {
+        if new_focus == Focus::Output && self.focus != Focus::Output {
+            self.console_return_focus = self.focus;
+        }
+
         if self.focus != new_focus && self.auto_expanded_pane == Some(self.focus) {
             self.collapse_pane(self.focus);
             self.auto_expanded_pane = None;
@@ -6443,7 +6778,26 @@ impl App {
         }
     }
 
-    /// `Tab`/`BackTab` landing on a collapsed Tree/Output — expands it for
+    /// Keyboard focus changes keep the focused pane visible, including in
+    /// fullscreen. Collapsed panes are only peeked open until focus leaves.
+    fn focus_read_pane(&mut self, target: Focus) {
+        self.set_focus(target);
+        if self.fullscreen.is_some() {
+            self.fullscreen = Some(target);
+        }
+        self.peek_pane_on_focus(target);
+    }
+
+    fn toggle_console_focus(&mut self) {
+        let target = if self.focus == Focus::Output {
+            self.console_return_focus
+        } else {
+            Focus::Output
+        };
+        self.focus_read_pane(target);
+    }
+
+    /// Keyboard focus landing on a collapsed Tree/Output — expands it for
     /// as long as focus actually stays there (see `set_focus`'s own
     /// collapse-on-blur logic), rather than leaving focus on an invisible
     /// sliver with no visible sign anything changed.
@@ -6767,7 +7121,7 @@ impl App {
         }
     }
 
-    /// `v` on a row with a `service` block: stops it if running, restarts
+    /// The services list can stop a running service or restart
     /// it otherwise (crashed or stopped) — the TUI's lightweight
     /// stand-in for the webui's dedicated service panel (no separate
     /// browsing view here; the tree itself, via `TreeRow::has_service` and
@@ -6775,7 +7129,7 @@ impl App {
     /// belonging to the selected node — same row-level (not per-block)
     /// granularity `has_service`/the glyph already use. No-op for a row
     /// with no active service to act on.
-    /// `v` — opens the services list view (every service this process
+    /// `s` — opens the services list view (every service this process
     /// knows about at once, not scoped to the selected node), or reports
     /// there's nothing to show yet. See `ServicesViewState`.
     async fn open_services_view(&mut self) {
@@ -7437,7 +7791,7 @@ impl App {
     /// (`POST /api/session/reset`: every block's "already ran, still fresh"
     /// record, `AppState::session_runs`, the thing that lets a chain run skip
     /// re-running an unchanged dependency, plus its own copy of submitted
-    /// form values). Without that second half `S` looked like it reset the
+    /// form values). Without that second half session reset looked like it reset the
     /// session but the next `r` still skipped every dependency the worker
     /// thought fresh. Never touches the canvas file itself or any persisted
     /// `<!-- meshfox:output ... -->` cache. See TODO.canvas.md: "Сброс
@@ -8541,26 +8895,28 @@ impl App {
         self.apply_table_view(view);
     }
 
-    fn copy_table_cell(&mut self) {
-        let Some(tm) = self.table_mode.as_mut() else {
+    async fn copy_table_cell(&mut self) {
+        let Some(tm) = self.table_mode.as_ref() else {
             return;
         };
         let value = self.tables.get(&tm.node_id).and_then(|d| {
             let col = d.columns().get(tm.cursor_col)?;
             d.row(tm.cursor_row)?.get(col.index).cloned()
         });
-        tm.notice = Some(match value {
-            None => "nothing to copy yet".to_string(),
-            Some(v) => match table::copy_to_clipboard(v.as_deref().unwrap_or("")) {
-                Ok(()) => "copied the cell to the clipboard".to_string(),
-                Err(e) => format!("copy failed: {e}"),
-            },
-        });
+        if let Some(value) = value {
+            self.deliver_copy(value.unwrap_or_default(), self.clipboard_method)
+                .await;
+            if let Some(tm) = &mut self.table_mode {
+                tm.notice = Some(self.status.clone());
+            }
+        } else if let Some(tm) = &mut self.table_mode {
+            tm.notice = Some("nothing to copy yet".into());
+        }
     }
 
     /// Keys in the full-screen table. A prompt (`/`, `f`) claims every key
     /// until Enter applies it or Esc drops it.
-    fn on_table_key(&mut self, key: KeyEvent) {
+    async fn on_table_key(&mut self, key: KeyEvent) {
         let Some(tm) = self.table_mode.as_mut() else {
             return;
         };
@@ -8662,7 +9018,7 @@ impl App {
                 }
             }
             KeyCode::Enter => tm.show_cell = true,
-            KeyCode::Char('y') => self.copy_table_cell(),
+            KeyCode::Char('y') => self.copy_table_cell().await,
             _ => {}
         }
     }
@@ -8712,6 +9068,156 @@ impl App {
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    #[tokio::test]
+    async fn fullscreen_roundtrip_preserves_temporary_console_expansion() {
+        let mut app = app_with_blocks("console-fullscreen-peek", "").await;
+        let console = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for exit in [key(KeyCode::Tab), key(KeyCode::BackTab), console] {
+            app.set_focus(Focus::Tree);
+            app.console_collapsed = true;
+            app.on_key(console).await;
+            assert_eq!(app.auto_expanded_pane, Some(Focus::Output));
+            app.on_key(key(KeyCode::Char('f'))).await;
+            assert_eq!(app.fullscreen, Some(Focus::Output));
+            app.on_key(key(KeyCode::Char('f'))).await;
+            assert_eq!(app.fullscreen, None);
+            app.on_key(exit).await;
+            assert!(
+                app.console_collapsed,
+                "fullscreen must not pin a temporarily opened console"
+            );
+        }
+        app.set_focus(Focus::Tree);
+        app.expand_pane(Focus::Output);
+        app.on_key(console).await;
+        app.on_key(key(KeyCode::Char('f'))).await;
+        app.on_key(key(KeyCode::Char('f'))).await;
+        app.on_key(key(KeyCode::Tab)).await;
+        assert!(
+            !app.console_collapsed,
+            "an explicitly opened console stays open"
+        );
+    }
+
+    #[tokio::test]
+    async fn tab_skips_console_and_ctrl_w_peeks_then_restores_focus() {
+        let mut app = app_with_blocks("console-focus", "").await;
+        app.console_collapsed = true;
+        for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Tab, KeyCode::Tab] {
+            let previous = app.focus;
+            app.on_key(key(code)).await;
+            assert_eq!(
+                app.focus,
+                if previous == Focus::Tree {
+                    Focus::Document
+                } else {
+                    Focus::Tree
+                }
+            );
+            assert!(app.console_collapsed);
+        }
+        let console = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        for origin in [Focus::Tree, Focus::Document] {
+            app.set_focus(origin);
+            app.on_key(console).await;
+            assert_eq!(app.focus, Focus::Output);
+            assert!(!app.console_collapsed);
+            app.on_key(console).await;
+            assert_eq!(app.focus, origin);
+            assert!(app.console_collapsed);
+        }
+        app.on_key(console).await;
+        app.on_key(key(KeyCode::Tab)).await;
+        assert_eq!(app.focus, Focus::Document);
+        assert!(app.console_collapsed);
+        app.on_key(console).await;
+        app.on_key(key(KeyCode::BackTab)).await;
+        assert_eq!(app.focus, Focus::Tree);
+        assert!(app.console_collapsed);
+        app.set_focus(Focus::Document);
+        app.copy_document_area = Rect::new(1, 1, 20, 4);
+        app.begin_text_selection();
+        assert!(app.text_selection.is_some());
+        app.on_key(console).await;
+        assert!(app.text_selection.is_none());
+        assert_eq!(app.focus, Focus::Output);
+    }
+
+    #[tokio::test]
+    async fn console_focus_follows_fullscreen_and_palette_uses_the_same_action() {
+        let mut app = app_with_blocks("console-fullscreen", "").await;
+        app.fullscreen = Some(Focus::Tree);
+        app.run_palette_request(super::super::palette::Request {
+            id: super::super::palette::CommandId::FocusConsole,
+            text: None,
+        })
+        .await;
+        assert_eq!(app.focus, Focus::Output);
+        assert_eq!(app.fullscreen, Some(Focus::Output));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.fullscreen, Some(Focus::Tree));
+        app.on_key(key(KeyCode::Tab)).await;
+        assert_eq!(app.fullscreen, Some(Focus::Document));
+    }
+
+    #[tokio::test]
+    async fn text_selection_survives_palette_and_copies_using_an_explicit_method() {
+        let mut app = app_with_blocks("read-selection", "alpha beta gamma delta\n").await;
+        app.set_focus(Focus::Document);
+        app.doc_segments = vec![Segment::Text(vec![ratatui::text::Line::raw(
+            "alpha beta gamma delta",
+        )])];
+        app.copy_document_area = Rect::new(2, 2, 12, 4);
+        app.on_key(key(KeyCode::Char('v'))).await;
+        assert!(app.text_selection.is_some());
+        app.on_key(key(KeyCode::Char(' '))).await;
+        app.on_key(key(KeyCode::End)).await;
+        let text = app.text_selection.as_ref().unwrap().text();
+        assert_eq!(text, "alpha beta");
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await;
+        assert!(app.palette.is_some());
+        assert_eq!(app.text_selection.as_ref().unwrap().text(), text);
+        app.run_palette_request(super::super::palette::Request {
+            id: super::super::palette::CommandId::CopySelection(Some(
+                super::super::clipboard::Method::Text,
+            )),
+            text: None,
+        })
+        .await;
+        assert_eq!(app.pending_copy_text.as_deref(), Some(text.as_str()));
+        assert_eq!(
+            app.clipboard_method,
+            super::super::clipboard::Method::Terminal
+        );
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(app.text_selection.is_none());
+        app.on_key(key(KeyCode::Char('S'))).await;
+        assert!(!app.reset_session_confirm);
+        app.on_key(key(KeyCode::Char('s'))).await;
+        assert!(app.text_selection.is_none());
+        assert!(!app.reset_session_confirm);
+    }
+
+    #[tokio::test]
+    async fn output_selection_keeps_its_snapshot_during_live_updates() {
+        let mut app = app_with_blocks("output-selection", "").await;
+        app.set_focus(Focus::Output);
+        app.copy_output_area = Rect::new(0, 0, 10, 4);
+        app.copy_output_lines = vec![ratatui::text::Line::raw("hello world")];
+        app.begin_text_selection();
+        app.on_key(key(KeyCode::Char(' '))).await;
+        app.on_key(key(KeyCode::End)).await;
+        app.copy_output_lines
+            .push(ratatui::text::Line::raw("new output"));
+        assert_eq!(app.text_selection.as_ref().unwrap().text(), "hello world");
+        app.on_key(key(KeyCode::Esc)).await;
+        app.begin_text_selection();
+        assert_eq!(app.text_selection.as_ref().unwrap().rows.len(), 2);
+    }
 
     #[tokio::test]
     async fn malformed_number_can_be_corrected_in_both_forms() {
@@ -9937,7 +10443,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The bug this guards: `S` in a worker-routed TUI only cleared the TUI's
+    // The bug this guards: session reset in a worker-routed TUI only cleared the TUI's
     // own state, so the worker still considered every dependency fresh and
     // the next `r` ran only the block itself.
     #[tokio::test]
@@ -9958,7 +10464,11 @@ mod tests {
         let (port, request) = stub_worker().await;
         app.worker_port = Some(port);
 
-        app.on_key(key(KeyCode::Char('S'))).await;
+        app.run_palette_request(super::super::palette::Request {
+            id: super::super::palette::CommandId::ResetSession,
+            text: None,
+        })
+        .await;
         app.on_key(key(KeyCode::Char('y'))).await;
 
         assert_eq!(request.await.unwrap(), "POST /api/session/reset HTTP/1.1");
@@ -11169,7 +11679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s_key_only_resets_the_session_after_confirming() {
+    async fn palette_only_resets_the_session_after_confirming() {
         let dir = std::env::temp_dir().join(format!(
             "meshfox-tui-reset-session-confirm-test-{}",
             uuid_like()
@@ -11187,7 +11697,11 @@ mod tests {
             .insert("greeting".to_string(), "hi".to_string());
 
         // `S` alone opens the prompt — doesn't clear anything yet.
-        app.on_key(key(KeyCode::Char('S'))).await;
+        app.run_palette_request(super::super::palette::Request {
+            id: super::super::palette::CommandId::ResetSession,
+            text: None,
+        })
+        .await;
         assert!(app.reset_session_confirm);
         assert!(!app.session_vars.is_empty());
 
@@ -11196,8 +11710,12 @@ mod tests {
         assert!(!app.reset_session_confirm);
         assert!(!app.session_vars.is_empty());
 
-        // `S` then `y` actually resets.
-        app.on_key(key(KeyCode::Char('S'))).await;
+        // Choosing Reset session then `y` actually resets.
+        app.run_palette_request(super::super::palette::Request {
+            id: super::super::palette::CommandId::ResetSession,
+            text: None,
+        })
+        .await;
         app.on_key(key(KeyCode::Char('y'))).await;
         assert!(!app.reset_session_confirm);
         assert!(app.session_vars.is_empty());

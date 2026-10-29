@@ -11,6 +11,7 @@
 
 mod ansi;
 mod app;
+mod clipboard;
 mod date_picker;
 mod document_layout;
 mod external_editor;
@@ -21,6 +22,7 @@ mod open_file;
 mod palette;
 mod path_picker;
 mod search;
+mod selection;
 mod source_diff;
 mod source_editor;
 mod spatial;
@@ -466,6 +468,14 @@ async fn main_loop(
             return Ok(());
         }
 
+        if let Some(text) = app.pending_copy_text.take() {
+            show_copy_text(terminal, input_paused, &text).await?;
+            if let Some(selection) = &mut app.text_selection {
+                selection.flash_copy(std::time::Instant::now());
+            }
+            continue;
+        }
+
         // A run just ended (or the TUI just started): pick up the worker's
         // record of it now, then redraw, instead of waiting for the tick.
         if app.refresh_runs_soon {
@@ -553,7 +563,11 @@ async fn main_loop(
         // 10-frame cycle a little over a second per rotation, and is cheap
         // enough to run for however long a run takes.
         let spinner_active = app.spinner_active();
+        let copy_flash_until = app.text_selection.as_ref().and_then(|s| s.copy_flash_until);
         tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(copy_flash_until.unwrap_or_else(std::time::Instant::now))), if copy_flash_until.is_some() => {
+                if let Some(selection)=&mut app.text_selection {selection.copy_flash_until=None;}
+            }
             maybe_ev = input_rx.recv() => {
                 match maybe_ev {
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => app.on_key(key).await,
@@ -649,6 +663,55 @@ async fn run_child_canvas_handoff(
     watcher.abort();
     terminal.clear()?;
     result
+}
+
+/// Print to the terminal's ordinary screen/scrollback with mouse reporting
+/// disabled, then suspend until Enter/Esc. No redraw can disturb selection.
+async fn show_copy_text(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    input_paused: &Arc<AtomicBool>,
+    text: &str,
+) -> io::Result<()> {
+    hand_terminal_over(terminal, input_paused, async {
+        use std::io::Write;
+        enable_raw_mode()?;
+        {
+            let mut out = io::stdout().lock();
+            write!(
+                out,
+                "\r\n── Copy text · select with your terminal ──\r\n\r\n"
+            )?;
+            // Text can contain literal control characters in a code fence.
+            // Never let plain-copy output execute terminal escape sequences.
+            for c in text.chars() {
+                match c {
+                    '\n' => write!(out, "\r\n")?,
+                    '\t' => write!(out, "\t")?,
+                    c if !c.is_control() => write!(out, "{c}")?,
+                    _ => {}
+                }
+            }
+            write!(out, "\r\n\r\n── Enter / Esc: return to TUI ──\r\n")?;
+            out.flush()?;
+        }
+        tokio::task::spawn_blocking(|| -> io::Result<()> {
+            loop {
+                if let Event::Key(key) = crossterm::event::read()? {
+                    if key.kind == KeyEventKind::Press
+                        && matches!(
+                            key.code,
+                            crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Esc
+                        )
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
+    })
+    .await?
 }
 
 /// Hands the real terminal to the user's editor and takes it back. Raw mode

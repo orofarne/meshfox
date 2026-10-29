@@ -928,18 +928,6 @@ fn draw_cell_popup(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMode) 
     }
 }
 
-/// Copies `text` to the terminal's clipboard with the OSC 52 escape — the
-/// one clipboard route that works over ssh and needs no extra dependency
-/// (terminals that don't support it just ignore it).
-pub fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
-    use base64::Engine;
-    use std::io::Write;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let mut out = std::io::stdout();
-    write!(out, "\x1b]52;c;{encoded}\x07")?;
-    out.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1553,8 +1553,8 @@ alive or not.
   is that it survives a page reload.
 - **TUI** (`meshfox tui`) — a node with a `service` block shows a small
   dot next to its title: white when idle, a smoothly pulsing green while
-  running, red if crashed. `v`, with that node selected, stops it if
-  running or restarts it otherwise; the footer shows a running/crashed
+  running, red if crashed. `s` opens the services list; inside it, `s`
+  stops the selected service and `r` restarts it. The footer shows a running/crashed
   count. Quitting the TUI (`q`/Esc) stops every service it owns first —
   unlike the web UI, there's no separate long-lived server behind a TUI
   session for a service to keep being tracked by once it ends.
@@ -3194,11 +3194,34 @@ Typing fuzzy-filters the commands (case-insensitive subsequence, tighter
 matches first); Up/Down moves, Enter chooses, Esc steps back and then closes.
 Each command shows the key that does the same thing, if there is one.
 
+In the main TUI view, Tab/Shift+Tab switch only between Tree and Document.
+Ctrl+W focuses Output, temporarily expanding it if collapsed; repeating Ctrl+W
+returns to the previous pane. From Output, Tab goes to Document and Shift+Tab
+to Tree. Fullscreen follows the focused pane. The palette offers the same
+console action. Forms and dialogs retain their own Tab navigation.
+
+Read-mode text selection in Document and Output uses `v` to show a cursor.
+Arrows/hjkl, Home/End and PageUp/PageDown move it without selecting. Space
+anchors a selection; further movement extends it, Space clears it. Shift+arrows
+can also start selecting. `y` copies, Esc exits cursor mode. Mouse drag
+selects text and double-click selects a word. Selection survives opening the
+palette and freezes its own text while incoming output continues in the
+background. Soft wraps do not become copied newlines; code-frame borders and
+gutters are excluded. Its colors come from the theme's `[editor] selection`
+and `fg` pair. `[tui] clipboard` accepts `"terminal"` (default, OSC 52),
+`"system"` (native clipboard tools on the machine running the TUI), or
+`"text"` (ordinary terminal text, mouse reporting off, Enter/Esc returns).
+The palette offers the default copy action and each explicit method for one
+invocation; there is no automatic fallback. Table-cell `y` uses the same
+setting. The services shortcut is `s`; session reset is palette-only.
+
+
 Main-view commands (not listed inside the editor) are the existing actions:
-run (with deps / only this block), kill, reset session, services, terminal
+run (with deps / only this block), kill, reset session (palette only), services (`s`), terminal
 sessions, document history, block run history, open file target, configure
 variables, edit source, search, fullscreen and collapse pane, help, quit. Each
-replays its key through the normal key handler, so the two cannot differ.
+uses the same action as its key binding where one exists. Copy and reset
+session have explicit palette actions.
 "Block statistics" and "Canvas statistics" show the report `meshfox stats`
 prints (retained journals only) in a scrollable view; both need a worker. Block
 statistics pick their block like `L` (run history): the block selected in the

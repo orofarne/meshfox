@@ -26,7 +26,7 @@ fn canvas_search_navigates_hidden_nodes_and_keeps_the_last_result_on_close() {
         .unwrap();
     session.send_keys("\x1b");
     session
-        .wait_for("tab focus", Duration::from_secs(3))
+        .wait_for("tab tree/document", Duration::from_secs(3))
         .unwrap();
     assert!(session.screen_text().contains("final-result"));
     // q must get back to the ordinary keymap after Escape.

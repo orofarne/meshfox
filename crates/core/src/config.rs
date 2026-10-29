@@ -216,6 +216,34 @@ fn server_socket_from_table(table: &toml::Table) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// How the terminal client delivers copied text. Default is OSC 52.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuiClipboard {
+    #[default]
+    Terminal,
+    System,
+    Text,
+}
+
+pub fn tui_clipboard(canvas_root: &Path) -> Result<TuiClipboard, String> {
+    tui_clipboard_from_table(&load(canvas_root))
+}
+
+fn tui_clipboard_from_table(table: &toml::Table) -> Result<TuiClipboard, String> {
+    match table.get("tui").and_then(|t| t.get("clipboard")) {
+        None => Ok(TuiClipboard::Terminal),
+        Some(toml::Value::String(s)) => match s.as_str() {
+            "terminal" => Ok(TuiClipboard::Terminal),
+            "system" => Ok(TuiClipboard::System),
+            "text" => Ok(TuiClipboard::Text),
+            _ => Err(format!(
+                "invalid tui.clipboard={s:?}; expected terminal, system, or text"
+            )),
+        },
+        Some(_) => Err("tui.clipboard must be a string: terminal, system, or text".into()),
+    }
+}
+
 /// Configured TUI graphics protocol. Environment overrides belong to the
 /// terminal client, whose environment may differ from the worker's.
 pub fn tui_image_protocol(canvas_root: &Path) -> Result<Option<String>, String> {
@@ -506,6 +534,36 @@ mod tests {
 
     fn lock_server_socket_env() -> std::sync::MutexGuard<'static, ()> {
         SERVER_SOCKET_ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn tui_clipboard_defaults_validates_and_merges() {
+        assert_eq!(
+            tui_clipboard_from_table(&toml::Table::new()).unwrap(),
+            TuiClipboard::Terminal
+        );
+        for (value, expected) in [
+            ("terminal", TuiClipboard::Terminal),
+            ("system", TuiClipboard::System),
+            ("text", TuiClipboard::Text),
+        ] {
+            let table = format!("[tui]\nclipboard = \"{value}\"").parse().unwrap();
+            assert_eq!(tui_clipboard_from_table(&table).unwrap(), expected);
+        }
+        for value in ["42", "true", "\"auto\"", "[]"] {
+            let table = format!("[tui]\nclipboard = {value}").parse().unwrap();
+            assert!(tui_clipboard_from_table(&table).is_err());
+        }
+        let mut global: toml::Table = "[tui]\nclipboard = \"system\"\ntheme = \"lightfox\""
+            .parse()
+            .unwrap();
+        let local = "[tui]\nclipboard = \"text\"".parse().unwrap();
+        deep_merge(&mut global, local);
+        assert_eq!(
+            tui_clipboard_from_table(&global).unwrap(),
+            TuiClipboard::Text
+        );
+        assert_eq!(global["tui"]["theme"].as_str(), Some("lightfox"));
     }
 
     #[test]

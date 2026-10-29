@@ -1,5 +1,5 @@
 //! TODO.canvas.md: "Мышь в панелях TUI (tree/document/output)" — the
-//! Output-pane bullet (click-to-focus, `Tab`-focus, scroll, fullscreen
+//! Output-pane bullet (click-to-focus, `Ctrl-w`-focus, scroll, fullscreen
 //! toggle). Implemented; these all pass now.
 
 use std::time::Duration;
@@ -38,24 +38,63 @@ fn clicking_inside_the_output_pane_focuses_it() {
 
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
-fn tab_cycles_focus_through_the_output_pane_too() {
+fn tab_skips_console_and_ctrl_w_focuses_it_and_returns() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SIMPLE_RUNNABLE);
-    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
-    session
-        .wait_for("Output", Duration::from_secs(5))
-        .expect("initial render");
-    let (row, col) = session.find("Output").expect("Output pane title");
-
-    // Today Tab only cycles Tree <-> Document (2 stops); once Output joins
-    // the cycle, some bounded number of Tabs must land focus on it.
-    for _ in 0..4 {
-        session.send_keys("\t");
-        std::thread::sleep(Duration::from_millis(50));
-        if session.fgcolor_at(row, col) == Some(ACCENT) {
-            return;
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 110);
+    session.wait_for("Output", Duration::from_secs(5)).unwrap();
+    let focused = |session: &TuiSession, title: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((row, col)) = session.find(title) {
+                if session.fgcolor_at(row, col) == Some(ACCENT) {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{title} should have focus\n{}",
+                session.screen_text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
+    };
+    for key in ["\t", "\t", "\x1b[Z", "\x1b[Z"] {
+        let title = "Document";
+        // Both directions now alternate exactly two main panes.
+        session.send_keys(key);
+        focused(&session, title);
+        let (row, col) = session.find("Output").unwrap();
+        assert_ne!(session.fgcolor_at(row, col), Some(ACCENT));
+        session.send_keys(key);
+        focused(&session, "canvas.canvas.md");
     }
-    panic!("Tab never focused the Output pane");
+    session.send_keys("\x17");
+    focused(&session, "Output");
+    assert!(!session.screen_text().contains("▸Output"));
+    session.send_keys("\x17");
+    focused(&session, "canvas.canvas.md");
+    session.wait_for("▸Output", Duration::from_secs(5)).unwrap();
+    session.send_keys("\t");
+    focused(&session, "Document");
+    session.send_keys("\x17");
+    focused(&session, "Output");
+    session.send_keys("ff\t");
+    focused(&session, "Document");
+    session.wait_for("▸Output", Duration::from_secs(5)).unwrap();
+    session.send_keys("\x17");
+    focused(&session, "Output");
+    session.send_keys("\x17");
+    focused(&session, "Document");
+    session.send_keys("\x10");
+    session
+        .wait_for("Commands", Duration::from_secs(5))
+        .unwrap();
+    session.send_keys("focus console\r");
+    focused(&session, "Output");
+    session.send_keys("\x17");
+    focused(&session, "Document");
+    session.send_keys("q");
+    assert!(session.wait_for_exit(Duration::from_secs(5)));
 }
 
 #[test]

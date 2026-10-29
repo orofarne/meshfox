@@ -230,6 +230,14 @@ impl TuiSession {
         }
     }
 
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.parser.lock().unwrap().screen().cursor_position()
+    }
+
+    pub fn raw_output(&self) -> Vec<u8> {
+        self.raw.lock().unwrap().clone()
+    }
+
     pub fn clear_raw(&self) {
         self.raw.lock().unwrap().clear();
     }

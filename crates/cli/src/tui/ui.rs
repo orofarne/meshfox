@@ -401,11 +401,27 @@ fn render_screen(f: &mut Frame, app: &mut App) {
         None => {
             render_tree(f, layout.tree, app);
             render_document(f, layout.document, app);
-            render_output(f, layout.output, &*app);
+            render_output(f, layout.output, app);
         }
         Some(Focus::Tree) => render_tree(f, layout.tree, app),
         Some(Focus::Document) => render_document(f, layout.document, app),
-        Some(Focus::Output) => render_output(f, layout.output, &*app),
+        Some(Focus::Output) => render_output(f, layout.output, app),
+    }
+    if let Some(selection) = &app.text_selection {
+        let area = match selection.pane {
+            Focus::Document => app.copy_document_area,
+            _ => app.copy_output_area,
+        };
+        if area == selection.area {
+            selection.render(f);
+            if app.palette.is_none() {
+                if let Some(position) = selection.cursor_position() {
+                    f.set_cursor_position(position);
+                }
+            }
+        } else {
+            app.text_selection = None;
+        }
     }
     render_footer(f, layout.footer, &*app);
     if app.search.open {
@@ -1256,6 +1272,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
         .title(fullscreen_icon_title(app, Focus::Document));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.copy_document_area = inner;
 
     app.doc_click_targets.clear();
     if inner.height == 0 || inner.width == 0 {
@@ -1526,7 +1543,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn render_output(f: &mut Frame, area: Rect, app: &App) {
+fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
     let title = if !app.external_running.is_empty() {
         " Output (running) ".to_string()
     } else if let Some(run) = &app.run {
@@ -1543,6 +1560,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         " Output ".to_string()
     };
 
+    app.copy_output_area = Rect::default();
     if app.console_collapsed {
         // A 1-row strip (see `compute_layout`) — no border (there's no room
         // for one plus content), just the same title text a click here
@@ -1567,6 +1585,7 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         .title(fullscreen_icon_title(app, Focus::Output));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    app.copy_output_area = inner;
 
     // The plain `==>`/exit-code transcript, always shown as-is — plus, once
     // a step whose own block declared `output="markdown"` is done, that
@@ -1631,6 +1650,8 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
         let scroll = (app.output_scroll as usize).min(max_scroll);
         let end = lines.len() - scroll;
         let start = end.saturating_sub(take);
+        app.copy_output_lines = lines.clone();
+        app.copy_output_top = start;
         Text::from(lines[start..end].to_vec())
     } else if !app.status.is_empty() {
         Text::from(Line::from(Span::styled(
@@ -1643,6 +1664,14 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(super::theme::muted()),
         )))
     };
+    if app.run.is_none() && app.external_console_lines.is_empty() {
+        app.copy_output_lines = text
+            .lines
+            .iter()
+            .map(|l| Line::raw(l.to_string()))
+            .collect();
+        app.copy_output_top = 0;
+    }
     // `output_hscroll` counts columns scrolled right (see its own doc
     // comment) — clamped here against the *currently visible* lines' own
     // longest width, same "state is unclamped, rendering clamps"
@@ -1650,24 +1679,50 @@ fn render_output(f: &mut Frame, area: Rect, app: &App) {
     // can't go past a line's own last column.
     let max_hscroll = (text.width() as u16).saturating_sub(inner.width);
     let hscroll = app.output_hscroll.min(max_hscroll);
+    app.copy_output_left = hscroll;
     f.render_widget(Paragraph::new(text).scroll((0, hscroll)), inner);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(selection) = &app.text_selection {
+        let mode = if selection.selecting {
+            "SELECT"
+        } else {
+            "CURSOR"
+        };
+        let hint = selection
+            .notice
+            .as_ref()
+            .map(|s| format!("{mode} · {s} · Space new selection · Esc exit"))
+            .unwrap_or_else(|| {
+                if selection.selecting {
+                    "SELECT · arrows extend · Space clear · y copy · Ctrl-p method · Esc exit"
+                        .into()
+                } else {
+                    "CURSOR · arrows/hjkl move · Space select · Shift+arrows select · Esc exit"
+                        .into()
+                }
+            });
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(super::theme::accent())),
+            area,
+        );
+        return;
+    }
     let mut hint = String::from(
-        "tab focus · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand/follow link · h/l collapse/expand · r run · R run (no deps) · K kill · e edit",
+        "tab tree/document · Ctrl-w console · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand/follow link · h/l collapse/expand · r run · R run (no deps) · K kill · e edit · v select",
     );
     if app.focus == Focus::Document {
         hint = if let Some(addr) = &app.selected_block {
             if let Some(label) = app.render_block_label(addr) {
-                format!("render: {label} · [/] select · Enter/c source · Esc clear · j/k scroll · tab focus")
+                format!("render: {label} · [/] select · Enter/c source · Esc clear · j/k scroll · v select text · tab tree/document · Ctrl-w console")
             } else if app.is_button_block(addr) {
-                format!("button: {} · Enter/r run chain · R run without deps · [/] select · Esc clear · tab focus", addr.block_name)
+                format!("button: {} · Enter/r run chain · R run without deps · [/] select · Esc clear · tab tree/document · Ctrl-w console", addr.block_name)
             } else {
-                format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · tab focus", addr.block_name)
+                format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · v select text · tab tree/document · Ctrl-w console", addr.block_name)
             }
         } else {
-            "[/] select block · r run · R run (no deps) · L history · j/k scroll · tab focus".into()
+            "[/] select block · r run · R run (no deps) · L history · j/k scroll · v select text · tab tree/document · Ctrl-w console".into()
         };
     }
     if spatial::active_spatial_parent(app).is_some() {
@@ -1685,7 +1740,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         hint.push_str(" · c configure");
     }
     if app.service_stats.is_some() {
-        hint.push_str(" · v services");
+        hint.push_str(" · s services");
     }
     if app.worker_port.is_some() {
         hint.push_str(" · t live terminals · H history · L run history");
@@ -2467,7 +2522,7 @@ fn render_block_picker(f: &mut Frame, area: Rect, bp: &super::app::BlockPickerSt
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-/// The `S` (reset session) confirm prompt — see `App::reset_session_confirm`
+/// The palette's reset-session confirm prompt — see `App::reset_session_confirm`
 /// and `App::on_reset_session_confirm_key`. Fixed size rather than
 /// `render_block_picker`/`render_var_form`'s content-driven height (`bp
 /// .blocks.len()`/`vf.decls.len()`) since this has no list to size around,
@@ -2539,7 +2594,7 @@ fn render_service_conflict(f: &mut Frame, area: Rect, conflict: &ServiceConflict
     );
 }
 
-/// The `v` services list view (`App::services_view`) — every `service`
+/// The `s` services list view (`App::services_view`) — every `service`
 /// this process knows about at once, sorted the same stable
 /// `(node_id, block_name)` order `App::sorted_service_keys` uses so the
 /// selected row stays put between frames. **Experimental**, see SPEC.md's
@@ -3018,8 +3073,9 @@ fn render_run_history_view(f: &mut Frame, area: Rect, rv: &super::app::RunHistor
 
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let mut items = vec![
-        "tab             cycle focus: tree -> document -> output -> tree",
-        "                (shift-tab: reverse)",
+        "tab / shift-tab switch focus between tree and document",
+        "ctrl-w          focus console; repeat to return to the previous pane",
+        "                opens a collapsed console while focused",
         "arrows / hjkl   move in spatial view",
         "esc / backspace fold spatial group",
         "j / k           select tree / scroll panes",
@@ -3041,8 +3097,12 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "                shrink it back (esc also shrinks it back)",
         "z               collapse/expand the focused Tree/Output pane — same",
         "                as clicking its title bar or collapsed handle",
-        "S               reset session — forget which blocks already ran,",
-        "                so the next chain run re-runs every dependency",
+        "v               text cursor in Document/Output; arrows/hjkl move",
+        "                Space starts/clears selection; Shift+arrows starts it",
+        "                Home/End, PgUp/PgDn move; y copy; Esc exit",
+        "mouse drag      select text; double-click selects a word",
+        "ctrl-p copy     copy via terminal/system, or show plain text",
+        "ctrl-p reset    reset session — forget which blocks already ran",
         "e               edit this node's own file, full-screen (Ctrl-s save,",
         "                Ctrl-f switch file, Ctrl-n heading->node, Ctrl-Space",
         "                suggest attributes/tags, Ctrl-g Unicode, esc close)",
@@ -3072,7 +3132,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     if app.service_stats.is_some() {
-        items.push("v               open the services list (stop/restart any of them) —");
+        items.push("s               open the services list (stop/restart any of them) —");
         items.push("                experimental, see SPEC.md's \"Service blocks (experimental)\"");
     }
     if app.worker_port.is_some() {
@@ -4102,7 +4162,7 @@ mod tests {
         let backend = TestBackend::new(40, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect::new(0, 0, 40, 20);
-        terminal.draw(|f| render_output(f, area, &app)).unwrap();
+        terminal.draw(|f| render_output(f, area, &mut app)).unwrap();
 
         let buf = terminal.backend().buffer();
         let mut screen = String::new();
@@ -4606,7 +4666,7 @@ mod tests {
     async fn render_help_wraps_a_long_line_instead_of_clipping_it() {
         let mut app = test_app().await;
         app.show_help = true;
-        let area = Rect::new(0, 0, 40, 60);
+        let area = Rect::new(0, 0, 40, 140);
         let screen = render_to_screen(area, |f| render_help(f, area, &app));
         assert!(
             screen.contains("close)"),
