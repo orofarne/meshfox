@@ -157,6 +157,10 @@ fn watch_reports_each_step_change_and_ends_with_done_and_the_chains_exit_code() 
     let (dir, canvas) = setup(
         "```sh name=slow\necho STARTED\nsleep 2\n```\n\n```sh name=after deps=slow\necho FINISHED\n```\n",
     );
+    // Start the canvas's worker first. Two CLI processes that find none both
+    // start one, and the loser's `run` fails with "could not connect to the
+    // worker" — a race of its own, not what this test is about.
+    assert!(invoke(&dir, &canvas, &["logs", "--list"]).status.success());
     let mut run = Process(
         command(&dir)
             .arg(&canvas)
@@ -168,10 +172,15 @@ fn watch_reports_each_step_change_and_ends_with_done_and_the_chains_exit_code() 
     );
     // Let the chain be admitted, then watch it from the middle.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !String::from_utf8_lossy(&invoke(&dir, &canvas, &["logs", "--list"]).stdout)
-        .contains("running")
-    {
-        assert!(Instant::now() < deadline, "the chain never started");
+    loop {
+        let listing = invoke(&dir, &canvas, &["logs", "--list"]);
+        if String::from_utf8_lossy(&listing.stdout).contains("running") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the chain never started; last `logs --list`: {listing:?}"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let output = invoke(&dir, &canvas, &["status", "--watch", "--json"]);

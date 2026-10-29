@@ -115,13 +115,19 @@ fn select_utf8_locale(mut available: impl FnMut(&str) -> bool) -> Option<&'stati
         .find(|name| available(name))
 }
 
+// The `libc` crate has no `LC_ALL_MASK` for musl; this is musl's value.
+#[cfg(target_env = "musl")]
+const LC_ALL_MASK: libc::c_int = 0x7fff_ffff;
+#[cfg(all(unix, not(target_env = "musl")))]
+const LC_ALL_MASK: libc::c_int = libc::LC_ALL_MASK;
+
 #[cfg(unix)]
 fn locale_available(name: &str) -> bool {
     let name = std::ffi::CString::new(name).expect("locale name has no NUL");
     // SAFETY: name is NUL-terminated, a null base creates an independent
     // object, and only a successfully allocated object is freed.
     unsafe {
-        let locale = libc::newlocale(libc::LC_ALL_MASK, name.as_ptr(), std::ptr::null_mut());
+        let locale = libc::newlocale(LC_ALL_MASK, name.as_ptr(), std::ptr::null_mut());
         if locale.is_null() {
             false
         } else {
@@ -226,6 +232,8 @@ mod tests {
     #[test]
     fn selected_locale_is_accepted_by_a_child_process() {
         assert!(locale_available("C"));
+        // musl's `newlocale` accepts any name: UTF-8 is its only multibyte mode.
+        #[cfg(not(target_env = "musl"))]
         assert!(!locale_available("meshfox_nonexistent_locale"));
         let Some(locale) = default_utf8_locale() else {
             return;
