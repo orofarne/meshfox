@@ -2086,20 +2086,16 @@ fn check_updates(yes: bool) {
         std::process::exit(1);
     }
 
-    let mut update = self_update::backends::github::Update::configure();
-    update
+    let result = self_update::backends::github::Update::configure()
         .repo_owner("orofarne")
         .repo_name("meshfox")
         .bin_name("meshfox")
         .bin_path_in_archive("{{ target }}/meshfox")
         .current_version(current_version)
         .no_confirm(yes)
-        .show_download_progress(true);
-    // The release is built with Alpine's rustc, whose own triple
-    // (`i586-alpine-linux-musl`) is what `self_update` would look for.
-    #[cfg(all(target_arch = "x86", target_os = "linux", target_env = "musl"))]
-    update.target("i686-unknown-linux-musl");
-    let result = update.build().and_then(|update| update.update());
+        .show_download_progress(true)
+        .build()
+        .and_then(|update| update.update());
 
     match result {
         Ok(self_update::Status::UpToDate(v)) => println!("meshfox: already up to date (v{v})"),

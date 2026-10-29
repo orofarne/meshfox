@@ -104,18 +104,13 @@ detect_target() {
     case "$arch" in
         x86_64 | amd64) arch_part="x86_64" ;;
         arm64 | aarch64) arch_part="aarch64" ;;
-        # 32-bit x86 (e.g. iSH on iOS) gets a static musl build.
-        i386 | i486 | i586 | i686)
-            arch_part="i686"
-            [ "$os" = Linux ] && os_part="unknown-linux-musl"
-            ;;
         *) err "unsupported architecture '$arch'" ;;
     esac
 
     TARGET="${arch_part}-${os_part}"
 
     case "$TARGET" in
-        x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | i686-unknown-linux-musl | x86_64-apple-darwin | aarch64-apple-darwin) ;;
+        x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | x86_64-apple-darwin | aarch64-apple-darwin) ;;
         *) err "no prebuilt binary for '$TARGET' — see https://github.com/${REPO}/releases" ;;
     esac
 }
