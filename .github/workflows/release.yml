@@ -71,7 +71,9 @@ jobs:
           # `--target` = the container's own triple, so `+crt-static` applies
           # to the binary but not to build scripts and proc-macros (a static
           # musl host can't load those). The 64-bit time_t flag matches musl
-          # 1.2+ (see the libc crate's `musl_v1_2_3`).
+          # 1.2+ (see the libc crate's `musl_v1_2_3`). meshfox-server is built
+          # at opt-level=1: at 3, rustc dies there with SIGFPE on 32-bit x86
+          # (seen under emulation; the CI run for v0.28.1 failed in this step).
           docker run --rm --platform linux/386 -v "$PWD":/src -w /src \
             -e RUST_LIBC_UNSTABLE_MUSL_V1_2_3=1 \
             -e RUSTFLAGS="-C target-feature=+crt-static" \
@@ -79,7 +81,8 @@ jobs:
             alpine:3 sh -euc '
               apk add --no-cache rust cargo rustfmt build-base perl cmake
               host="$(rustc -vV | sed -n "s/^host: //p")"
-              cargo build --locked --release -p meshfox-cli --target "$host"
+              cargo build --locked --release -p meshfox-cli --target "$host" \
+                --config "profile.release.package.meshfox-server.opt-level=1"
               mkdir -p "target/${{ matrix.target }}/release"
               cp "target/build/$host/release/meshfox" "target/${{ matrix.target }}/release/meshfox"
             '
