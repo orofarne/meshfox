@@ -376,6 +376,7 @@ enum ExternalMsg {
 /// One incremental update for a run this TUI session never itself started
 /// — see `App::on_external_run_event`, which this feeds.
 struct ExternalRunUpdate {
+    subscription_id: u64,
     node_id: String,
     block: String,
     event: crate::worker_client::SubscribeEvent,
@@ -403,10 +404,13 @@ fn spawn_run_subscriber(
     known_duration_ms: Option<u64>,
     tx: tokio::sync::mpsc::UnboundedSender<ExternalMsg>,
 ) {
+    static NEXT_SUBSCRIPTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let subscription_id = NEXT_SUBSCRIPTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::spawn(async move {
         let mut events = crate::worker_client::subscribe_run(port, node_id.clone(), block.clone());
         while let Some(event) = events.recv().await {
             let update = ExternalRunUpdate {
+                subscription_id,
                 node_id: node_id.clone(),
                 block: block.clone(),
                 event,
@@ -570,7 +574,8 @@ async fn main_loop(
                 app.on_background_msg(msg);
             }
             Some(msg) = external_run_rx.recv() => match msg {
-                ExternalMsg::Run(update) => app.on_reconciled_run_event(
+                ExternalMsg::Run(update) => app.on_subscribed_run_event(
+                    update.subscription_id,
                     BlockAddr::new(update.node_id, update.block),
                     update.event,
                     update.known_duration_ms,

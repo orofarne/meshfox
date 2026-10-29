@@ -216,7 +216,7 @@ enum Command {
         canvas: CanvasOpt,
         #[arg(long, value_enum, default_value = terminal_status::default_mode())]
         terminal_status: terminal_status::Mode,
-        /// Prefix each output line with the UTC time the core recorded it.
+        /// Prefix each output line with the local time the core recorded it.
         #[arg(long)]
         timestamps: bool,
     },

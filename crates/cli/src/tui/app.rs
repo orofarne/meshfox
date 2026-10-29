@@ -641,6 +641,8 @@ pub struct App {
     /// once that run's own `Done` arrives (`step_output` keeps the settled
     /// result, same as any other finished step).
     pub external_running: HashMap<BlockAddr, std::time::Instant>,
+    /// Passive subscriptions keep their ownership decision through their terminal event.
+    external_subscriptions: HashMap<u64, (BlockAddr, bool)>,
     /// Transcript of active runs observed through passive subscriptions.
     pub external_console_lines: Vec<String>,
     /// Whether the Output pane (the "console" — a running transcript of the
@@ -1267,6 +1269,7 @@ impl App {
             child_steps: HashMap::new(),
             displayed_invocations: HashMap::new(),
             external_running: HashMap::new(),
+            external_subscriptions: HashMap::new(),
             external_console_lines: Vec::new(),
             console_collapsed: true,
             console_last_activity: None,
@@ -5722,6 +5725,11 @@ impl App {
                 // stream announces the step. Transfer ownership of its badge
                 // along with its output to the foreground run.
                 self.external_running.remove(&addr);
+                for (subscription_addr, suppressed) in self.external_subscriptions.values_mut() {
+                    if subscription_addr == &addr {
+                        *suppressed = true;
+                    }
+                }
                 self.displayed_invocations
                     .insert(definition_addr(&addr), addr.clone());
                 run.chain.push(addr.clone());
@@ -5982,6 +5990,37 @@ impl App {
             .into_iter()
             .find(|b| b.name.as_deref() == Some(definition_addr(&addr).block_name.as_str()))
             .is_some_and(|b| b.attrs.get("output").map(String::as_str) == Some("markdown"))
+    }
+
+    /// Fold a passive replay without letting a partially ignored subscription replace foreground output.
+    pub fn on_subscribed_run_event(
+        &mut self,
+        subscription_id: u64,
+        addr: BlockAddr,
+        event: crate::worker_client::SubscribeEvent,
+        duration_ms: Option<u64>,
+    ) {
+        let done = matches!(event, crate::worker_client::SubscribeEvent::Done { .. });
+        let foreground = self
+            .run
+            .as_ref()
+            .is_some_and(|r| r.is_running() && r.chain.contains(&addr));
+        let (_, suppressed) = self
+            .external_subscriptions
+            .entry(subscription_id)
+            .or_insert_with(|| (addr.clone(), false));
+        *suppressed |= foreground;
+        let suppressed = *suppressed;
+        if done {
+            self.external_subscriptions.remove(&subscription_id);
+        }
+        // Once any part of this replay belongs to the foreground stream,
+        // discard its entire remainder, including events queued after Done.
+        // Otherwise the first late Line would clear the complete result and
+        // replace it with only the replay's tail.
+        if !suppressed {
+            self.on_reconciled_run_event(addr, event, duration_ms);
+        }
     }
 
     /// [`Self::on_external_run_event`] for a run found at startup
@@ -8917,6 +8956,137 @@ mod tests {
             "waiting\nwrote files\nwarning\n"
         );
         assert!(!app.spinner_active());
+    }
+
+    #[tokio::test]
+    async fn passive_replay_tail_after_foreground_done_preserves_complete_output() {
+        use crate::worker_client::{RunEvent, SubscribeEvent};
+        for replay_before_start in [true, false] {
+            let mut app =
+                app_with_blocks("spinner-race", "```sh name=build\necho build\n```\n").await;
+            let addr = BlockAddr::new("root", "build");
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            app.run = Some(RunState {
+                chain: Vec::new(),
+                idx: 0,
+                http_rx: Some(rx),
+                lines: Vec::new(),
+                full_output: String::new(),
+                stdout_only: String::new(),
+                stderr_only: String::new(),
+                output_markdown: false,
+                step_started: std::time::Instant::now(),
+                had_failure: false,
+                killed: false,
+                finished: false,
+            });
+            if replay_before_start {
+                app.on_subscribed_run_event(
+                    1,
+                    addr.clone(),
+                    SubscribeEvent::Line {
+                        stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                        text: "ignored replay header".into(),
+                        time_ms: None,
+                    },
+                    None,
+                );
+                assert!(app.external_running.contains_key(&addr));
+            }
+            app.on_run_event(Some(RunEvent::StepStart {
+                node_id: "root".into(),
+                block: "build".into(),
+            }))
+            .await;
+            assert!(!app.external_running.contains_key(&addr));
+            if !replay_before_start {
+                app.on_subscribed_run_event(
+                    1,
+                    addr.clone(),
+                    SubscribeEvent::Line {
+                        stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                        text: "ignored replay header".into(),
+                        time_ms: None,
+                    },
+                    None,
+                );
+                assert!(!app.external_running.contains_key(&addr));
+            }
+            assert!(app.spinner_active());
+            for (stream, text) in [
+                (meshfox_server::stream_exec::OutputStream::Stderr, "waiting"),
+                (
+                    meshfox_server::stream_exec::OutputStream::Stdout,
+                    "wrote files",
+                ),
+                (meshfox_server::stream_exec::OutputStream::Stderr, "warning"),
+            ] {
+                app.on_run_event(Some(RunEvent::Output {
+                    node_id: "root".into(),
+                    block: "build".into(),
+                    stream,
+                    text: text.into(),
+                    child: None,
+                }))
+                .await;
+            }
+            assert_eq!(
+                app.step_output[&addr].text,
+                "waiting\nwrote files\nwarning\n"
+            );
+            app.on_run_event(Some(RunEvent::StepEnd {
+                node_id: "root".into(),
+                block: "build".into(),
+                exit_code: 0,
+                duration_ms: 10,
+            }))
+            .await;
+            app.on_run_event(Some(RunEvent::Done { exit_code: 0 }))
+                .await;
+            app.on_subscribed_run_event(
+                1,
+                addr.clone(),
+                SubscribeEvent::Line {
+                    stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                    text: "late replay tail".into(),
+                    time_ms: None,
+                },
+                None,
+            );
+            app.on_subscribed_run_event(
+                1,
+                addr.clone(),
+                SubscribeEvent::Done { exit_code: Some(0) },
+                None,
+            );
+            assert!(!app.step_output[&addr].running);
+            assert_eq!(
+                app.step_output[&addr].text,
+                "waiting\nwrote files\nwarning\n"
+            );
+            assert!(!app.spinner_active());
+            assert!(app.external_subscriptions.is_empty());
+            // A later external run at the same address must still be accepted.
+            app.on_subscribed_run_event(
+                2,
+                addr.clone(),
+                SubscribeEvent::Line {
+                    stream: meshfox_server::stream_exec::OutputStream::Stdout,
+                    text: "new external run".into(),
+                    time_ms: None,
+                },
+                None,
+            );
+            app.on_subscribed_run_event(
+                2,
+                addr.clone(),
+                SubscribeEvent::Done { exit_code: Some(0) },
+                Some(42),
+            );
+            assert_eq!(app.step_output[&addr].stdout, "new external run\n");
+            assert_eq!(app.step_output[&addr].duration_ms, 42);
+            assert!(!app.spinner_active());
+        }
     }
 
     #[tokio::test]

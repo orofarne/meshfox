@@ -1720,10 +1720,13 @@ chain survive per-block history rotation and subsequent document edits.
 `--follow` replays and tails only the selected invocation, using sequence
 cursors, and ends when it completes. Ctrl-C detaches without cancellation.
 `meshfox console` instead remains attached across invocations; its
-`--timestamps` flag prefixes each output line with the UTC `HH:MM:SS.mmm` at
-which the core recorded it (`timeMs` on `/api/run/subscribe` lines), the same
-clock as the transcripts' `time` fields; lines the core has no time for
-(service logs, ledger replays) show `--:--:--.---`. All history
+`--timestamps` flag prefixes each output line with the local `HH:MM:SS.mmm` at
+which the core recorded it (`timeMs` on `/api/run/subscribe` lines, shown in
+the machine's own time zone; the transcripts' `time` fields stay UTC); lines
+the core has no time for (service logs, ledger replays) show `--:--:--.---`.
+It prints the lines it has received before it polls for runs again, so
+attaching to a run in progress shows its buffered output at once rather than
+paced by the poll. All history
 access goes through the worker API, including when a worker must be started
 just to read saved logs. Reading a failed invocation returns exit 0; missing
 history or a read failure returns nonzero. Pre-existing per-block history is

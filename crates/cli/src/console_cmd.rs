@@ -36,15 +36,16 @@ pub fn discover() -> Result<PathBuf, String> {
     }
 }
 
-/// UTC `HH:MM:SS.mmm` of a core timestamp (Unix epoch ms) — the same clock
-/// and zone as the saved run transcripts' `time` fields. A line the core
-/// recorded no time for (service logs, output replayed from the run ledger)
-/// shows placeholders.
-fn utc_clock(time_ms: Option<u64>) -> String {
+/// Local `HH:MM:SS.mmm` of a core timestamp (Unix epoch ms), in the zone this
+/// machine's clock is set to. A line the core recorded no time for (service
+/// logs, output replayed from the run ledger) shows placeholders.
+fn clock(time_ms: Option<u64>) -> String {
     let Some(ms) = time_ms else {
         return "--:--:--.---".into();
     };
-    let secs = ms / 1000 % 86_400;
+    let unix = (ms / 1000) as i64;
+    let local = unix + i64::from(meshfox_core::datevars::local_offset_seconds(unix));
+    let secs = local.rem_euclid(86_400);
     format!(
         "{:02}:{:02}:{:02}.{:03}",
         secs / 3600,
@@ -69,7 +70,7 @@ fn output(addr: &Address, text: &str, stderr: bool, timestamps: bool, time_ms: O
     );
     for line in text.lines() {
         let prefix = if timestamps {
-            format!("{} {prefix}", utc_clock(time_ms))
+            format!("{} {prefix}", clock(time_ms))
         } else {
             prefix.clone()
         };
@@ -130,13 +131,16 @@ async fn monitor(
     let mut was_active = false;
     let mut watch = api::watch(port);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // A poll can take longer than the interval (`GET /api/runs` costs about a
+    // second on a large canvas). Without this a late tick fires again at once,
+    // the loop does nothing but poll, and the output lines it has received
+    // wait their turn behind it.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Output first: lines already received are printed before the next
+        // poll starts, so a long replay is not paced by the poll.
         tokio::select! {
-            Some(event) = watch.recv() => {
-                if matches!(event, api::WatchEvent::RunStarted { .. } | api::WatchEvent::RunsChanged) {
-                    tick.reset_immediately();
-                }
-            }
+            biased;
             Some((addr, event)) = rx.recv() => {
                 match event {
                     api::SubscribeEvent::Line { stream, text, time_ms } => {
@@ -148,6 +152,11 @@ async fn monitor(
                         if exit_code != Some(0) { result = State::Failure(addr.1); }
                         else if !matches!(result, State::Failure(_)) { result = State::Completed(addr.1); }
                     }
+                }
+            }
+            Some(event) = watch.recv() => {
+                if matches!(event, api::WatchEvent::RunStarted { .. } | api::WatchEvent::RunsChanged) {
+                    tick.reset_immediately();
                 }
             }
             _ = tick.tick() => {
