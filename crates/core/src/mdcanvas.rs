@@ -89,6 +89,8 @@ pub fn split_target_fragment(target: &str) -> (&str, Option<&str>) {
 pub enum ParseError {
     #[error("document has no top-level (#) heading to serve as the root node")]
     NoRoot,
+    #[error("node {0:?}: csv-strict must be true or false on a file node with display=table")]
+    InvalidCsvStrict(String),
     #[error("document has more than one top-level (#) heading; meshfox expects exactly one root")]
     MultipleRoots,
     #[error("duplicate node id {0:?}")]
@@ -285,6 +287,7 @@ pub const NODE_ATTRS: &[&str] = &[
     "tags",
     "parent",
     "display",
+    "csv-strict",
     "lang",
     "interpreter",
     "preview",
@@ -502,6 +505,20 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             NodeType::Text => (None, None),
         };
 
+        let csv_strict = match seg.node_attrs.get("csv-strict") {
+            None => None,
+            Some(v)
+                if node_type == NodeType::File
+                    && seg.node_attrs.get("display").map(String::as_str) == Some("table") =>
+            {
+                match v.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => return Err(ParseError::InvalidCsvStrict(id.clone())),
+                }
+            }
+            Some(_) => return Err(ParseError::InvalidCsvStrict(id.clone())),
+        };
         let created_at = match seg.node_attrs.get("createdAt") {
             Some(v) if crate::timestamp::is_valid_rfc3339(v) => Some(v.clone()),
             Some(v) => {
@@ -554,6 +571,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
                     "table" => Some(FileDisplay::Table),
                     _ => None,
                 }),
+            csv_strict,
             lang: seg.node_attrs.get("lang").cloned(),
             interpreter: seg.node_attrs.get("interpreter").cloned(),
             preview: seg
@@ -766,6 +784,9 @@ fn render_node_line(canvas: &Canvas, node: &Node) -> String {
         if !d.is_link() {
             parts.push(format!("display=\"{}\"", d.as_str()));
         }
+    }
+    if let Some(strict) = node.csv_strict {
+        parts.push(format!("csv-strict=\"{strict}\""));
     }
     if let Some(l) = &node.lang {
         parts.push(format!("lang=\"{l}\""));
@@ -1081,6 +1102,7 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
         Some(_) => None, // explicitly set back to the default — omit the attribute
         None => seg.node_attrs.get("type").cloned(),
     };
+    let is_file = type_str.as_deref() == Some("file");
     if let Some(t) = type_str {
         parts.push(format!("type=\"{t}\""));
     }
@@ -1112,6 +1134,14 @@ pub fn set_node_meta(markdown: &str, node_id: &str, meta: &NodeMeta) -> Option<S
     if let Some(d) = &meta.display {
         if !d.is_link() {
             parts.push(format!("display=\"{}\"", d.as_str()));
+        }
+    }
+    // Like `parent=`, carried over rather than set via `NodeMeta` — but only
+    // while the node stays a `file` + `display="table"`: `csv-strict` on
+    // anything else doesn't parse.
+    if is_file && meta.display == Some(FileDisplay::Table) {
+        if let Some(strict) = seg.node_attrs.get("csv-strict") {
+            parts.push(format!("csv-strict=\"{strict}\""));
         }
     }
     if let Some(l) = &meta.lang {
@@ -1763,6 +1793,9 @@ fn set_node_id_attr(markdown: &str, old_id: &str, new_id: Option<&str>) -> Optio
     }
     if let Some(d) = seg.node_attrs.get("display") {
         parts.push(format!("display=\"{d}\""));
+    }
+    if let Some(strict) = seg.node_attrs.get("csv-strict") {
+        parts.push(format!("csv-strict=\"{strict}\""));
     }
     if let Some(l) = seg.node_attrs.get("lang") {
         parts.push(format!("lang=\"{l}\""));
@@ -4260,6 +4293,51 @@ Reused from Tests as well.
         assert!(rendered.contains("display=\"code\""));
         assert!(rendered.contains("lang=\"rust\""));
         assert_eq!(parse(&rendered).unwrap(), c);
+    }
+
+    #[test]
+    fn csv_strict_is_explicit_validated_and_preserved_by_edits() {
+        let doc = "# Root\n\n## Data\n<!-- meshfox:node id=\"data\" type=\"file\" display=\"table\" csv-strict=\"false\" -->\n\n[data](./data.csv)\n";
+        let canvas = parse(doc).unwrap();
+        assert_eq!(canvas.node("data").unwrap().csv_strict, Some(false));
+        assert_eq!(parse(&render(&canvas)).unwrap(), canvas);
+        assert_eq!(unknown_node_edge_attr(doc), None);
+        let edited = set_node_meta(
+            doc,
+            "data",
+            &NodeMeta::from_node(canvas.node("data").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            parse(&edited).unwrap().node("data").unwrap().csv_strict,
+            Some(false)
+        );
+        // Leaving table mode drops the attribute instead of corrupting the line.
+        let mut meta = NodeMeta::from_node(canvas.node("data").unwrap());
+        meta.display = Some(FileDisplay::Code);
+        let edited = set_node_meta(doc, "data", &meta).unwrap();
+        assert!(!edited.contains("csv-strict"), "{edited}");
+        assert_eq!(
+            parse(&edited).unwrap().node("data").unwrap().csv_strict,
+            None
+        );
+        for invalid in [
+            doc.replace("csv-strict=\"false\"", "csv-strict=\"no\""),
+            doc.replace("display=\"table\"", "display=\"code\""),
+        ] {
+            assert!(matches!(
+                parse(&invalid),
+                Err(ParseError::InvalidCsvStrict(_))
+            ));
+        }
+        assert_eq!(
+            parse(&doc.replace(" csv-strict=\"false\"", ""))
+                .unwrap()
+                .node("data")
+                .unwrap()
+                .csv_strict,
+            None
+        );
     }
 
     #[test]

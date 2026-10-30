@@ -1228,6 +1228,12 @@ one to try, and turns it into Parquet (read in place, no import) with `duckdb`
 itself. Any format the `duckdb` command-line tool reads works, `.csv.gz`
 included.
 
+CSV/TSV previews use strict dialect validation by default. For an export with
+mixed CRLF/LF line endings, set `csv-strict="false"` on that particular
+`meshfox:node type="file" display="table"` comment. This setting applies
+only to that node's preview, does not skip error rows, and does not change
+how runnable import blocks read the file.
+
 It needs that `duckdb` executable on `PATH` (or `duckdb_path` under `[tables]`
 in the config above): meshfox never installs it, and a table node without it
 says so rather than showing anything. The table is read-only — edit the file

@@ -466,6 +466,7 @@ pub fn build_document_for_static_export(
         target: None,
         caption: None,
         display: None,
+        csv_strict: None,
         lang: None,
         interpreter: None,
         preview: false,

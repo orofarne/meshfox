@@ -303,6 +303,9 @@ pub struct Node {
     /// of the target file's own content. `None` for every other node type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<FileDisplay>,
+    /// CSV table dialect validation; omitted means strict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csv_strict: Option<bool>,
     /// `file`-node only: language hint for the `display="code"` preview's
     /// syntax highlighting (e.g. `"rust"`). `None` means auto-detect from
     /// the target's file extension.

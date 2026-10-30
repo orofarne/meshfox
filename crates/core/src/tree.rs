@@ -146,6 +146,7 @@ mod tests {
             target: None,
             caption: None,
             display: None,
+            csv_strict: None,
             lang: None,
             interpreter: None,
             preview: false,

@@ -33,6 +33,10 @@ const SCHEMA_SQL: &str = "
         name  TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS session_paths (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 ";
 
 /// One `session_runs` row — the plain-data twin of `crate::SessionRun`.
@@ -173,12 +177,40 @@ impl SessionStore {
             .map_err(sqlite_err)
     }
 
+    /// Last confirmed path selections, for display only (never run inputs).
+    pub fn save_path(&self, name: &str, value: &str) -> io::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO session_paths (name, value) VALUES (?1, ?2) \
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+                params![name, value],
+            )
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn load_paths(&self) -> io::Result<HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name, value FROM session_paths")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(sqlite_err)?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(sqlite_err)
+    }
+
     /// Forgets everything stored — `reset_session`'s persistent half.
     pub fn clear(&self) -> io::Result<()> {
         self.conn
             .lock()
             .unwrap()
-            .execute_batch("DELETE FROM session_runs; DELETE FROM session_vars;")
+            .execute_batch(
+                "DELETE FROM session_runs; DELETE FROM session_vars; DELETE FROM session_paths;",
+            )
             .map_err(sqlite_err)
     }
 }
@@ -233,11 +265,17 @@ mod tests {
     }
 
     #[test]
-    fn vars_round_trip_and_clear_wipes_both_tables() {
+    fn vars_and_paths_round_trip_and_clear_wipes_all_tables() {
         let store = SessionStore::open_in_memory(1024).unwrap();
         store.save_var("A", "1").unwrap();
         store.save_var("A", "2").unwrap();
         store.save_run(&run("x")).unwrap();
+        store.save_path("IN", "/first.csv").unwrap();
+        store.save_path("IN", "/second.csv").unwrap();
+        assert_eq!(
+            store.load_paths().unwrap(),
+            HashMap::from([("IN".into(), "/second.csv".into())])
+        );
         assert_eq!(
             store.load_vars().unwrap(),
             HashMap::from([("A".to_string(), "2".to_string())])
@@ -245,5 +283,6 @@ mod tests {
         store.clear().unwrap();
         assert!(store.load_vars().unwrap().is_empty());
         assert!(store.load_runs().unwrap().is_empty());
+        assert!(store.load_paths().unwrap().is_empty());
     }
 }

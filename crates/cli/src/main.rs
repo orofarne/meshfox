@@ -2350,7 +2350,7 @@ fn validate_document_rules(canvas: &Canvas, raw: &str) -> Result<(), String> {
     // acyclic.
     meshfox_core::validate_var_refs(canvas).map_err(|e| e.to_string())?;
     // A node-scoped `meshfox:var` (declared outside root) is only visible
-    // to `env=` inside its own subtree — same lenient-at-runtime,
+    // to block references and path targets inside its own subtree — same lenient-at-runtime,
     // strict-at-`validate` split as every check above.
     meshfox_core::validate_var_scope(canvas).map_err(|e| e.to_string())?;
     // Same idea for `meshfox:option` (unique name, declared in the root)

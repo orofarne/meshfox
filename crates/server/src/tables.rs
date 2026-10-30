@@ -283,14 +283,24 @@ fn effective_extension(path: &Path) -> String {
 /// The DuckDB table function reading `path`, and whether the result is
 /// imported (CSV-like, JSON) or just viewed (Parquet). `all_varchar` is the
 /// CSV retry when type inference over the sample guessed wrong.
-fn reader_sql(path: &Path, all_varchar: bool) -> Result<(String, Source), String> {
+fn reader_sql(
+    path: &Path,
+    all_varchar: bool,
+    csv_strict: bool,
+) -> Result<(String, Source), String> {
     let lit = sql_path(path)?;
     Ok(match effective_extension(path).as_str() {
         "parquet" | "parq" => (format!("read_parquet({lit})"), Source::View),
         "json" | "jsonl" | "ndjson" => (format!("read_json_auto({lit})"), Source::Table),
         _ => (
             format!(
-                "read_csv({lit}, null_padding=true{})",
+                "read_csv({lit}, null_padding=true{}{})",
+                // Only spelled out when relaxed: `strict_mode` needs DuckDB 1.1+.
+                if csv_strict {
+                    ""
+                } else {
+                    ", strict_mode=false"
+                },
                 if all_varchar {
                     ", all_varchar=true"
                 } else {
@@ -776,6 +786,7 @@ pub struct Session {
     key: String,
     source: PathBuf,
     kind: Source,
+    csv_strict: bool,
     dir: PathBuf,
     duckdb: PathBuf,
     max_bytes: u64,
@@ -904,6 +915,15 @@ impl TableManager {
     /// canvas directory. `Err(TableError::Unavailable(..))` is an expected
     /// condition the UI reports in place (DuckDB missing, no cache dir).
     pub async fn session(&self, node_id: &str, source: &Path) -> Result<Arc<Session>, TableError> {
+        self.session_with_csv_strict(node_id, source, true).await
+    }
+
+    pub async fn session_with_csv_strict(
+        &self,
+        node_id: &str,
+        source: &Path,
+        csv_strict: bool,
+    ) -> Result<Arc<Session>, TableError> {
         let meta = std::fs::metadata(source)
             .map_err(|e| TableError::Target(format!("{}: {e}", source.display())))?;
         if !meta.is_file() {
@@ -920,7 +940,15 @@ impl TableManager {
         let mtime_ns = mtime.map(|d| d.as_nanos()).unwrap_or(0);
         let key = format!(
             "{:016x}",
-            fnv1a64(format!("{}\0{}\0{}", source.display(), meta.len(), mtime_ns).as_bytes())
+            fnv1a64(
+                format!(
+                    "{}\0{}\0{}\0{csv_strict}",
+                    source.display(),
+                    meta.len(),
+                    mtime_ns
+                )
+                .as_bytes()
+            )
         );
 
         let mut sessions = self.sessions.lock().await;
@@ -947,11 +975,12 @@ impl TableManager {
             ))
         })?;
         touch(&dir);
-        let (_, kind) = reader_sql(source, false).map_err(TableError::BadRequest)?;
+        let (_, kind) = reader_sql(source, false, csv_strict).map_err(TableError::BadRequest)?;
         let session = Arc::new(Session {
             key,
             source: source.to_path_buf(),
             kind,
+            csv_strict,
             dir,
             duckdb,
             max_bytes: self.max_bytes(),
@@ -975,7 +1004,19 @@ impl TableManager {
     /// condition — those come back as `state: failed` with an error the UI
     /// shows in place.
     pub async fn meta(&self, node_id: &str, source: &Path) -> Result<TableMeta, TableError> {
-        match self.session(node_id, source).await {
+        self.meta_with_csv_strict(node_id, source, true).await
+    }
+
+    pub async fn meta_with_csv_strict(
+        &self,
+        node_id: &str,
+        source: &Path,
+        csv_strict: bool,
+    ) -> Result<TableMeta, TableError> {
+        match self
+            .session_with_csv_strict(node_id, source, csv_strict)
+            .await
+        {
             Ok(s) => Ok(s.meta().await),
             Err(TableError::Unavailable(failure)) => {
                 let (file_size, mtime_ms) = std::fs::metadata(source)
@@ -1110,7 +1151,7 @@ impl Session {
 
         match self.kind {
             Source::View => {
-                let (reader, _) = reader_sql(&self.source, false).map_err(fail)?;
+                let (reader, _) = reader_sql(&self.source, false, self.csv_strict).map_err(fail)?;
                 proc.exec(
                     &format!("CREATE OR REPLACE VIEW t AS SELECT * FROM {reader};"),
                     QUERY_TIMEOUT,
@@ -1132,7 +1173,8 @@ impl Session {
                 if !exists {
                     // No timeout worth the name: importing is as long as the file is.
                     let long = Duration::from_secs(60 * 60 * 24);
-                    let (reader, _) = reader_sql(&self.source, false).map_err(fail)?;
+                    let (reader, _) =
+                        reader_sql(&self.source, false, self.csv_strict).map_err(fail)?;
                     let first = proc
                         .exec(&format!("CREATE TABLE t AS SELECT * FROM {reader};"), long)
                         .await;
@@ -1142,7 +1184,8 @@ impl Session {
                         if proc.dead {
                             return Err(fail(first_err));
                         }
-                        let (reader, _) = reader_sql(&self.source, true).map_err(fail)?;
+                        let (reader, _) =
+                            reader_sql(&self.source, true, self.csv_strict).map_err(fail)?;
                         proc.exec(&format!("CREATE TABLE t AS SELECT * FROM {reader};"), long)
                             .await
                             .map_err(|e| fail(format!("{first_err}\n(retry as text: {e})")))?;
@@ -1188,7 +1231,7 @@ impl Session {
     async fn preview(&self) -> Result<Arc<Preview>, String> {
         self.preview
             .get_or_init(|| async {
-                let (reader, _) = reader_sql(&self.source, false)?;
+                let (reader, _) = reader_sql(&self.source, false, self.csv_strict)?;
                 let mut proc = DuckProc::spawn(&self.duckdb, None)?;
                 let result = async {
                     let mut setup = String::from(
@@ -1413,20 +1456,23 @@ mod tests {
 
     #[test]
     fn reader_follows_the_effective_extension() {
-        let (r, k) = reader_sql(Path::new("/d/a.parquet"), false).unwrap();
+        let (r, k) = reader_sql(Path::new("/d/a.parquet"), false, true).unwrap();
         assert_eq!(
             (r.as_str(), k),
             ("read_parquet('/d/a.parquet')", Source::View)
         );
-        let (r, k) = reader_sql(Path::new("/d/a.json.gz"), false).unwrap();
+        let (r, k) = reader_sql(Path::new("/d/a.json.gz"), false, true).unwrap();
         assert_eq!(
             (r.as_str(), k),
             ("read_json_auto('/d/a.json.gz')", Source::Table)
         );
-        let (r, k) = reader_sql(Path::new("/d/a.csv.gz"), true).unwrap();
+        let (r, k) = reader_sql(Path::new("/d/a.csv.gz"), true, true).unwrap();
         assert_eq!(k, Source::Table);
         assert!(r.starts_with("read_csv('/d/a.csv.gz'") && r.contains("all_varchar=true"));
-        let (r, _) = reader_sql(Path::new("/d/it's.tsv"), false).unwrap();
+        assert!(!r.contains("strict_mode"));
+        let (r, _) = reader_sql(Path::new("/d/a.csv"), false, false).unwrap();
+        assert!(r.contains("strict_mode=false"));
+        let (r, _) = reader_sql(Path::new("/d/it's.tsv"), false, true).unwrap();
         assert!(r.contains("'/d/it''s.tsv'"));
     }
 
@@ -1542,6 +1588,42 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("import did not finish");
+    }
+
+    #[tokio::test]
+    async fn csv_with_bom_and_mixed_line_endings_preserves_all_rows() {
+        if !duckdb_available() {
+            eprintln!("skipping: no duckdb");
+            return;
+        }
+        let dir = scratch("mixed-newlines");
+        let file = dir.join("statement.csv");
+        std::fs::write(
+            &file,
+            "\u{feff}id;description;amount\r\n1;Donation;12,34\n2;\"Two\nlines\";56,78\n",
+        )
+        .unwrap();
+        let manager = TableManager::new(&dir.join("c.canvas.md"), false);
+        let strict_session = ready(&manager, "statement", &file).await;
+        assert!(strict_session.failure().is_some());
+        let session = manager
+            .session_with_csv_strict("statement", &file, false)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if session.meta().await.state != TableState::Importing {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(session.failure(), None);
+        assert_eq!(session.meta().await.total_rows, Some(2));
+        let page = session.rows(ViewSpec::default(), 0, 10).await.unwrap();
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0][1].as_deref(), Some("Donation"));
+        assert_eq!(page.rows[1][1].as_deref(), Some("Two\nlines"));
+        assert_eq!(page.rows[1][2].as_deref(), Some("56,78"));
+        session.close().await;
     }
 
     #[tokio::test]

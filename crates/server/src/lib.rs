@@ -231,6 +231,9 @@ struct AppState {
     /// whatever that specific call's own one-shot override already
     /// supplies — see `effective_overrides`.
     session_vars: Mutex<HashMap<String, String>>,
+    /// Last confirmed session path values for previews only. Kept separate
+    /// from run overrides so `required` still prompts on every invocation.
+    session_paths: Mutex<HashMap<String, String>>,
     /// Every `service` block this process has spawned and still knows
     /// about (running, crashed, or just-stopped — never removed on its
     /// own), keyed by `(node_id, block_name)` — see `crate::services`'s own
@@ -6360,7 +6363,8 @@ fn file_access(state: &AppState) -> meshfox_core::FileAccess {
     let Ok(canvas) = parse_or_error(&raw) else {
         return meshfox_core::FileAccess::none();
     };
-    let overrides = effective_overrides(state, &HashMap::new());
+    let mut overrides = state.session_paths.lock().unwrap().clone();
+    overrides.extend(effective_overrides(state, &HashMap::new()));
     let computed: HashMap<String, String> = state
         .session_runs
         .lock()
@@ -6378,6 +6382,40 @@ fn file_access(state: &AppState) -> meshfox_core::FileAccess {
         &computed,
         &shared,
     )
+}
+
+/// Remember admitted run inputs for file display, without making them inputs
+/// to subsequent runs. Only resolved non-secret session path declarations qualify.
+fn remember_session_paths(
+    state: &AppState,
+    declarations: &[meshfox_core::VarDecl],
+    values: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    let mut paths = state.session_paths.lock().unwrap();
+    for decl in declarations {
+        if !decl.session
+            || decl.secret
+            || !matches!(
+                decl.var_type,
+                meshfox_core::VarType::File | meshfox_core::VarType::Dir
+            )
+        {
+            continue;
+        }
+        if let Some(value) = values.get(&decl.name) {
+            state
+                .session_store
+                .save_path(&decl.name, value)
+                .map_err(|e| {
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("couldn't remember selected path {}: {e}", decl.name),
+                    )
+                })?;
+            paths.insert(decl.name.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 fn confine_api_error(target: &str) -> impl Fn(meshfox_core::ConfineError) -> ApiError + '_ {
@@ -6453,7 +6491,7 @@ async fn get_node_file_content(
 
 /// Resolves a `display="table"` file node's target to a confined path (see
 /// `resolve_confined_target`).
-fn table_target(state: &AppState, id: &str) -> Result<std::path::PathBuf, ApiError> {
+fn table_target(state: &AppState, id: &str) -> Result<(std::path::PathBuf, bool), ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, id)?;
     let canvas = parse_or_error(&located.raw)?;
@@ -6472,7 +6510,10 @@ fn table_target(state: &AppState, id: &str) -> Result<std::path::PathBuf, ApiErr
             format!("node {id:?} has no target"),
         )
     })?;
-    resolve_confined_target(state, target)
+    Ok((
+        resolve_confined_target(state, target)?,
+        node.csv_strict.unwrap_or(true),
+    ))
 }
 
 fn table_api_error(e: tables::TableError) -> ApiError {
@@ -6492,10 +6533,10 @@ async fn get_node_table(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<tables::TableMeta>, ApiError> {
-    let source = table_target(&state, &id)?;
+    let (source, csv_strict) = table_target(&state, &id)?;
     state
         .tables
-        .meta(&id, &source)
+        .meta_with_csv_strict(&id, &source, csv_strict)
         .await
         .map(Json)
         .map_err(table_api_error)
@@ -6518,7 +6559,7 @@ async fn get_node_table_rows(
     Path(id): Path<String>,
     Query(query): Query<TableRowsQuery>,
 ) -> Result<Json<tables::RowsPage>, ApiError> {
-    let source = table_target(&state, &id)?;
+    let (source, csv_strict) = table_target(&state, &id)?;
     let spec = match query.view.as_deref() {
         None | Some("") => tables::ViewSpec::default(),
         Some(raw) => serde_json::from_str(raw).map_err(|e| {
@@ -6530,7 +6571,7 @@ async fn get_node_table_rows(
     };
     let session = state
         .tables
-        .session(&id, &source)
+        .session_with_csv_strict(&id, &source, csv_strict)
         .await
         .map_err(table_api_error)?;
     session
@@ -7811,6 +7852,14 @@ async fn run_block_impl_sized(
             return Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         }
     };
+    // Admitted: the chain planned and holds its locks. Earlier rejections
+    // (missing/invalid vars, a plan error, a lock conflict) grant nothing.
+    if let Err(e) = remember_session_paths(&state, &relevant_decls, &resolved_vars) {
+        for (_, id) in held_locks {
+            let _ = state.run_ledger.discard_reservation(id);
+        }
+        return Err(e);
+    }
 
     // Reserves the requested block's own next-run identity in
     // `runs_registry` *now*, synchronously, before this function returns —
@@ -10073,6 +10122,7 @@ async fn force_start_service(
         resolved.values
     };
 
+    remember_session_paths(&state, &relevant_decls, &resolved_vars)?;
     let located = locate_node(&raw_snapshot, &target.node_id)?;
     let step_canvas = resolved_canvas(&located.raw, &state.canvas_path)?;
     let step_node = step_canvas.node(&target.node_id).ok_or_else(|| {
@@ -10290,6 +10340,7 @@ async fn debug_start(
     }
     drop(cache);
 
+    remember_session_paths(&state, &relevant, &resolved.values)?;
     let envs = meshfox_core::map_block_env(&block.env, &resolved.values);
     let cwd = node.cwd(canvas_root_dir(&state.canvas_path));
 
@@ -10846,6 +10897,7 @@ async fn subscribe_run_impl(
 async fn reset_session(State(state): State<Arc<AppState>>) -> StatusCode {
     state.session_runs.lock().unwrap().clear();
     state.session_vars.lock().unwrap().clear();
+    state.session_paths.lock().unwrap().clear();
     if let Err(e) = state.session_store.clear() {
         eprintln!("meshfox: failed to clear the persisted session state ({e})");
     }
@@ -11316,6 +11368,7 @@ async fn build_state_with(
         })
         .collect();
     let session_vars = session_store.load_vars()?;
+    let session_paths = session_store.load_paths()?;
     let run_journal = run_journal::RunJournal::new(
         Arc::clone(&session_conn),
         meshfox_core::config::session_max_chain_output_bytes(&config_root),
@@ -11375,6 +11428,7 @@ async fn build_state_with(
         session_runs: Mutex::new(session_runs),
         session_store,
         session_vars: Mutex::new(session_vars),
+        session_paths: Mutex::new(session_paths),
         services: Mutex::new(HashMap::new()),
         lease_scopes: Mutex::new(HashMap::new()),
         runs_registry: Mutex::new(HashMap::new()),
@@ -17626,6 +17680,140 @@ mod session_skip_tests {
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("hello-from-data"), "{body}");
         let (status, _) = request(addr, "GET", "/api/nodes/other/file-content", "", "").await;
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn csv_strict_is_applied_per_table_node() {
+        let path = dir_var_canvas("", &[]);
+        std::fs::write(
+            path.parent().unwrap().join("mixed.csv"),
+            "a;b\r\n1;one\n2;two\n",
+        )
+        .unwrap();
+        std::fs::write(&path, concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Strict\n<!-- meshfox:node id=\"strict\" type=\"file\" display=\"table\" -->\n\n[data](mixed.csv)\n\n",
+            "## Relaxed\n<!-- meshfox:node id=\"relaxed\" type=\"file\" display=\"table\" csv-strict=\"false\" -->\n\n[data](mixed.csv)\n"
+        )).unwrap();
+        let addr = spawn_test_server(path).await;
+        for (id, expected) in [("strict", "failed"), ("relaxed", "ready")] {
+            let mut meta = serde_json::Value::Null;
+            for _ in 0..100 {
+                let (status, body) =
+                    request(addr, "GET", &format!("/api/nodes/{id}/table"), "", "").await;
+                assert_eq!(status, 200, "{body}");
+                meta = serde_json::from_str(&body).unwrap();
+                if meta["state"] != "importing" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // DuckDB is an optional dependency for this suite.
+            if meta["error"]["kind"] == "duckdb-missing" {
+                return;
+            }
+            assert_eq!(meta["state"], expected, "{meta}");
+        }
+        let (status, body) = request(
+            addr,
+            "GET",
+            "/api/nodes/relaxed/table/rows?offset=0&limit=10",
+            "",
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(rows["rows"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn session_path_selection_is_for_previews_not_subsequent_runs() {
+        let data = outside_dir_with("first.csv", "first-selection");
+        std::fs::write(data.join("second.csv"), "second-selection").unwrap();
+        std::fs::write(data.join("sibling.csv"), "private").unwrap();
+        let path = dir_var_canvas("", &[]);
+        std::fs::write(&path, format!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Upload\n<!-- meshfox:node id=\"upload\" -->\n\n\
+             <!-- meshfox:var name=\"IN\" type=\"file\" required -->\n\n\
+             ```sh name=\"use-file\" env=\"IN\"\nprintf selected\n```\n\n\
+             ### Preview\n<!-- meshfox:node id=\"preview\" type=\"file\" -->\n\n[file]($IN)\n\n\
+             ### Sibling\n<!-- meshfox:node id=\"sibling\" type=\"file\" -->\n\n[file]({}/sibling.csv)\n",
+            data.display()
+        )).unwrap();
+        let addr = spawn_test_server(path.clone()).await;
+        let (status, _) = request(addr, "GET", "/api/nodes/preview/file-content", "", "").await;
+        assert_eq!(status, 403);
+        for (file, content) in [
+            ("first.csv", "first-selection"),
+            ("second.csv", "second-selection"),
+        ] {
+            let vars = serde_json::json!({"IN":data.join(file)}).to_string();
+            let mut url = reqwest::Url::parse(&format!("ws://{addr}/api/run")).unwrap();
+            url.query_pairs_mut().extend_pairs([
+                ("path", "upload"),
+                ("block", "use-file"),
+                ("vars", vars.as_str()),
+            ]);
+            let events = ws_messages(url.to_string()).await;
+            assert!(really_ran(&events, "use-file"), "{events:?}");
+            let (status, body) =
+                request(addr, "GET", "/api/nodes/preview/file-content", "", "").await;
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains(content), "{body}");
+            let (status, _) = request(addr, "GET", "/api/nodes/sibling/file-content", "", "").await;
+            assert_eq!(status, 403);
+            let (status, body) =
+                request(addr, "GET", "/api/vars?path=upload&block=use-file", "", "").await;
+            assert_eq!(status, 200, "{body}");
+            let vars: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                vars.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["name"] == "IN" && v["resolved"] == false),
+                "{body}"
+            );
+        }
+        // Worker restart retains the last selection, without a dotenv cache.
+        assert!(!meshfox_core::varcache::cache_path(&path).exists());
+        let addr = spawn_test_server(path).await;
+        let (status, body) = request(addr, "GET", "/api/nodes/preview/file-content", "", "").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("second-selection"), "{body}");
+        let (status, _) =
+            request(addr, "POST", "/api/session/reset", "application/json", "{}").await;
+        assert_eq!(status, 204);
+        let (status, _) = request(addr, "GET", "/api/nodes/preview/file-content", "", "").await;
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_session_path_default_grants_no_preview() {
+        let data = outside_dir_with("in.csv", "unconfirmed");
+        let path = dir_var_canvas("", &[]);
+        std::fs::write(
+            &path,
+            format!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ## Upload\n<!-- meshfox:node id=\"upload\" -->\n\n\
+             <!-- meshfox:var name=\"IN\" type=\"file\" default=\"{}\" -->\n\n\
+             ```sh name=\"use-file\" env=\"IN\"\nprintf selected\n```\n\n\
+             ### Preview\n<!-- meshfox:node id=\"preview\" type=\"file\" -->\n\n[file]($IN)\n",
+                data.join("in.csv").display()
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(path).await;
+        // No confirmation: the run is refused, so nothing is remembered.
+        let mut url = reqwest::Url::parse(&format!("ws://{addr}/api/run")).unwrap();
+        url.query_pairs_mut()
+            .extend_pairs([("path", "upload"), ("block", "use-file")]);
+        let events = ws_messages(url.to_string()).await;
+        assert!(!really_ran(&events, "use-file"), "{events:?}");
+        let (status, _) = request(addr, "GET", "/api/nodes/preview/file-content", "", "").await;
         assert_eq!(status, 403);
     }
 

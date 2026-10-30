@@ -120,6 +120,7 @@ fn locate_parse_error(e: &ParseError, text: &str, spans: &[NodeSpan]) -> Range<u
         | ParseError::CyclicParent(id)
         | ParseError::UnknownNodeType(id, _)
         | ParseError::PreviewRequiresLinkType(id)
+        | ParseError::InvalidCsvStrict(id)
         | ParseError::GroupHasBody(id)
         | ParseError::InvalidLinkBody(id, _)
         | ParseError::InvalidTimestamp(id, _, _) => by_id(id),

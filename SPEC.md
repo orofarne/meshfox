@@ -174,6 +174,8 @@ manual path, not gated by it.
     table (CSV, TSV, Parquet, JSON lines, compressed variants, ... —
     anything the `duckdb` CLI reads), windowed so huge files stay usable.
     Requires the `duckdb` executable; see "Table previews" below.
+  - `csv-strict="true|false"` — CSV/TSV dialect validation for a
+    `file` node with `display="table"`; default `true`. See "Table previews".
   - `lang="..."` — syntax-highlighting language hint for `display="code"`
     (e.g. `lang="rust"`). Optional; when omitted, the language is guessed
     from the target's file extension. Ignored when `display` isn't `code`.
@@ -320,7 +322,26 @@ table; there is no fallback preview.
 everything else as delimited text with auto-detected dialect and types
 (a trailing `.gz`/`.zst` is looked through). If type inference over the
 sample fails on a later row, the file is read again with every column as
-text. The target is confined like `display="code"`: the canvas directory
+text. CSV/TSV dialect validation is strict by default. A particular table
+node may opt out with `csv-strict="false"`, passed to DuckDB as
+`strict_mode=false`, for example for bank exports with mixed CRLF/LF line
+endings:
+
+```
+<!-- meshfox:node id="statement" type="file" display="table" csv-strict="false" -->
+
+[Statement]($STATEMENT)
+```
+
+`csv-strict` accepts only `true` or `false`, is allowed only on `file`
+nodes with `display="table"`, and applies only to that node (no inheritance
+or document-wide setting). It has no effect on Parquet/JSON readers or
+runnable blocks that import the file. There is no automatic retry in
+non-strict mode and no `ignore_errors` row skipping. The same setting is
+used for the initial preview, full import and text-type retry. Changing
+it invalidates that node's table session/cache even if the source file
+has not changed.
+The target is confined like `display="code"`: the canvas directory
 and the directories of `type="dir"` variables plus the exact files of
 `type="file"` variables.
 
@@ -1934,8 +1955,10 @@ variables":
 A `meshfox:var` may also be declared inside any other node — a
 **node-scoped** variable, for a value only one block (or a small cluster
 of related ones) genuinely needs, e.g. a search term only one ad hoc query
-block uses. It's visible only to `env=` on a runnable fence *inside that
-node's own subtree* (`meshfox validate` catches a reference from outside
+block uses. It's visible only to references *inside that node's own subtree*,
+including runnable fences, form fields, and `$NAME` / `${NAME}` references to
+`dir`/`file` variables in file, link and include targets
+(`meshfox validate` catches a reference from outside
 it — see `meshfox_core::validate_var_scope` — though `run`/`view` stay
 lenient about it, same as every other `validate`-only check); it's
 implicitly `session` (see below) whether or not `session` is written on it
@@ -1953,6 +1976,18 @@ pair it with `required` too — the combination this section's own `session`
 bullet already calls out as guaranteeing "a real prompt on *every* run":
 
     <!-- meshfox:var name="MANUFACTURER_QUERY" prompt="Manufacturer name" default="Sanofi" required -->
+
+For a non-secret session `file` or `dir` variable, the worker also retains
+the last resolved path from an admitted run (one that resolved all its
+variables, planned its chain and acquired its locks; a refused run retains
+nothing) for file previews and other file reads. This display value survives
+worker restarts until `session reset`, and grants only that exact file
+(`file`) or directory tree (`dir`). It is separate from run inputs: it does
+not satisfy `required` on the next run or populate the document's variable
+cache. Node-scope validation still
+applies to targets referencing the variable. Ordinary `file`/`dir` path
+defaults already require confirmation; `required` makes that intent explicit
+and also requires confirmation for a default under `@tmp`.
 
 Variable names still share one flat namespace across the whole document
 regardless of where they're declared — a duplicate `name=`, root or not,

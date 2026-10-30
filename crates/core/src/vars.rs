@@ -186,6 +186,8 @@ pub enum VarsError {
     UndeclaredEnvVar(String, String, String, &'static str),
     #[error("node {0:?} block {1:?} references variable {2:?} via {4}=, but it's declared in node {3:?} — a node-scoped meshfox:var (see declared_vars) is only visible to its own subtree")]
     VarOutOfScope(String, String, String, String, &'static str),
+    #[error("node {0:?} target references variable {1:?}, but it's declared in node {2:?} — a node-scoped meshfox:var is only visible to its own subtree")]
+    TargetVarOutOfScope(String, String, String),
     #[error("meshfox:var {0:?} has an empty from= target")]
     EmptyFrom(String),
     #[error(
@@ -765,7 +767,7 @@ fn static_block_env_names(
     })
 }
 
-/// Validates that no block's `env=` reaches outside a node-scoped
+/// Validates that no file target or block's variable reference reaches outside a node-scoped
 /// `meshfox:var`'s own subtree (a root-declared var has no such
 /// restriction — its subtree is the whole document). `meshfox validate`-only
 /// (see `validate_env_refs`'s own doc comment for why this stays out of
@@ -785,6 +787,28 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
         .map(|s| (s.decl.name.as_str(), &s.decl))
         .collect();
     for node in &canvas.nodes {
+        if let Some(target) = &node.target {
+            for scanned in &scanned {
+                let decl = &scanned.decl;
+                if !matches!(decl.var_type, VarType::Dir | VarType::File) {
+                    continue;
+                }
+                // Use the runtime target expander so braced names, name
+                // boundaries and literal dollar signs have identical semantics.
+                let references = crate::dirvars::expand_target(
+                    target,
+                    &HashMap::from([(decl.name.clone(), String::new())]),
+                    None,
+                ) != *target;
+                if references && !is_within_subtree(canvas, &node.id, &scanned.owner_node) {
+                    return Err(VarsError::TargetVarOutOfScope(
+                        node.id.clone(),
+                        decl.name.clone(),
+                        scanned.owner_node.clone(),
+                    ));
+                }
+            }
+        }
         for block in node.runnable_blocks() {
             let mut refs: Vec<(String, &'static str)> = static_block_env_names(node, &block)?
                 .into_iter()
@@ -1887,6 +1911,58 @@ mod tests {
             "```bash name=\"q\" env=\"$X\"\necho hi\n```\n",
         );
         assert!(validate_var_scope(&canvas(doc)).is_ok());
+    }
+
+    #[test]
+    fn validate_var_scope_checks_path_targets_with_runtime_expansion_rules() {
+        for kind in ["file", "include", "link"] {
+            for var_type in ["file", "dir"] {
+                for target in ["$STATEMENT", "${STATEMENT}", "$STATEMENT/data.csv"] {
+                    let doc = format!(
+                        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+                         ## Upload\n<!-- meshfox:node id=\"upload\" -->\n\n\
+                         <!-- meshfox:var name=\"STATEMENT\" type=\"{var_type}\" -->\n\n\
+                         ## Preview\n<!-- meshfox:node id=\"preview\" type=\"{kind}\" -->\n\n\
+                         [Selected file]({target})\n"
+                    );
+                    assert_eq!(
+                        validate_var_scope(&canvas(&doc)).unwrap_err(),
+                        VarsError::TargetVarOutOfScope(
+                            "preview".into(),
+                            "STATEMENT".into(),
+                            "upload".into()
+                        ),
+                        "{kind} {var_type} {target}"
+                    );
+                    // The same target becomes valid when nested under its owner.
+                    assert!(
+                        validate_var_scope(&canvas(&doc.replace("## Preview", "### Preview")))
+                            .is_ok()
+                    );
+                    // Root declarations are visible throughout the document.
+                    let root_decl =
+                        format!("<!-- meshfox:var name=\"STATEMENT\" type=\"{var_type}\" -->\n");
+                    let root_doc = doc
+                        .replace(&root_decl, "")
+                        .replace("## Upload", &format!("{root_decl}\n## Upload"));
+                    assert!(validate_var_scope(&canvas(&root_doc)).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_var_scope_leaves_literal_target_names_alone() {
+        for target in ["$STATEMENT_OTHER", "${STATEMENT_OTHER}", "statement.csv"] {
+            let doc = format!(
+                "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+                 ## Upload\n<!-- meshfox:node id=\"upload\" -->\n\n\
+                 <!-- meshfox:var name=\"STATEMENT\" type=\"file\" -->\n\n\
+                 ## Preview\n<!-- meshfox:node id=\"preview\" type=\"file\" -->\n\n\
+                 [Selected file]({target})\n"
+            );
+            assert!(validate_var_scope(&canvas(&doc)).is_ok());
+        }
     }
 
     #[test]
