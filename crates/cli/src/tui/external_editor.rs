@@ -73,7 +73,7 @@ pub async fn run(request: Request) -> Outcome {
                 .code()
                 .map_or_else(|| "a signal".to_string(), |c| format!("code {c}"))
         )),
-        Ok(_) => match std::fs::read_to_string(&scratch.file) {
+        Ok(_) => match tokio::fs::read_to_string(&scratch.file).await {
             Err(e) => Outcome::Failed(format!("couldn't read the edited file back: {e}")),
             Ok(text) if text == request.text => Outcome::Unchanged,
             Ok(text) => Outcome::Edited(text),

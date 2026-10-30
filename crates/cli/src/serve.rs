@@ -132,7 +132,7 @@ pub async fn run(
         task.abort();
     }
     if owned {
-        let _ = std::fs::remove_file(&socket_path);
+        let _ = tokio::fs::remove_file(&socket_path).await;
     }
     Ok(())
 }

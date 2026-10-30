@@ -4906,7 +4906,7 @@ async fn get_canvas_raw(
             (state.raw.lock().unwrap().clone(), false)
         }
         SourceFile::Include { path } => {
-            let text = std::fs::read_to_string(&path).map_err(|e| {
+            let text = tokio::fs::read_to_string(&path).await.map_err(|e| {
                 ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to read {}: {e}", path.display()),
