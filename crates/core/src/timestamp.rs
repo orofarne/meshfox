@@ -20,9 +20,15 @@ use time::OffsetDateTime;
 /// offset) — what meshfox itself writes whenever it stamps `createdAt`/
 /// `updatedAt` automatically.
 pub fn now_utc_rfc3339() -> String {
-    OffsetDateTime::now_utc()
+    format_unix_nanos(crate::host::now_nanos())
+}
+
+/// `nanos` since the Unix epoch as UTC RFC3339 (`Z`).
+fn format_unix_nanos(nanos: i128) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .expect("a clock reading is a representable instant")
         .format(&Rfc3339)
-        .expect("OffsetDateTime::now_utc() always formats as RFC3339")
+        .expect("a UTC instant always formats as RFC3339")
 }
 
 /// Whether `s` parses as a valid RFC3339 timestamp, any offset included —
@@ -74,12 +80,21 @@ pub fn parse_since(s: &str) -> Option<i64> {
         "w" => n * 60 * 60 * 24 * 7,
         _ => return None,
     };
-    Some(OffsetDateTime::now_utc().unix_timestamp() - seconds)
+    Some((crate::host::now_nanos() / 1_000_000_000) as i64 - seconds)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_a_known_instant_with_subsecond_digits() {
+        assert_eq!(
+            format_unix_nanos(1_793_437_277_544_000_000),
+            "2026-10-31T09:01:17.544Z"
+        );
+        assert_eq!(format_unix_nanos(0), "1970-01-01T00:00:00Z");
+    }
 
     #[test]
     fn now_is_valid_and_utc() {

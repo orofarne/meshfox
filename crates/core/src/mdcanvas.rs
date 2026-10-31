@@ -3110,14 +3110,16 @@ fn unique_slug(title: &str, used: &HashSet<String>) -> String {
 }
 
 /// A random 64-bit number, base36-encoded (`0-9a-z`, lowercase, no
-/// padding) — see `insert_child_node_random_id`. Uses `RandomState`'s own
-/// OS-seeded key rather than pulling in a `rand` dependency just for this;
-/// not cryptographic, only needs to not collide, which the caller's `used`
+/// padding) — see `insert_child_node_random_id`. Takes its bits from
+/// `crate::host::random_u64` (OS-seeded natively, installed by the embedder
+/// elsewhere) rather than pulling in a `rand` dependency just for this; not
+/// cryptographic, only needs to not collide, which the caller's `used`
 /// check already guards regardless.
 fn random_base36_id() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let mut n = RandomState::new().build_hasher().finish();
+    base36(crate::host::random_u64())
+}
+
+fn base36(mut n: u64) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     if n == 0 {
         return "0".to_string();
@@ -3481,6 +3483,14 @@ fn rewrite_from_node_id(markdown: &str, old_id: &str, new_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base36_encodes_like_the_old_random_id() {
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
+        assert_eq!(base36(u64::MAX), "3w5e11264sgsf");
+    }
+
     use super::*;
 
     #[test]

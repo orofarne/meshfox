@@ -31,6 +31,7 @@ pub mod file_source;
 pub mod form;
 pub mod fsbrowse;
 pub mod gateway_header;
+pub mod host;
 pub mod image_attrs;
 pub mod include;
 pub mod locate;
