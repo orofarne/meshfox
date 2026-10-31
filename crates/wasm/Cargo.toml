@@ -1,0 +1,19 @@
+[package]
+name = "meshfox-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly binding for the meshfox document model: render a .canvas.md in a browser or Node, no server"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+meshfox-model = { path = "../model" }
+serde_json = "1"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+# `meshfox-model` already enables its `wasm_js` backend on wasm32; this is
+# the entropy source handed to `host::set_entropy`.
+getrandom = "0.4"

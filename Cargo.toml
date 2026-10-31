@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/model",
     "crates/core",
+    "crates/wasm",
     "crates/server",
     "crates/cli",
 ]
@@ -11,3 +12,13 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+# `scripts/build-wasm.sh` builds `meshfox-wasm` with this profile: small and
+# aborting on panic. Kept separate from `release` so native builds are unchanged.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

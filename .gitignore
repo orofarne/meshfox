@@ -52,3 +52,7 @@ examples/tables-data/events.*
 /.wrangler
 # Built skill archives (see skills/*/README.canvas.md) — regenerated, never committed.
 /skills/*.zip
+
+# wasm build output (scripts/build-wasm.sh)
+/crates/wasm/pkg/
+/crates/wasm/pkg-node/
