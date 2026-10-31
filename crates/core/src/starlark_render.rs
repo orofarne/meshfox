@@ -1,6 +1,6 @@
 //! Computed Markdown: evaluated by the document owner, never written into
 //! authored text and never fed back to Starlark's document snapshot.
-use crate::{canvas::Canvas, dirvars::FileAccess};
+use crate::{canvas::Canvas, file_source::FileSource};
 use serde::{Deserialize, Serialize};
 use starlark::environment::{GlobalsBuilder, LibraryExtension, Module};
 use std::{cell::RefCell, path::Path};
@@ -29,7 +29,7 @@ impl starlark::PrintHandler for Output {
     }
 }
 
-pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &FileAccess) {
+pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &dyn FileSource) {
     if !canvas
         .nodes
         .iter()
@@ -94,6 +94,7 @@ pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &FileAcces
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dirvars::FileAccess;
     fn canvas(code: &str) -> Canvas {
         Canvas::from_markdown(&format!("# Root\n<!-- meshfox:node id=\"root\" -->\n```starlark render name=\"summary\" output=\"markdown\"\n{code}\n```\n## Task\n<!-- meshfox:node id=\"task\" tags=\"todo,task\" -->\n")).unwrap()
     }

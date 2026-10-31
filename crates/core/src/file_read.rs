@@ -9,9 +9,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
-pub use crate::file_source::ConfineError;
+pub use crate::file_source::{ConfineError, FilePreview, PreviewError, FILE_PREVIEW_MAX_BYTES};
 
 /// Resolves `target` relative to `dir`, canonicalizing both, and confines
 /// the result: a `../../etc/passwd` or an absolute path pointing outside
@@ -67,28 +66,6 @@ pub fn confine_in_files(
     Ok(resolved)
 }
 
-#[derive(Debug, Error)]
-pub enum PreviewError {
-    #[error(transparent)]
-    Confine(#[from] ConfineError),
-    #[error("{0}: {1}")]
-    Read(PathBuf, #[source] std::io::Error),
-    #[error("target looks like a binary file, can't read it as text")]
-    Binary,
-}
-
-pub struct FilePreview {
-    pub content: String,
-    /// `true` if `content` was cut off at `FILE_PREVIEW_MAX_BYTES` — callers
-    /// that surface this to a user should say so rather than imply the
-    /// preview is the whole file.
-    pub truncated: bool,
-}
-
-/// Same cap the server's file-content preview and `staticgen`'s
-/// `display="code"` export already used.
-pub const FILE_PREVIEW_MAX_BYTES: usize = 1_000_000;
-
 /// Reads `target` (relative to `dir`, confined to it — see `confine`)
 /// fresh off disk. A null byte anywhere in a representative prefix is a
 /// cheap, standard "this isn't text" heuristic (same one `file`/git use) —
@@ -116,14 +93,7 @@ pub fn preview_in_files(
 ) -> Result<FilePreview, PreviewError> {
     let resolved = confine_in_files(dir, roots, files, target)?;
     let bytes = fs::read(&resolved).map_err(|e| PreviewError::Read(resolved.clone(), e))?;
-    let sample_len = bytes.len().min(8000);
-    if bytes[..sample_len].contains(&0) {
-        return Err(PreviewError::Binary);
-    }
-    let truncated = bytes.len() > FILE_PREVIEW_MAX_BYTES;
-    let slice = &bytes[..bytes.len().min(FILE_PREVIEW_MAX_BYTES)];
-    let content = String::from_utf8_lossy(slice).into_owned();
-    Ok(FilePreview { content, truncated })
+    crate::file_source::preview_from_bytes(&bytes)
 }
 
 #[cfg(test)]

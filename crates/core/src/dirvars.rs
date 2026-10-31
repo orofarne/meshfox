@@ -393,6 +393,30 @@ impl FileAccess {
     }
 }
 
+impl crate::file_source::FileSource for FileAccess {
+    fn confine(&self, dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
+        FileAccess::confine(self, dir, target)
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+
+    fn asset_base(&self, path: &Path) -> Option<String> {
+        path.canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_string_lossy().into_owned()))
+    }
+
+    fn preview(&self, dir: &Path, target: &str) -> Result<FilePreview, PreviewError> {
+        FileAccess::preview(self, dir, target)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

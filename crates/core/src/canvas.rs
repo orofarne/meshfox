@@ -494,17 +494,15 @@ impl Node {
 
 impl Canvas {
     /// Fills `Node::target_digest` for every runnable `file` node by reading
-    /// its target (confined like any other file read, see
-    /// `FileAccess::confine`). A target that is missing or outside what the
+    /// its target through `access` (confined like any other file read, see
+    /// `FileSource::confine`). A target that is missing or outside what the
     /// canvas may read simply gets no digest — running it reports the real
     /// error; this only makes cache/stale follow the file's content.
-    pub fn hydrate_target_digests(&mut self, canvas_path: &std::path::Path) {
-        // Most canvases have none: do not even build the file access
-        // (it reads the variable cache and shared config) for those.
-        if !self.nodes.iter().any(Node::is_runnable_file) {
-            return;
-        }
-        let access = crate::dirvars::FileAccess::for_canvas_path(self, canvas_path);
+    pub fn hydrate_target_digests_with(
+        &mut self,
+        canvas_path: &std::path::Path,
+        access: &dyn crate::file_source::FileSource,
+    ) {
         let canvas_dir = canvas_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -517,13 +515,26 @@ impl Canvas {
             let dir = node.cwd(&canvas_dir);
             let target = node.target.clone().unwrap_or_default();
             if let Ok(path) = access.confine(&dir, &target) {
-                if let Ok(content) = std::fs::read(path) {
+                if let Ok(content) = access.read(&path) {
                     node.set_target_digest(&content);
                 }
             }
             node.block_fingerprint =
                 Some(crate::fence::fingerprint(&crate::fence::target_block(node)));
         }
+    }
+
+    /// [`Canvas::hydrate_target_digests_with`] against the real disk, with
+    /// the file access a run would have. (Core-side convenience: moves out of
+    /// the model together with `dirvars::FileAccess`.)
+    pub fn hydrate_target_digests(&mut self, canvas_path: &std::path::Path) {
+        // Most canvases have none: do not even build the file access
+        // (it reads the variable cache and shared config) for those.
+        if !self.nodes.iter().any(Node::is_runnable_file) {
+            return;
+        }
+        let access = crate::dirvars::FileAccess::for_canvas_path(self, canvas_path);
+        self.hydrate_target_digests_with(canvas_path, &access);
     }
 
     pub fn node(&self, id: &str) -> Option<&Node> {

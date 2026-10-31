@@ -200,7 +200,7 @@ pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResul
 pub fn evaluate_with_access(
     canvas: &Canvas,
     base_dir: Option<&Path>,
-    access: &crate::dirvars::FileAccess,
+    access: &dyn crate::file_source::FileSource,
 ) -> Vec<ConstraintResult> {
     let prelude = build_prelude(canvas, base_dir, access);
     let globals = globals();
@@ -229,7 +229,7 @@ pub fn annotate_status(canvas: &mut Canvas, base_dir: Option<&Path>) {
 pub fn annotate_status_with_access(
     canvas: &mut Canvas,
     base_dir: Option<&Path>,
-    access: &crate::dirvars::FileAccess,
+    access: &dyn crate::file_source::FileSource,
 ) {
     let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> =
         std::collections::HashMap::new();
@@ -333,7 +333,7 @@ pub(crate) fn run_module<'v, 'a>(
 pub(crate) fn build_prelude(
     canvas: &Canvas,
     base_dir: Option<&Path>,
-    access: &crate::dirvars::FileAccess,
+    access: &dyn crate::file_source::FileSource,
 ) -> String {
     let mut out = String::new();
     out.push_str(
@@ -465,7 +465,7 @@ struct FileDataLiterals {
 fn file_data_literals(
     node: &Node,
     base_dir: Option<&Path>,
-    access: &crate::dirvars::FileAccess,
+    access: &dyn crate::file_source::FileSource,
 ) -> FileDataLiterals {
     let none = || FileDataLiterals {
         content: "None".to_string(),
@@ -480,7 +480,7 @@ fn file_data_literals(
     let (Some(dir), Some(target)) = (base_dir, node.target.as_deref()) else {
         return none();
     };
-    let Ok(preview) = access.preview(dir, target) else {
+    let Ok(preview) = crate::file_source::FileSource::preview(access, dir, target) else {
         return none();
     };
 

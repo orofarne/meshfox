@@ -58,7 +58,7 @@ fn access_for(canvas: &Canvas, base_path: &Path) -> crate::FileAccess {
 pub fn resolve_with_access(
     canvas: &Canvas,
     base_path: &Path,
-    access: &crate::FileAccess,
+    access: &dyn crate::file_source::FileSource,
 ) -> Result<Canvas, IncludeError> {
     let base_dir = base_path
         .parent()
@@ -83,16 +83,14 @@ pub fn resolve_with_access(
                 }
                 other => IncludeError::Access(other),
             })?;
-        let contents = std::fs::read_to_string(&target_path)
+        let contents = access
+            .read_to_string(&target_path)
             .map_err(|e| IncludeError::NotFound(target_path.clone(), e))?;
         // Best-effort: an unreadable/relative-weirdness parent just leaves
         // `asset_base` unset, falling back to the canvas's own directory —
         // same graceful-degradation posture the rest of this crate takes
         // for display-only metadata.
-        let asset_base = target_path
-            .canonicalize()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_string_lossy().into_owned()));
+        let asset_base = access.asset_base(&target_path);
 
         node.node_type = NodeType::Text;
         node.target = None;
@@ -137,7 +135,7 @@ pub fn list_includes(canvas: &Canvas, base_path: &Path) -> Vec<IncludeInfo> {
 pub fn list_includes_with_access(
     canvas: &Canvas,
     base_path: &Path,
-    access: &crate::FileAccess,
+    access: &dyn crate::file_source::FileSource,
 ) -> Vec<IncludeInfo> {
     let base_dir = base_path
         .parent()
