@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src", "wasm-demo", "e2e-wasm-demo", "vite.wasm.config.ts", "wasm-demo.playwright.config.ts"]
+}

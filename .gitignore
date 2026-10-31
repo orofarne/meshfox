@@ -56,3 +56,4 @@ examples/tables-data/events.*
 # wasm build output (scripts/build-wasm.sh)
 /crates/wasm/pkg/
 /crates/wasm/pkg-node/
+/web/dist-wasm/
