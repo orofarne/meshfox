@@ -382,6 +382,27 @@ fn fnv1a(bytes: &[u8]) -> u32 {
     hash
 }
 
+/// Runtime cache identity, including the resolved builtin and the configuration
+/// loaded from the same cwd as execution. The authored output hash stays static.
+pub fn execution_fingerprint(
+    block: &crate::fence::CodeBlock,
+    resolved_vars: &std::collections::HashMap<String, String>,
+    cwd: &std::path::Path,
+) -> String {
+    let base = crate::fence::session_fingerprint(block, resolved_vars);
+    let Some(spec) = crate::args::resolve_interpreter(block, resolved_vars) else {
+        return base;
+    };
+    if !is_builtin(&spec) {
+        return base;
+    }
+    let config = crate::config::load(cwd);
+    match execution_identity(&spec, &config) {
+        Some(identity) => crate::fence::combine_fingerprints([base, identity]),
+        None => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

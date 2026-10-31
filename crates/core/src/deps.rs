@@ -701,7 +701,7 @@ pub fn closure_fingerprint_with(
         stack.push(addr.clone());
         let mut parts = vec![
             key.clone(),
-            crate::fence::execution_fingerprint(
+            crate::builtin_interpreter::execution_fingerprint(
                 &block,
                 values,
                 &canvas

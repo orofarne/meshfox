@@ -1693,7 +1693,7 @@ fn step_fingerprint(
             let cwd = canvas
                 .and_then(|c| c.node(&addr.node_id).map(|n| n.cwd(&c.artifact_root)))
                 .unwrap_or_else(|| PathBuf::from("."));
-            meshfox_core::fence::execution_fingerprint(block, resolved_vars, &cwd)
+            meshfox_core::builtin_interpreter::execution_fingerprint(block, resolved_vars, &cwd)
         })
 }
 
