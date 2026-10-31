@@ -26,6 +26,7 @@ pub mod mdcanvas;
 pub mod merge;
 pub mod options;
 pub mod output;
+pub mod render;
 pub mod slug;
 pub mod starlark_render;
 pub mod subsup;

@@ -4640,38 +4640,83 @@ impl AppState {
 
 fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canvas>, ApiError> {
     let mut canvas = resolved_canvas(raw, canvas_path)?;
-    // Every embedded constraint fence's script itself is cheap and pure
-    // (tick/heap/callstack-bounded — see `constraint::evaluate`); the only
-    // I/O it can trigger is a `file`-type node's own already-declared
-    // target, capped the same way the `display="code"` preview is (see
-    // `meshfox_core::file_read`). Running every constraint on every fetch
-    // (rather than only on an explicit `meshfox check`) is still safe and
-    // keeps the UI's pass/fail badges current without a separate endpoint
-    // or a stale on-disk cache to invalidate — just no longer free of disk
-    // reads for a document whose constraints reach into `file` nodes.
+    // The annotation passes (constraint badges, computed views, options,
+    // tag colors, body revisions) are the model's own — the same ones a
+    // browser embedding runs through `meshfox_core::render::render_canvas`.
+    // Only the file access differs: here it is the full one (trusted `dir`
+    // variables, `@tmp`), built from the include-resolved document.
     let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
-    meshfox_core::constraint::annotate_status_with_access(
-        &mut canvas,
-        Some(canvas_root_dir(canvas_path)),
-        &access,
-    );
-    meshfox_core::starlark_render::annotate(
-        &mut canvas,
-        Some(canvas_root_dir(canvas_path)),
-        &access,
-    );
-    // Best-effort: a malformed `meshfox:option` declaration shouldn't break
-    // *viewing* the canvas (falls back to no options declared, same as if
-    // there were none at all) — `meshfox validate` is what surfaces that
-    // loudly, same split `vars`/constraint fences already have between
-    // "parses enough to view" and "fully valid".
-    canvas.options = meshfox_core::declared_options(&canvas).unwrap_or_default();
-    // Same best-effort split for `meshfox:tag-color` — a malformed
-    // declaration just means no node falls back to a tag-derived color
-    // this fetch, not a broken canvas view.
-    meshfox_core::annotate_effective_colors(&mut canvas);
-    meshfox_core::annotate_body_revs(&mut canvas);
+    meshfox_core::render::annotate_resolved(&mut canvas, canvas_root_dir(canvas_path), &access);
     Ok(Json(canvas))
+}
+
+#[cfg(test)]
+mod canvas_response_matches_model_render_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mfx-server-render-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// `canvas_response` (what `GET /api/canvas` serves) and the model's own
+    /// `render_canvas` must agree on everything a viewer can see.
+    fn assert_same(raw: &str, path: &std::path::Path) {
+        let Json(served) = canvas_response(raw, path).unwrap_or_else(|e| panic!("{}", e.1));
+        let parsed = Canvas::from_markdown(raw).unwrap();
+        let access = meshfox_core::FileAccess::for_canvas_path(&parsed, path);
+        let rendered = meshfox_core::render::render_canvas(raw, path, &access).unwrap();
+        assert_eq!(
+            serde_json::to_value(&served).unwrap(),
+            serde_json::to_value(&rendered).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_plain_document_with_constraints_colors_and_options() {
+        let dir = tmp("plain");
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n",
+            "<!-- meshfox:tag-color tag=\"bug\" color=\"1\" -->\n",
+            "<!-- meshfox:option name=\"auto-timestamps\" -->\n\n",
+            "```starlark constraint\nif len(doc.descendants()) < 1:\n    fail(\"no nodes\")\n```\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" tags=\"bug\" -->\n\nbody\n",
+        );
+        assert_same(raw, &dir.join("x.canvas.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_include_and_a_file_node_read_through_the_same_disk() {
+        let dir = tmp("files");
+        std::fs::write(dir.join("notes.md"), "# Notes\n\nhello from disk\n").unwrap();
+        std::fs::write(dir.join("data.json"), "{\"n\": 3}\n").unwrap();
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```starlark constraint\nfor n in doc.descendants():\n    if n.id == \"data\" and n.json()[\"n\"] != 3:\n        fail(\"wrong n\")\n```\n\n",
+            "## Notes\n<!-- meshfox:node id=\"notes\" type=\"include\" -->\n\n[notes](./notes.md)\n\n",
+            "## Data\n<!-- meshfox:node id=\"data\" type=\"file\" -->\n\n[data](./data.json)\n",
+        );
+        assert_same(raw, &dir.join("x.canvas.md"));
+        // Not a vacuous comparison: both really read the files.
+        let Json(served) = canvas_response(raw, &dir.join("x.canvas.md")).unwrap();
+        assert!(served
+            .node("notes")
+            .unwrap()
+            .text
+            .contains("hello from disk"));
+        let result = &served.node("root").unwrap().constraint_results[0];
+        assert!(result.ok, "{:?}", result.messages);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // TODO.canvas.md: "Node colour by tag" — `canvas_response`'s own
