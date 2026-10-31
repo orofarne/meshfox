@@ -1,4 +1,5 @@
 //! File-value dependencies. Producer discovery never implies execution cascade.
+pub use crate::block_refs::{declarations, var_refs};
 use crate::{BlockAddr, Canvas, CodeBlock};
 use globset::{GlobBuilder, GlobMatcher};
 use std::collections::{BTreeMap, HashMap};
@@ -7,20 +8,6 @@ use std::path::{Component, Path, PathBuf};
 
 fn error(message: impl Into<String>) -> crate::DepsError {
     crate::DepsError::Artifacts(message.into())
-}
-
-pub fn declarations(block: &CodeBlock, attr: &str) -> Vec<String> {
-    block
-        .attrs
-        .get(attr)
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // $NAME and ${NAME} may occur anywhere in a path; $$ escapes a literal dollar.
@@ -73,43 +60,6 @@ fn substitute(
         }
     }
     Ok(out)
-}
-
-pub fn var_refs(block: &CodeBlock) -> Vec<String> {
-    let mut names = Vec::new();
-    for attr in ["inputs", "outputs"] {
-        for path in declarations(block, attr) {
-            let mut chars = path.chars().peekable();
-            while let Some(c) = chars.next() {
-                if c != '$' {
-                    continue;
-                }
-                if chars.peek() == Some(&'$') {
-                    chars.next();
-                    continue;
-                }
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                }
-                let mut name = String::new();
-                while let Some(&c) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        name.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if !name.is_empty() {
-                    names.push(name);
-                }
-            }
-        }
-    }
-    names.retain(|name| !block.arguments.contains_key(name));
-    names.sort();
-    names.dedup();
-    names
 }
 
 fn normalize(path: &Path) -> PathBuf {

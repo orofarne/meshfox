@@ -28,7 +28,7 @@ pub enum IncludeError {
     #[error("include target {0} not found: {1}")]
     NotFound(PathBuf, #[source] std::io::Error),
     #[error(transparent)]
-    Access(#[from] crate::file_read::ConfineError),
+    Access(#[from] crate::file_source::ConfineError),
 }
 
 /// Returns a new `Canvas` with every `include` node's target dumped into
@@ -78,7 +78,7 @@ pub fn resolve_with_access(
         let target_path = access
             .confine(&base_dir, &target)
             .map_err(|error| match error {
-                crate::file_read::ConfineError::TargetNotFound(path, source) => {
+                crate::file_source::ConfineError::TargetNotFound(path, source) => {
                     IncludeError::NotFound(path, source)
                 }
                 other => IncludeError::Access(other),

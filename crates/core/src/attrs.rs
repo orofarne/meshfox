@@ -117,6 +117,13 @@ pub fn first_unknown<'a>(attrs: &'a HashMap<String, String>, known: &[&str]) -> 
     unknown.into_iter().next()
 }
 
+pub(crate) fn parse_var_comment(line: &str) -> Option<HashMap<String, String>> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
+    let rest = inner.strip_prefix("meshfox:var")?;
+    Some(parse_attrs(rest.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

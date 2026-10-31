@@ -8,6 +8,7 @@
 pub mod args;
 pub mod artifacts;
 pub mod attrs;
+pub mod block_refs;
 pub mod body_rev;
 pub mod builtin_interpreter;
 pub mod canvas;
@@ -26,6 +27,7 @@ pub mod env_state;
 pub mod exec;
 pub mod fence;
 pub mod file_read;
+pub mod file_source;
 pub mod form;
 pub mod fsbrowse;
 pub mod gateway_header;

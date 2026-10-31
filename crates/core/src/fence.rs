@@ -324,7 +324,7 @@ fn parse_env(attrs: &HashMap<String, String>) -> Vec<EnvRef> {
 /// what a caller building one from scratch (`node block --deps`) needs,
 /// since it has no fence to have parsed one out of yet.
 pub fn parse_deps_list(s: &str) -> Vec<BlockRef> {
-    crate::args::split_list(s)
+    crate::block_refs::split_list(s)
         .into_iter()
         .filter(|s| !s.is_empty())
         .map(parse_block_ref)
@@ -526,7 +526,7 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
                 && ["render", "constraint"]
                     .iter()
                     .any(|key| attrs.get(*key).is_some_and(|v| v != "false")))
-                && (crate::exec::is_supported_lang(lang) || attrs.contains_key("interpreter"))
+                && (crate::block_refs::is_supported_lang(lang) || attrs.contains_key("interpreter"))
         })
         .collect()
 }
@@ -1064,7 +1064,7 @@ pub fn fingerprint(block: &CodeBlock) -> String {
 
 /// `fingerprint` plus the *resolved values* of the variables this block
 /// actually references — only its own `env=` list and any `$NAME` its
-/// `interpreter=` refers to (`crate::exec::interpreter_var_refs`), same
+/// `interpreter=` refers to (`crate::block_refs::interpreter_var_refs`), same
 /// scoping `resolve_block_env` already applies. So a variable's *value*
 /// changing (not just which variables the block declares) changes it too — a
 /// re-answered `meshfox:var` prompt, a changed `--set`/env override, or an
@@ -1082,11 +1082,11 @@ pub fn fingerprint(block: &CodeBlock) -> String {
 pub fn session_fingerprint(block: &CodeBlock, resolved_vars: &HashMap<String, String>) -> String {
     let mut names: Vec<String> = block.env.iter().map(|e| e.var_name.clone()).collect();
     if let Some(spec) = &block.interpreter {
-        names.extend(crate::exec::interpreter_var_refs(spec));
+        names.extend(crate::block_refs::interpreter_var_refs(spec));
     }
-    names.extend(crate::artifacts::var_refs(block));
+    names.extend(crate::block_refs::var_refs(block));
     names.retain(|name| !block.arguments.contains_key(name));
-    names.extend(crate::args::selected_env_var_names(block));
+    names.extend(crate::block_refs::selected_env_var_names(block));
     names.sort();
     names.dedup();
     let base = fingerprint(block);

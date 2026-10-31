@@ -7,6 +7,11 @@
 
 use crate::mdcanvas::{EDGE_ATTRS, NODE_ATTRS};
 
+/// Names of the embedded `@` interpreter macros, for completion. Mirrors
+/// `builtin_interpreter::BUILTINS` (a test there keeps the two in sync) so this
+/// module needn't depend on the execution side.
+pub const BUILTIN_NAMES: &[&str] = &["agent", "python_venv", "node_env"];
+
 /// A runnable fence's own attribute vocabulary (`crates/core/src/fence.rs`)
 /// — value-taking (`name="..."`) vs. bare presence flags (`cache`, no
 /// `=value` at all) need different insertion shapes, see `AttrCandidate`.
@@ -545,9 +550,9 @@ fn interpreter_completions(
         detail: Some(detail.to_string()),
         filter: None,
     };
-    let items: Vec<Item> = crate::builtin_interpreter::BUILTINS
+    let items: Vec<Item> = BUILTIN_NAMES
         .iter()
-        .map(|b| item(format!("@{}", b.name), "built-in macro"))
+        .map(|name| item(format!("@{name}"), "built-in macro"))
         .chain(["python3", "node"].map(|p| item(p.to_string(), "program")))
         .collect();
     Some(Completions {

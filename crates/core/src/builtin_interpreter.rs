@@ -384,6 +384,12 @@ fn fnv1a(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn suggest_builtin_names_match_the_embedded_macros() {
+        let names: Vec<&str> = super::BUILTINS.iter().map(|b| b.name).collect();
+        assert_eq!(names, crate::suggest::BUILTIN_NAMES);
+    }
+
     use super::*;
 
     #[test]

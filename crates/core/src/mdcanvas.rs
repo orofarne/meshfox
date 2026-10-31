@@ -1681,7 +1681,7 @@ pub fn rename_node_id(markdown: &str, old_id: &str, new_id: &str) -> Result<Stri
     }
 
     result = rewrite_deps_node_id(&result, old_id, new_id);
-    result = crate::vars::rewrite_from_node_id(&result, old_id, new_id);
+    result = rewrite_from_node_id(&result, old_id, new_id);
 
     Ok(result)
 }
@@ -3427,6 +3427,56 @@ fn scan(markdown: &str) -> Vec<Segment> {
         });
     }
     segments
+}
+
+/// Best-effort textual rewrite of every `meshfox:var ... from="old_id/..."`
+/// to `new_id/...`, used by `rename_node_id` alongside its
+/// `deps=` sweep. Same fence-and-output-aware line scan as
+/// `scan_var_decls`; a bare `from="block"` (no `node-id/`) names no node and
+/// is left alone.
+fn rewrite_from_node_id(markdown: &str, old_id: &str, new_id: &str) -> String {
+    let prefix = format!("{old_id}/");
+    let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
+    let output_ranges = crate::output::output_byte_ranges(markdown);
+    let mut fi = 0;
+    let mut offset = 0;
+    let mut out = String::with_capacity(markdown.len());
+    for (n, line) in markdown.split('\n').enumerate() {
+        let start = offset;
+        offset += line.len() + 1;
+        if n > 0 {
+            out.push('\n');
+        }
+        while fi < fence_ranges.len() && fence_ranges[fi].end <= start {
+            fi += 1;
+        }
+        let skip = (fi < fence_ranges.len() && fence_ranges[fi].start <= start)
+            || crate::fence::in_output_region(&output_ranges, start)
+            || crate::attrs::is_indented_as_code(line);
+        let from = if skip {
+            None
+        } else {
+            crate::attrs::parse_var_comment(line).and_then(|a| a.get("from").cloned())
+        };
+        match from.as_deref().and_then(|f| f.strip_prefix(&prefix)) {
+            Some(rest) => {
+                let from = format!("{prefix}{rest}");
+                let new_from = format!("{new_id}/{rest}");
+                let quoted = format!("from=\"{from}\"");
+                if line.contains(&quoted) {
+                    out.push_str(&line.replacen(&quoted, &format!("from=\"{new_from}\""), 1));
+                } else {
+                    out.push_str(&line.replacen(
+                        &format!("from={from}"),
+                        &format!("from={new_from}"),
+                        1,
+                    ));
+                }
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

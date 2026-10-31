@@ -1,4 +1,5 @@
 //! Local signatures attached to the immediately following runnable fence.
+pub use crate::block_refs::{selected_env_var_names, split_list};
 use crate::{attrs, fence, vars, Canvas, CodeBlock, VarDecl};
 use std::collections::HashSet;
 
@@ -210,42 +211,6 @@ pub fn validate(canvas: &Canvas) -> Result<(), ArgsError> {
         scan_node_signatures(node)?;
     }
     Ok(())
-}
-
-/// Separate commas only outside quoted strings and application brackets.
-pub fn split_list(text: &str) -> Vec<&str> {
-    let mut start = 0;
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut escape = false;
-    let mut result = Vec::new();
-    for (index, c) in text.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if quoted && c == '\\' {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            quoted = !quoted;
-            continue;
-        }
-        if !quoted {
-            match c {
-                '[' => depth += 1,
-                ']' => depth = depth.saturating_sub(1),
-                ',' if depth == 0 => {
-                    result.push(text[start..index].trim());
-                    start = index + 1;
-                }
-                _ => (),
-            }
-        }
-    }
-    result.push(text[start..].trim());
-    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -773,23 +738,6 @@ fn prepare_in(
         fields,
         block,
     })
-}
-
-/// Template selection always names a canvas variable, even when an argument
-/// shadows that name locally. Ordinary direct env references keep local scope.
-pub fn selected_env_var_names(block: &CodeBlock) -> Vec<String> {
-    block
-        .attrs
-        .get("env")
-        .map(|raw| {
-            fence::parse_env_list(raw)
-                .into_iter()
-                .zip(&block.env)
-                .filter(|(source, _)| source.var_name.contains("${"))
-                .map(|(_, selected)| selected.var_name.clone())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub fn block_env(
