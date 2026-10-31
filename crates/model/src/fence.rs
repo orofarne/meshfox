@@ -239,7 +239,7 @@ pub struct BlockRef {
     pub sync: bool,
 }
 
-pub(crate) fn parse_block_ref(s: &str) -> BlockRef {
+pub fn parse_block_ref(s: &str) -> BlockRef {
     let (s, sync) = match s.strip_suffix('!') {
         Some(rest) => (rest, true),
         None => (s, false),
@@ -351,7 +351,7 @@ pub fn parse_env_list(s: &str) -> Vec<EnvRef> {
 /// what makes nesting (`` ```` `` around `` ``` ``) and arbitrary cached
 /// command output safe to embed.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RawFence {
+pub struct RawFence {
     pub delim_char: char,
     pub delim_len: usize,
     pub info: String,
@@ -398,7 +398,7 @@ fn fence_close(line: &str, ch: char, min_len: usize) -> bool {
 /// consumed by one fence is never rescanned, so fences don't nest in the
 /// output — matching CommonMark, where what looks like a fence marker
 /// inside another fence's content is inert unless it actually closes it.
-pub(crate) fn scan_raw_fences(markdown: &str) -> Vec<RawFence> {
+pub fn scan_raw_fences(markdown: &str) -> Vec<RawFence> {
     let lines = lines_with_offsets(markdown);
     let mut fences = Vec::new();
     let mut i = 0;
@@ -443,7 +443,7 @@ pub(crate) fn scan_raw_fences(markdown: &str) -> Vec<RawFence> {
 /// closing delimiter line, inclusive), in document order. Anything a
 /// heading/structure scanner finds starting inside one of these ranges is
 /// fence content, not real document structure.
-pub(crate) fn fenced_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
+pub fn fenced_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
     scan_raw_fences(markdown)
         .into_iter()
         .map(|f| f.span)
@@ -549,7 +549,7 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
 /// `vars::scan_var_decls`/`unknown_var_attr`) for the same reason — see
 /// TODO.canvas.md: "Другие fence-aware сканеры не знают про
 /// meshfox:output-регионы".
-pub(crate) fn in_output_region(ranges: &[Range<usize>], pos: usize) -> bool {
+pub fn in_output_region(ranges: &[Range<usize>], pos: usize) -> bool {
     ranges.iter().any(|r| r.start <= pos && pos < r.end)
 }
 
@@ -1113,7 +1113,7 @@ pub fn combine_fingerprints<I: IntoIterator<Item = String>>(parts: I) -> String 
     format!("{:08x}", fnv1a(joined.as_bytes()))
 }
 
-pub(crate) fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
+pub fn parse_info_string(info: &str) -> (String, HashMap<String, String>) {
     let mut tokens = crate::attrs::tokenize(info).into_iter();
     let lang = tokens.next().unwrap_or_default();
     let attrs = crate::attrs::attrs_from_tokens(tokens);

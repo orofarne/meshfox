@@ -4576,7 +4576,7 @@ fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
 fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
     let mut resolved = resolved_canvas_structure(raw, canvas_path)?;
     // A runnable file node's block fingerprint covers its target's content.
-    resolved.hydrate_target_digests(canvas_path);
+    meshfox_core::hydrate_target_digests(&mut resolved, canvas_path);
     Ok(resolved)
 }
 

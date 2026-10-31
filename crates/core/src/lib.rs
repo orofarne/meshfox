@@ -2,21 +2,29 @@
 //! `.canvas.md` parsing/rendering, Markdown runnable-fence scanning,
 //! cached-output rewriting, and code executors.
 //!
+//! The document model itself (parsing and patching, fence scanning, output
+//! regions, the Starlark constraint/render passes) lives in `meshfox-model`,
+//! which has no filesystem, process or OS dependency and builds for
+//! `wasm32-unknown-unknown`. This crate re-exports it under the same module
+//! paths and adds everything that touches the machine: running blocks,
+//! variables and secrets, locks, and the disk-backed `FileAccess` that
+//! implements the model's `FileSource`.
+//!
 //! See the repository README for the on-disk format and conventions (the
 //! README is itself a valid meshfox document).
 
 pub mod args;
 pub mod artifacts;
-pub mod attrs;
-pub mod block_refs;
-pub mod body_rev;
+pub use meshfox_model::attrs;
+pub use meshfox_model::block_refs;
+pub use meshfox_model::body_rev;
 pub mod builtin_interpreter;
-pub mod canvas;
+pub use meshfox_model::canvas;
 pub mod canvas_call;
 pub mod canvas_index;
 pub mod capabilities;
-pub mod color_spans;
-pub mod comment;
+pub use meshfox_model::color_spans;
+pub use meshfox_model::comment;
 pub mod config;
 pub mod constraint;
 pub mod datevars;
@@ -25,22 +33,21 @@ pub mod diagnostics;
 mod dotenv;
 pub mod env_state;
 pub mod exec;
-pub mod fence;
+pub use meshfox_model::fence;
 pub mod file_read;
-pub mod file_source;
+pub use meshfox_model::file_source;
 pub mod form;
 pub mod fsbrowse;
 pub mod gateway_header;
-pub mod host;
-pub mod image_attrs;
+pub use meshfox_model::host;
+pub use meshfox_model::image_attrs;
 pub mod include;
-pub mod locate;
-mod markdown_fragment;
+pub use meshfox_model::locate;
 pub mod mdcanvas;
-pub mod merge;
+pub use meshfox_model::merge;
 pub mod open_rules;
-pub mod options;
-pub mod output;
+pub use meshfox_model::options;
+pub use meshfox_model::output;
 pub mod process_env;
 pub mod prune;
 pub mod run_plan;
@@ -50,16 +57,16 @@ pub mod service;
 pub mod service_lock;
 pub mod shared_env;
 pub mod slug;
-pub mod starlark_render;
+pub use meshfox_model::starlark_render;
 pub mod staticgen;
-pub mod subsup;
-pub mod suggest;
-pub mod svg;
+pub use meshfox_model::subsup;
+pub use meshfox_model::suggest;
+pub use meshfox_model::svg;
 pub mod syntax_dirs;
-pub mod tag_colors;
+pub use meshfox_model::tag_colors;
 pub mod tangle;
-pub mod timestamp;
-pub mod tree;
+pub use meshfox_model::timestamp;
+pub use meshfox_model::tree;
 pub mod tui_theme;
 pub mod varcache;
 pub mod varout;
@@ -86,8 +93,8 @@ pub use fence::{
 };
 pub mod dirvars;
 pub use dirvars::{
-    expand_dir_value, expand_file_value, expand_target, is_tmp_ref, reset_tmp, tmp_dir, tmp_size,
-    FileAccess,
+    expand_dir_value, expand_file_value, expand_target, hydrate_target_digests, is_tmp_ref,
+    reset_tmp, tmp_dir, tmp_size, FileAccess,
 };
 pub use file_read::{
     confine, confine_in, preview, preview_in, ConfineError, FilePreview, PreviewError,

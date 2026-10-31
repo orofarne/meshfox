@@ -1,0 +1,27 @@
+[package]
+name = "meshfox-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+starlark = "0.14"
+allocative = "0.3"
+pulldown-cmark = "0.13.4"
+csv = "1.4.0"
+serde_norway = "0.9.42"
+toml = "0.8"
+shlex = "1"
+blake3 = "1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+similar = "2"
+unicode-normalization = "0.1"
+
+# `starlark` pulls in `getrandom` 0.4 (via quickcheck/rand), which has no
+# default backend on wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

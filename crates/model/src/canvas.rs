@@ -524,19 +524,6 @@ impl Canvas {
         }
     }
 
-    /// [`Canvas::hydrate_target_digests_with`] against the real disk, with
-    /// the file access a run would have. (Core-side convenience: moves out of
-    /// the model together with `dirvars::FileAccess`.)
-    pub fn hydrate_target_digests(&mut self, canvas_path: &std::path::Path) {
-        // Most canvases have none: do not even build the file access
-        // (it reads the variable cache and shared config) for those.
-        if !self.nodes.iter().any(Node::is_runnable_file) {
-            return;
-        }
-        let access = crate::dirvars::FileAccess::for_canvas_path(self, canvas_path);
-        self.hydrate_target_digests_with(canvas_path, &access);
-    }
-
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.iter().find(|n| n.id == id)
     }

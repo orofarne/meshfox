@@ -85,7 +85,7 @@ pub fn format_duration_ms(duration_ms: u64) -> String {
 /// shorter than 3. `body` is a command's captured output, so it can contain
 /// literally anything — including a run of backticks as long as (or longer
 /// than) a fixed ` ```` ` would be.
-pub(crate) fn safe_fence_len(body: &str) -> usize {
+pub fn safe_fence_len(body: &str) -> usize {
     let mut longest_run = 0;
     let mut run = 0;
     for c in body.chars() {
@@ -333,7 +333,7 @@ fn render_output_block_image(
 /// `<!-- /meshfox:output -->` text partway through — true for text mode
 /// (always inside its own single fence) and, for markdown mode, exactly
 /// what `escape_html_comments` guarantees at write time.
-pub(crate) fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
+pub fn output_byte_ranges(markdown: &str) -> Vec<Range<usize>> {
     let fence_ranges = crate::fence::fenced_byte_ranges(markdown);
     let follows_a_real_fence = |pos: usize| {
         fence_ranges.iter().any(|r| r.end + 1 == pos)

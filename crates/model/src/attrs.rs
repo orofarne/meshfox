@@ -26,7 +26,7 @@ use std::collections::HashMap;
 /// node-scoped `meshfox:var` made non-root nodes newly reachable to
 /// `declared_vars`, which is what first exposed this — SPEC.md's own
 /// indented `INSTALL_PATH` example collided with README.md's real one).
-pub(crate) fn is_indented_as_code(line: &str) -> bool {
+pub fn is_indented_as_code(line: &str) -> bool {
     line.len() - line.trim_start_matches(' ').len() >= 4
 }
 
@@ -117,7 +117,7 @@ pub fn first_unknown<'a>(attrs: &'a HashMap<String, String>, known: &[&str]) -> 
     unknown.into_iter().next()
 }
 
-pub(crate) fn parse_var_comment(line: &str) -> Option<HashMap<String, String>> {
+pub fn parse_var_comment(line: &str) -> Option<HashMap<String, String>> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
     let rest = inner.strip_prefix("meshfox:var")?;

@@ -94,13 +94,13 @@ pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &dyn FileS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dirvars::FileAccess;
+    use crate::test_disk::DiskFiles;
     fn canvas(code: &str) -> Canvas {
         Canvas::from_markdown(&format!("# Root\n<!-- meshfox:node id=\"root\" -->\n```starlark render name=\"summary\" output=\"markdown\"\n{code}\n```\n## Task\n<!-- meshfox:node id=\"task\" tags=\"todo,task\" -->\n")).unwrap()
     }
     fn render(code: &str) -> RenderResult {
         let mut c = canvas(code);
-        annotate(&mut c, None, &FileAccess::none());
+        annotate(&mut c, None, &DiskFiles);
         c.nodes[0].render_results.remove(0)
     }
     #[test]
@@ -179,12 +179,12 @@ for n in [doc] + doc.descendants():
 print(md.table(headers=["Tag", "Nodes"], rows=[[tag, counts[tag]] for tag in sorted(counts)]))"#,
         );
         let text = c.nodes[0].text.clone();
-        annotate(&mut c, None, &FileAccess::none());
+        annotate(&mut c, None, &DiskFiles);
         assert!(c.nodes[0].render_results[0]
             .markdown
             .contains("| todo | 1 |"));
         c.nodes[1].tags = vec!["done".into()];
-        annotate(&mut c, None, &FileAccess::none());
+        annotate(&mut c, None, &DiskFiles);
         assert!(c.nodes[0].render_results[0]
             .markdown
             .contains("| done | 1 |"));
@@ -224,9 +224,9 @@ print(md.table(headers=["Tag", "Nodes"], rows=[[tag, counts[tag]] for tag in sor
     #[test]
     fn plain_starlark_is_inert_and_modes_are_validated() {
         let mut c = Canvas::from_markdown("# Root\n```starlark\nnot_valid()\n```\n```starlark constraint render\nprint(1)\n```\n```starlark render output=\"text\"\nprint(2)\n```").unwrap();
-        annotate(&mut c, None, &FileAccess::none());
+        annotate(&mut c, None, &DiskFiles);
         assert_eq!(c.nodes[0].render_results.len(), 2);
         assert!(c.nodes[0].render_results.iter().all(|r| r.error.is_some()));
-        assert!(crate::constraint::evaluate(&c, None).is_empty());
+        assert!(crate::constraint::evaluate_with_access(&c, None, &DiskFiles).is_empty());
     }
 }

@@ -3471,17 +3471,34 @@ dependencies = [
 name = "meshfox-core"
 version = "0.1.0"
 dependencies = [
- "allocative",
- "anyhow",
  "blake3",
- "csv",
  "globset",
  "ignore",
  "libc",
+ "meshfox-model",
  "pulldown-cmark",
  "rusqlite",
  "secret-service",
  "security-framework",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "shlex 1.3.0",
+ "thiserror 1.0.69",
+ "time",
+ "toml",
+]
+
+[[package]]
+name = "meshfox-model"
+version = "0.1.0"
+dependencies = [
+ "allocative",
+ "anyhow",
+ "blake3",
+ "csv",
+ "getrandom 0.4.3",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "serde_norway",

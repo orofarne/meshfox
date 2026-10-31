@@ -393,6 +393,22 @@ impl FileAccess {
     }
 }
 
+/// [`Canvas::hydrate_target_digests_with`] against the real disk, with the
+/// file access a run would have.
+pub fn hydrate_target_digests(canvas: &mut Canvas, canvas_path: &Path) {
+    // Most canvases have none: do not even build the file access
+    // (it reads the variable cache and shared config) for those.
+    if !canvas
+        .nodes
+        .iter()
+        .any(crate::canvas::Node::is_runnable_file)
+    {
+        return;
+    }
+    let access = FileAccess::for_canvas_path(canvas, canvas_path);
+    canvas.hydrate_target_digests_with(canvas_path, &access);
+}
+
 impl crate::file_source::FileSource for FileAccess {
     fn confine(&self, dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
         FileAccess::confine(self, dir, target)
