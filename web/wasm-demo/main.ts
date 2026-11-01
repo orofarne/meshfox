@@ -45,7 +45,9 @@ const STYLE = `
   #status { margin-top:1rem; min-height:1.3em; font-size:.82rem; opacity:.75; }
   #status.error { color:var(--fail); opacity:1; }
   .launcher .note { font-size:.75rem; opacity:.55; margin-top:2rem; line-height:1.6; }
-  #wasm-pill { position:fixed; left:12px; bottom:12px; z-index:2147483000; font:12px "Fira Code", system-ui, sans-serif; background:var(--node-bg); color:var(--fg); border:1px solid var(--node-border); padding:4px 10px; border-radius:999px; opacity:.9; }
+  /* Floats over the app, bottom centre: React Flow's controls sit bottom left
+     and its minimap bottom right, so the middle is the free place. */
+  #wasm-pill { position:fixed; left:50%; transform:translateX(-50%); bottom:12px; z-index:2147483000; max-width:calc(100vw - 460px); font:12px "Fira Code", system-ui, sans-serif; background:var(--node-bg); color:var(--fg); border:1px solid var(--node-border); padding:4px 10px; border-radius:999px; opacity:.9; }
   #wasm-pill a { color:var(--accent); margin-left:8px; cursor:pointer; text-decoration:underline; }
 `;
 

@@ -647,3 +647,21 @@ test("the edits a page can make are the ones the server's endpoints make (api le
   const nodes = (await canvasJson(page)).nodes.map((n) => n.id);
   expect(nodes).toEqual(["root", "b"]);
 });
+
+test("the pill covers none of React Flow's controls or minimap", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  // Two nodes: a single node is shown as a page, with no React Flow around it.
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator(".react-flow__controls")).toBeVisible();
+  const box = async (selector: string) => (await page.locator(selector).first().boundingBox())!;
+  const pill = await box("#wasm-pill");
+  for (const selector of [".react-flow__controls", ".react-flow__minimap"]) {
+    const other = await box(selector);
+    const apart =
+      pill.x + pill.width <= other.x || other.x + other.width <= pill.x || pill.y + pill.height <= other.y || other.y + other.height <= pill.y;
+    expect(apart, `the pill must not overlap ${selector}`).toBe(true);
+  }
+});
