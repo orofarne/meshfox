@@ -34,6 +34,7 @@ export interface UndoWasm {
 const SUMMARIES: Record<string, string> = {
   source: "edited the source",
   node_upserted: "edited a node",
+  restored: "restored an unsaved draft",
   node_created: "added a node",
   node_removed: "deleted a node",
   node_moved: "moved a node",
@@ -50,13 +51,16 @@ export class EditSession {
   private savedRev: string;
   private listeners: Array<() => void> = [];
 
+  /** `unsaved`: the text it starts from was never saved anywhere (a recovered
+   * draft, say), so it counts as changed from the first moment. */
   constructor(
     private readonly wasm: UndoWasm,
     initial: string,
+    unsaved = false,
   ) {
     this.log = new wasm.UndoLog(initial);
     this.current = initial;
-    this.savedRev = wasm.bodyRev(initial);
+    this.savedRev = unsaved ? "" : wasm.bodyRev(initial);
   }
 
   get raw(): string {

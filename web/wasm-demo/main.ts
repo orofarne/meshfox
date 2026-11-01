@@ -10,6 +10,7 @@
 import init, * as wasmApi from "../../crates/wasm/pkg/meshfox_wasm.js";
 import { addPicked } from "./add";
 import { createRenderer, installBackend, type Backend, type Document, type IncludeWarning } from "./backend";
+import { ago, deleteDraft, getDraft, listDrafts, putDraft, type Draft } from "./drafts";
 import { VirtualFiles } from "./files";
 import { fromDrop, fromFileList, type Picked } from "./pick";
 import { applyThemePreference, getThemePreference } from "../src/theme";
@@ -35,6 +36,8 @@ const STYLE = `
   .fresh span { opacity:.65; }
   .fresh .suffix { opacity:.5; margin-left:-.4rem; }
   .fresh input { font:inherit; font-size:.85rem; padding:.35rem .6rem; border-radius:6px; border:1px solid var(--node-border); background:var(--node-bg); color:var(--fg); width:10rem; }
+  .draft { display:flex; gap:.6rem; align-items:center; flex-wrap:wrap; font-size:.82rem; margin:.4rem 0; }
+  .draft span { margin-right:auto; opacity:.85; overflow-wrap:anywhere; }
   .row { display:flex; gap:.6rem; justify-content:center; flex-wrap:wrap; margin-top:1.1rem; }
   .launcher button { font:inherit; font-size:.85rem; padding:.4rem .9rem; border-radius:6px; border:1px solid var(--node-border); background:transparent; color:var(--fg); cursor:pointer; }
   .launcher button:hover { border-color:var(--accent); color:var(--accent); }
@@ -104,8 +107,17 @@ function download(doc: Document, backend: Backend) {
   backend.session.markSaved();
 }
 
+type SaveFilePicker = (options: {
+  suggestedName: string;
+  types: Array<{ description: string; accept: Record<string, string[]> }>;
+}) => Promise<{ createWritable(): Promise<{ write(data: string): Promise<void>; close(): Promise<void> }> }>;
+
+/** Where "save" writes, once the user has said so (File System Access API: Chromium). */
+const savePicker = (): SaveFilePicker | undefined =>
+  (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
+
 /** The strip at the bottom of a document: what is missing, and ways to add it. */
-function pill(doc: Document, backend: Backend): HTMLElement {
+function pill(doc: Document, backend: Backend, pending?: Draft): HTMLElement {
   let problem: string | undefined;
   const label = el("span");
   const warnings = (): IncludeWarning[] => backend.current().warnings ?? [];
@@ -113,6 +125,7 @@ function pill(doc: Document, backend: Backend): HTMLElement {
     const names = [...new Set(warnings().map((w) => w.target.replace(/^\.\//, "")))];
     label.textContent = [
       backend.session.dirty ? "in your browser · unsaved changes" : "in your browser",
+      pending && `unsaved edits from ${ago(pending.savedAt)} found`,
       doc.note,
       names.length > 0 &&
         `${names.length} include${names.length === 1 ? "" : "s"} missing: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""}`,
@@ -145,6 +158,36 @@ function pill(doc: Document, backend: Backend): HTMLElement {
     if (folderPicker.files) void add(fromFileList(folderPicker.files, newRules), false);
     folderPicker.value = "";
   };
+  // Writing into a file, where the browser lets a page do that: asked about once,
+  // then the same file is written again silently.
+  let target: Awaited<ReturnType<SaveFilePicker>> | undefined;
+  const save = async () => {
+    const pick = savePicker();
+    if (!pick) return;
+    try {
+      target ??= await pick({
+        suggestedName: doc.path.split("/").pop() ?? "canvas.canvas.md",
+        types: [{ description: "meshfox canvas", accept: { "text/markdown": [".md"] } }],
+      });
+      const writable = await target.createWritable();
+      await writable.write(backend.session.raw);
+      await writable.close();
+      backend.session.markSaved();
+      problem = undefined;
+    } catch (e) {
+      // Closing the picker is not a problem.
+      problem = e instanceof DOMException && e.name === "AbortError" ? undefined : `not saved: ${String(e)}`;
+    }
+    draw();
+  };
+  const decide = (restore: boolean) => {
+    const draft = pending;
+    pending = undefined;
+    if (draft && restore) problem = backend.replace(draft.raw, "restored");
+    else if (draft) void deleteDraft(draft.key);
+    for (const id of ["wasm-restore", "wasm-discard"]) document.getElementById(id)?.remove();
+    draw();
+  };
   backend.session.onChange(draw);
   draw();
   return el(
@@ -153,11 +196,45 @@ function pill(doc: Document, backend: Backend): HTMLElement {
     label,
     filePicker,
     folderPicker,
+    ...(pending
+      ? [
+          el("a", { id: "wasm-restore", textContent: "restore them", onclick: () => decide(true) }),
+          el("a", { id: "wasm-discard", textContent: "discard", onclick: () => decide(false) }),
+        ]
+      : []),
+    ...(savePicker() ? [el("a", { id: "wasm-save", textContent: "save", onclick: () => void save() })] : []),
     el("a", { id: "wasm-download", textContent: "download", onclick: () => download(doc, backend) }),
     el("a", { id: "wasm-add-files", textContent: "add files…", onclick: () => filePicker.click() }),
     el("a", { id: "wasm-add-folder", textContent: "add folder…", onclick: () => folderPicker.click() }),
     el("a", { textContent: "open another", onclick: () => history.back() }),
   );
+}
+
+/** Keeps the unsaved text as a draft while it differs from what was saved, and
+ * drops it once it does not (saved, or undone back). Held back while an older
+ * draft is waiting for the user's decision: it must not be overwritten (or
+ * deleted by a clean document) before they have chosen. */
+function keepDraft(doc: Document, backend: Backend, waiting: () => boolean) {
+  const key = doc.key!;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const write = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    if (waiting()) return;
+    if (backend.session.dirty) {
+      void putDraft({ key, path: doc.path, raw: backend.session.raw, savedAt: Date.now() });
+    } else {
+      void deleteDraft(key);
+    }
+  };
+  backend.session.onChange(() => {
+    clearTimeout(timer);
+    timer = setTimeout(write, 400);
+  });
+  // A debounce that has not fired yet must not be lost with the tab.
+  const flush = () => timer !== undefined && write();
+  addEventListener("pagehide", flush);
+  document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && flush());
 }
 
 async function start(doc: Document) {
@@ -176,8 +253,13 @@ async function start(doc: Document) {
   // fetch interception) depend on it.
   history.pushState({ meshfox: "document" } satisfies HistoryState, "");
   documentOpen = true;
-  document.body.append(pill(doc, backend));
+  // Work left over from an earlier visit to this same document: offered, never
+  // applied on its own (and kept until the user decides).
+  const stored = doc.key && !doc.unsaved ? await getDraft(doc.key) : undefined;
+  const pending = stored && stored.raw !== backend.session.raw ? stored : undefined;
+  document.body.append(pill(doc, backend, pending));
   unsaved = () => backend.session.dirty;
+  if (doc.key) keepDraft(doc, backend, () => pending !== undefined && document.getElementById("wasm-restore") !== null);
   await import("../src/main");
 }
 
@@ -294,6 +376,7 @@ function launcher(note?: string) {
         }),
         drop,
         fresh,
+        el("div", { id: "drafts" }),
         filePicker,
         folderPicker,
         el("div", { id: "choices" }),
@@ -307,6 +390,43 @@ function launcher(note?: string) {
     ),
   );
   if (note) status(note);
+  void showDrafts();
+}
+
+/** Drafts left in this browser, on the launcher: where work lost to a closed
+ * tab or a crash comes back from. */
+async function showDrafts() {
+  const box = document.getElementById("drafts");
+  if (!box) return;
+  const drafts = await listDrafts();
+  if (drafts.length === 0) return;
+  const row = (draft: Draft) => {
+    const line: HTMLElement = el(
+      "div",
+      { className: "draft" },
+      el("span", { textContent: `${draft.key} · ${ago(draft.savedAt)}` }),
+      el("button", {
+        textContent: "Restore",
+        onclick: () => {
+          // Only the canvas text was kept: its includes and pictures show as
+          // missing until the files are added back ("add files…").
+          const files = new VirtualFiles();
+          files.set(draft.path, draft.raw);
+          void start({ path: draft.path, files, key: draft.key, unsaved: true });
+        },
+      }),
+      el("button", {
+        textContent: "Discard",
+        onclick: () => {
+          void deleteDraft(draft.key);
+          line.remove();
+          if (box.querySelectorAll(".draft").length === 0) box.replaceChildren();
+        },
+      }),
+    );
+    return line;
+  };
+  box.replaceChildren(el("h2", { textContent: "Unsaved work in this browser" }), ...drafts.map(row));
 }
 
 applyThemePreference(getThemePreference());

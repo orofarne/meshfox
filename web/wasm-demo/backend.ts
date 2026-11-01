@@ -21,6 +21,8 @@ export interface Document {
   /** Tells this document from others opened at the same address (the picked
    * folder's name and the canvas's path): scopes what the page remembers. */
   key?: string;
+  /** The text was never saved anywhere (a recovered draft): unsaved from the start. */
+  unsaved?: boolean;
   /** Shown beside the "in your browser" pill, e.g. what was not read. */
   note?: string;
 }
@@ -96,6 +98,9 @@ export interface Backend {
   session: EditSession;
   /** The document as rendered now. */
   current(): Rendered;
+  /** Makes `raw` the document, as one undoable step (a recovered draft). The
+   * reason it does not render, or `undefined`. */
+  replace(raw: string, opKind: string): string | undefined;
   /** The files changed: render again and tell the page, which reloads the
    * canvas as it does when a file changes under a real server. */
   refresh(): Rendered;
@@ -110,7 +115,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   let version = 1;
   let seq = 0;
   const watchers = new Set<{ push(event: unknown): void }>();
-  const session = new EditSession(wasm, doc.files.text(doc.path) ?? "");
+  const session = new EditSession(wasm, doc.files.text(doc.path) ?? "", doc.unsaved);
 
   /** Tells every open page what a server would after a save: the undo state,
    * and (when the document moved) that it changed. */
@@ -547,6 +552,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   return {
     session,
     current: () => render(),
+    replace: (raw, opKind) => commit(raw, opKind),
     refresh() {
       render.reset();
       swapped = new Map(); // blob URLs of the old bytes

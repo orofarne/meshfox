@@ -28,6 +28,16 @@ the page refreshes in place (a file lands where the missing target points when
 its name matches, otherwise beside the canvas; a folder is taken as the same
 root as the first pick).
 
+Unsaved work is kept in the browser (IndexedDB, `drafts.ts`) while it differs
+from what was saved: closing the tab, a crash or a reload loses nothing. The
+launcher lists such drafts ("Unsaved work in this browser": Restore / Discard),
+and opening the same file again offers the one it finds ("restore them" /
+"discard"; it is kept until you decide). A draft goes away when the text is
+saved or undone back to the saved text. "download" saves a file; "save" (only
+where the browser lets a page write to a file: Chromium) writes into a file you
+choose once, then again without asking. Only the canvas text is kept — it is the
+only file the editor changes.
+
 Browser history: opening a document pushes a history entry (the URL is left
 alone, since the app's relative `api/...` requests depend on it), so Back
 returns to the launcher. A document lives only in memory, so a reload, or

@@ -372,8 +372,12 @@ const END_OF_DOCUMENT = "Control+End";
 /** Opens Source mode and types into Monaco: `replace` swaps the whole text,
  * otherwise `text` goes at the end. */
 async function typeInSource(page: Page, text: string, replace = false) {
-  await page.getByRole("button", { name: "Edit", exact: true }).click();
-  await page.getByRole("button", { name: "Source" }).click();
+  // Already editing, on a second edit: there is no "Edit" button then.
+  const edit = page.getByRole("button", { name: "Edit", exact: true });
+  const source = page.getByRole("button", { name: "Source" });
+  await expect(edit.or(source)).toBeVisible();
+  if ((await edit.count()) > 0) await edit.click();
+  await source.click();
   const editor = page.locator(".mesh-source-editor-body .monaco-editor");
   await editor.waitFor();
   // Only once the document's text is in the editor does a key press mean anything.
@@ -664,4 +668,148 @@ test("the pill covers none of React Flow's controls or minimap", async ({ page }
       pill.x + pill.width <= other.x || other.x + other.width <= pill.x || pill.y + pill.height <= other.y || other.y + other.height <= pill.y;
     expect(apart, `the pill must not overlap ${selector}`).toBe(true);
   }
+});
+
+// ---- drafts: unsaved work survives a closed tab ----
+
+const drafts = (page: Page) =>
+  page.evaluate(
+    () =>
+      new Promise<Array<{ key: string; raw: string }>>((resolve) => {
+        const open = indexedDB.open("meshfox-editor", 1);
+        open.onupgradeneeded = () => open.result.createObjectStore("drafts", { keyPath: "key" });
+        open.onsuccess = () => {
+          const all = open.result.transaction("drafts").objectStore("drafts").getAll();
+          all.onsuccess = () => resolve(all.result);
+        };
+      }),
+  );
+
+async function openAndEdit(page: Page, file: string) {
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect.poll(async () => (await drafts(page)).length).toBe(1);
+}
+
+test("unsaved edits come back after the tab was closed: from the launcher", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await openAndEdit(page, file);
+  expect((await drafts(page))[0].raw).toBe(ROOT + ADDED);
+
+  page.on("dialog", (d) => void d.accept()); // "leave without downloading?"
+  await page.reload();
+  await expect(page.locator("#launcher")).toBeVisible();
+  await expect(page.locator("#drafts")).toContainText("doc.canvas.md");
+  await page.locator("#drafts button", { hasText: "Restore" }).click();
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  // It was never saved anywhere: still unsaved, and still kept.
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+  expect((await drafts(page))[0].raw).toBe(ROOT + ADDED);
+});
+
+test("opening the same file again offers the draft, and keeps it until the user decides", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await openAndEdit(page, file);
+  page.on("dialog", (d) => void d.accept());
+  await page.reload();
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved edits from");
+  await expect(page.getByText("added in the browser")).toHaveCount(0);
+  // Not touched, not deleted, though the document in the page is clean.
+  await page.waitForTimeout(800);
+  expect(await drafts(page)).toHaveLength(1);
+
+  await page.locator("#wasm-restore").click();
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+  // Restoring is a step like any other: one undo goes back to the file as opened.
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.getByRole("button", { name: /undo/ }).click();
+  await expect(page.getByText("added in the browser")).toHaveCount(0);
+});
+
+test("discarding the draft, and saving, both delete it", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await openAndEdit(page, file);
+  page.on("dialog", (d) => void d.accept());
+  await page.reload();
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await page.locator("#wasm-discard").click();
+  await expect.poll(async () => (await drafts(page)).length).toBe(0);
+
+  // A fresh edit makes a draft again; downloading it (the work is safe) removes it.
+  await editSource(page, ADDED);
+  await expect.poll(async () => (await drafts(page)).length).toBe(1);
+  const downloading = page.waitForEvent("download");
+  await page.locator("#wasm-download").click();
+  await downloading;
+  await expect.poll(async () => (await drafts(page)).length).toBe(0);
+});
+
+test("a draft removes itself when the edit is undone back to the saved text", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await openAndEdit(page, file);
+  await page.getByRole("button", { name: /undo/ }).click();
+  await expect(page.getByText("added in the browser")).toHaveCount(0);
+  await expect.poll(async () => (await drafts(page)).length).toBe(0);
+});
+
+test("a new canvas's work is kept too", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("#new-canvas").click();
+  await expect(page.locator("#wasm-pill")).toBeVisible();
+  await editSource(page, ADDED);
+  await expect.poll(async () => (await drafts(page)).map((d) => d.key)).toEqual(["new:untitled.canvas.md"]);
+});
+
+// ---- save into a file (File System Access API: Chromium) ----
+
+test("save writes into the chosen file, and again without asking", async ({ page }) => {
+  await page.addInitScript(() => {
+    const w = window as unknown as Record<string, unknown>;
+    w.__saves = { asked: 0, name: "", writes: [] as string[], closed: 0 };
+    w.showSaveFilePicker = async (options: { suggestedName: string }) => {
+      const saves = w.__saves as { asked: number; name: string; writes: string[]; closed: number };
+      saves.asked++;
+      saves.name = options.suggestedName;
+      return {
+        createWritable: async () => ({
+          write: async (data: string) => void saves.writes.push(data),
+          close: async () => void saves.closed++,
+        }),
+      };
+    };
+  });
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await editSource(page, ADDED);
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+
+  const saves = () =>
+    page.evaluate(() => (window as unknown as { __saves: { asked: number; name: string; writes: string[]; closed: number } }).__saves);
+  await page.locator("#wasm-save").click();
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+  expect(await saves()).toEqual({ asked: 1, name: "doc.canvas.md", writes: [ROOT + ADDED], closed: 1 });
+
+  // A second save goes to the same file without a picker.
+  await editSource(page, "\nmore text\n");
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+  await page.locator("#wasm-save").click();
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+  const after = await saves();
+  expect(after.asked).toBe(1);
+  expect(after.writes).toHaveLength(2);
+  expect(after.writes[1]).toContain("more text");
+  expect(after.closed).toBe(2);
 });
