@@ -31,17 +31,61 @@ pub enum IncludeError {
     Access(#[from] crate::file_source::ConfineError),
 }
 
+/// An `include` that could not be read, in a lenient resolve (see
+/// [`resolve_lenient`]): the node stays, holding a notice in place of the
+/// target's content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncludeWarning {
+    pub node_id: String,
+    /// The target as written, e.g. `./TEMPLATES.md`.
+    pub target: String,
+    /// Why it could not be read.
+    pub reason: String,
+}
+
+/// Strict: the first include that cannot be read is an error.
 pub fn resolve_with_access(
     canvas: &Canvas,
     base_path: &Path,
     access: &dyn crate::file_source::FileSource,
 ) -> Result<Canvas, IncludeError> {
+    resolve_inner(canvas, base_path, access, false).map(|(canvas, _)| canvas)
+}
+
+/// Lenient, for a viewer that only has some of the files (a single `.canvas.md`
+/// picked in a browser): an include whose target is missing, or outside what
+/// may be read, does not fail the document. Its node becomes a text node with
+/// a warning in place of the content, and is reported in the second result.
+/// A node with no target at all is still an error.
+pub fn resolve_lenient(
+    canvas: &Canvas,
+    base_path: &Path,
+    access: &dyn crate::file_source::FileSource,
+) -> Result<(Canvas, Vec<IncludeWarning>), IncludeError> {
+    resolve_inner(canvas, base_path, access, true)
+}
+
+fn unreadable_notice(target: &str, reason: &str) -> String {
+    format!(
+        "> [!WARNING]\n> **Include not available.** `{target}` could not be read: {reason}.\n\
+         > Its content is not shown here.\n"
+    )
+}
+
+fn resolve_inner(
+    canvas: &Canvas,
+    base_path: &Path,
+    access: &dyn crate::file_source::FileSource,
+    lenient: bool,
+) -> Result<(Canvas, Vec<IncludeWarning>), IncludeError> {
     let base_dir = base_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let mut nodes = canvas.nodes.clone();
+    let mut warnings = Vec::new();
 
     for node in nodes
         .iter_mut()
@@ -51,17 +95,41 @@ pub fn resolve_with_access(
             .target
             .clone()
             .ok_or_else(|| IncludeError::MissingTarget(node.id.clone()))?;
-        let target_path = access
-            .confine(&base_dir, &target)
-            .map_err(|error| match error {
-                crate::file_source::ConfineError::TargetNotFound(path, source) => {
-                    IncludeError::NotFound(path, source)
-                }
-                other => IncludeError::Access(other),
-            })?;
-        let contents = access
-            .read_to_string(&target_path)
-            .map_err(|e| IncludeError::NotFound(target_path.clone(), e))?;
+        let read = (|| {
+            let target_path = access
+                .confine(&base_dir, &target)
+                .map_err(|error| match error {
+                    crate::file_source::ConfineError::TargetNotFound(path, source) => {
+                        IncludeError::NotFound(path, source)
+                    }
+                    other => IncludeError::Access(other),
+                })?;
+            let contents = access
+                .read_to_string(&target_path)
+                .map_err(|e| IncludeError::NotFound(target_path.clone(), e))?;
+            Ok((target_path, contents))
+        })();
+        let (target_path, contents) = match read {
+            Ok(ok) => ok,
+            Err(error) if lenient => {
+                let reason = match &error {
+                    IncludeError::NotFound(..) => "it is not among the files that were opened".to_string(),
+                    other => other.to_string(),
+                };
+                node.node_type = NodeType::Text;
+                node.target = None;
+                node.text = unreadable_notice(&target, &reason);
+                // A notice folded away behind a toggle is no notice.
+                node.fold = Some(false);
+                warnings.push(IncludeWarning {
+                    node_id: node.id.clone(),
+                    target,
+                    reason,
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         // Best-effort: an unreadable/relative-weirdness parent just leaves
         // `asset_base` unset, falling back to the canvas's own directory —
         // same graceful-degradation posture the rest of this crate takes
@@ -75,15 +143,18 @@ pub fn resolve_with_access(
         node.plain_markdown_include = true;
     }
 
-    Ok(Canvas {
-        nodes,
-        options: Vec::new(),
-        artifact_root: base_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf(),
-        artifact_values: canvas.artifact_values.clone(),
-    })
+    Ok((
+        Canvas {
+            nodes,
+            options: Vec::new(),
+            artifact_root: base_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf(),
+            artifact_values: canvas.artifact_values.clone(),
+        },
+        warnings,
+    ))
 }
 
 /// One `include` node declared directly in `canvas`, resolved to the

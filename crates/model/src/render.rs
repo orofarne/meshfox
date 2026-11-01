@@ -10,7 +10,7 @@
 use crate::body_rev::annotate_body_revs;
 use crate::canvas::Canvas;
 use crate::file_source::FileSource;
-use crate::include::{self, IncludeError};
+use crate::include::{self, IncludeError, IncludeWarning};
 use crate::mdcanvas::{self, ParseError};
 use crate::options::declared_options;
 use crate::tag_colors::annotate_effective_colors;
@@ -43,11 +43,29 @@ pub fn render_canvas(
     files: &dyn FileSource,
 ) -> Result<Canvas, RenderError> {
     let parsed = mdcanvas::parse(raw)?;
-    let mut canvas = include::resolve_with_access(&parsed, canvas_path, files)?;
+    let canvas = include::resolve_with_access(&parsed, canvas_path, files)?;
+    Ok(finish(canvas, canvas_path, files))
+}
+
+/// Like [`render_canvas`], but an `include` that cannot be read does not fail
+/// the document (see [`include::resolve_lenient`]): it is shown as a notice
+/// and returned in the warnings. For a viewer that may hold only some of the
+/// files.
+pub fn render_canvas_lenient(
+    raw: &str,
+    canvas_path: &Path,
+    files: &dyn FileSource,
+) -> Result<(Canvas, Vec<IncludeWarning>), RenderError> {
+    let parsed = mdcanvas::parse(raw)?;
+    let (canvas, warnings) = include::resolve_lenient(&parsed, canvas_path, files)?;
+    Ok((finish(canvas, canvas_path, files), warnings))
+}
+
+fn finish(mut canvas: Canvas, canvas_path: &Path, files: &dyn FileSource) -> Canvas {
     // A runnable file node's block fingerprint covers its target's content.
     canvas.hydrate_target_digests_with(canvas_path, files);
     annotate_resolved(&mut canvas, canvas_root_dir(canvas_path), files);
-    Ok(canvas)
+    canvas
 }
 
 /// The annotation passes over an already include-resolved canvas, in order:
@@ -126,6 +144,29 @@ mod tests {
         let notes = canvas.node("notes").unwrap();
         assert!(notes.text.contains("hello from disk"));
         assert!(notes.plain_markdown_include);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lenient_render_shows_a_missing_include_as_a_notice() {
+        let dir = tmp("lenient");
+        fs::write(dir.join("here.md"), "# Here\n\npresent\n").unwrap();
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Gone\n<!-- meshfox:node id=\"gone\" type=\"include\" -->\n\n[gone](./gone.md)\n\n",
+            "## Here\n<!-- meshfox:node id=\"here\" type=\"include\" -->\n\n[here](./here.md)\n",
+        );
+        let path = dir.join("x.canvas.md");
+        assert!(render_canvas(raw, &path, &DiskFiles).is_err(), "strict stays strict");
+        let (canvas, warnings) = render_canvas_lenient(raw, &path, &DiskFiles).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].node_id, "gone");
+        assert_eq!(warnings[0].target, "./gone.md");
+        let gone = canvas.node("gone").unwrap();
+        assert!(gone.text.contains("[!WARNING]") && gone.text.contains("./gone.md"), "{}", gone.text);
+        assert!(!gone.plain_markdown_include);
+        assert_eq!(gone.fold, Some(false));
+        assert!(canvas.node("here").unwrap().text.contains("present"));
         let _ = fs::remove_dir_all(&dir);
     }
 

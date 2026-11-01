@@ -6,7 +6,7 @@
 import { VirtualFiles } from "./files";
 
 export interface WasmApi {
-  renderCanvas(source: string, path: string, files?: unknown): string;
+  renderCanvasWithWarnings(source: string, path: string, files?: unknown): string;
   version(): string;
 }
 
@@ -41,7 +41,16 @@ const json = (value: unknown, status = 200): Response =>
 const text = (body: string, status = 200): Response =>
   new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
 
-export type Rendered = { json: string; error?: undefined } | { error: string; json?: undefined };
+/** An `include` the opened files do not hold: its node shows a notice. */
+export interface IncludeWarning {
+  nodeId: string;
+  target: string;
+  reason: string;
+}
+
+export type Rendered =
+  | { json: string; warnings: IncludeWarning[]; error?: undefined }
+  | { error: string; json?: undefined; warnings?: undefined };
 
 /** Renders the document once (it never changes) — also how the launcher finds
  * out, before loading the UI, that a document cannot be shown. */
@@ -53,7 +62,10 @@ export function createRenderer(wasm: WasmApi, doc: Document): () => Rendered {
       try {
         const source = doc.files.text(doc.path);
         if (source === undefined) throw new Error(`${doc.path} is not among the opened files`);
-        rendered = { json: wasm.renderCanvas(source, doc.path, provider) };
+        // Lenient: someone who opened a single file has not got its includes,
+        // and should still see the document, with a notice where they go.
+        const out = JSON.parse(wasm.renderCanvasWithWarnings(source, doc.path, provider));
+        rendered = { json: JSON.stringify(out.canvas), warnings: out.warnings };
       } catch (e) {
         rendered = { error: e instanceof Error ? e.message : String(e) };
       }

@@ -69,6 +69,20 @@ pub fn render_canvas(source: &str, path: &str, files: JsValue) -> Result<String,
     serde_json::to_string(&canvas).map_err(|e| JsError::new(&e.to_string()))
 }
 
+/// Like `renderCanvas`, for a host that may hold only some of the files: an
+/// `include` that cannot be read does not fail the document. Its node shows a
+/// notice instead of the content, and the result is JSON
+/// `{ "canvas": <the canvas>, "warnings": [{ "nodeId", "target", "reason" }] }`.
+/// A document that does not parse is still an error.
+#[wasm_bindgen(js_name = renderCanvasWithWarnings)]
+pub fn render_canvas_with_warnings(source: &str, path: &str, files: JsValue) -> Result<String, JsError> {
+    let provider = Provider::from_js(&files)?;
+    let (canvas, warnings) = render::render_canvas_lenient(source, Path::new(path), &provider)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    serde_json::to_string(&serde_json::json!({ "canvas": canvas, "warnings": warnings }))
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
 /// Lexically resolves `target` against `dir` and refuses anything that
 /// leaves `dir`: the host's files are a virtual tree, so there is no disk to
 /// canonicalize against, only `.`/`..` to fold. A `..` may undo what the

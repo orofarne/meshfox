@@ -92,6 +92,11 @@ async function start(doc: Document) {
     return;
   }
   installBackend(wasmApi, doc, render);
+  const missing = first.warnings;
+  if (missing.length > 0) {
+    const names = [...new Set(missing.map((w) => w.target.replace(/^\.\//, "")))];
+    doc = { ...doc, note: [doc.note, `${names.length} include${names.length === 1 ? "" : "s"} missing: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""}`].filter(Boolean).join(" · ") };
+  }
   document.getElementById("launcher")?.remove();
   // The URL stays as it is: the app's own relative `api/...` requests (and the
   // fetch interception) depend on it.

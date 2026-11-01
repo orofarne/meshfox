@@ -134,3 +134,22 @@ test("IgnoreRules applies the model's rules: dots and .meshfoxignore", () => {
   assert.equal(rules.isIgnored("a.canvas.md", false), false);
   rules.free();
 });
+
+test("renderCanvasWithWarnings shows a missing include as a notice instead of failing", () => {
+  const out = JSON.parse(wasm.renderCanvasWithWarnings(INCLUDE_DOC, "doc.canvas.md", () => null));
+  assert.deepEqual(out.warnings.map((w) => [w.nodeId, w.target]), [["notes", "./notes.md"]]);
+  assert.match(out.warnings[0].reason, /not among the files/);
+  const notes = out.canvas.nodes.find((n) => n.id === "notes");
+  assert.match(notes.text, /\[!WARNING\]/);
+  assert.match(notes.text, /\.\/notes\.md/);
+  // With the file, no warnings and the content is there.
+  const ok = JSON.parse(
+    wasm.renderCanvasWithWarnings(INCLUDE_DOC, "doc.canvas.md", (p) => (p.endsWith("notes.md") ? "# N\n\nhi\n" : null)),
+  );
+  assert.deepEqual(ok.warnings, []);
+  assert.match(ok.canvas.nodes.find((n) => n.id === "notes").text, /hi/);
+  // A document that does not parse is still an error.
+  assert.throws(() => wasm.renderCanvasWithWarnings("no heading here\n", "x.canvas.md"), /root|heading/i);
+  // Strict stays strict.
+  assert.throws(() => render(INCLUDE_DOC, "doc.canvas.md", () => null), /notes\.md/);
+});

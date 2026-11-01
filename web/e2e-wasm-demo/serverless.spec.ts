@@ -125,16 +125,16 @@ test("a picked folder is read by the model's ignore rules: dots and .meshfoxigno
 
   await page.goto("/");
   await page.locator("input[webkitdirectory]").setInputFiles(dir);
-  // `drafts/b.md` was never read, so the include of it is missing: the pick
-  // is refused in the launcher, naming it. (It is neither a crash nor a pick
-  // among several canvases: the excluded and hidden canvases are not there.)
-  await expect(page.locator("#status.error")).toContainText("drafts/b.md");
-  await expect(page.getByRole("button", { name: /canvas\.md/ })).toHaveCount(0);
+  // `drafts/b.md` was never read, so its include shows a notice. (And there is
+  // no "which one?": the excluded and hidden canvases are not there.)
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("1 include missing: drafts/b.md");
 
   // Without the ignore file the same folder opens, `node_modules` included.
   fs.rmSync(path.join(dir, ".meshfoxignore"));
   put("doc.canvas.md", ROOT + '## A\n<!-- meshfox:node id="a" type="include" -->\n\n[a](./node_modules/a.md)\n');
   fs.rmSync(path.join(dir, "drafts"), { recursive: true });
+  await page.goto("/");
   await page.reload();
   await page.locator("input[webkitdirectory]").setInputFiles(dir);
   await expect(page.getByText("The root.")).toBeVisible();
@@ -197,15 +197,29 @@ test("a single file works when it needs nothing else", async ({ page }) => {
   expect((await canvasJson(page)).nodes.find((n) => n.id === "child")!.effectiveColor).toBe("1");
 });
 
-test("a canvas whose include is missing is reported in the launcher, not loaded", async ({ page }) => {
+test("a canvas whose include is missing opens, with a notice where it goes", async ({ page }) => {
   const dir = tmpDir();
   const file = path.join(dir, "doc.canvas.md");
   fs.writeFileSync(file, ROOT + INCLUDE);
   await page.goto("/");
   await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
-  await expect(page.locator("#status.error")).toContainText("notes.md");
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator("#launcher")).toHaveCount(0);
+  await expect(page.locator("#wasm-pill")).toContainText("1 include missing: notes.md");
+  const notes = (await canvasJson(page)).nodes.find((n) => n.id === "notes")!;
+  expect(notes.text).toContain("[!WARNING]");
+  expect(notes.text).toContain("./notes.md");
+  // The notice is drawn as a GFM alert, in the node.
+  await expect(page.locator(".markdown-alert-warning")).toContainText("Include not available");
+});
+
+test("a document that does not parse is still refused in the launcher", async ({ page }) => {
+  const file = path.join(tmpDir(), "bad.canvas.md");
+  fs.writeFileSync(file, "no heading here\n");
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.locator("#status.error")).toBeVisible();
   await expect(page.locator("#launcher")).toBeVisible();
-  await expect(page.locator(".react-flow__node")).toHaveCount(0);
 });
 
 test("a folder with several canvases asks which one", async ({ page }) => {
