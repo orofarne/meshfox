@@ -2624,6 +2624,7 @@ export default function App() {
             onOpenFile: () => handleOpenFile(n.id),
             onOpenFileFolder: () => handleOpenFileFolder(n.id),
             remote: workerRemote,
+            noExec: workerNoExec,
             onAddChild: () => handleAddChild(n.id),
             onFitSize: size => fitNodeSizeRef.current(n.id, size),
             onMoveUp:
@@ -2878,7 +2879,7 @@ export default function App() {
     // Deliberately excludes handleRun/handleKill/setNodes/setEdges: this effect should
     // only re-run when a fresh canvas doc arrives.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvas, workerRemote]);
+  }, [canvas, workerRemote, workerNoExec]);
 
   // Keeps `measuredHeightsRef` current — cheap (a ref write, no state) so
   // this can safely depend on `nodes` directly, unlike the canvas-load
@@ -3859,17 +3860,21 @@ export default function App() {
             🛡 {constraintStats.total - constraintStats.failed}/{constraintStats.total}
           </span>
         )}
-        <button
-          type="button"
-          className="service-stats service-stats-ok"
-          title="Console — a live transcript of the most recent run's output"
-          onClick={() => {
-            setConsolePinned(consoleCollapsed);
-            setConsoleCollapsed(!consoleCollapsed);
-          }}
-        >
-          ⎙ Console
-        </button>
+        {/* Nothing runs in a no-exec core, so there is no output to stream and
+         * no session of runs to forget: the controls for either are left out. */}
+        {!workerNoExec && (
+          <button
+            type="button"
+            className="service-stats service-stats-ok"
+            title="Console — a live transcript of the most recent run's output"
+            onClick={() => {
+              setConsolePinned(consoleCollapsed);
+              setConsoleCollapsed(!consoleCollapsed);
+            }}
+          >
+            ⎙ Console
+          </button>
+        )}
         {services.length > 0 && (
           <button
             type="button"
@@ -3949,7 +3954,7 @@ export default function App() {
           </span>
         )}
         {!editMode && !workerReadOnly && <button onClick={() => setEditMode(true)}>Edit</button>}
-        {hasConfigurableVars && (
+        {hasConfigurableVars && !workerNoExec && !workerReadOnly && (
           <button
             className="deps-toggle"
             onClick={handleConfigure}
@@ -3958,13 +3963,15 @@ export default function App() {
             ⚙ configure
           </button>
         )}
-        <button
-          className="deps-toggle"
-          onClick={() => setResetSessionConfirmOpen(true)}
-          title="Forget which blocks already ran successfully this session, so the next ⛓ run chain re-runs every dependency instead of skipping unchanged ones"
-        >
-          ↺ reset session
-        </button>
+        {!workerNoExec && (
+          <button
+            className="deps-toggle"
+            onClick={() => setResetSessionConfirmOpen(true)}
+            title="Forget which blocks already ran successfully this session, so the next ⛓ run chain re-runs every dependency instead of skipping unchanged ones"
+          >
+            ↺ reset session
+          </button>
+        )}
         <button
           className={searchOpen ? "deps-toggle deps-toggle-active" : "deps-toggle"}
           onClick={() => (searchOpen ? closeSearch() : openSearch())}

@@ -561,6 +561,11 @@ export interface MeshNodeData {
    * isn't a canvas has no server-side "open" to offer (see
    * `canOpenOnServer`). */
   remote: boolean;
+  /** The core was started with `--no-exec` (or has no process at all, as in the
+   * in-browser build): nothing here can run, so no control that would run
+   * something is offered — run/chain/kill buttons, the ▷ quick-run, `button`
+   * blocks, forms. Output a block already holds stays visible. */
+  noExec: boolean;
   /** Opens this node's body in a floating window (`NodeExpandPanel`) — same
    * live content (run/kill buttons, streaming output) as the inline box,
    * just bigger and not at the mercy of the canvas's current pan/zoom.
@@ -1652,6 +1657,8 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             service
           </span>
         )}
+        {!data.noExec && (
+          <>
         <button
           disabled={busy}
           onClick={runHandler}
@@ -1697,6 +1704,8 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
               ⏹ kill
             </button>
           )
+        )}
+          </>
         )}
       </div>
       <BlockDetails seg={seg} data={data} nodeId={nodeId} />
@@ -1872,6 +1881,10 @@ function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeDa
     if (closeTimer.current) clearTimeout(closeTimer.current);
   }, []);
 
+  // A button only ever runs its dependency chain: with nothing runnable, it
+  // has no reason to be on the page.
+  if (data.noExec) return null;
+
   return (
     <div className="mesh-button-block" ref={trigger}
       onMouseEnter={showDetails} onMouseLeave={hideDetails}
@@ -1943,6 +1956,8 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
   const runInProgress = useContext(ForegroundRunContext);
 
   useEffect(() => {
+    // A form only feeds blocks that run; there is nothing to ask the server.
+    if (data.noExec) return;
     let cancelled = false;
     fetchFormFields(nodeId, seg.name)
       .then(({ send, fields: f }) => {
@@ -1957,7 +1972,7 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
     return () => {
       cancelled = true;
     };
-  }, [nodeId, seg.name, seg.code]);
+  }, [nodeId, seg.name, seg.code, data.noExec]);
 
   const set = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }));
 
@@ -2038,6 +2053,8 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
       />
     );
   };
+
+  if (data.noExec) return null;
 
   if (fields === null) {
     return (
@@ -3118,8 +3135,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // `null` when neither applies (nothing to quick-run) — the button just
   // isn't shown.
   const quickRunBlock = isTextNode ? defaultBlock(data.text, id) : null;
-  const quickRunBlockName =
-    quickRunBlock?.name ?? (data.nodeType === "file" && data.interpreter && data.target ? id : null);
+  const quickRunBlockName = data.noExec
+    ? null
+    : (quickRunBlock?.name ?? (data.nodeType === "file" && data.interpreter && data.target ? id : null));
   // A `tty` block needs `onRunTty` (opens a real terminal over its own
   // WebSocket), not `onRun` (the plain captured/streamed-output path) —
   // the server rejects a `tty` block run over `/api/run` outright (see

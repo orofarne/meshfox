@@ -282,3 +282,35 @@ test("nothing was ever sent to a server", async ({ page }) => {
   await expect(page.getByText("3/3")).toBeVisible();
   expect(sent).toEqual([]);
 });
+
+test("with execution disabled there is nothing to click that would run", async ({ page }) => {
+  const file = path.join(tmpDir(), "run.canvas.md");
+  fs.writeFileSync(
+    file,
+    [
+      '# Root\n<!-- meshfox:node id="root" -->\n<!-- meshfox:option name="unfold" -->\n\nThe root.\n',
+      '## Runnable\n<!-- meshfox:node id="runnable" -->\n\nBefore.\n\n```bash name="hello" deps="other"\necho hello\n```\n',
+      '## Other\n<!-- meshfox:node id="other" -->\n\n```bash name="other"\necho other\n```\n',
+      '## Pipeline\n<!-- meshfox:node id="pipeline" -->\n\n```button name="go" deps="other/other"\nBuild everything\n```\n',
+      '## Settings\n<!-- meshfox:node id="settings" -->\n\n```form name="settings" send="Apply"\nfield var="X" label="An x"\n```\n',
+    ].join("\n"),
+  );
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.getByText("noexec", { exact: true })).toBeVisible();
+
+  // The code stays; every control that would run it is gone.
+  await expect(page.locator(".mesh-code-block")).toHaveCount(2);
+  await expect(page.locator(".mesh-code-block button", { hasText: /^run / })).toHaveCount(0);
+  await expect(page.locator(".mesh-run-chain")).toHaveCount(0);
+  await expect(page.locator(".mesh-kill-button")).toHaveCount(0);
+  await expect(page.locator(".mesh-node-quick-run-icon")).toHaveCount(0);
+  await expect(page.locator(".mesh-button-block, .mesh-run-button")).toHaveCount(0);
+  await expect(page.locator(".mesh-form-block")).toHaveCount(0);
+
+  // And nothing in the toolbar for runs.
+  await expect(page.getByRole("button", { name: /Console/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /reset session/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /search/ })).toBeVisible();
+});
