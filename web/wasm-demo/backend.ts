@@ -8,6 +8,7 @@ import { EditSession, type UndoWasm } from "./session";
 
 export interface WasmApi extends UndoWasm {
   renderCanvasWithWarnings(source: string, path: string, files?: unknown): string;
+  applyNodeUpdate(raw: string, id: string, requestJson: string): string;
   version(): string;
 }
 
@@ -250,6 +251,30 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       const problem = commit(body ?? "", "source");
       if (problem !== undefined) return text(problem, 422);
       return new Response(null, { status: 204, headers: { ETag: session.rev } });
+    }
+    const nodeRoute = /^nodes\/([^/]+)$/.exec(route);
+    if (method === "PATCH" && nodeRoute) {
+      // The same edit `PATCH /api/nodes/:id` makes (`meshfox_model::edit`).
+      const id = decodeURIComponent(nodeRoute[1]);
+      const out = JSON.parse(wasm.applyNodeUpdate(session.raw, id, body ?? "{}")) as {
+        raw?: string;
+        conflict?: { currentText: string; currentRev: string; currentTitle: string };
+        error?: { kind: string; message: string };
+      };
+      if (out.conflict) {
+        return json(
+          {
+            error: "bodyConflict",
+            message: "the node's body changed since it was read — reread, then retry with the current revision",
+            ...out.conflict,
+          },
+          409,
+        );
+      }
+      if (out.error) return text(out.error.message, out.error.kind === "notFound" ? 404 : 422);
+      const problem = commit(out.raw!, "node_upserted");
+      if (problem !== undefined) return text(problem, 422);
+      return canvasResponse();
     }
     if (method === "POST") {
       switch (route) {

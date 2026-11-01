@@ -33,6 +33,7 @@ export interface UndoWasm {
 /** What the history panel says about a step, by what kind of step it was. */
 const SUMMARIES: Record<string, string> = {
   source: "edited the source",
+  node_upserted: "edited a node",
   external_edit: "changed outside the editor",
 };
 

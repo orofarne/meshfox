@@ -21,8 +21,8 @@ use axum::{
 };
 use meshfox_core::capabilities::Capabilities;
 use meshfox_core::{
-    mdcanvas, merge3, worker_lock, Canvas, ExecOutput, ExtraEdge, FenceAttrsPatch, FileDisplay,
-    Merge, MergeConflict, NodeMeta, NodeType, RunError, VarCache,
+    mdcanvas, merge3, worker_lock, Canvas, ExecOutput, FenceAttrsPatch, FileDisplay, Merge,
+    MergeConflict, NodeMeta, NodeType, RunError, VarCache,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -5446,317 +5446,19 @@ async fn put_options(
     state.canvas_snapshot()
 }
 
-/// Tag changes for `UpdateNodeRequest::tags`: `remove` first, then `add`
-/// (appended in the order given, skipping tags the node already has — an
-/// existing tag keeps its place). A tag in both lists ends up present.
-#[derive(Debug, Default, Deserialize)]
-struct TagOps {
-    #[serde(default)]
-    add: Vec<String>,
-    #[serde(default)]
-    remove: Vec<String>,
-}
+// The request types and the pure edit live in `meshfox_model::edit`, shared
+// with the in-browser editor; this is the server's own half (who else may be
+// editing, where the result is written, events, the undo log).
+use meshfox_model::edit::{
+    apply_node_update, check_base, EditError, NodeUpdate as UpdateNodeRequest,
+};
 
-fn apply_tag_ops(mut tags: Vec<String>, ops: &TagOps) -> Vec<String> {
-    tags.retain(|t| !ops.remove.contains(t));
-    for tag in &ops.add {
-        let tag = tag.trim();
-        if !tag.is_empty() && !tags.iter().any(|t| t == tag) {
-            tags.push(tag.to_string());
+impl From<EditError> for ApiError {
+    fn from(e: EditError) -> Self {
+        match e {
+            EditError::NotFound(m) => ApiError(StatusCode::NOT_FOUND, m),
+            EditError::Invalid(m) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, m),
         }
-    }
-    tags
-}
-
-/// Edge changes for `UpdateNodeRequest::edges`, each entry naming the edge's
-/// source node (`from`): `remove` first, then `add` (a plain edge, a no-op
-/// when one from that node already exists — it never wipes the existing
-/// edge's label or route), then `patch` (changes to individual fields of the
-/// edge from that node, see `EdgePatch`; a node that has no such edge — it
-/// was removed meanwhile — is skipped, not an error). An edge created with
-/// properties is an `add` and a `patch` in the same request.
-#[derive(Debug, Default, Deserialize)]
-struct EdgeOps {
-    #[serde(default)]
-    add: Vec<String>,
-    #[serde(default)]
-    patch: Vec<EdgePatch>,
-    #[serde(default)]
-    remove: Vec<String>,
-}
-
-/// Changes to individual fields of one extra edge — the edge counterpart of
-/// `UpdateNodeRequest`'s per-field handling, with the same conventions: a
-/// field that is **absent** is left alone, so two clients changing different
-/// fields of the same edge both land; a field that is present is set, and
-/// cleared back to unset by the same spellings a node uses — `""` for
-/// `label` and `color`, `"auto"` for the sides, `"default"` for `style`
-/// and the arrow ends (`"none"` there is a real value, an end with no
-/// arrowhead), `500` for `labelAt` (the midpoint), `[]` for `via`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EdgePatch {
-    from: String,
-    label: Option<String>,
-    label_at: Option<u16>,
-    color: Option<String>,
-    style: Option<String>,
-    arrow_start: Option<String>,
-    arrow_end: Option<String>,
-    source_side: Option<String>,
-    target_side: Option<String>,
-    via: Option<Vec<meshfox_core::canvas::RoutePoint>>,
-    tags: Option<TagOps>,
-}
-
-fn invalid_edge_field(field: &str, value: &str, expected: &str) -> ApiError {
-    ApiError(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        format!("invalid edge {field} {value:?} (expected {expected})"),
-    )
-}
-
-/// Applies `patch`'s present fields onto `edge`; `422` for a value that
-/// isn't one of the field's spellings, with nothing applied past that field.
-fn apply_edge_patch(edge: &mut ExtraEdge, patch: &EdgePatch) -> Result<(), ApiError> {
-    use meshfox_core::canvas::{ArrowEnd, EdgeLineStyle, EdgeSide};
-    if let Some(label) = &patch.label {
-        edge.label = (!label.trim().is_empty()).then(|| label.clone());
-    }
-    if let Some(at) = patch.label_at {
-        edge.label_at = match at {
-            500 => None,
-            0..=1000 => Some(at),
-            _ => {
-                return Err(ApiError(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "labelAt must be between 0 and 1000".to_string(),
-                ))
-            }
-        };
-    }
-    if let Some(color) = &patch.color {
-        edge.color = (!color.trim().is_empty()).then(|| color.clone());
-    }
-    if let Some(style) = patch.style.as_deref() {
-        edge.style = match style {
-            "default" => None,
-            other => Some(EdgeLineStyle::parse(other).ok_or_else(|| {
-                invalid_edge_field("style", other, "solid, dashed, dotted or default")
-            })?),
-        };
-    }
-    for (field, value, slot) in [
-        (
-            "arrowStart",
-            patch.arrow_start.as_deref(),
-            &mut edge.arrow_start,
-        ),
-        ("arrowEnd", patch.arrow_end.as_deref(), &mut edge.arrow_end),
-    ] {
-        if let Some(value) = value {
-            *slot =
-                match value {
-                    "default" => None,
-                    other => Some(ArrowEnd::parse(other).ok_or_else(|| {
-                        invalid_edge_field(field, other, "none, arrow or default")
-                    })?),
-                };
-        }
-    }
-    for (field, value, slot) in [
-        (
-            "sourceSide",
-            patch.source_side.as_deref(),
-            &mut edge.source_side,
-        ),
-        (
-            "targetSide",
-            patch.target_side.as_deref(),
-            &mut edge.target_side,
-        ),
-    ] {
-        if let Some(value) = value {
-            *slot = match value {
-                "auto" => None,
-                other => Some(EdgeSide::parse(other).ok_or_else(|| {
-                    invalid_edge_field(field, other, "left, right, top, bottom or auto")
-                })?),
-            };
-        }
-    }
-    if let Some(via) = &patch.via {
-        edge.via = via.clone();
-    }
-    if let Some(ops) = &patch.tags {
-        edge.tags = apply_tag_ops(std::mem::take(&mut edge.tags), ops);
-    }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateNodeRequest {
-    title: Option<String>,
-    node_type: Option<NodeType>,
-    color: Option<String>,
-    /// New link target for a `file`/`link` node — written as the node's
-    /// whole body (`[title](target)`), replacing whatever body was there.
-    target: Option<String>,
-    /// New raw Markdown body for a `text` node — what the web UI's
-    /// CodeMirror editor sends. Mutually exclusive with `target` in
-    /// practice (the client only ever sends one, depending on node type),
-    /// but nothing here enforces that beyond whichever one is applied last
-    /// winning.
-    text: Option<String>,
-    /// The `bodyRev` of the node as the client last saw it — **required
-    /// whenever `text` is sent**, and ignored otherwise. A mismatch with the
-    /// node's current text is a `409` carrying that current text and
-    /// revision (see `body_conflict`); there is no way to skip the check.
-    base_rev: Option<String>,
-    /// Optional original title for atomic editor saves.
-    base_title: Option<String>,
-    /// With `text`: when `baseRev` (or `baseTitle`) is stale, don't reject —
-    /// find the body the client started from in the undo history and
-    /// three-way merge the client's text with the current one. A clean merge
-    /// is written (response `merged: true`); overlapping edits are still a
-    /// `409`, now with `conflicts`; a base that is no longer in the history
-    /// is the ordinary `409`. Off by default: a line-level merge of prose
-    /// can read wrong, so only a caller that looks at the result opts in.
-    merge: Option<bool>,
-    /// Changes to the node's extra incoming edges (`meshfox:edge
-    /// from="..."`), applied to the edges it has right now — never a
-    /// replacement list, for the same reason as `tags`. `None` leaves them
-    /// untouched.
-    edges: Option<EdgeOps>,
-    /// `file`-node display mode (see `FileDisplay`) — `None` leaves the
-    /// existing value untouched, same "not sent" convention as every other
-    /// field here.
-    display: Option<FileDisplay>,
-    /// `file`-node syntax-highlighting language hint.
-    lang: Option<String>,
-    /// `file`-node interpreter (see `meshfox_core::Node::is_runnable_file`)
-    /// — makes the node runnable via the web UI's "▷ run" button.
-    interpreter: Option<String>,
-    /// `link`-node social preview toggle (see `meshfox_core::Node::preview`)
-    /// — `None` leaves the existing value untouched, same "not sent"
-    /// convention as every other field here.
-    preview: Option<bool>,
-    /// Changes to the node's tags, applied to the tags it has right now —
-    /// never a replacement list, so two clients adding different tags at
-    /// once both land. `None` leaves them untouched.
-    tags: Option<TagOps>,
-    /// Structural-edge label (see `meshfox_core::Node::edge_label`) — the
-    /// text shown on the implicit edge from this node's parent into it.
-    /// `None` (key not sent) leaves it untouched; `Some("")` (sent, empty)
-    /// clears it back to unset rather than writing a literal `edgeLabel=""`
-    /// — see this field's own handling in `update_node`.
-    edge_label: Option<String>,
-    /// 0..=1000 along the rendered path; 500 clears back to the midpoint.
-    edge_label_at: Option<u16>,
-    /// "auto" clears an explicitly selected structural-edge side.
-    edge_source_side: Option<String>,
-    edge_target_side: Option<String>,
-    edge_via: Option<Vec<meshfox_core::canvas::RoutePoint>>,
-    /// Per-node fold-state override (see `meshfox_core::Node::fold`) —
-    /// `None` (the field not sent at all) leaves it untouched, same
-    /// convention as every other field here. Unlike those, though, this
-    /// one's own *target* type (`Option<bool>`) already has its own
-    /// "unset" state to reach — plain JSON `null` is indistinguishable
-    /// from an absent field to `serde`'s usual `Option<T>` handling, so
-    /// this is a string sentinel instead: `"true"`/`"false"` set an
-    /// explicit override, `"default"` clears back to "follow the
-    /// document's own default" (see `resolve_fold_override`).
-    fold: Option<String>,
-    /// Absolute position/size — `None` leaves each untouched, same
-    /// convention as every other field here. Added for `crate::coordinator`-
-    /// routed CLI/MCP `node meta` (TODO.canvas.md: "worker-routing для
-    /// node add/meta отложен"): the web UI itself never sends these through
-    /// this endpoint (a node is only ever moved/resized by drag, which has
-    /// its own dedicated endpoints), so this is new surface for a caller
-    /// that already has to pass *some* value, not something the existing
-    /// web client needs to change to keep using. `width`/`height` are
-    /// rejected below for a group node (real or becoming one via
-    /// `nodeType` in the same request) — its box is always derived from
-    /// its children, never stored, same invariant `crate::main`'s own
-    /// `apply_node_meta` already enforces client-side for the direct-file
-    /// path this is the worker-routed counterpart to.
-    x: Option<f64>,
-    y: Option<f64>,
-    width: Option<f64>,
-    height: Option<f64>,
-    #[serde(default)]
-    clear_position: bool,
-    /// `None` leaves it untouched; explicit RFC3339 string (already
-    /// validated CLI-side by `apply_node_meta` for the direct-file path,
-    /// validated here too since this endpoint has its own callers now)
-    /// replaces it. No "clear" sentinel — same as the direct-file path,
-    /// which only ever adds/overwrites this, never removes it.
-    created_at: Option<String>,
-}
-
-/// `req.fold`'s string sentinel (see `UpdateNodeRequest::fold`'s own doc
-/// comment) resolved against `existing` (the node's current value, kept
-/// when nothing was sent) into the `Option<bool>` `Node::fold` itself
-/// wants. `422` for anything other than `"true"`/`"false"`/`"default"`.
-fn resolve_fold_override(
-    raw: Option<&str>,
-    existing: Option<bool>,
-) -> Result<Option<bool>, ApiError> {
-    match raw {
-        None => Ok(existing),
-        Some(s) => meshfox_core::parse_fold_override(s)
-            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e)),
-    }
-}
-
-#[cfg(test)]
-mod resolve_fold_override_tests {
-    use super::*;
-
-    fn expect_ok(result: Result<Option<bool>, ApiError>) -> Option<bool> {
-        match result {
-            Ok(v) => v,
-            Err(e) => panic!("unexpected error: {}", e.1),
-        }
-    }
-
-    #[test]
-    fn not_sent_keeps_the_existing_value() {
-        assert_eq!(
-            expect_ok(resolve_fold_override(None, Some(true))),
-            Some(true)
-        );
-        assert_eq!(expect_ok(resolve_fold_override(None, None)), None);
-    }
-
-    #[test]
-    fn true_and_false_set_an_explicit_override() {
-        assert_eq!(
-            expect_ok(resolve_fold_override(Some("true"), None)),
-            Some(true)
-        );
-        assert_eq!(
-            expect_ok(resolve_fold_override(Some("false"), Some(true))),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn default_clears_back_to_no_override() {
-        assert_eq!(
-            expect_ok(resolve_fold_override(Some("default"), Some(true))),
-            None
-        );
-    }
-
-    #[test]
-    fn garbage_is_rejected() {
-        let err = match resolve_fold_override(Some("bogus"), None) {
-            Ok(_) => panic!("expected an error"),
-            Err(e) => e,
-        };
-        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
 
@@ -5775,411 +5477,72 @@ async fn update_node(
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
-    let mut raw = located.raw.clone();
+    let raw = located.raw.clone();
     let local_id = located.local_id.clone();
 
-    // A `from=` in `edges` names another node the same way `id` itself was
-    // named — resolved to that node's local id before it's written into a
-    // `meshfox:edge from="..."` line. Adding an edge from a
-    // node that doesn't exist is a 404; removing one whose source is
-    // already gone just matches the id as given.
-    let resolve_from =
-        |from: &str| -> Result<String, ApiError> { Ok(locate_node(&primary_raw, from)?.local_id) };
-    let edge_ops_local = req
-        .edges
-        .as_ref()
-        .map(|ops| -> Result<EdgeOps, ApiError> {
-            // Every patch is checked now, against a scratch edge, so a bad
-            // value is a 422 whether or not the edge it names still exists.
-            for p in &ops.patch {
-                apply_edge_patch(&mut ExtraEdge::default(), p)?;
-            }
-            let patch = ops
-                .patch
-                .iter()
-                .map(|p| EdgePatch {
-                    // A source that no longer exists has no edge to patch;
-                    // its id then simply matches nothing below.
-                    from: resolve_from(&p.from).unwrap_or_else(|_| p.from.clone()),
-                    label: p.label.clone(),
-                    label_at: p.label_at,
-                    color: p.color.clone(),
-                    style: p.style.clone(),
-                    arrow_start: p.arrow_start.clone(),
-                    arrow_end: p.arrow_end.clone(),
-                    source_side: p.source_side.clone(),
-                    target_side: p.target_side.clone(),
-                    via: p.via.clone(),
-                    tags: p.tags.as_ref().map(|t| TagOps {
-                        add: t.add.clone(),
-                        remove: t.remove.clone(),
-                    }),
-                })
-                .collect();
-            Ok(EdgeOps {
-                add: ops
-                    .add
-                    .iter()
-                    .map(|f| resolve_from(f))
-                    .collect::<Result<_, _>>()?,
-                patch,
-                remove: ops
-                    .remove
-                    .iter()
-                    .map(|f| resolve_from(f).unwrap_or_else(|_| f.clone()))
-                    .collect(),
-            })
-        })
-        .transpose()?;
-
-    let not_found = || ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}"));
-
-    // Read the node's current fields once, up front — every mutation below
-    // is a surgical splice that doesn't require (and, for a type change
-    // that hasn't had its body fixed up yet, must NOT require) the
-    // document to still parse cleanly in between. Only the fully-patched
-    // result is validated, at the very end. Re-parsing after e.g. the type
-    // change below (as an earlier version of this function did, to look up
-    // the node's title for the `target` step) would spuriously reject a
-    // still-in-progress edit — switching a node to `file`/`link` and
-    // supplying its target in the same request — since the type would
-    // already say `file`/`link` while the body briefly still isn't a
-    // single link.
-    let initial = parse_or_error(&raw)?;
-    let initial_node = initial.node(&local_id).ok_or_else(not_found)?;
-    // A plain-Markdown `include` node keeps its own id post-resolve (see
-    // `include::resolve`'s module doc), so `locate_node` above found it
-    // right here in the primary document — but its *body*, as the client
-    // just saw it via `GET /api/canvas`, is the include target's own
-    // (shifted-headings) content, not what's actually stored here (a bare
-    // `[label](target)` link). Writing that back as `text` would silently
-    // try to overwrite the link with the target's whole content — reject
-    // it with a clear reason up front rather than relying on the later
-    // `parse_or_error` to incidentally catch it as a mangled link body.
+    // Whether a body edit was made against the node as it is now, and the
+    // edit itself, are `meshfox_model::edit`'s (the in-browser editor runs the
+    // same code); this function is the part that depends on *who else is
+    // editing*: merging, writing, events.
     // Set when the write was combined with a concurrent change (`merge`).
     let mut merged = false;
-    if req.text.is_some() {
-        let Some(base_rev) = req.base_rev.as_deref() else {
-            return Err(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "baseRev is required when replacing a node's body — read the node first and \
-                 send back its bodyRev"
-                    .to_string(),
-            ));
-        };
-        let current_rev = meshfox_core::body_rev(&initial_node.text);
-        let title_stale = req
-            .base_title
-            .as_ref()
-            .is_some_and(|title| title != &initial_node.title);
-        if base_rev != current_rev || title_stale {
-            // The title merges by equality: if the client changed it and so
-            // did someone else, to something different, that is a conflict
-            // no text merge can settle.
-            let title_conflict = title_stale
-                && req.title.as_ref().is_some_and(|title| {
-                    Some(title) != req.base_title.as_ref() && title != &initial_node.title
-                });
-            let attempt = match (req.merge, req.text.as_deref()) {
-                (Some(true), Some(mine)) if !title_conflict => merge_node_body(
-                    &state,
-                    &primary_raw,
-                    &local_id,
-                    base_rev,
-                    mine,
-                    &initial_node.text,
-                ),
-                _ => MergeAttempt::Unavailable,
-            };
-            let mut conflict = None;
-            match attempt {
-                MergeAttempt::Clean(text) => {
-                    req.text = Some(text);
-                    // A title left as the client first read it is not an
-                    // edit: don't write it back over someone else's rename.
-                    if title_stale && req.title == req.base_title {
-                        req.title = None;
-                    }
-                    merged = true;
-                }
-                MergeAttempt::Conflict(found) => conflict = Some(found),
-                MergeAttempt::Unavailable => {}
-            }
-            if !merged {
-                let mut error =
-                    body_conflict_with(&initial_node.text, &current_rev, conflict.as_ref());
-                let mut payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
-                payload["currentTitle"] = serde_json::json!(initial_node.title);
-                error.1 = payload.to_string();
-                return Err(error);
-            }
-        }
-    }
-    if initial_node.node_type == NodeType::Include && req.text.is_some() {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "node {id:?} is a plain-Markdown include — its shown body comes from the include \
-                 target file, not from here; open that file directly to edit it (use `target` \
-                 here to change which file it links to instead)"
+    if let Some(stale) = check_base(&raw, &local_id, &req)? {
+        let base_rev = stale.base_rev.as_str();
+        // The title merges by equality: if the client changed it and so did
+        // someone else, to something different, that is a conflict no text
+        // merge can settle.
+        let title_conflict = stale.title_stale
+            && req.title.as_ref().is_some_and(|title| {
+                Some(title) != req.base_title.as_ref() && title != &stale.current_title
+            });
+        let attempt = match (req.merge, req.text.as_deref()) {
+            (Some(true), Some(mine)) if !title_conflict => merge_node_body(
+                &state,
+                &primary_raw,
+                &local_id,
+                base_rev,
+                mine,
+                &stale.current_text,
             ),
-        ));
-    }
-    let (
-        x,
-        y,
-        width,
-        height,
-        existing_color,
-        existing_display,
-        existing_lang,
-        existing_interpreter,
-        existing_preview,
-        existing_tags,
-        existing_fold,
-        existing_edge_label,
-        existing_created_at,
-    ) = (
-        initial_node.x,
-        initial_node.y,
-        initial_node.width,
-        initial_node.height,
-        initial_node.color.clone(),
-        initial_node.display,
-        initial_node.lang.clone(),
-        initial_node.interpreter.clone(),
-        initial_node.preview,
-        initial_node.tags.clone(),
-        initial_node.fold,
-        initial_node.edge_label.clone(),
-        initial_node.created_at.clone(),
-    );
-    // `display`/`lang`/`interpreter` only mean anything on a `file` node —
-    // clear them (rather than leave a stale attribute behind) whenever this
-    // request moves the node to some other type. `preview` is the same idea
-    // but for `link` nodes.
-    let final_type = req.node_type.unwrap_or(initial_node.node_type);
-    let mut title = initial_node.title.clone();
-
-    if let Some(new_title) = &req.title {
-        raw = mdcanvas::try_set_node_title(&raw, &local_id, new_title).map_err(|e| match e {
-            mdcanvas::SetTitleError::NotFound(_) => not_found(),
-            // The node exists; the request itself can't be honoured safely.
-            mdcanvas::SetTitleError::DerivedId(_) => {
-                ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+            _ => MergeAttempt::Unavailable,
+        };
+        let mut conflict = None;
+        match attempt {
+            MergeAttempt::Clean(text) => {
+                req.text = Some(text);
+                // A title left as the client first read it is not an edit:
+                // don't write it back over someone else's rename.
+                if stale.title_stale && req.title == req.base_title {
+                    req.title = None;
+                }
+                merged = true;
             }
-        })?;
-        title = new_title.clone();
-    }
-
-    // Same invariant `crate::main`'s own `apply_node_meta` enforces for the
-    // direct-file path: a group's box is always derived from its children,
-    // never stored — reject an explicit width/height for one outright
-    // (whether it already is a group, or is becoming one via `nodeType` in
-    // this same request) rather than silently writing (and immediately
-    // ignoring) a size nothing will ever read back.
-    if final_type == NodeType::Group && (req.width.is_some() || req.height.is_some()) {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "group nodes never store a size — their box is always derived from their children"
-                .to_string(),
-        ));
-    }
-    if req.clear_position
-        && (req.x.is_some() || req.y.is_some() || req.width.is_some() || req.height.is_some())
-    {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "clearPosition cannot be combined with x/y/width/height".to_string(),
-        ));
-    }
-    if let Some(created_at) = &req.created_at {
-        if !meshfox_core::timestamp::is_valid_rfc3339(created_at) {
-            return Err(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("invalid createdAt {created_at:?} — expected RFC3339"),
-            ));
+            MergeAttempt::Conflict(found) => conflict = Some(found),
+            MergeAttempt::Unavailable => {}
+        }
+        if !merged {
+            let mut error =
+                body_conflict_with(&stale.current_text, &stale.current_rev, conflict.as_ref());
+            let mut payload: serde_json::Value = serde_json::from_str(&error.1).unwrap();
+            payload["currentTitle"] = serde_json::json!(stale.current_title);
+            error.1 = payload.to_string();
+            return Err(error);
         }
     }
-
-    if req.title.is_some()
-        || req.node_type.is_some()
-        || req.color.is_some()
-        || req.display.is_some()
-        || req.lang.is_some()
-        || req.interpreter.is_some()
-        || req.preview.is_some()
-        || req.tags.is_some()
-        || req.fold.is_some()
-        || req.edge_label.is_some()
-        || req.edge_label_at.is_some()
-        || req.edge_source_side.is_some()
-        || req.edge_target_side.is_some()
-        || req.edge_via.is_some()
-        || req.x.is_some()
-        || req.y.is_some()
-        || req.width.is_some()
-        || req.height.is_some()
-        || req.clear_position
-        || req.created_at.is_some()
-    {
-        // This also has the side effect of pinning the node's `id=`
-        // attribute explicitly the moment any of its metadata changes,
-        // same as any other first write-back (see `canvas.rs`'s doc
-        // comment on `id`).
-        let (display, lang, interpreter) = if final_type == NodeType::File {
-            (
-                req.display.or(existing_display),
-                req.lang.clone().or(existing_lang),
-                req.interpreter.clone().or(existing_interpreter),
-            )
-        } else {
-            (None, None, None)
-        };
-        let preview = if final_type == NodeType::Link {
-            Some(req.preview.unwrap_or(existing_preview))
-        } else {
-            None
-        };
-        // Unlike `color` (which would happily store and write back a
-        // literal `color=""` if sent empty), an empty `edgeLabel` clears
-        // the attribute entirely rather than leaving that cruft behind —
-        // the client (see `web/src/DeletableEdge.tsx`) always sends this
-        // key explicitly (never omitted) whenever the label actually
-        // changed, including changing it *to* empty, so there's no
-        // "not sent at all" case to conflate this with.
-        let edge_label = match &req.edge_label {
-            None => existing_edge_label,
-            Some(s) if s.trim().is_empty() => None,
-            Some(s) => Some(s.clone()),
-        };
-        // Groups never store a width/height regardless of what's in `x`/
-        // `y` here (already rejected above if the request tried to set
-        // one) — carrying `existing` width/height forward for a group
-        // would just re-write whatever stray value was already there
-        // instead of actually clearing it, so force both to `None` for
-        // one, same as `crate::main`'s own `apply_node_meta`.
-        let (final_width, final_height) = if final_type == NodeType::Group {
-            (None, None)
-        } else {
-            (
-                if req.clear_position {
-                    req.width
-                } else {
-                    req.width.or(width)
-                },
-                if req.clear_position {
-                    req.height
-                } else {
-                    req.height.or(height)
-                },
-            )
-        };
-        let meta = NodeMeta {
-            block_attrs: None,
-            x: if req.clear_position {
-                req.x
-            } else {
-                req.x.or(x)
-            },
-            y: if req.clear_position {
-                req.y
-            } else {
-                req.y.or(y)
-            },
-            width: final_width,
-            height: final_height,
-            color: req.color.clone().or(existing_color),
-            node_type: req.node_type,
-            display,
-            lang,
-            interpreter,
-            preview,
-            edge_label,
-            edge_label_at: match req.edge_label_at {
-                None => initial_node.edge_label_at,
-                Some(500) => None,
-                Some(at @ 0..=1000) => Some(at),
-                Some(_) => {
-                    return Err(ApiError(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "edgeLabelAt must be between 0 and 1000".to_string(),
-                    ))
+    // The request is settled (a body conflict was refused or merged above);
+    // what it does to the document is `meshfox_model::edit`'s, the same code
+    // the in-browser editor runs. A `from` in `edges` names another node the
+    // same way `id` itself was named.
+    let raw = apply_node_update(&raw, &local_id, &req, &|from| {
+        meshfox_core::locate_node(&primary_raw, from)
+            .map(|located| located.local_id)
+            .map_err(|e| match e {
+                meshfox_core::LocateError::Parse(e) => EditError::Invalid(e.to_string()),
+                meshfox_core::LocateError::NotFound(id) => {
+                    EditError::NotFound(format!("no node {id:?}"))
                 }
-            },
-            edge_source_side: match req.edge_source_side.as_deref() {
-                None => initial_node.edge_source_side,
-                Some("auto") => None,
-                Some(side) => {
-                    Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| {
-                        ApiError(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            format!("invalid edgeSourceSide {side:?}"),
-                        )
-                    })?)
-                }
-            },
-            edge_target_side: match req.edge_target_side.as_deref() {
-                None => initial_node.edge_target_side,
-                Some("auto") => None,
-                Some(side) => {
-                    Some(meshfox_core::canvas::EdgeSide::parse(side).ok_or_else(|| {
-                        ApiError(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            format!("invalid edgeTargetSide {side:?}"),
-                        )
-                    })?)
-                }
-            },
-            edge_via: req
-                .edge_via
-                .clone()
-                .unwrap_or_else(|| initial_node.edge_via.clone()),
-            fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
-            tags: match &req.tags {
-                Some(ops) => apply_tag_ops(existing_tags, ops),
-                None => existing_tags,
-            },
-            created_at: req.created_at.clone().or(existing_created_at),
-        };
-        raw = mdcanvas::set_node_meta(&raw, &local_id, &meta).ok_or_else(not_found)?;
-    }
-
-    if let Some(target) = &req.target {
-        // Preserves an existing caption (see `Node::caption`) rather than
-        // silently dropping it — this patch only ever means "change the
-        // link", never "clear whatever explanatory text was under it".
-        let body = match &initial_node.caption {
-            Some(caption) => format!("[{title}]({target})\n\n{caption}"),
-            None => format!("[{title}]({target})"),
-        };
-        raw = mdcanvas::set_node_body(&raw, &local_id, &body).ok_or_else(not_found)?;
-    }
-
-    if let Some(text) = &req.text {
-        raw = mdcanvas::set_node_body(&raw, &local_id, text).ok_or_else(not_found)?;
-    }
-
-    if let Some(ops) = &edge_ops_local {
-        let mut edges = initial_node.extra_parents.clone();
-        edges.retain(|e| !ops.remove.contains(&e.from));
-        for from in &ops.add {
-            if !edges.iter().any(|e| &e.from == from) {
-                edges.push(ExtraEdge::new(from.as_str()));
-            }
-        }
-        for patch in &ops.patch {
-            if let Some(edge) = edges.iter_mut().find(|e| e.from == patch.from) {
-                apply_edge_patch(edge, patch)?;
-            }
-        }
-        raw = mdcanvas::set_node_edges(&raw, &local_id, &edges).ok_or_else(not_found)?;
-    }
-
-    // Validate the whole patched document before committing anything —
-    // none of the writes above touched `state.raw`/disk (or the include
-    // target's) yet.
-    parse_or_error(&raw)?;
+            })
+    })?;
 
     let op = node_upserted_event(&raw, &state.canvas_path, &local_id);
     commit_located(&state, &located, &raw, op)?;
@@ -12310,7 +11673,7 @@ mod node_op_broadcast_tests {
     async fn patch_edges(
         state: &Arc<AppState>,
         value: serde_json::Value,
-    ) -> Result<Vec<ExtraEdge>, (StatusCode, String)> {
+    ) -> Result<Vec<meshfox_core::ExtraEdge>, (StatusCode, String)> {
         update_node(
             State(state.clone()),
             Path("b".to_string()),

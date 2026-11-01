@@ -401,3 +401,54 @@ impl JsUndoLog {
 pub fn new_canvas_content(title: &str) -> String {
     meshfox_model::mdcanvas::new_canvas_content(title)
 }
+
+/// Edits one node of `raw` the way `PATCH /api/nodes/:id` does (the very same
+/// code, `meshfox_model::edit`): `request_json` is the request body. The result
+/// is JSON, one of
+///
+/// * `{ "raw": "<the new document>" }`
+/// * `{ "conflict": { "baseRev", "currentText", "currentRev", "currentTitle",
+///   "titleStale" } }` — a body edit made against a node that has changed
+///   since the client read it (nothing applied);
+/// * `{ "error": { "kind": "notFound" | "invalid", "message" } }`.
+#[wasm_bindgen(js_name = applyNodeUpdate)]
+pub fn apply_node_update(raw: &str, id: &str, request_json: &str) -> String {
+    use meshfox_model::canvas::Canvas;
+    use meshfox_model::edit::{apply_node_update, check_base, EditError, NodeUpdate};
+
+    let outcome = (|| -> Result<serde_json::Value, EditError> {
+        let req: NodeUpdate = serde_json::from_str(request_json)
+            .map_err(|e| EditError::Invalid(format!("invalid request: {e}")))?;
+        if let Some(stale) = check_base(raw, id, &req)? {
+            return Ok(serde_json::json!({ "conflict": {
+                "baseRev": stale.base_rev,
+                "currentText": stale.current_text,
+                "currentRev": stale.current_rev,
+                "currentTitle": stale.current_title,
+                "titleStale": stale.title_stale,
+            }}));
+        }
+        let canvas = Canvas::from_markdown(raw).map_err(|e| EditError::Invalid(e.to_string()))?;
+        // A node an edge comes from must exist in this document.
+        let resolve = |from: &str| -> Result<String, EditError> {
+            if canvas.node(from).is_some() {
+                Ok(from.to_string())
+            } else {
+                Err(EditError::NotFound(format!("no node {from:?}")))
+            }
+        };
+        let updated = apply_node_update(raw, id, &req, &resolve)?;
+        Ok(serde_json::json!({ "raw": updated }))
+    })();
+    match outcome {
+        Ok(value) => value,
+        Err(e) => {
+            let kind = match e {
+                EditError::NotFound(_) => "notFound",
+                EditError::Invalid(_) => "invalid",
+            };
+            serde_json::json!({ "error": { "kind": kind, "message": e.to_string() } })
+        }
+    }
+    .to_string()
+}

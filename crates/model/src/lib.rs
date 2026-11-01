@@ -15,6 +15,7 @@ pub mod canvas;
 pub mod color_spans;
 pub mod comment;
 pub mod constraint;
+pub mod edit;
 pub mod fence;
 pub mod file_source;
 pub mod host;

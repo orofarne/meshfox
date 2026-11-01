@@ -198,3 +198,28 @@ test("newCanvasContent is the template `meshfox create` writes, and renders", ()
   assert.equal(canvas.nodes.length, 1);
   assert.equal(canvas.nodes[0].title, "my notes");
 });
+
+test("applyNodeUpdate: PATCH /api/nodes/:id's edit, in the page", () => {
+  const doc =
+    '# Root\n<!-- meshfox:node id="root" -->\n\n## Child\n<!-- meshfox:node id="child" tags="a" -->\n\nbody\n';
+  const call = (id, req) => JSON.parse(wasm.applyNodeUpdate(doc, id, JSON.stringify(req)));
+  const rev = render(doc, "d.canvas.md").nodes.find((n) => n.id === "child").bodyRev;
+
+  const ok = call("child", { text: "new body", baseRev: rev, tags: { add: ["b"] }, color: "2" });
+  const child = render(ok.raw, "d.canvas.md").nodes.find((n) => n.id === "child");
+  assert.equal(child.text.trim(), "new body");
+  assert.deepEqual(child.tags, ["a", "b"]);
+  assert.equal(child.color, "2");
+
+  // A stale base is a conflict, with the node as it is now; nothing applied.
+  const stale = call("child", { text: "mine", baseRev: "0000" });
+  assert.equal(stale.conflict.currentText.trim(), "body");
+  assert.equal(stale.conflict.currentRev, rev);
+  // A body without a base is refused; so is a node that is not there.
+  assert.equal(call("child", { text: "mine" }).error.kind, "invalid");
+  assert.equal(call("ghost", { color: "1" }).error.kind, "notFound");
+  // An edge from a node that does not exist.
+  assert.equal(call("child", { edges: { add: ["ghost"] } }).error.kind, "notFound");
+  // A request that is not one.
+  assert.equal(call("child", { width: "wide" }).error.kind, "invalid");
+});

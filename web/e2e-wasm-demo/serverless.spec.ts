@@ -516,3 +516,39 @@ test("a new canvas can be started, edited and downloaded without opening anythin
   expect(saved.startsWith("<!-- meshfox:canvas -->\n# my notes\n")).toBe(true);
   expect(saved.endsWith(ADDED)).toBe(true);
 });
+
+test("a node's settings are edited in the page by the same code as the server's, and undone", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("child body")).toBeVisible();
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+
+  const child = page.locator('.react-flow__node[data-id="child"]');
+  await child.locator(".mesh-node-title-text, .mesh-node-title-centered-text").first().click();
+  await page.locator('.mesh-node-toolbar button[title*="settings" i]').click();
+  const modal = page.locator(".node-settings-modal");
+  await modal.getByLabel("Title").fill("Renamed child");
+  await modal.getByLabel("Color").fill("3");
+  await page.locator(".vars-modal-actions button", { hasText: "ok" }).click();
+  await expect(modal).toHaveCount(0);
+
+  // The node shows the new title, and the document text says so too.
+  await expect(child).toContainText("Renamed child");
+  const canvas = await canvasJson(page);
+  const node = canvas.nodes.find((n) => n.id === "child")! as { title: string; color?: string };
+  expect([node.title, node.color]).toEqual(["Renamed child", "3"]);
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+  const raw = await page.evaluate(() => fetch("api/canvas/raw").then((r) => r.text()));
+  expect(raw).toContain("## Renamed child");
+  expect(raw).toContain('color="3"');
+  expect(raw).toContain("child body");
+
+  // One undo takes both fields back.
+  await page.getByRole("button", { name: /undo/ }).click();
+  await expect(child).not.toContainText("Renamed child");
+  const back = await page.evaluate(() => fetch("api/canvas/raw").then((r) => r.text()));
+  expect(back).not.toContain("Renamed");
+  expect(back).not.toContain('color="3"');
+});
