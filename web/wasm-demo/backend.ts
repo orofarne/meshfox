@@ -405,8 +405,8 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     }
     return text(
       method === "GET"
-        ? "not available in the browser (nothing runs here)"
-        : "this edit is not available in the browser editor yet — Source mode can change anything",
+        ? "this is not supported in the browser editor"
+        : "this is not supported in the browser editor yet — Source mode can change anything",
       501,
     );
   };

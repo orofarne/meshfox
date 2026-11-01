@@ -813,3 +813,26 @@ test("save writes into the chosen file, and again without asking", async ({ page
   expect(after.writes[1]).toContain("more text");
   expect(after.closed).toBe(2);
 });
+
+test("nodes that need a server say so plainly, and offer no button that cannot work", async ({ page }) => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "other.canvas.md"), '# Other\n<!-- meshfox:node id="root" -->\n\nOther.\n');
+  fs.writeFileSync(path.join(dir, "data.csv"), "a,b\n1,2\n");
+  fs.writeFileSync(
+    path.join(dir, "doc.canvas.md"),
+    [
+      '# Root\n<!-- meshfox:node id="root" -->\n<!-- meshfox:option name="unfold" -->\n\nThe root.\n',
+      '## Sibling\n<!-- meshfox:node id="sibling" type="file" -->\n\n[sibling canvas](./other.canvas.md)\n',
+      '## Data\n<!-- meshfox:node id="data" type="file" display="table" -->\n\n[data table](./data.csv)\n',
+    ].join("\n"),
+  );
+  await page.goto("/");
+  await page.locator("input[webkitdirectory]").setInputFiles(dir);
+  await page.getByRole("button", { name: "doc.canvas.md" }).click();
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.getByText("Sibling", { exact: true })).toBeVisible();
+  // "Open in the default application" has no meaning in a page.
+  await expect(page.getByTitle("Open this file in the default application")).toHaveCount(0);
+  // A table says it is not supported here, not that something is broken.
+  await expect(page.getByText(/not supported in the browser editor/)).toBeVisible();
+});
