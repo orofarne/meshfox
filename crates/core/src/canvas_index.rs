@@ -558,6 +558,49 @@ mod tests {
             .collect()
     }
 
+    /// The browser applies `meshfox_model::ignore_rules` to what a picked
+    /// folder holds; the server walk above must agree with it, path for path.
+    #[test]
+    fn the_walk_agrees_with_the_model_ignore_rules() {
+        use meshfox_model::ignore_rules::IgnoreRules;
+        let root = tmp("parity");
+        let canvases = [
+            "keep.canvas.md",
+            "drafts/a.canvas.md",
+            "sub/drafts/b.canvas.md",
+            "node_modules/x/c.canvas.md",
+            "logs/old.canvas.md",
+            "docs/old.canvas.md",
+            "docs/new.canvas.md",
+            ".hidden/d.canvas.md",
+            "a/.dot.canvas.md",
+            "deep/er/e.canvas.md",
+            "deep/er/skipme.canvas.md",
+        ];
+        for c in canvases {
+            touch(&root, c);
+        }
+        let ignore_files = [
+            ("", "# c\nnode_modules/\n/drafts/\nold.canvas.md\n"),
+            ("docs", "!old.canvas.md\n"),
+            ("deep/er", "skipme.canvas.md\n"),
+        ];
+        let mut rules = IgnoreRules::new();
+        for (dir, text) in ignore_files {
+            fs::write(root.join(dir).join(IGNORE_FILE), text).unwrap();
+            rules.add(dir, text);
+        }
+        let index = CanvasIndex::scan(&root, &ScanOptions::default()).unwrap();
+        let mut expected: Vec<String> = canvases
+            .iter()
+            .filter(|c| !rules.is_ignored(c, false))
+            .map(|c| c.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(rels(&index), expected);
+        assert!(expected.contains(&"docs/old.canvas.md".to_string()), "the deeper file brings it back");
+    }
+
     #[test]
     fn lists_canvases_sorted_and_ignores_other_files() {
         let root = tmp("list");

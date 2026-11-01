@@ -119,3 +119,18 @@ test("the large repository documents render", () => {
     assert.ok(canvas.nodes.length >= 3, f);
   }
 });
+
+test("IgnoreRules applies the model's rules: dots and .meshfoxignore", () => {
+  const rules = new wasm.IgnoreRules();
+  assert.equal(rules.isIgnored("node_modules/x.md", false), false, "nothing is left out by name alone");
+  assert.equal(rules.isIgnored(".git/config", false), true);
+  assert.equal(rules.isIgnored("a/.notes/x.md", false), true);
+  rules.addFile("", "node_modules/\n*.log\n");
+  rules.addFile("docs", "!keep.log\n");
+  assert.equal(rules.isIgnored("node_modules", true), true);
+  assert.equal(rules.isIgnored("a/node_modules/x.md", false), true);
+  assert.equal(rules.isIgnored("run.log", false), true);
+  assert.equal(rules.isIgnored("docs/keep.log", false), false, "a deeper file brings it back");
+  assert.equal(rules.isIgnored("a.canvas.md", false), false);
+  rules.free();
+});

@@ -105,6 +105,42 @@ test("opening a folder resolves includes, assets and file previews from it", asy
   expect(missing).toBe(404);
 });
 
+test("a picked folder is read by the model's ignore rules: dots and .meshfoxignore, nothing by name", async ({ page }) => {
+  const dir = tmpDir();
+  const put = (rel: string, text: string) => {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+    fs.writeFileSync(path.join(dir, rel), text);
+  };
+  put(
+    "doc.canvas.md",
+    ROOT +
+      '## A\n<!-- meshfox:node id="a" type="include" -->\n\n[a](./node_modules/a.md)\n\n' +
+      '## B\n<!-- meshfox:node id="b" type="include" -->\n\n[b](./drafts/b.md)\n',
+  );
+  put("node_modules/a.md", "# A\n\nread, though it is called node_modules\n");
+  put("drafts/b.md", "# B\n\nexcluded by .meshfoxignore\n");
+  put("drafts/other.canvas.md", ROOT); // would make the pick ask "which one?" if it were read
+  put(".hidden/c.canvas.md", ROOT); // dot directory
+  put(".meshfoxignore", "# not for the viewer\ndrafts/\n");
+
+  await page.goto("/");
+  await page.locator("input[webkitdirectory]").setInputFiles(dir);
+  // `drafts/b.md` was never read, so the include of it is missing: the pick
+  // is refused in the launcher, naming it. (It is neither a crash nor a pick
+  // among several canvases: the excluded and hidden canvases are not there.)
+  await expect(page.locator("#status.error")).toContainText("drafts/b.md");
+  await expect(page.getByRole("button", { name: /canvas\.md/ })).toHaveCount(0);
+
+  // Without the ignore file the same folder opens, `node_modules` included.
+  fs.rmSync(path.join(dir, ".meshfoxignore"));
+  put("doc.canvas.md", ROOT + '## A\n<!-- meshfox:node id="a" type="include" -->\n\n[a](./node_modules/a.md)\n');
+  fs.rmSync(path.join(dir, "drafts"), { recursive: true });
+  await page.reload();
+  await page.locator("input[webkitdirectory]").setInputFiles(dir);
+  await expect(page.getByText("The root.")).toBeVisible();
+  expect((await canvasJson(page)).nodes.find((n) => n.id === "a")!.text).toContain("read, though it is called node_modules");
+});
+
 test("images in a document are shown, not just fetchable", async ({ page }) => {
   // `<img src="api/asset?...">` is loaded by the browser itself, not by
   // `fetch`: the page has to hand it a blob URL built from the opened files.

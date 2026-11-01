@@ -16,6 +16,7 @@
 //! directory, `/`-separated, never escaping it.
 
 use meshfox_model::file_source::{ConfineError, FileSource};
+use meshfox_model::ignore_rules::IgnoreRules;
 use meshfox_model::{host, render};
 use std::path::{Component, Path, PathBuf};
 use wasm_bindgen::prelude::*;
@@ -229,5 +230,40 @@ mod tests {
 
         let empty = Mem(HashMap::new());
         assert!(render::render_canvas(raw, Path::new("doc.canvas.md"), &empty).is_err());
+    }
+}
+
+/// What meshfox leaves out of a tree it walks (names starting with `.`, and what
+/// `.meshfoxignore` files exclude): the same rules as `meshfox serve --http`.
+/// A host picking a folder feeds it each `.meshfoxignore` it finds, then asks
+/// about every path before reading it. Paths are `/`-separated, relative to
+/// the picked folder.
+#[wasm_bindgen(js_name = IgnoreRules)]
+pub struct JsIgnoreRules(IgnoreRules);
+
+#[wasm_bindgen(js_class = IgnoreRules)]
+impl JsIgnoreRules {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> JsIgnoreRules {
+        JsIgnoreRules(IgnoreRules::new())
+    }
+
+    /// Registers the text of the `.meshfoxignore` that sits in `dir` (`""` is
+    /// the root).
+    #[wasm_bindgen(js_name = addFile)]
+    pub fn add_file(&mut self, dir: &str, text: &str) {
+        self.0.add(dir, text);
+    }
+
+    /// Whether `path`, or a directory above it, is left out.
+    #[wasm_bindgen(js_name = isIgnored)]
+    pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
+        self.0.is_ignored(path, is_dir)
+    }
+}
+
+impl Default for JsIgnoreRules {
+    fn default() -> Self {
+        Self::new()
     }
 }

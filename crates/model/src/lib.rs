@@ -18,6 +18,7 @@ pub mod constraint;
 pub mod fence;
 pub mod file_source;
 pub mod host;
+pub mod ignore_rules;
 pub mod image_attrs;
 pub mod include;
 pub mod locate;

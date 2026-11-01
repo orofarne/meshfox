@@ -16,7 +16,7 @@ const pageAsIndex: Plugin = {
   name: "editor-page-as-index",
   apply: "build",
   closeBundle() {
-    const dir = path.resolve(__dirname, "dist-wasm");
+    const dir = path.resolve(import.meta.dirname, "dist-wasm");
     if (fs.existsSync(path.join(dir, "editor.html"))) {
       fs.renameSync(path.join(dir, "editor.html"), path.join(dir, "index.html"));
     }

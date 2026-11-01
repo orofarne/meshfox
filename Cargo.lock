@@ -3508,6 +3508,7 @@ dependencies = [
  "blake3",
  "csv",
  "getrandom 0.4.3",
+ "ignore",
  "pulldown-cmark",
  "serde",
  "serde_json",

@@ -65,9 +65,25 @@ function status(message: string, isError = false) {
 
 let documentOpen = false;
 
+// Loaded as soon as the page is: a folder pick needs the model's ignore rules,
+// and a drop must hand over its entries before its first `await`.
+const ready = init();
+const newRules = async () => {
+  await ready;
+  return new wasmApi.IgnoreRules();
+};
+
+const skippedNote = (skipped: Picked["skipped"]): string | undefined => {
+  const parts = [
+    skipped.tooLarge > 0 && `${skipped.tooLarge} over 25 MB`,
+    skipped.tooMany > 0 && `${skipped.tooMany} beyond the 20 000-file limit`,
+  ].filter(Boolean);
+  return parts.length > 0 ? `not read: ${parts.join(", ")}` : undefined;
+};
+
 async function start(doc: Document) {
   status(`Loading the model…`);
-  await init();
+  await ready;
   // Find out now, with the launcher still on screen, whether this can be shown.
   const render = createRenderer(wasmApi, doc);
   const first = render();
@@ -81,7 +97,7 @@ async function start(doc: Document) {
   // fetch interception) depend on it.
   history.pushState({ meshfox: "document" } satisfies HistoryState, "");
   documentOpen = true;
-  const pill = el("div", { id: "wasm-pill", textContent: "in your browser · read-only" });
+  const pill = el("div", { id: "wasm-pill", textContent: ["in your browser · read-only", doc.note].filter(Boolean).join(" · ") });
   pill.append(el("a", { textContent: "open another", onclick: () => history.back() }));
   document.body.append(pill);
   await import("../src/main");
@@ -96,7 +112,7 @@ async function chooseAndStart(picked: Picked) {
     return;
   }
   if (pool.length === 1) {
-    await start({ path: pool[0], files: picked.files });
+    await start({ path: pool[0], files: picked.files, note: skippedNote(picked.skipped) });
     return;
   }
   document.getElementById("choices")!.replaceChildren(
@@ -105,11 +121,11 @@ async function chooseAndStart(picked: Picked) {
       "div",
       { className: "list" },
       ...pool.slice(0, 40).map((path) =>
-        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files }) }),
+        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, note: skippedNote(picked.skipped) }) }),
       ),
     ),
   );
-  status(`${picked.files.size} files read.`);
+  status([`${picked.files.size} files read`, skippedNote(picked.skipped)].filter(Boolean).join("; ") + ".");
 }
 
 function launcher(note?: string) {
@@ -122,8 +138,8 @@ function launcher(note?: string) {
     status("Reading…");
     task.then(chooseAndStart).catch((e) => status(String(e), true));
   };
-  filePicker.onchange = () => filePicker.files && handle(fromFileList(filePicker.files));
-  folderPicker.onchange = () => folderPicker.files && handle(fromFileList(folderPicker.files));
+  filePicker.onchange = () => filePicker.files && handle(fromFileList(filePicker.files, newRules));
+  folderPicker.onchange = () => folderPicker.files && handle(fromFileList(folderPicker.files, newRules));
 
   const drop = el(
     "div",
@@ -142,7 +158,7 @@ function launcher(note?: string) {
   drop.ondrop = (e) => {
     e.preventDefault();
     drop.classList.remove("over");
-    if (e.dataTransfer) handle(fromDrop(e.dataTransfer.items));
+    if (e.dataTransfer) handle(fromDrop(e.dataTransfer.items, newRules));
   };
 
   root.append(

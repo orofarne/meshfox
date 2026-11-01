@@ -14,6 +14,8 @@ export interface Document {
   /** The canvas's own path inside `files`. */
   path: string;
   files: VirtualFiles;
+  /** Shown beside the "in your browser" pill, e.g. what was not read. */
+  note?: string;
 }
 
 const SESSION = "wasm-demo";
