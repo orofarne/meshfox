@@ -264,6 +264,27 @@ pub struct NodeUpdate {
     pub created_at: Option<String>,
 }
 
+impl BlockAttrsUpdate {
+    /// A request that changes nothing.
+    pub fn blank() -> Self {
+        BlockAttrsUpdate {
+            name: None,
+            lang: None,
+            cache: None,
+            always: None,
+            default: None,
+            tty: None,
+            autoclose: None,
+            service: None,
+            deps: None,
+            env: None,
+            interpreter: None,
+            clear_interpreter: false,
+            code: None,
+        }
+    }
+}
+
 impl NodeUpdate {
     /// A request that changes nothing.
     pub fn blank() -> Self {
@@ -996,6 +1017,102 @@ pub fn reorder_siblings(raw: &str) -> Result<String, EditError> {
         .ok_or_else(|| EditError::Invalid("failed to parse".to_string()))
 }
 
+/// Changes to one runnable code block's fence attributes (and, optionally, its
+/// code) — `PATCH /api/nodes/:id/blocks/:name`. A field that is absent is left
+/// alone.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockAttrsUpdate {
+    pub name: Option<String>,
+    pub lang: Option<String>,
+    pub cache: Option<bool>,
+    pub always: Option<bool>,
+    pub default: Option<bool>,
+    pub tty: Option<bool>,
+    pub autoclose: Option<bool>,
+    pub service: Option<bool>,
+    /// Comma-separated `deps=` list, the syntax `--deps` already accepts —
+    /// `None` leaves it untouched, `Some("")` clears it, anything else replaces
+    /// it outright.
+    pub deps: Option<String>,
+    /// Same convention as `deps`, for `env=`.
+    pub env: Option<String>,
+    /// `None` (the field not sent) leaves the interpreter untouched.
+    /// `clearInterpreter: true` clears it (mutually exclusive with `interpreter`
+    /// being set): a plain `Option<String>` cannot reach that third "explicitly
+    /// cleared" state on its own.
+    pub interpreter: Option<String>,
+    #[serde(default)]
+    pub clear_interpreter: bool,
+    /// New code, replacing everything between the fence's delimiter lines.
+    /// `None` leaves it untouched.
+    pub code: Option<String>,
+}
+
+/// Applies `req` to the runnable block `block_name` of node `id`. When `deps`
+/// is touched, the whole document is checked with `validate_deps` — the one
+/// check that needs the run planner (every reference resolves, no cycles, one
+/// default per node), so it is the caller's: a server passes the real one, a
+/// host that never runs anything may pass `|_| Ok(())`.
+pub fn update_block_attrs(
+    raw: &str,
+    id: &str,
+    block_name: &str,
+    req: &BlockAttrsUpdate,
+    validate_deps: &dyn Fn(&Canvas) -> Result<(), String>,
+) -> Result<String, EditError> {
+    if req.interpreter.is_some() && req.clear_interpreter {
+        return invalid("interpreter is mutually exclusive with clearInterpreter");
+    }
+    let interpreter = if req.clear_interpreter {
+        Some(None)
+    } else {
+        req.interpreter.clone().map(Some)
+    };
+    let deps = req.deps.as_deref().map(crate::fence::parse_deps_list);
+    let env = req.env.as_deref().map(crate::fence::parse_env_list);
+    let not_found = || {
+        EditError::NotFound(format!(
+            "no runnable code block named {block_name:?} in node {id:?}"
+        ))
+    };
+
+    let canvas = parse_checked(raw)?;
+    let node = canvas.node(id).ok_or_else(not_found)?;
+    if !node
+        .runnable_blocks()
+        .iter()
+        .any(|b| b.name.as_deref() == Some(block_name))
+    {
+        return Err(not_found());
+    }
+    let patch = mdcanvas::FenceAttrsPatch {
+        name: req.name.clone(),
+        lang: req.lang.clone(),
+        cache: req.cache,
+        always: req.always,
+        default: req.default,
+        tty: req.tty,
+        autoclose: req.autoclose,
+        service: req.service,
+        deps,
+        env,
+        interpreter,
+        code: req.code.clone(),
+    };
+    if node.is_runnable_file() {
+        if let Some(why) = patch.file_node_conflict() {
+            return invalid(why.to_string());
+        }
+    }
+    let updated = mdcanvas::set_fence_attrs(raw, id, block_name, &patch).ok_or_else(not_found)?;
+    let updated_canvas = parse_checked(&updated)?;
+    if req.deps.is_some() {
+        validate_deps(&updated_canvas).map_err(EditError::Invalid)?;
+    }
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,6 +1657,60 @@ mod tests {
         assert!(matches!(
             append_node_body(DOC, "ghost", "x"),
             Err(EditError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_blocks_attributes_and_code_change_and_deps_are_checked_by_the_caller() {
+        let doc =
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```bash name=\"build\"\necho hi\n```\n";
+        let ok = |_: &Canvas| Ok(());
+        let out = update_block_attrs(
+            doc,
+            "root",
+            "build",
+            &BlockAttrsUpdate {
+                cache: Some(true),
+                code: Some("echo bye".into()),
+                ..BlockAttrsUpdate::blank()
+            },
+            &ok,
+        )
+        .unwrap();
+        assert!(out.contains("cache") && out.contains("echo bye") && !out.contains("echo hi"));
+        // `deps` is checked only when it is touched, and the caller's check wins.
+        let refuse = |_: &Canvas| Err("a dependency cycle".to_string());
+        let touched = BlockAttrsUpdate {
+            deps: Some("build".into()),
+            ..BlockAttrsUpdate::blank()
+        };
+        assert!(
+            err(update_block_attrs(doc, "root", "build", &touched, &refuse))
+                .to_string()
+                .contains("cycle")
+        );
+        let untouched = BlockAttrsUpdate {
+            cache: Some(false),
+            ..BlockAttrsUpdate::blank()
+        };
+        assert!(update_block_attrs(doc, "root", "build", &untouched, &refuse).is_ok());
+        // Unknown block / node, and the mutually exclusive pair.
+        assert!(matches!(
+            update_block_attrs(doc, "root", "nope", &untouched, &ok),
+            Err(EditError::NotFound(_))
+        ));
+        assert!(matches!(
+            update_block_attrs(doc, "ghost", "build", &untouched, &ok),
+            Err(EditError::NotFound(_))
+        ));
+        let both = BlockAttrsUpdate {
+            interpreter: Some("python".into()),
+            clear_interpreter: true,
+            ..BlockAttrsUpdate::blank()
+        };
+        assert!(matches!(
+            update_block_attrs(doc, "root", "build", &both, &ok),
+            Err(EditError::Invalid(_))
         ));
     }
 

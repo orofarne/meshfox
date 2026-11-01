@@ -10,6 +10,7 @@ export interface WasmApi extends UndoWasm {
   renderCanvasWithWarnings(source: string, path: string, files?: unknown): string;
   applyNodeUpdate(raw: string, id: string, requestJson: string): string;
   applyEdit(raw: string, op: string, argsJson: string): string;
+  applyBlockAttrs(raw: string, id: string, blockName: string, requestJson: string): string;
   version(): string;
 }
 
@@ -277,6 +278,21 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       return new Response(null, { status: 204, headers: { ETag: session.rev } });
     }
     const nodeRoute = /^nodes\/([^/]+)$/.exec(route);
+    const blockRoute = /^nodes\/([^/]+)\/block\/([^/]+)$/.exec(route);
+    if (method === "PATCH" && blockRoute) {
+      const out = JSON.parse(
+        wasm.applyBlockAttrs(
+          session.raw,
+          decodeURIComponent(blockRoute[1]),
+          decodeURIComponent(blockRoute[2]),
+          body ?? "{}",
+        ),
+      ) as { raw?: string; error?: { kind: string; message: string } };
+      if (out.error) return text(out.error.message, out.error.kind === "notFound" ? 404 : 422);
+      const problem = commit(out.raw!, "node_upserted");
+      if (problem !== undefined) return text(problem, 422);
+      return canvasResponse();
+    }
     if (method === "PATCH" && nodeRoute) {
       // The same edit `PATCH /api/nodes/:id` makes (`meshfox_model::edit`).
       const id = decodeURIComponent(nodeRoute[1]);

@@ -21,8 +21,8 @@ use axum::{
 };
 use meshfox_core::capabilities::Capabilities;
 use meshfox_core::{
-    mdcanvas, merge3, worker_lock, Canvas, ExecOutput, FenceAttrsPatch, FileDisplay, Merge,
-    MergeConflict, NodeMeta, NodeType, RunError, VarCache,
+    mdcanvas, merge3, worker_lock, Canvas, ExecOutput, FileDisplay, Merge, MergeConflict, NodeMeta,
+    NodeType, RunError, VarCache,
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -5296,8 +5296,10 @@ use meshfox_model::edit::{
     clear_node_layout as clear_node_layout_in_document, create_node as create_node_in_document,
     move_sibling as move_sibling_in_document, remove_node as remove_node_from_document,
     rename_node_id as rename_node_id_in_document, reorder_siblings as reorder_siblings_in_document,
-    reparent_node as reparent_node_in_document, save_layout, set_options, EditError,
-    LayoutBox as NodeBox, LayoutHint, NodeUpdate as UpdateNodeRequest,
+    reparent_node as reparent_node_in_document, save_layout, set_options,
+    update_block_attrs as update_block_attrs_in_document,
+    BlockAttrsUpdate as UpdateBlockAttrsRequest, EditError, LayoutBox as NodeBox, LayoutHint,
+    NodeUpdate as UpdateNodeRequest,
 };
 
 impl From<EditError> for ApiError {
@@ -5416,42 +5418,6 @@ async fn append_node_body(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateBlockAttrsRequest {
-    name: Option<String>,
-    lang: Option<String>,
-    cache: Option<bool>,
-    always: Option<bool>,
-    default: Option<bool>,
-    tty: Option<bool>,
-    autoclose: Option<bool>,
-    service: Option<bool>,
-    /// Comma-separated `deps=` list, same syntax `--deps`/CLI's own `node
-    /// block` already accepts (parsed via `meshfox_core::parse_deps_list`)
-    /// — `None` leaves it untouched, `Some("")` clears it, anything else
-    /// replaces it outright. A plain `Option<String>` carries this instead
-    /// of a typed list since `meshfox_core::fence::BlockRef` has no
-    /// `Serialize`/`Deserialize` of its own — reusing the exact text
-    /// syntax the CLI already parses avoids needing one just for this.
-    deps: Option<String>,
-    /// Same convention as `deps`, for `env=` (`meshfox_core::parse_env_list`).
-    env: Option<String>,
-    /// `None` (the field not sent) leaves the interpreter untouched.
-    /// `clearInterpreter: true` clears it back to unset (mutually
-    /// exclusive with `interpreter` being set at the same time, same as
-    /// the CLI's own `--interpreter`/`--clear-interpreter`) — plain
-    /// `Option<String>` can't reach that third "explicitly cleared" state
-    /// on its own, so this mirrors the CLI's own two-field shape instead
-    /// of inventing a new sentinel convention.
-    interpreter: Option<String>,
-    #[serde(default)]
-    clear_interpreter: bool,
-    /// New code, replacing everything between the fence's own delimiter
-    /// lines. `None` leaves it untouched.
-    code: Option<String>,
-}
-
 /// Rewrites one runnable fence's own info-string attributes (and,
 /// optionally, its code) inside node `id` — the worker-routed counterpart
 /// to CLI/MCP `node block`'s own direct-file `apply_node_block`, which
@@ -5466,68 +5432,18 @@ async fn update_block_attrs(
     Json(req): Json<UpdateBlockAttrsRequest>,
 ) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
-    if req.interpreter.is_some() && req.clear_interpreter {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "interpreter is mutually exclusive with clearInterpreter".to_string(),
-        ));
-    }
-    let interpreter = if req.clear_interpreter {
-        Some(None)
-    } else {
-        req.interpreter.clone().map(Some)
-    };
-    let deps = req.deps.as_deref().map(meshfox_core::parse_deps_list);
-    let env = req.env.as_deref().map(meshfox_core::parse_env_list);
-
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
-    let not_found = || {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            format!("no runnable code block named {block_name:?} in node {id:?}"),
-        )
-    };
-
-    let canvas = parse_or_error(&located.raw)?;
-    let node = canvas.node(&located.local_id).ok_or_else(not_found)?;
-    if !node
-        .runnable_blocks()
-        .iter()
-        .any(|b| b.name.as_deref() == Some(block_name.as_str()))
-    {
-        return Err(not_found());
-    }
-
-    let deps_touched = req.deps.is_some();
-    let patch = FenceAttrsPatch {
-        name: req.name.clone(),
-        lang: req.lang.clone(),
-        cache: req.cache,
-        always: req.always,
-        default: req.default,
-        tty: req.tty,
-        autoclose: req.autoclose,
-        service: req.service,
-        deps,
-        env,
-        interpreter,
-        code: req.code.clone(),
-    };
-    if node.is_runnable_file() {
-        if let Some(why) = patch.file_node_conflict() {
-            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, why.to_string()));
-        }
-    }
-    let updated = mdcanvas::set_fence_attrs(&located.raw, &located.local_id, &block_name, &patch)
-        .ok_or_else(not_found)?;
-    parse_or_error(&updated)?;
-    if deps_touched {
-        let updated_canvas = parse_or_error(&updated)?;
-        meshfox_core::deps::validate(&updated_canvas)
-            .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    }
-
+    // What a block's own edit does to the document is `meshfox_model::edit`'s;
+    // the dependency graph (every `deps=` resolves, no cycles, one default per
+    // node) needs the run planner, which is this crate's.
+    let updated = update_block_attrs_in_document(
+        &located.raw,
+        &located.local_id,
+        &block_name,
+        &req,
+        &|canvas| meshfox_core::deps::validate(canvas).map_err(|e| e.to_string()),
+    )?;
     let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &updated, op)?;
     state.canvas_snapshot()

@@ -263,3 +263,14 @@ test("applyEdit: create, move, rename, remove, options, layout — the server's 
   assert.equal(edit("remove", { id: "ghost" }).error.kind, "notFound");
   assert.equal(edit("bogus", {}).error.kind, "invalid");
 });
+
+test("applyBlockAttrs: a block's attributes and code, as PATCH /api/nodes/:id/block/:name", () => {
+  const doc = '# Root\n<!-- meshfox:node id="root" -->\n\n```bash name="build"\necho hi\n```\n';
+  const call = (block, req) => JSON.parse(wasm.applyBlockAttrs(doc, "root", block, JSON.stringify(req)));
+  const out = call("build", { cache: true, code: "echo bye", deps: "other" });
+  assert.match(out.raw, /cache/);
+  assert.match(out.raw, /echo bye/);
+  assert.equal(call("nope", { cache: true }).error.kind, "notFound");
+  assert.equal(call("build", { interpreter: "python", clearInterpreter: true }).error.kind, "invalid");
+  assert.equal(call("build", { cache: "yes" }).error.kind, "invalid");
+});

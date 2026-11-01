@@ -598,7 +598,7 @@ test("the edits a page can make are the ones the server's endpoints make (api le
         const r = await fetch(u as string, {
           method: m as string,
           headers: { "content-type": "application/json" },
-          body: b === undefined ? undefined : JSON.stringify(b),
+          body: b === undefined ? undefined : typeof b === "string" ? b : JSON.stringify(b),
         });
         return { status: r.status, text: await r.text() };
       },
@@ -618,6 +618,14 @@ test("the edits a page can make are the ones the server's endpoints make (api le
   expect((await call("PUT", "api/options", { options: ["unfold"] })).status).toBe(200);
   expect((await call("PUT", "api/canvas", { nodes: [{ id: "a", x: 10, y: 20, width: 300 }], layoutHints: {} })).status).toBe(204);
   expect((await call("POST", "api/nodes/a/clear-layout")).status).toBe(200);
+  // A block's attributes (the CLI/MCP's `node block`): the same endpoint, in the page.
+  await call("POST", "api/nodes/b/append", "\n```bash name=\"build\"\necho hi\n```\n");
+  expect((await call("PATCH", "api/nodes/b/block/build", { cache: true, code: "echo bye" })).status).toBe(200);
+  expect((await call("PATCH", "api/nodes/b/block/none", { cache: true })).status).toBe(404);
+  expect((await call("PATCH", "api/nodes/b/block/build", { interpreter: "python", clearInterpreter: true })).status).toBe(422);
+  const afterBlock = await page.evaluate(() => fetch("api/canvas/raw").then((r) => r.text()));
+  expect(afterBlock).toContain("echo bye");
+  expect(afterBlock).not.toContain("echo hi");
   expect((await call("DELETE", "api/nodes/root")).status).toBe(422);
   expect((await call("DELETE", "api/nodes/a")).status).toBe(200);
   const nodes = (await canvasJson(page)).nodes.map((n) => n.id);

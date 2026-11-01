@@ -558,3 +558,31 @@ pub fn apply_edit(raw: &str, op: &str, args_json: &str) -> String {
     }
     .to_string()
 }
+
+/// Edits one runnable block of a node the way `PATCH /api/nodes/:id/block/:name`
+/// does (`meshfox_model::edit::update_block_attrs`): `request_json` is the
+/// request body (`name`, `lang`, `cache`, `deps`, `env`, `interpreter`, `code`,
+/// …). The result is `{ "raw": … }` or `{ "error": { "kind", "message" } }` as
+/// for [`apply_edit`]. Nothing here runs, so the dependency graph the server
+/// checks when `deps` changes (every reference resolves, no cycles) is not
+/// checked: that needs the run planner, which does not belong in a page.
+#[wasm_bindgen(js_name = applyBlockAttrs)]
+pub fn apply_block_attrs(raw: &str, id: &str, block_name: &str, request_json: &str) -> String {
+    use meshfox_model::edit::{update_block_attrs, BlockAttrsUpdate, EditError};
+    let outcome = (|| -> Result<String, EditError> {
+        let req: BlockAttrsUpdate = serde_json::from_str(request_json)
+            .map_err(|e| EditError::Invalid(format!("invalid request: {e}")))?;
+        update_block_attrs(raw, id, block_name, &req, &|_| Ok(()))
+    })();
+    match outcome {
+        Ok(raw) => serde_json::json!({ "raw": raw }),
+        Err(e) => {
+            let kind = match e {
+                EditError::NotFound(_) => "notFound",
+                EditError::Invalid(_) => "invalid",
+            };
+            serde_json::json!({ "error": { "kind": kind, "message": e.to_string() } })
+        }
+    }
+    .to_string()
+}
