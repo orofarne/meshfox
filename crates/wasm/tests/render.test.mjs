@@ -223,3 +223,43 @@ test("applyNodeUpdate: PATCH /api/nodes/:id's edit, in the page", () => {
   // A request that is not one.
   assert.equal(call("child", { width: "wide" }).error.kind, "invalid");
 });
+
+test("applyEdit: create, move, rename, remove, options, layout — the server's own edits", () => {
+  let doc = '# Root\n<!-- meshfox:node id="root" -->\n\n## A\n<!-- meshfox:node id="a" -->\n\nfirst\n\n## B\n<!-- meshfox:node id="b" -->\n\nsecond\n';
+  const edit = (op, args) => {
+    const out = JSON.parse(wasm.applyEdit(doc, op, JSON.stringify(args)));
+    if (out.raw !== undefined) doc = out.raw;
+    return out;
+  };
+  const ids = () => render(doc, "d.canvas.md").nodes.map((n) => n.id);
+
+  const created = edit("create", { parentId: "a", title: "Deep one", titleSlugId: true, body: "deep body" });
+  assert.equal(created.newId, "deep-one");
+  assert.equal(render(doc, "d.canvas.md").nodes.find((n) => n.id === "deep-one").parent, "a");
+
+  edit("move", { id: "b", before: "a" });
+  assert.ok(ids().indexOf("b") < ids().indexOf("a"));
+  assert.equal(edit("move", { id: "b" }).error.kind, "invalid", "needs before or after");
+
+  edit("renameId", { id: "a", newId: "alpha" });
+  assert.ok(ids().includes("alpha") && !ids().includes("a"));
+  assert.equal(edit("renameId", { id: "alpha", newId: "b" }).error.kind, "invalid", "taken");
+
+  edit("options", { options: ["unfold"] });
+  assert.deepEqual(render(doc, "d.canvas.md").options, ["unfold"]);
+
+  edit("layout", { nodes: [{ id: "alpha", x: 10, y: 20, width: 300 }], layoutHints: {} });
+  const alpha = render(doc, "d.canvas.md").nodes.find((n) => n.id === "alpha");
+  assert.deepEqual([alpha.x, alpha.y, alpha.width], [10, 20, 300]);
+  edit("clearNodeLayout", { id: "alpha" });
+  assert.equal(render(doc, "d.canvas.md").nodes.find((n) => n.id === "alpha").x, undefined);
+
+  edit("append", { id: "b", text: "\nappended" });
+  assert.match(render(doc, "d.canvas.md").nodes.find((n) => n.id === "b").text, /appended/);
+
+  edit("remove", { id: "alpha" });
+  assert.ok(!ids().includes("alpha") && !ids().includes("deep-one"), "the subtree goes");
+  assert.equal(edit("remove", { id: "root" }).error.kind, "invalid");
+  assert.equal(edit("remove", { id: "ghost" }).error.kind, "notFound");
+  assert.equal(edit("bogus", {}).error.kind, "invalid");
+});

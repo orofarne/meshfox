@@ -679,6 +679,323 @@ pub fn apply_node_update(
     Ok(raw)
 }
 
+// ---- the rest of the document-editing endpoints: each one validates, calls a
+// ---- patcher from `mdcanvas`, and checks the result still parses.
+
+use std::collections::HashMap;
+
+fn parse_checked(text: &str) -> Result<Canvas, EditError> {
+    Canvas::from_markdown(text).map_err(|e| EditError::Invalid(e.to_string()))
+}
+
+fn no_node(id: &str) -> EditError {
+    EditError::NotFound(format!("no node {id:?}"))
+}
+
+/// Adds a new, empty-bodied child heading node under `parent_id`, as the last
+/// item of its subtree, with `body` as its text when given (a body replacement
+/// of an *existing* node needs a base revision; a node that doesn't exist yet
+/// has nothing to be stale against). With `title_slug_id` the id is a readable
+/// slug of the title, otherwise a random one. Deliberately doesn't set a
+/// position — the client's auto-layout places it. Returns the new document and
+/// the new node's id.
+pub fn create_node(
+    raw: &str,
+    parent_id: &str,
+    title: &str,
+    title_slug_id: bool,
+    body: Option<&str>,
+) -> Result<(String, String), EditError> {
+    let insert = if title_slug_id {
+        mdcanvas::insert_child_node
+    } else {
+        mdcanvas::insert_child_node_random_id
+    };
+    let (mut updated, new_id) = insert(raw, parent_id, title).ok_or_else(|| no_node(parent_id))?;
+    if let Some(body) = body {
+        updated = mdcanvas::set_node_body(&updated, &new_id, body).ok_or_else(|| {
+            EditError::Invalid(format!("failed to set the body of the new node {new_id:?}"))
+        })?;
+    }
+    parse_checked(&updated)?;
+    Ok((updated, new_id))
+}
+
+/// Deletes node `id` — its whole subtree, or with `reparent_children` just
+/// itself, promoting its direct children to its own parent. The root is
+/// refused rather than producing a rootless document.
+pub fn remove_node(raw: &str, id: &str, reparent_children: bool) -> Result<String, EditError> {
+    let canvas = parse_checked(raw)?;
+    let node = canvas.node(id).ok_or_else(|| no_node(id))?;
+    if node.parent.is_none() {
+        return invalid("can't delete the root node");
+    }
+    let updated = if reparent_children {
+        mdcanvas::delete_node_reparent_children(raw, id)
+    } else {
+        mdcanvas::delete_node(raw, id)
+    }
+    .ok_or_else(|| no_node(id))?;
+    parse_checked(&updated)?;
+    Ok(updated)
+}
+
+/// The `NodeMeta` that rewrites `node`'s `meshfox:node` line with its position
+/// and size cleared and everything else carried over.
+fn layout_cleared_meta(node: &crate::canvas::Node) -> NodeMeta {
+    NodeMeta {
+        block_attrs: None,
+        x: None,
+        y: None,
+        width: None,
+        height: None,
+        color: node.color.clone(),
+        node_type: None,
+        display: node.display,
+        lang: node.lang.clone(),
+        interpreter: node.interpreter.clone(),
+        preview: Some(node.preview),
+        edge_label: node.edge_label.clone(),
+        edge_label_at: node.edge_label_at,
+        edge_source_side: node.edge_source_side,
+        edge_target_side: node.edge_target_side,
+        edge_via: node.edge_via.clone(),
+        fold: node.fold,
+        tags: node.tags.clone(),
+        created_at: node.created_at.clone(),
+    }
+}
+
+/// Makes `id` a direct child of `new_parent_id` in place of its structural
+/// parent: promotes its existing extra edge from there (the document must
+/// already state that relationship — this never invents one). The node moves
+/// with its fragment, so a move into, out of or between groups would silently
+/// change what its `x`/`y` mean; they are re-expressed so the node stays where
+/// it was drawn.
+pub fn reparent_node(raw: &str, id: &str, new_parent_id: &str) -> Result<String, EditError> {
+    let canvas = parse_checked(raw)?;
+    let node = canvas.node(id).ok_or_else(|| no_node(id))?;
+    if node.parent.is_none() {
+        return invalid("can't reparent the root node");
+    }
+    canvas
+        .node(new_parent_id)
+        .ok_or_else(|| no_node(new_parent_id))?;
+    if !node.extra_parents.iter().any(|e| e.from == new_parent_id) {
+        return invalid(format!(
+            "{new_parent_id:?} is not one of {id:?}'s extra parents"
+        ));
+    }
+    // The pre-move absolute position, in the *old* parent chain.
+    let abs_before = canvas.resolve_absolute_position(id);
+    let mut updated = mdcanvas::reparent_node(raw, id, new_parent_id).ok_or_else(|| {
+        EditError::Invalid(format!(
+            "can't reparent {id:?} onto {new_parent_id:?} (would create a cycle)"
+        ))
+    })?;
+    let new_canvas = parse_checked(&updated)?;
+    // Then the same place expressed in the new parent chain. Only when it
+    // changed, and only through `x`/`y`; a node with no position of its own
+    // stays unpositioned rather than getting a synthetic anchor.
+    if let Some((abs_x, abs_y)) = abs_before {
+        if let Some((local_x, local_y)) = new_canvas.absolute_to_local(id, abs_x, abs_y) {
+            if let Some(new_node) = new_canvas.node(id) {
+                if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
+                    let meta = NodeMeta {
+                        x: Some(local_x),
+                        y: Some(local_y),
+                        width: new_node.width,
+                        height: new_node.height,
+                        ..layout_cleared_meta(new_node)
+                    };
+                    if let Some(patched) = mdcanvas::set_node_meta(&updated, id, &meta) {
+                        updated = patched;
+                    }
+                }
+            }
+        }
+    }
+    Ok(updated)
+}
+
+/// Moves node `id`'s whole subtree to sit immediately before (`before`) or
+/// after `target_id`, which must be a sibling under the same structural parent
+/// (moving among a *different* parent's children is [`reparent_node`]'s job).
+pub fn move_sibling(
+    raw: &str,
+    id: &str,
+    target_id: &str,
+    before: bool,
+) -> Result<String, EditError> {
+    let position = if before {
+        mdcanvas::MoveSiblingPosition::Before
+    } else {
+        mdcanvas::MoveSiblingPosition::After
+    };
+    let updated = mdcanvas::move_sibling(raw, id, target_id, position).map_err(|e| match e {
+        mdcanvas::MoveSiblingError::NotFound(_) => EditError::NotFound(e.to_string()),
+        mdcanvas::MoveSiblingError::NotSiblings(_, _) | mdcanvas::MoveSiblingError::SameNode => {
+            EditError::Invalid(e.to_string())
+        }
+    })?;
+    parse_checked(&updated)?;
+    Ok(updated)
+}
+
+/// Changes node `id`'s id to `new_id`, rewriting every reference the parser
+/// tracks (other nodes' `parent=` / `meshfox:edge from=`) exactly and
+/// best-effort the `deps="id/block"` text of fences. Not found for an unknown
+/// id; invalid for an empty id, one with a `"`, a reserved one, or one already
+/// taken.
+pub fn rename_node_id(raw: &str, id: &str, new_id: &str) -> Result<String, EditError> {
+    let updated = mdcanvas::rename_node_id(raw, id, new_id).map_err(|e| match e {
+        mdcanvas::RenameIdError::NotFound(_) => EditError::NotFound(e.to_string()),
+        _ => EditError::Invalid(e.to_string()),
+    })?;
+    parse_checked(&updated)?;
+    Ok(updated)
+}
+
+/// Drops node `id`'s explicit `id="..."` attribute, handing it back to the
+/// parser's title-slug fallback. Returns the new document and the id the node
+/// has now (usually unchanged; a fresh slug if the title has diverged).
+pub fn clear_node_id(raw: &str, id: &str) -> Result<(String, String), EditError> {
+    let (updated, new_id) =
+        mdcanvas::clear_node_id(raw, id).map_err(|e| EditError::NotFound(e.to_string()))?;
+    parse_checked(&updated)?;
+    Ok((updated, new_id))
+}
+
+/// Replaces the document's whole set of declared `meshfox:option` names with
+/// exactly `options`, in the given order; an empty list removes every
+/// declaration.
+pub fn set_options(raw: &str, options: &[String]) -> Result<String, EditError> {
+    let updated = mdcanvas::set_document_options(raw, options)
+        .ok_or_else(|| EditError::Invalid("document has no root node".to_string()))?;
+    parse_checked(&updated)?;
+    Ok(updated)
+}
+
+/// Appends `text` to node `id`'s body.
+pub fn append_node_body(raw: &str, id: &str, text: &str) -> Result<String, EditError> {
+    let updated = mdcanvas::append_node_body(raw, id, text).ok_or_else(|| no_node(id))?;
+    parse_checked(&updated)?;
+    Ok(updated)
+}
+
+/// One node's new box in a layout save — what the client itself moved or
+/// resized, nothing else. `width`/`height` omitted mean "leave as they are".
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutBox {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+}
+
+/// A node's currently drawn position: only a sort hint for the same request
+/// (see [`save_layout`]), never authored data.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct LayoutHint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Saves the position/size of every box back into the document, patching each
+/// node's `meshfox:node` line in place rather than regenerating anything, then
+/// reorders each parent's children to match the new layout (top-to-bottom,
+/// then left-to-right), so the heading order tracks the canvas. Only positions
+/// and sizes are taken from the client: each box is applied onto the node's
+/// *current* fields, so a stale copy of a node cannot write itself back along
+/// with its drag. `locate` turns a client's node id into the id it is written
+/// under here (`None`: no longer there — skipped, not an error).
+pub fn save_layout(
+    raw: &str,
+    boxes: &[LayoutBox],
+    hints: &HashMap<String, LayoutHint>,
+    locate: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, EditError> {
+    use crate::canvas::NodeType;
+    let mut out = raw.to_string();
+    // Parsed once, before any patch: `set_node_meta` only rewrites the one
+    // node's own line, so every other node's fields are the same here as in
+    // `out` however many boxes were applied.
+    let current = parse_checked(raw)?;
+    for node_box in boxes {
+        let Some(local_id) = locate(&node_box.id) else {
+            continue;
+        };
+        let Some(node) = current.node(&local_id) else {
+            continue;
+        };
+        // Include nodes never reach the client as such (they are resolved
+        // away first); skipped, same as a stray unknown id.
+        if node.node_type == NodeType::Include {
+            continue;
+        }
+        // A group's *size* is always derived from its members, never
+        // authored — whatever width/height the client reports is ignored
+        // rather than written as if it were data. Its own *position* is a
+        // real anchor its members are relative to, so that is kept.
+        let mut meta = NodeMeta::from_node(node);
+        meta.x = Some(node_box.x);
+        meta.y = Some(node_box.y);
+        if node.node_type == NodeType::Group {
+            meta.width = None;
+            meta.height = None;
+        } else {
+            meta.width = node_box.width.or(meta.width);
+            meta.height = node_box.height.or(meta.height);
+        }
+        if let Some(patched) = mdcanvas::set_node_meta(&out, &local_id, &meta) {
+            out = patched;
+        }
+    }
+    let mut local_hints: HashMap<String, (f64, f64)> = HashMap::new();
+    for (id, hint) in hints {
+        if let Some(local_id) = locate(id) {
+            local_hints.insert(local_id, (hint.x, hint.y));
+        }
+    }
+    if let Some(reordered) = mdcanvas::reorder_by_position(&out, &local_hints) {
+        out = reordered;
+    }
+    parse_checked(&out)?;
+    Ok(out)
+}
+
+/// Clears every node's stored `x`/`y`/`width`/`height`, reverting the document
+/// to auto-placed. Every other field is carried over; a group's own position
+/// (a real anchor) is cleared like any other.
+pub fn clear_layout(raw: &str) -> Result<String, EditError> {
+    let canvas = parse_checked(raw)?;
+    let mut out = raw.to_string();
+    for node in &canvas.nodes {
+        if let Some(patched) = mdcanvas::set_node_meta(&out, &node.id, &layout_cleared_meta(node)) {
+            out = patched;
+        }
+    }
+    Ok(out)
+}
+
+/// [`clear_layout`] for one node.
+pub fn clear_node_layout(raw: &str, id: &str) -> Result<String, EditError> {
+    let canvas = parse_checked(raw)?;
+    let node = canvas.node(id).ok_or_else(|| no_node(id))?;
+    mdcanvas::set_node_meta(raw, id, &layout_cleared_meta(node)).ok_or_else(|| no_node(id))
+}
+
+/// Re-sorts every parent's structural children by their position, with no
+/// hints (an unpositioned sibling sorts last, stably).
+pub fn reorder_siblings(raw: &str) -> Result<String, EditError> {
+    mdcanvas::reorder_by_position(raw, &HashMap::new())
+        .ok_or_else(|| EditError::Invalid("failed to parse".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,5 +1376,271 @@ mod tests {
         assert_eq!(fold(Some("false"), Some(true)), Some(false));
         assert_eq!(fold(Some("default"), Some(true)), None);
         assert!(resolve_fold_override(Some("bogus"), None).is_err());
+    }
+
+    // ---- the other document edits ----
+
+    fn ids(raw: &str) -> Vec<String> {
+        Canvas::from_markdown(raw)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_node_is_created_under_a_parent_with_a_readable_or_random_id() {
+        let (out, id) = create_node(DOC, "root", "Fresh idea", true, Some("its body")).unwrap();
+        assert_eq!(id, "fresh-idea");
+        assert_eq!(node(&out, "fresh-idea").parent.as_deref(), Some("root"));
+        assert_eq!(node(&out, "fresh-idea").text.trim(), "its body");
+        assert_eq!(
+            node(&out, "child").text.trim(),
+            "body",
+            "nothing else moved"
+        );
+
+        let (out, id) = create_node(DOC, "child", "Under child", false, None).unwrap();
+        assert_ne!(id, "under-child", "a random id, not a slug");
+        assert_eq!(node(&out, &id).parent.as_deref(), Some("child"));
+        assert!(matches!(
+            create_node(DOC, "ghost", "x", true, None),
+            Err(EditError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_node_is_removed_with_its_subtree_or_alone_and_the_root_never() {
+        let nested = create_node(DOC, "child", "Grandchild", true, None)
+            .unwrap()
+            .0;
+        let all = remove_node(&nested, "child", false).unwrap();
+        assert!(!ids(&all).contains(&"child".to_string()));
+        assert!(!ids(&all).contains(&"grandchild".to_string()));
+        let alone = remove_node(&nested, "child", true).unwrap();
+        assert!(!ids(&alone).contains(&"child".to_string()));
+        assert_eq!(node(&alone, "grandchild").parent.as_deref(), Some("root"));
+        assert!(err(remove_node(DOC, "root", false))
+            .to_string()
+            .contains("root"));
+        assert!(matches!(
+            remove_node(DOC, "ghost", false),
+            Err(EditError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn siblings_are_moved_next_to_each_other_and_only_siblings() {
+        let out = move_sibling(DOC, "other", "child", true).unwrap();
+        let order: Vec<_> = ids(&out);
+        assert!(order.iter().position(|i| i == "other") < order.iter().position(|i| i == "child"));
+        assert!(matches!(
+            move_sibling(DOC, "child", "child", true),
+            Err(EditError::Invalid(_))
+        ));
+        assert!(matches!(
+            move_sibling(DOC, "child", "ghost", true),
+            Err(EditError::NotFound(_))
+        ));
+        let nested = create_node(DOC, "child", "Grandchild", true, None)
+            .unwrap()
+            .0;
+        assert!(matches!(
+            move_sibling(&nested, "grandchild", "other", false),
+            Err(EditError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn a_node_is_reparented_only_onto_one_of_its_extra_parents() {
+        let with_edge = apply(
+            DOC,
+            "other",
+            NodeUpdate {
+                edges: Some(EdgeOps {
+                    add: vec!["child".into()],
+                    ..EdgeOps::default()
+                }),
+                ..NodeUpdate::blank()
+            },
+        )
+        .unwrap();
+        let out = reparent_node(&with_edge, "other", "child").unwrap();
+        assert_eq!(node(&out, "other").parent.as_deref(), Some("child"));
+        // Not an extra parent: refused; the root: refused.
+        assert!(matches!(
+            reparent_node(DOC, "other", "child"),
+            Err(EditError::Invalid(_))
+        ));
+        assert!(matches!(
+            reparent_node(&with_edge, "root", "child"),
+            Err(EditError::Invalid(_))
+        ));
+        assert!(matches!(
+            reparent_node(&with_edge, "other", "ghost"),
+            Err(EditError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn an_id_is_renamed_everywhere_it_is_referenced_and_cleared_back_to_the_slug() {
+        let with_edge = apply(
+            DOC,
+            "other",
+            NodeUpdate {
+                edges: Some(EdgeOps {
+                    add: vec!["child".into()],
+                    ..EdgeOps::default()
+                }),
+                ..NodeUpdate::blank()
+            },
+        )
+        .unwrap();
+        let out = rename_node_id(&with_edge, "child", "kid").unwrap();
+        assert!(ids(&out).contains(&"kid".to_string()));
+        assert_eq!(
+            node(&out, "other").extra_parents[0].from,
+            "kid",
+            "references follow"
+        );
+        assert!(matches!(
+            rename_node_id(DOC, "child", "other"),
+            Err(EditError::Invalid(_))
+        ));
+        assert!(matches!(
+            rename_node_id(DOC, "child", ""),
+            Err(EditError::Invalid(_))
+        ));
+        assert!(matches!(
+            rename_node_id(DOC, "ghost", "x"),
+            Err(EditError::NotFound(_))
+        ));
+        let (cleared, now) = clear_node_id(&out, "kid").unwrap();
+        assert_eq!(now, "child", "the id is the title's slug again");
+        assert!(ids(&cleared).contains(&"child".to_string()));
+    }
+
+    #[test]
+    fn options_are_replaced_and_a_body_is_appended() {
+        let out = set_options(DOC, &["unfold".to_string()]).unwrap();
+        assert_eq!(
+            crate::options::declared_options(&Canvas::from_markdown(&out).unwrap()).unwrap(),
+            ["unfold"]
+        );
+        let none = set_options(&out, &[]).unwrap();
+        assert!(
+            crate::options::declared_options(&Canvas::from_markdown(&none).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let appended = append_node_body(DOC, "child", "\nmore").unwrap();
+        assert!(node(&appended, "child").text.contains("body"));
+        assert!(node(&appended, "child").text.contains("more"));
+        assert!(matches!(
+            append_node_body(DOC, "ghost", "x"),
+            Err(EditError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_layout_save_writes_boxes_onto_current_fields_and_reorders_by_position() {
+        let locate = |id: &str| Some(id.to_string());
+        let boxes = vec![
+            LayoutBox {
+                id: "other".into(),
+                x: 0.0,
+                y: 0.0,
+                width: Some(200.0),
+                height: None,
+            },
+            LayoutBox {
+                id: "child".into(),
+                x: 500.0,
+                y: 0.0,
+                width: None,
+                height: Some(90.0),
+            },
+            LayoutBox {
+                id: "ghost".into(),
+                x: 1.0,
+                y: 1.0,
+                width: None,
+                height: None,
+            },
+        ];
+        let out = save_layout(DOC, &boxes, &HashMap::new(), &locate).unwrap();
+        let other = node(&out, "other");
+        assert_eq!(
+            (other.x, other.y, other.width),
+            (Some(0.0), Some(0.0), Some(200.0))
+        );
+        let child = node(&out, "child");
+        assert_eq!((child.x, child.height), (Some(500.0), Some(90.0)));
+        assert_eq!(child.tags, ["a"], "fields the box does not carry are kept");
+        // `other` is to the left of `child` now, so it comes first in the text.
+        let order = ids(&out);
+        assert!(order.iter().position(|i| i == "other") < order.iter().position(|i| i == "child"));
+        // A node the client no longer knows is skipped, not an error.
+        assert!(
+            save_layout(DOC, &boxes, &HashMap::new(), &|id: &str| (id != "ghost")
+                .then(|| id.to_string()))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_group_never_stores_the_size_a_client_reports() {
+        let group_doc = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n## G\n<!-- meshfox:node id=\"g\" type=\"group\" -->\n";
+        let boxes = vec![LayoutBox {
+            id: "g".into(),
+            x: 5.0,
+            y: 6.0,
+            width: Some(100.0),
+            height: Some(100.0),
+        }];
+        let out = save_layout(group_doc, &boxes, &HashMap::new(), &|id: &str| {
+            Some(id.to_string())
+        })
+        .unwrap();
+        let g = node(&out, "g");
+        assert_eq!(
+            (g.x, g.y, g.width, g.height),
+            (Some(5.0), Some(6.0), None, None)
+        );
+    }
+
+    #[test]
+    fn layout_is_cleared_for_one_node_or_all_and_everything_else_stays() {
+        let laid = apply(
+            DOC,
+            "child",
+            NodeUpdate {
+                x: Some(1.0),
+                y: Some(2.0),
+                width: Some(3.0),
+                height: Some(4.0),
+                color: Some("2".into()),
+                ..NodeUpdate::blank()
+            },
+        )
+        .unwrap();
+        let one = clear_node_layout(&laid, "child").unwrap();
+        let child = node(&one, "child");
+        assert_eq!(
+            (child.x, child.y, child.width, child.height),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            (child.color.as_deref(), child.tags.as_slice()),
+            (Some("2"), ["a".to_string()].as_slice())
+        );
+        let all = clear_layout(&laid).unwrap();
+        assert_eq!(node(&all, "child").x, None);
+        assert!(matches!(
+            clear_node_layout(&laid, "ghost"),
+            Err(EditError::NotFound(_))
+        ));
+        assert!(reorder_siblings(DOC).is_ok());
     }
 }

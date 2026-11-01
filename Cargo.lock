@@ -3558,6 +3558,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "meshfox-model",
+ "serde",
  "serde_json",
  "wasm-bindgen",
 ]

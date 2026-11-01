@@ -9,6 +9,7 @@ import { EditSession, type UndoWasm } from "./session";
 export interface WasmApi extends UndoWasm {
   renderCanvasWithWarnings(source: string, path: string, files?: unknown): string;
   applyNodeUpdate(raw: string, id: string, requestJson: string): string;
+  applyEdit(raw: string, op: string, argsJson: string): string;
   version(): string;
 }
 
@@ -128,7 +129,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   };
   /** A new text for the document, if it renders; otherwise nothing changes and
    * the reason comes back. */
-  const commit = (raw: string, opKind: string): string | undefined => {
+  const commit = (raw: string, opKind: string, quiet = false): string | undefined => {
     const before = session.raw;
     doc.files.set(doc.path, raw);
     render.reset();
@@ -138,14 +139,37 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       render.reset();
       return result.error;
     }
-    session.edit(raw, opKind);
-    announce(true);
+    // `quiet`: the page that made the edit already shows it (a layout save) —
+    // only the undo state needs telling, not a reload.
+    if (session.edit(raw, opKind)) announce(!quiet);
     return undefined;
   };
-  const canvasResponse = (extra: Record<string, unknown> = {}): Response => {
+  const canvasObject = (extra: Record<string, unknown> = {}): Record<string, unknown> | string => {
     const r = render();
-    if (r.json === undefined) return text(r.error, 422);
-    return json({ ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION, documentKey: doc.key, ...extra });
+    if (r.json === undefined) return r.error;
+    return { ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION, documentKey: doc.key, ...extra };
+  };
+  const canvasResponse = (extra: Record<string, unknown> = {}): Response => {
+    const c = canvasObject(extra);
+    return typeof c === "string" ? text(c, 422) : json(c);
+  };
+  /** One of the document edits (`applyEdit`): applied and recorded, or the
+   * server's own refusal. */
+  const edit = (
+    op: string,
+    args: unknown,
+    kind: string,
+    quiet = false,
+  ): { response: Response } | { out: { raw: string; newId?: string } } => {
+    const out = JSON.parse(wasm.applyEdit(session.raw, op, JSON.stringify(args))) as {
+      raw?: string;
+      newId?: string;
+      error?: { kind: string; message: string };
+    };
+    if (out.error) return { response: text(out.error.message, out.error.kind === "notFound" ? 404 : 422) };
+    const problem = commit(out.raw!, kind, quiet);
+    if (problem !== undefined) return { response: text(problem, 422) };
+    return { out: { raw: out.raw!, newId: out.newId } };
   };
   const stepResult = (changed: boolean): Response =>
     canvasResponse({ changed, canUndo: session.canUndo, canRedo: session.canRedo });
@@ -275,6 +299,63 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       const problem = commit(out.raw!, "node_upserted");
       if (problem !== undefined) return text(problem, 422);
       return canvasResponse();
+    }
+    // The document edits: the same ones `meshfox view`'s endpoints make
+    // (`meshfox_model::edit`), recorded in the undo log.
+    {
+      const json_ = (): Record<string, unknown> => {
+        try {
+          return JSON.parse(body || "{}");
+        } catch {
+          return {};
+        }
+      };
+      const idRoute = /^nodes\/([^/]+)\/(reparent|move|rename-id|clear-id|append|clear-layout)$/.exec(route);
+      const id = idRoute ? decodeURIComponent(idRoute[1]) : nodeRoute ? decodeURIComponent(nodeRoute[1]) : "";
+      let result: { response: Response } | { out: { raw: string; newId?: string } } | undefined;
+      let respond: ((out: { raw: string; newId?: string }) => Response) | undefined;
+      if (method === "POST" && route === "nodes") {
+        result = edit("create", json_(), "node_created");
+        respond = (out) => canvasResponse({ newId: out.newId });
+      } else if (method === "DELETE" && nodeRoute) {
+        result = edit("remove", { id, reparent: params.get("children") === "reparent" }, "node_removed");
+        respond = () => canvasResponse();
+      } else if (method === "POST" && idRoute?.[2] === "reparent") {
+        result = edit("reparent", { id, ...json_() }, "node_moved");
+        respond = () => canvasResponse();
+      } else if (method === "POST" && idRoute?.[2] === "move") {
+        result = edit("move", { id, ...json_() }, "node_moved");
+        respond = () => canvasResponse();
+      } else if (method === "POST" && idRoute?.[2] === "rename-id") {
+        result = edit("renameId", { id, ...json_() }, "node_id_renamed");
+        respond = () => canvasResponse();
+      } else if (method === "POST" && idRoute?.[2] === "clear-id") {
+        result = edit("clearId", { id }, "node_id_renamed");
+        respond = (out) => {
+          const c = canvasObject();
+          return typeof c === "string" ? text(c, 422) : json({ id: out.newId, canvas: c });
+        };
+      } else if (method === "POST" && idRoute?.[2] === "append") {
+        result = edit("append", { id, text: body ?? "" }, "node_upserted");
+        respond = () => new Response(null, { status: 204 });
+      } else if (method === "POST" && idRoute?.[2] === "clear-layout") {
+        result = edit("clearNodeLayout", { id }, "layout_cleared");
+        respond = () => canvasResponse();
+      } else if (method === "PUT" && route === "options") {
+        result = edit("options", json_(), "options_changed");
+        respond = () => canvasResponse();
+      } else if (method === "PUT" && route === "canvas") {
+        // A drag or a resize: the page already shows it.
+        result = edit("layout", json_(), "layout", true);
+        respond = () => new Response(null, { status: 204 });
+      } else if (method === "POST" && route === "canvas/clear-layout") {
+        result = edit("clearLayout", {}, "layout_cleared");
+        respond = () => canvasResponse();
+      } else if (method === "POST" && route === "canvas/reorder-siblings") {
+        result = edit("reorder", {}, "node_moved");
+        respond = () => canvasResponse();
+      }
+      if (result !== undefined) return "response" in result ? result.response : respond!(result.out);
     }
     if (method === "POST") {
       switch (route) {

@@ -537,7 +537,7 @@ test("a node's settings are edited in the page by the same code as the server's,
   // The node shows the new title, and the document text says so too.
   await expect(child).toContainText("Renamed child");
   const canvas = await canvasJson(page);
-  const node = canvas.nodes.find((n) => n.id === "child")! as { title: string; color?: string };
+  const node = canvas.nodes.find((n) => n.id === "child")! as unknown as { title: string; color?: string };
   expect([node.title, node.color]).toEqual(["Renamed child", "3"]);
   await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
   const raw = await page.evaluate(() => fetch("api/canvas/raw").then((r) => r.text()));
@@ -551,4 +551,75 @@ test("a node's settings are edited in the page by the same code as the server's,
   const back = await page.evaluate(() => fetch("api/canvas/raw").then((r) => r.text()));
   expect(back).not.toContain("Renamed");
   expect(back).not.toContain('color="3"');
+});
+
+test("add a child node, delete it, save a layout — each is one undoable step of the page's own", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  const raw = () => page.evaluate(() => fetch("api/canvas/raw").then((r) => r.text()));
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+
+  // "+" next to a node adds a child under it.
+  const root = page.locator('.react-flow__node[data-id="root"]');
+  await root.locator(".mesh-node-title-text, .mesh-node-title-centered-text").first().click();
+  await page.locator(".mesh-node-add-child").click();
+  await expect.poll(async () => (await canvasJson(page)).nodes.length).toBe(2);
+  const created = (await canvasJson(page)).nodes.find((n) => n.id !== "root")!;
+  expect(await raw()).toContain(`id="${created.id}"`);
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+
+  // Undo takes the new node away again; redo brings it back.
+  await page.getByRole("button", { name: /undo/ }).click();
+  await expect.poll(async () => (await canvasJson(page)).nodes.length).toBe(1);
+  await page.getByRole("button", { name: /redo/ }).click();
+  await expect.poll(async () => (await canvasJson(page)).nodes.length).toBe(2);
+
+  // Delete it through the toolbar's button and the confirmation.
+  const child = page.locator(`.react-flow__node[data-id="${created.id}"]`);
+  await child.locator(".mesh-node-title-text, .mesh-node-title-centered-text").first().click();
+  await page.locator('.mesh-node-toolbar button[title="Delete this node"]').click();
+  await page.locator(".node-delete-modal button", { hasText: /delete/i }).first().click();
+  await expect.poll(async () => (await canvasJson(page)).nodes.length).toBe(1);
+  expect(await raw()).not.toContain(`id="${created.id}"`);
+});
+
+test("the edits a page can make are the ones the server's endpoints make (api level)", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## A\n<!-- meshfox:node id="a" -->\n\nfirst\n\n## B\n<!-- meshfox:node id="b" -->\n\nsecond\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  const call = (method: string, url: string, body?: unknown) =>
+    page.evaluate(
+      async ([m, u, b]) => {
+        const r = await fetch(u as string, {
+          method: m as string,
+          headers: { "content-type": "application/json" },
+          body: b === undefined ? undefined : JSON.stringify(b),
+        });
+        return { status: r.status, text: await r.text() };
+      },
+      [method, url, body] as const,
+    );
+
+  const created = await call("POST", "api/nodes", { parentId: "a", title: "Deep", titleSlugId: true, body: "inside" });
+  expect(created.status).toBe(200);
+  expect(JSON.parse(created.text).newId).toBe("deep");
+  expect((await call("POST", "api/nodes/b/move", { before: "a" })).status).toBe(200);
+  expect((await call("POST", "api/nodes/a/move", { before: "a" })).status).toBe(422);
+  expect((await call("POST", "api/nodes/a/rename-id", { newId: "alpha" })).status).toBe(200);
+  expect((await call("POST", "api/nodes/alpha/rename-id", { newId: "b" })).status).toBe(422);
+  expect((await call("POST", "api/nodes/ghost/rename-id", { newId: "x" })).status).toBe(404);
+  const cleared = await call("POST", "api/nodes/alpha/clear-id");
+  expect(JSON.parse(cleared.text).id).toBe("a");
+  expect((await call("PUT", "api/options", { options: ["unfold"] })).status).toBe(200);
+  expect((await call("PUT", "api/canvas", { nodes: [{ id: "a", x: 10, y: 20, width: 300 }], layoutHints: {} })).status).toBe(204);
+  expect((await call("POST", "api/nodes/a/clear-layout")).status).toBe(200);
+  expect((await call("DELETE", "api/nodes/root")).status).toBe(422);
+  expect((await call("DELETE", "api/nodes/a")).status).toBe(200);
+  const nodes = (await canvasJson(page)).nodes.map((n) => n.id);
+  expect(nodes).toEqual(["root", "b"]);
 });

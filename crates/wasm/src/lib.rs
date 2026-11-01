@@ -452,3 +452,109 @@ pub fn apply_node_update(raw: &str, id: &str, request_json: &str) -> String {
     }
     .to_string()
 }
+
+/// The document-editing endpoints other than `PATCH /api/nodes/:id`
+/// ([`apply_node_update`]), as one entry: `op` names the edit and `args_json`
+/// is what its request carried (the same field names). The result is JSON —
+/// `{ "raw": "<the new document>", … }` (a few ops add a field: `newId`) or
+/// `{ "error": { "kind": "notFound" | "invalid", "message" } }` — and nothing
+/// is applied on an error.
+///
+/// | op | args | extra result |
+/// |---|---|---|
+/// | `create` | `parentId`, `title`, `titleSlugId?`, `body?` | `newId` |
+/// | `remove` | `id`, `reparent?` | |
+/// | `reparent` | `id`, `newParentId` | |
+/// | `move` | `id`, exactly one of `before` / `after` | |
+/// | `renameId` | `id`, `newId` | |
+/// | `clearId` | `id` | `newId` |
+/// | `options` | `options` | |
+/// | `append` | `id`, `text` | |
+/// | `layout` | `nodes`, `layoutHints?` | |
+/// | `clearLayout` | | |
+/// | `clearNodeLayout` | `id` | |
+/// | `reorder` | | |
+#[wasm_bindgen(js_name = applyEdit)]
+pub fn apply_edit(raw: &str, op: &str, args_json: &str) -> String {
+    use meshfox_model::edit::{self, EditError, LayoutBox, LayoutHint};
+    use std::collections::HashMap;
+
+    #[derive(serde::Deserialize, Default)]
+    #[serde(rename_all = "camelCase", default)]
+    struct Args {
+        id: String,
+        parent_id: String,
+        new_parent_id: String,
+        new_id: String,
+        title: String,
+        title_slug_id: bool,
+        body: Option<String>,
+        reparent: bool,
+        before: Option<String>,
+        after: Option<String>,
+        options: Vec<String>,
+        text: String,
+        nodes: Vec<LayoutBox>,
+        layout_hints: HashMap<String, LayoutHint>,
+    }
+
+    let outcome = (|| -> Result<serde_json::Value, EditError> {
+        let args: Args = serde_json::from_str(args_json)
+            .map_err(|e| EditError::Invalid(format!("invalid request: {e}")))?;
+        let done = |raw: String| Ok(serde_json::json!({ "raw": raw }));
+        match op {
+            "create" => {
+                let (raw, new_id) = edit::create_node(
+                    raw,
+                    &args.parent_id,
+                    &args.title,
+                    args.title_slug_id,
+                    args.body.as_deref(),
+                )?;
+                Ok(serde_json::json!({ "raw": raw, "newId": new_id }))
+            }
+            "remove" => done(edit::remove_node(raw, &args.id, args.reparent)?),
+            "reparent" => done(edit::reparent_node(raw, &args.id, &args.new_parent_id)?),
+            "move" => {
+                let (target, before) = match (args.before, args.after) {
+                    (Some(t), None) => (t, true),
+                    (None, Some(t)) => (t, false),
+                    _ => {
+                        return Err(EditError::Invalid(
+                            "exactly one of `before`/`after` must be set".to_string(),
+                        ))
+                    }
+                };
+                done(edit::move_sibling(raw, &args.id, &target, before)?)
+            }
+            "renameId" => done(edit::rename_node_id(raw, &args.id, &args.new_id)?),
+            "clearId" => {
+                let (raw, new_id) = edit::clear_node_id(raw, &args.id)?;
+                Ok(serde_json::json!({ "raw": raw, "newId": new_id }))
+            }
+            "options" => done(edit::set_options(raw, &args.options)?),
+            "append" => done(edit::append_node_body(raw, &args.id, &args.text)?),
+            "layout" => done(edit::save_layout(
+                raw,
+                &args.nodes,
+                &args.layout_hints,
+                &|id: &str| Some(id.to_string()),
+            )?),
+            "clearLayout" => done(edit::clear_layout(raw)?),
+            "clearNodeLayout" => done(edit::clear_node_layout(raw, &args.id)?),
+            "reorder" => done(edit::reorder_siblings(raw)?),
+            other => Err(EditError::Invalid(format!("unknown edit {other:?}"))),
+        }
+    })();
+    match outcome {
+        Ok(value) => value,
+        Err(e) => {
+            let kind = match e {
+                EditError::NotFound(_) => "notFound",
+                EditError::Invalid(_) => "invalid",
+            };
+            serde_json::json!({ "error": { "kind": kind, "message": e.to_string() } })
+        }
+    }
+    .to_string()
+}

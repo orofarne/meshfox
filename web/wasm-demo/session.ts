@@ -34,6 +34,13 @@ export interface UndoWasm {
 const SUMMARIES: Record<string, string> = {
   source: "edited the source",
   node_upserted: "edited a node",
+  node_created: "added a node",
+  node_removed: "deleted a node",
+  node_moved: "moved a node",
+  node_id_renamed: "renamed a node id",
+  options_changed: "changed the document options",
+  layout: "moved or resized nodes",
+  layout_cleared: "cleared the layout",
   external_edit: "changed outside the editor",
 };
 

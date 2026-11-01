@@ -5053,29 +5053,6 @@ async fn put_canvas_raw(
         .into_response())
 }
 
-/// One entry of `PutCanvasRequest::layout_hints` — a node's current
-/// on-screen position, per `reorder_by_position`'s own `hints` parameter.
-#[derive(Debug, Clone, Copy, Deserialize)]
-struct LayoutHint {
-    x: f64,
-    y: f64,
-}
-
-/// One node's new box in a `PUT /api/canvas` — what the client itself moved
-/// or resized, nothing else. `width`/`height` omitted mean "leave as they
-/// are".
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NodeBox {
-    id: String,
-    x: f64,
-    y: f64,
-    #[serde(default)]
-    width: Option<f64>,
-    #[serde(default)]
-    height: Option<f64>,
-}
-
 /// `PUT /api/canvas`'s request body: the boxes the client moved or resized,
 /// plus `layoutHints`, a same-request-only
 /// sort hint for every node *not* being positioned this call (its currently
@@ -5110,69 +5087,12 @@ async fn put_canvas(
 ) -> Result<StatusCode, ApiError> {
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
-    let mut primary_out = primary_raw.clone();
-    // Parsed once, before any patch: `set_node_meta` only ever rewrites the
-    // one node's own comment line, so every other node's current fields are
-    // the same here as in `primary_out` however many boxes were applied.
-    let current = parse_or_error(&primary_raw)?;
-
-    for node_box in &req.nodes {
-        // A node the client posted back that no longer resolves to
-        // anything (deleted meanwhile) is skipped rather than failing the
-        // whole batch.
-        let Ok(located) = locate_node(&primary_raw, &node_box.id) else {
-            continue;
-        };
-        let Some(node) = current.node(&located.local_id) else {
-            continue;
-        };
-        // Include nodes never reach the client as such (`get_canvas`
-        // resolves them away first); skipped here too, same as a stray
-        // unknown id.
-        if node.node_type == NodeType::Include {
-            continue;
-        }
-        // A group's *size* is always derived from its members, never
-        // authored — ignore whatever width/height the client reports
-        // rather than let a computed value get written into the file as if
-        // it were real data. Its own *position*, though, is a real anchor a
-        // member's own `x`/`y` is relative to (see
-        // `Canvas::resolve_absolute_position`), draggable like any other
-        // node's — so only width/height are forced back to "unset" here.
-        let is_group = node.node_type == NodeType::Group;
-        let mut meta = NodeMeta::from_node(node);
-        meta.x = Some(node_box.x);
-        meta.y = Some(node_box.y);
-        if is_group {
-            meta.width = None;
-            meta.height = None;
-        } else {
-            meta.width = node_box.width.or(meta.width);
-            meta.height = node_box.height.or(meta.height);
-        }
-        if let Some(patched) = mdcanvas::set_node_meta(&primary_out, &located.local_id, &meta) {
-            primary_out = patched;
-        }
-    }
-
-    // Re-key the flat, client-visible `layout_hints` by each node's own
-    // local id before handing it to `reorder_by_position`. A hint naming a
-    // node that no longer resolves to anything is silently dropped, same
-    // tolerance the main loop above already has.
-    let mut primary_hints: HashMap<String, (f64, f64)> = HashMap::new();
-    for (id, hint) in &req.layout_hints {
-        let Ok(located) = locate_node(&primary_raw, id) else {
-            continue;
-        };
-        primary_hints.insert(located.local_id, (hint.x, hint.y));
-    }
-
-    if let Some(reordered) = mdcanvas::reorder_by_position(&primary_out, &primary_hints) {
-        primary_out = reordered;
-    }
-
-    parse_or_error(&primary_out)?;
-
+    // A client's node id may name one spliced in from an include; it is
+    // written under its own local id. One that no longer resolves to anything
+    // (deleted meanwhile) is skipped rather than failing the batch.
+    let primary_out = save_layout(&primary_raw, &req.nodes, &req.layout_hints, &|id| {
+        locate_node(&primary_raw, id).ok().map(|l| l.local_id)
+    })?;
     state
         .save(&primary_out)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5208,34 +5128,8 @@ async fn clear_layout(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
-    let mut raw = state.raw.lock().unwrap().clone();
-    let canvas = parse_or_error(&raw)?;
-    for node in &canvas.nodes {
-        let meta = NodeMeta {
-            block_attrs: None,
-            x: None,
-            y: None,
-            width: None,
-            height: None,
-            color: node.color.clone(),
-            node_type: None,
-            display: node.display,
-            lang: node.lang.clone(),
-            interpreter: node.interpreter.clone(),
-            preview: Some(node.preview),
-            edge_label: node.edge_label.clone(),
-            edge_label_at: node.edge_label_at,
-            edge_source_side: node.edge_source_side,
-            edge_target_side: node.edge_target_side,
-            edge_via: node.edge_via.clone(),
-            fold: node.fold,
-            tags: node.tags.clone(),
-            created_at: node.created_at.clone(),
-        };
-        if let Some(patched) = mdcanvas::set_node_meta(&raw, &node.id, &meta) {
-            raw = patched;
-        }
-    }
+    let raw = state.raw.lock().unwrap().clone();
+    let raw = clear_layout_in_document(&raw)?;
     state
         .save_with_event(&raw, ServerEvent::LayoutCleared)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5257,12 +5151,7 @@ async fn reorder_siblings(
 ) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let raw = state.raw.lock().unwrap().clone();
-    let updated = mdcanvas::reorder_by_position(&raw, &HashMap::new()).ok_or_else(|| {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "failed to parse".to_string(),
-        )
-    })?;
+    let updated = reorder_siblings_in_document(&raw)?;
     state
         .save_with_event(&updated, ServerEvent::AllChildrenReordered)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5283,33 +5172,7 @@ async fn clear_node_layout(
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
-    let canvas = parse_or_error(&located.raw)?;
-    let node = canvas
-        .node(&located.local_id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    let meta = NodeMeta {
-        block_attrs: None,
-        x: None,
-        y: None,
-        width: None,
-        height: None,
-        color: node.color.clone(),
-        node_type: None,
-        display: node.display,
-        lang: node.lang.clone(),
-        interpreter: node.interpreter.clone(),
-        preview: Some(node.preview),
-        edge_label: node.edge_label.clone(),
-        edge_label_at: node.edge_label_at,
-        edge_source_side: node.edge_source_side,
-        edge_target_side: node.edge_target_side,
-        edge_via: node.edge_via.clone(),
-        fold: node.fold,
-        tags: node.tags.clone(),
-        created_at: node.created_at.clone(),
-    };
-    let updated = mdcanvas::set_node_meta(&located.raw, &located.local_id, &meta)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
+    let updated = clear_node_layout_in_document(&located.raw, &located.local_id)?;
     let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &updated, op)?;
     state.canvas_snapshot()
@@ -5377,33 +5240,17 @@ async fn create_node(
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     // `parentId` may itself name a node spliced in from an include (e.g.
-    // adding a child under something inside an included canvas) — locate
-    // it first so the new node is actually written into the file the
-    // parent lives in, same as editing an existing node there already is.
+    // adding a child under something inside an included canvas) — locate it
+    // first so the new node is actually written into the file the parent
+    // lives in, same as editing an existing node there already is.
     let located = locate_node(&primary_raw, &req.parent_id)?;
-    let insert = if req.title_slug_id {
-        mdcanvas::insert_child_node
-    } else {
-        mdcanvas::insert_child_node_random_id
-    };
-    let (mut updated, new_id) =
-        insert(&located.raw, &located.local_id, &req.title).ok_or_else(|| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                format!("no node {:?}", req.parent_id),
-            )
-        })?;
-    if let Some(body) = &req.body {
-        updated = mdcanvas::set_node_body(&updated, &new_id, body).ok_or_else(|| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to set the body of the new node {new_id:?}"),
-            )
-        })?;
-    }
-    // Insertion can't actually break parsing, but validate anyway — same
-    // validate-before-commit shape every other mutating endpoint here uses.
-    parse_or_error(&updated)?;
+    let (updated, new_id) = create_node_in_document(
+        &located.raw,
+        &located.local_id,
+        &req.title,
+        req.title_slug_id,
+        req.body.as_deref(),
+    )?;
     let op = node_upserted_event(&updated, &state.canvas_path, &new_id);
     commit_located(&state, &located, &updated, op)?;
     let Json(canvas) = state.canvas_snapshot()?;
@@ -5433,13 +5280,7 @@ async fn put_options(
 ) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
     let raw = state.raw.lock().unwrap().clone();
-    let updated = mdcanvas::set_document_options(&raw, &req.options).ok_or_else(|| {
-        ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "document has no root node".to_string(),
-        )
-    })?;
-    parse_or_error(&updated)?;
+    let updated = set_options(&raw, &req.options)?;
     state
         .save_with_event(&updated, ServerEvent::OptionsChanged)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -5450,7 +5291,13 @@ async fn put_options(
 // with the in-browser editor; this is the server's own half (who else may be
 // editing, where the result is written, events, the undo log).
 use meshfox_model::edit::{
-    apply_node_update, check_base, EditError, NodeUpdate as UpdateNodeRequest,
+    append_node_body as append_node_body_in_document, apply_node_update, check_base,
+    clear_layout as clear_layout_in_document, clear_node_id as clear_node_id_in_document,
+    clear_node_layout as clear_node_layout_in_document, create_node as create_node_in_document,
+    move_sibling as move_sibling_in_document, remove_node as remove_node_from_document,
+    rename_node_id as rename_node_id_in_document, reorder_siblings as reorder_siblings_in_document,
+    reparent_node as reparent_node_in_document, save_layout, set_options, EditError,
+    LayoutBox as NodeBox, LayoutHint, NodeUpdate as UpdateNodeRequest,
 };
 
 impl From<EditError> for ApiError {
@@ -5563,9 +5410,7 @@ async fn append_node_body(
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
-    let raw = mdcanvas::append_node_body(&located.raw, &located.local_id, &body)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    parse_or_error(&raw)?;
+    let raw = append_node_body_in_document(&located.raw, &located.local_id, &body)?;
     let op = node_upserted_event(&raw, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &raw, op)?;
     Ok(StatusCode::NO_CONTENT)
@@ -6417,29 +6262,13 @@ async fn remove_node(
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
     let local_id = &located.local_id;
-    let canvas = parse_or_error(&located.raw)?;
-    let node = canvas
-        .node(local_id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    if node.parent.is_none() {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "can't delete the root node".to_string(),
-        ));
-    }
     let reparent = query.children.as_deref() == Some("reparent");
-    let updated = if reparent {
-        mdcanvas::delete_node_reparent_children(&located.raw, local_id)
-    } else {
-        mdcanvas::delete_node(&located.raw, local_id)
-    }
-    .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    parse_or_error(&updated)?;
+    let updated = remove_node_from_document(&located.raw, local_id, reparent)?;
     // `reparent` changes every direct child's own `parent` too, not just
     // removing `id` — describing that fully would mean one `NodeUpserted`
-    // per promoted child on top of the removal itself. Not worth it yet
-    // for what's the less common of the two delete modes — falls back to
-    // the generic `Changed` (a full reload), same as before this feature.
+    // per promoted child on top of the removal itself. Not worth it yet for
+    // what's the less common of the two delete modes — falls back to the
+    // generic `Changed` (a full reload).
     let op = if reparent {
         ServerEvent::Changed
     } else {
@@ -6474,103 +6303,12 @@ async fn reparent_node(
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
     let located_parent = locate_node(&primary_raw, &req.new_parent_id)?;
-    let raw = located.raw.clone();
-    let local_id = &located.local_id;
-    let local_parent_id = &located_parent.local_id;
-
-    let canvas = parse_or_error(&raw)?;
-    let node = canvas
-        .node(local_id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
-    if node.parent.is_none() {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "can't reparent the root node".to_string(),
-        ));
-    }
-    canvas.node(local_parent_id).ok_or_else(|| {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            format!("no node {:?}", req.new_parent_id),
-        )
-    })?;
-    if !node
-        .extra_parents
-        .iter()
-        .any(|e| &e.from == local_parent_id)
-    {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "{:?} is not one of {id:?}'s extra parents",
-                req.new_parent_id
-            ),
-        ));
-    }
-    // `mdcanvas::reparent_node` moves `id`'s markdown fragment verbatim,
-    // `x`/`y` attribute included — harmless when those are always absolute,
-    // but a move into, out of, or between groups now silently flips what
-    // those numbers *mean* (see `Canvas::resolve_absolute_position`) unless
-    // corrected here. Resolve the pre-move absolute position first, in the
-    // *old* parent chain — within `local_id`'s own file is the right frame
-    // for this even when it's an include target: any outer group anchor
-    // from the including document applies equally before and after a move
-    // that (per the check above) never leaves this same file, so it
-    // cancels out.
-    let abs_before = canvas.resolve_absolute_position(local_id);
-    let mut updated =
-        mdcanvas::reparent_node(&raw, local_id, local_parent_id).ok_or_else(|| {
-            ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "can't reparent {id:?} onto {:?} (would create a cycle)",
-                    req.new_parent_id
-                ),
-            )
-        })?;
-    let new_canvas = parse_or_error(&updated)?;
-    // ...then, once the *new* parent chain is known, convert it back into
-    // whatever frame `id` should now store its position in, so it stays
-    // visually put across the move instead of teleporting (e.g. jumping by
-    // a whole group anchor because its `x`/`y` is now read relative to a
-    // *different* group, or no group at all). `None` on either side (an
-    // unanchored group ancestor somewhere in the old or new chain — the
-    // common case for a group nobody's ever dragged) leaves the node's
-    // stored position untouched instead, a documented, bounded limitation
-    // rather than inventing a synthetic anchor mid-request.
-    if let Some((abs_x, abs_y)) = abs_before {
-        if let Some((local_x, local_y)) = new_canvas.absolute_to_local(local_id, abs_x, abs_y) {
-            if let Some(new_node) = new_canvas.node(local_id) {
-                if new_node.x != Some(local_x) || new_node.y != Some(local_y) {
-                    let meta = NodeMeta {
-                        block_attrs: None,
-                        x: Some(local_x),
-                        y: Some(local_y),
-                        width: new_node.width,
-                        height: new_node.height,
-                        color: new_node.color.clone(),
-                        node_type: None,
-                        display: new_node.display,
-                        lang: new_node.lang.clone(),
-                        interpreter: new_node.interpreter.clone(),
-                        preview: Some(new_node.preview),
-                        edge_label: new_node.edge_label.clone(),
-                        edge_label_at: new_node.edge_label_at,
-                        edge_source_side: new_node.edge_source_side,
-                        edge_target_side: new_node.edge_target_side,
-                        edge_via: new_node.edge_via.clone(),
-                        fold: new_node.fold,
-                        tags: new_node.tags.clone(),
-                        created_at: new_node.created_at.clone(),
-                    };
-                    if let Some(patched) = mdcanvas::set_node_meta(&updated, local_id, &meta) {
-                        updated = patched;
-                    }
-                }
-            }
-        }
-    }
-    let op = node_upserted_event(&updated, &state.canvas_path, local_id);
+    // Within `located`'s own file, which is the right frame even when it is an
+    // include target: any outer group anchor from the including document
+    // applies equally before and after a move that never leaves this file.
+    let updated =
+        reparent_node_in_document(&located.raw, &located.local_id, &located_parent.local_id)?;
+    let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &updated, op)?;
     state.canvas_snapshot()
 }
@@ -6599,9 +6337,9 @@ async fn move_sibling(
     Json(req): Json<MoveSiblingRequest>,
 ) -> Result<Json<VersionedCanvas>, ApiError> {
     let _guard = state.begin_mutation().await;
-    let (target_id, position) = match (req.before, req.after) {
-        (Some(t), None) => (t, mdcanvas::MoveSiblingPosition::Before),
-        (None, Some(t)) => (t, mdcanvas::MoveSiblingPosition::After),
+    let (target_id, before) = match (req.before, req.after) {
+        (Some(t), None) => (t, true),
+        (None, Some(t)) => (t, false),
         _ => {
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -6614,26 +6352,18 @@ async fn move_sibling(
     let located = locate_node(&primary_raw, &id)?;
     let located_target = locate_node(&primary_raw, &target_id)?;
 
-    let updated = mdcanvas::move_sibling(
+    let updated = move_sibling_in_document(
         &located.raw,
         &located.local_id,
         &located_target.local_id,
-        position,
-    )
-    .map_err(|e| {
-        let status = match e {
-            mdcanvas::MoveSiblingError::NotFound(_) => StatusCode::NOT_FOUND,
-            mdcanvas::MoveSiblingError::NotSiblings(_, _)
-            | mdcanvas::MoveSiblingError::SameNode => StatusCode::UNPROCESSABLE_ENTITY,
-        };
-        ApiError(status, e.to_string())
-    })?;
+        before,
+    )?;
     // Sent as the *whole* new sibling order (not a "moved before/after"
-    // delta) so a client never has to reconstruct one from the other —
-    // see `ServerEvent::NodesReordered`'s own doc comment. `new_canvas.
-    // nodes` is already in document order, which for siblings *is* tree
-    // order, so this is just "every node whose `parent` matches, in the
-    // order they already come back in" — no separate sort needed.
+    // delta) so a client never has to reconstruct one from the other — see
+    // `ServerEvent::NodesReordered`'s own doc comment. `new_canvas.nodes` is
+    // already in document order, which for siblings *is* tree order, so this
+    // is just "every node whose `parent` matches, in the order they already
+    // come back in" — no separate sort needed.
     let new_canvas = parse_or_error(&updated)?;
     let op = match new_canvas
         .node(&located.local_id)
@@ -6651,9 +6381,9 @@ async fn move_sibling(
                 child_ids,
             }
         }
-        // No parent (the root) — `move_sibling` requires two siblings
-        // under a common parent, so this can't actually happen; falls
-        // back to a full reload rather than assuming.
+        // No parent (the root) — `move_sibling` requires two siblings under a
+        // common parent, so this can't actually happen; falls back to a full
+        // reload rather than assuming.
         None => ServerEvent::Changed,
     };
     commit_located(&state, &located, &updated, op)?;
@@ -6682,27 +6412,15 @@ async fn rename_node_id(
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
-    // `req.newId` is a fresh id being assigned, not a reference to an
-    // existing (possibly-namespaced) one — used verbatim as the new local
-    // id in whichever file `id` lives in; `include::resolve` re-derives
-    // the composed, namespaced form from it next time regardless.
-    let updated =
-        mdcanvas::rename_node_id(&located.raw, &located.local_id, &req.new_id).map_err(|e| {
-            let status = match e {
-                mdcanvas::RenameIdError::NotFound(_) => StatusCode::NOT_FOUND,
-                mdcanvas::RenameIdError::AlreadyExists(_)
-                | mdcanvas::RenameIdError::Empty
-                | mdcanvas::RenameIdError::InvalidChar
-                | mdcanvas::RenameIdError::Reserved(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            };
-            ApiError(status, e.to_string())
-        })?;
-    parse_or_error(&updated)?;
+    // `req.newId` is a fresh id being assigned, not a reference to an existing
+    // (possibly-namespaced) one — used verbatim as the new local id in
+    // whichever file `id` lives in; `include::resolve` re-derives the
+    // composed, namespaced form from it next time regardless.
+    let updated = rename_node_id_in_document(&located.raw, &located.local_id, &req.new_id)?;
     // An id rename ripples into every other node's own `parent=`/
-    // `meshfox:edge from=` reference plus any `deps=` fence text — too
-    // much for `NodeUpserted`'s single-node shape to describe accurately;
-    // still replays as a full reload, same as `Changed`, just named
-    // specifically (see `ServerEvent::NodeIdRenamed`'s own doc comment).
+    // `meshfox:edge from=` reference plus any `deps=` fence text — too much
+    // for `NodeUpserted`'s single-node shape to describe accurately; still
+    // replays as a full reload, same as `Changed`, just named specifically.
     commit_located(
         &state,
         &located,
@@ -6741,13 +6459,10 @@ async fn clear_node_id(
     let _guard = state.begin_mutation().await;
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
-    let (updated, local_new_id) = mdcanvas::clear_node_id(&located.raw, &located.local_id)
-        .map_err(|e| ApiError(StatusCode::NOT_FOUND, e.to_string()))?;
-    parse_or_error(&updated)?;
+    let (updated, local_new_id) = clear_node_id_in_document(&located.raw, &located.local_id)?;
     // Same reasoning as `rename_node_id`: an id change ripples too far for
-    // `NodeUpserted`, so this still replays as a full reload too — just
-    // named specifically (see `ServerEvent::NodeIdCleared`'s own doc
-    // comment).
+    // `NodeUpserted`, so this still replays as a full reload too — just named
+    // specifically.
     commit_located(
         &state,
         &located,
