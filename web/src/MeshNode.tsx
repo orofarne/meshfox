@@ -3153,7 +3153,11 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
   const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
   const canOpenFile =
-    data.nodeType === "file" && !!data.target && !data.serverless && canOpenOnServer(data.target, data.remote);
+    data.nodeType === "file" &&
+    !!data.target &&
+    // In the browser editor only a canvas can be opened: it is another canvas
+    // of the opened files; a plain file has no application to go to.
+    (data.serverless ? data.target.split("#")[0].endsWith(".canvas.md") : canOpenOnServer(data.target, data.remote));
   // A `link` node's own title-bar "↗ open" button — same spot/icon as a
   // `file` node's (`canOpenFile` above), just opening the URL directly in a
   // new tab (no OS-level app to hand it off to, unlike a file) rather than

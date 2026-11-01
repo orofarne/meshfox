@@ -831,8 +831,9 @@ test("nodes that need a server say so plainly, and offer no button that cannot w
   await page.getByRole("button", { name: "doc.canvas.md" }).click();
   await expect(page.getByText("The root.")).toBeVisible();
   await expect(page.getByText("Sibling", { exact: true })).toBeVisible();
-  // "Open in the default application" has no meaning in a page.
-  await expect(page.getByTitle("Open this file in the default application")).toHaveCount(0);
+  // "Open in the default application" has no meaning in a page: only the node
+  // that leads to another canvas keeps its button.
+  await expect(page.getByTitle("Open this file in the default application")).toHaveCount(1);
   // A table says it is not supported here, not that something is broken.
   await expect(page.getByText(/not supported in the browser editor/)).toBeVisible();
 });
@@ -864,4 +865,53 @@ test("when the engine cannot be fetched the launcher says so", async ({ page }) 
   await page.route("**/*.wasm", (route) => route.abort());
   await page.goto("/");
   await expect(page.locator("#engine")).toContainText("could not be loaded");
+});
+
+test("a canvas node opens the other canvas of the folder; Back and Forward move between them", async ({ page }) => {
+  const dir = tmpDir();
+  fs.writeFileSync(
+    path.join(dir, "a.canvas.md"),
+    [
+      '# Alpha\n<!-- meshfox:node id="root" -->\n<!-- meshfox:option name="unfold" -->\n\nFirst canvas.\n',
+      '## To B\n<!-- meshfox:node id="tob" type="file" -->\n\n[b](./sub/b.canvas.md)\n',
+      '## Nowhere\n<!-- meshfox:node id="nowhere" type="file" -->\n\n[missing](./missing.canvas.md)\n',
+    ].join("\n"),
+  );
+  fs.mkdirSync(path.join(dir, "sub"));
+  fs.writeFileSync(
+    path.join(dir, "sub", "b.canvas.md"),
+    '# Beta\n<!-- meshfox:node id="root" -->\n\nSecond canvas.\n',
+  );
+  await page.goto("/");
+  await page.locator("input[webkitdirectory]").setInputFiles(dir);
+  await page.getByRole("button", { name: "a.canvas.md" }).click();
+  await expect(page.getByText("First canvas.")).toBeVisible();
+
+  // A canvas that is not among the files says so and stays where it is.
+  await page.getByTitle("Open this file in the default application").nth(1).click();
+  await expect(page.getByText(/not among the opened files/)).toBeVisible();
+  await expect(page.getByText("First canvas.")).toBeVisible();
+
+  await page.getByTitle("Open this file in the default application").first().click();
+  await expect(page.getByText("Second canvas.")).toBeVisible();
+  await expect(page.getByText("First canvas.")).toHaveCount(0);
+
+  // Edit it, go Back to the first, Forward again: the edit is still there.
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await page.goBack();
+  await expect(page.getByText("First canvas.")).toBeVisible();
+  await expect(page.getByText("added in the browser")).toHaveCount(0);
+  await page.goForward();
+  await expect(page.getByText("added in the browser")).toBeVisible();
+
+  // Leaving for the launcher asks, because the other canvas has edits.
+  let asked = false;
+  page.on("dialog", (d) => {
+    asked = true;
+    void d.dismiss();
+  });
+  await page.goBack();
+  await page.goBack();
+  await expect.poll(() => asked).toBe(true);
 });

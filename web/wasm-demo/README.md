@@ -66,3 +66,13 @@ Forward onto a document that is gone, lands on the launcher with a note.
 - The whole document is rendered once at load; a changed file needs a reload.
 - `asset_base` for included files is the included file's directory inside the
   opened tree; images beside an include resolve, deeper cases are untested.
+
+## Several canvases in one folder
+
+A `file` node whose target is a `.canvas.md` keeps its "↗" button: it shows that
+canvas in the same page (nothing else can be opened from a page, so a plain
+file has no such button). Each canvas keeps its own edits and undo history for
+as long as the page lives, Back and Forward move between them, and the draft
+(see above) is kept per canvas. A canvas that is not among the opened files
+says so; "add files…" brings it in. The `#fragment` of a link is not followed
+yet.

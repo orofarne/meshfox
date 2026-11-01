@@ -23,6 +23,8 @@ export interface Document {
   key?: string;
   /** The text was never saved anywhere (a recovered draft): unsaved from the start. */
   unsaved?: boolean;
+  /** The key of another canvas of the same files, for `open`. */
+  keyFor?: (path: string) => string;
   /** Shown beside the "in your browser" pill, e.g. what was not read. */
   note?: string;
 }
@@ -94,8 +96,17 @@ export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
 }
 
 export interface Backend {
-  /** The text being edited and its undo history. */
-  session: EditSession;
+  /** The text being edited and its undo history (of the canvas now shown). */
+  readonly session: EditSession;
+  /** Whether any canvas opened so far has edits that were never saved. */
+  readonly dirty: boolean;
+  /** Makes another canvas of the opened files the one shown, the way a
+   * server's "open" of a canvas node does in a new tab. The reason it cannot
+   * be shown, or `undefined`. */
+  open(path: string): string | undefined;
+  /** What a click on a canvas node's "↗ open" does; set by the page, which
+   * owns the browser history. Without it, nothing opens. */
+  navigate?: (path: string, fragment: string | null) => string | undefined;
   /** The document as rendered now. */
   current(): Rendered;
   /** Makes `raw` the document, as one undoable step (a recovered draft). The
@@ -110,12 +121,16 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   const nativeFetch = window.fetch.bind(window);
   const NativeWebSocket = window.WebSocket;
   const base = new URL(".", document.baseURI).pathname;
-  const canvasDir = VirtualFiles.dirname(doc.path);
+  const canvasDir = () => VirtualFiles.dirname(doc.path);
   // Bumped by every `refresh`: the page compares it to know the canvas moved on.
   let version = 1;
   let seq = 0;
   const watchers = new Set<{ push(event: unknown): void }>();
-  const session = new EditSession(wasm, doc.files.text(doc.path) ?? "", doc.unsaved);
+  // One session per canvas opened so far: going back to a canvas finds its
+  // edits and its undo history as they were left.
+  const sessions = new Map<string, EditSession>();
+  let session = new EditSession(wasm, doc.files.text(doc.path) ?? "", doc.unsaved);
+  sessions.set(doc.path, session);
 
   /** Tells every open page what a server would after a save: the undo state,
    * and (when the document moved) that it changed. */
@@ -187,7 +202,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
 
   /** Where an `api/asset?file=&dir=` request points, inside the opened files. */
   const assetPath = (params: URLSearchParams): string =>
-    VirtualFiles.join(params.get("dir") || canvasDir, params.get("file") ?? "");
+    VirtualFiles.join(params.get("dir") || canvasDir(), params.get("file") ?? "");
   const mimeOf = (path: string): string => MIME[path.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
 
   const handle = async (
@@ -216,7 +231,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
           // An included file: shown, not editable here yet.
           const node = canvas()?.nodes.find((n) => n.id === include);
           const target = node?.target;
-          const path = target ? VirtualFiles.join(canvasDir, target.split("#")[0]) : undefined;
+          const path = target ? VirtualFiles.join(canvasDir(), target.split("#")[0]) : undefined;
           const data = path === undefined ? undefined : doc.files.get(path);
           if (data === undefined) return text(`no readable include ${include}`, 404);
           return new Response(data as BodyInit, {
@@ -255,7 +270,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
         const id = decodeURIComponent(fileContent[1]);
         const node = canvas()?.nodes.find((n) => n.id === id);
         if (!node?.target) return text(`no file node ${id}`, 404);
-        const path = VirtualFiles.join(canvasDir, node.target.split("#")[0]);
+        const path = VirtualFiles.join(canvasDir(), node.target.split("#")[0]);
         const data = doc.files.get(path);
         if (data === undefined) return text(`${path}: not among the opened files`, 404);
         const truncated = data.length > FILE_PREVIEW_MAX_BYTES;
@@ -320,6 +335,18 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       const problem = commit(out.raw!, "node_upserted");
       if (problem !== undefined) return text(problem, 422);
       return canvasResponse();
+    }
+    // "↗ open" on a file node that is a canvas: another canvas of the opened
+    // files, shown in this page (nothing else can be opened from a page).
+    const openRoute = /^nodes\/([^/]+)\/open$/.exec(route);
+    if (method === "POST" && openRoute) {
+      const node = canvas()?.nodes.find((n) => n.id === decodeURIComponent(openRoute[1]));
+      if (!node?.target) return text(`no file node ${openRoute[1]}`, 404);
+      const [target, fragment] = node.target.split("#");
+      if (!target.endsWith(".canvas.md")) return text("only a canvas can be opened in the browser editor", 422);
+      const path = VirtualFiles.join(canvasDir(), target);
+      const problem = backend.navigate?.(path, fragment ?? null);
+      return problem === undefined ? json({ action: "done" }) : text(problem, 404);
     }
     // The document edits: the same ones `meshfox view`'s endpoints make
     // (`meshfox_model::edit`), recorded in the undo log.
@@ -549,8 +576,33 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   } as unknown as typeof WebSocket;
   Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
 
-  return {
-    session,
+  const backend: Backend = {
+    get session() {
+      return session;
+    },
+    get dirty() {
+      return [...sessions.values()].some((x) => x.dirty);
+    },
+    open(path) {
+      const text = doc.files.text(path);
+      if (text === undefined) return `${path} is not among the opened files — add it with "add files…"`;
+      const before = { path: doc.path, key: doc.key, unsaved: doc.unsaved };
+      doc.path = path;
+      doc.key = doc.keyFor?.(path) ?? doc.key;
+      doc.unsaved = false;
+      render.reset();
+      const result = render();
+      if (result.error !== undefined) {
+        Object.assign(doc, before);
+        render.reset();
+        return `${path}: ${result.error}`;
+      }
+      session = sessions.get(path) ?? new EditSession(wasm, text);
+      sessions.set(path, session);
+      swapped = new Map();
+      announce(true);
+      return undefined;
+    },
     current: () => render(),
     replace: (raw, opKind) => commit(raw, opKind),
     refresh() {
@@ -563,4 +615,5 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       return result;
     },
   };
+  return backend;
 }

@@ -123,8 +123,12 @@ export class EditSession {
     return entries.map((e) => ({ ...e, summary: SUMMARIES[e.opKind] ?? e.opKind }));
   }
 
-  onChange(listener: () => void): void {
+  /** Calls `listener` after every change; the returned function stops it. */
+  onChange(listener: () => void): () => void {
     this.listeners.push(listener);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener);
+    };
   }
 
   private move(next: string | undefined): boolean {

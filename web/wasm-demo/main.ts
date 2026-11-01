@@ -60,7 +60,7 @@ const STYLE = `
   #wasm-pill a { color:var(--accent); margin-left:8px; cursor:pointer; text-decoration:underline; }
 `;
 
-type HistoryState = { meshfox: "launcher" | "document" } | null;
+type HistoryState = { meshfox: "launcher" } | { meshfox: "document"; path?: string } | null;
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -149,7 +149,7 @@ const savePicker = (): SaveFilePicker | undefined =>
   (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
 
 /** The strip at the bottom of a document: what is missing, and ways to add it. */
-function pill(doc: Document, backend: Backend, pending?: Draft): HTMLElement {
+function pill(doc: Document, backend: Backend, pending?: Draft): { element: HTMLElement; dispose(): void } {
   let problem: string | undefined;
   const label = el("span");
   const warnings = (): IncludeWarning[] => backend.current().warnings ?? [];
@@ -166,11 +166,10 @@ function pill(doc: Document, backend: Backend, pending?: Draft): HTMLElement {
       .filter(Boolean)
       .join(" · ");
   };
-  const canvasDir = VirtualFiles.dirname(doc.path);
   const add = async (task: Promise<Picked>, loose: boolean) => {
     try {
       const picked = await task;
-      const n = addPicked(doc.files, canvasDir, warnings().map((w) => w.target), picked.files, loose);
+      const n = addPicked(doc.files, VirtualFiles.dirname(doc.path), warnings().map((w) => w.target), picked.files, loose);
       problem = n === 0 ? "nothing to add in that" : undefined;
       const result = backend.refresh();
       if (result.error !== undefined) problem = result.error;
@@ -220,9 +219,9 @@ function pill(doc: Document, backend: Backend, pending?: Draft): HTMLElement {
     for (const id of ["wasm-restore", "wasm-discard"]) document.getElementById(id)?.remove();
     draw();
   };
-  backend.session.onChange(draw);
+  const unsubscribe = backend.session.onChange(draw);
   draw();
-  return el(
+  const element = el(
     "div",
     { id: "wasm-pill" },
     label,
@@ -240,33 +239,78 @@ function pill(doc: Document, backend: Backend, pending?: Draft): HTMLElement {
     el("a", { id: "wasm-add-folder", textContent: "add folder…", onclick: () => folderPicker.click() }),
     el("a", { textContent: "open another", onclick: () => history.back() }),
   );
+  return { element, dispose: () => (unsubscribe(), element.remove()) };
 }
 
 /** Keeps the unsaved text as a draft while it differs from what was saved, and
  * drops it once it does not (saved, or undone back). Held back while an older
  * draft is waiting for the user's decision: it must not be overwritten (or
  * deleted by a clean document) before they have chosen. */
-function keepDraft(doc: Document, backend: Backend, waiting: () => boolean) {
+function keepDraft(doc: Document, backend: Backend, waiting: () => boolean): () => void {
   const key = doc.key!;
+  const path = doc.path;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const write = () => {
     clearTimeout(timer);
     timer = undefined;
     if (waiting()) return;
     if (backend.session.dirty) {
-      void putDraft({ key, path: doc.path, raw: backend.session.raw, savedAt: Date.now() });
+      void putDraft({ key, path, raw: backend.session.raw, savedAt: Date.now() });
     } else {
       void deleteDraft(key);
     }
   };
-  backend.session.onChange(() => {
+  const unsubscribe = backend.session.onChange(() => {
     clearTimeout(timer);
     timer = setTimeout(write, 400);
   });
-  // A debounce that has not fired yet must not be lost with the tab.
+  // A debounce that has not fired yet must not be lost with the tab (or with
+  // a move to another canvas).
   const flush = () => timer !== undefined && write();
+  const hidden = () => document.visibilityState === "hidden" && flush();
   addEventListener("pagehide", flush);
-  document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && flush());
+  document.addEventListener("visibilitychange", hidden);
+  return () => {
+    flush();
+    unsubscribe();
+    removeEventListener("pagehide", flush);
+    document.removeEventListener("visibilitychange", hidden);
+  };
+}
+
+/** What is mounted for the canvas now shown: the strip at the bottom and the
+ * draft-keeping. Taken down, and put up again, when another canvas is shown. */
+let mounted: { dispose(): void } | undefined;
+/** The document the page is showing, for Back/Forward between canvases. */
+let shown: { doc: Document; backend: Backend } | undefined;
+
+async function mount(doc: Document, backend: Backend) {
+  const session = backend.session;
+  // Work left over from an earlier visit to this same document: offered, never
+  // applied on its own (and kept until the user decides).
+  const stored = doc.key && !doc.unsaved ? await getDraft(doc.key) : undefined;
+  if (backend.session !== session) return; // already moved on
+  const pending = stored && stored.raw !== session.raw ? stored : undefined;
+  const strip = pill(doc, backend, pending);
+  document.body.append(strip.element);
+  const stopKeeping = doc.key
+    ? keepDraft(doc, backend, () => pending !== undefined && document.getElementById("wasm-restore") !== null)
+    : () => {};
+  mounted = { dispose: () => (stopKeeping(), strip.dispose()) };
+}
+
+/** Shows another canvas of the opened files. Edits to the one left stay in the
+ * page (and in its draft); going back finds them as they were. */
+function switchTo(doc: Document, backend: Backend, open: () => string | undefined, how: { push: boolean }): string | undefined {
+  const left = mounted;
+  mounted = undefined;
+  left?.dispose();
+  const problem = open();
+  if (problem === undefined && how.push) {
+    history.pushState({ meshfox: "document", path: doc.path } satisfies HistoryState, "");
+  }
+  void mount(doc, backend);
+  return problem;
 }
 
 async function start(doc: Document) {
@@ -284,15 +328,12 @@ async function start(doc: Document) {
   document.getElementById("launcher")?.remove();
   // The URL stays as it is: the app's own relative `api/...` requests (and the
   // fetch interception) depend on it.
-  history.pushState({ meshfox: "document" } satisfies HistoryState, "");
+  history.pushState({ meshfox: "document", path: doc.path } satisfies HistoryState, "");
   documentOpen = true;
-  // Work left over from an earlier visit to this same document: offered, never
-  // applied on its own (and kept until the user decides).
-  const stored = doc.key && !doc.unsaved ? await getDraft(doc.key) : undefined;
-  const pending = stored && stored.raw !== backend.session.raw ? stored : undefined;
-  document.body.append(pill(doc, backend, pending));
-  unsaved = () => backend.session.dirty;
-  if (doc.key) keepDraft(doc, backend, () => pending !== undefined && document.getElementById("wasm-restore") !== null);
+  shown = { doc, backend };
+  backend.navigate = (path) => switchTo(doc, backend, () => backend.open(path), { push: true });
+  unsaved = () => backend.dirty;
+  await mount(doc, backend);
   // The app is the next heavy download; until it has mounted the page would
   // be empty, so say what is happening.
   const booting = el("p", { id: "booting", textContent: "Loading the app…" });
@@ -327,7 +368,7 @@ async function chooseAndStart(picked: Picked) {
     return;
   }
   if (pool.length === 1) {
-    await start({ path: pool[0], files: picked.files, key: documentKey(picked, pool[0]), note: skippedNote(picked.skipped) });
+    await start({ path: pool[0], files: picked.files, key: documentKey(picked, pool[0]), keyFor: (p) => documentKey(picked, p), note: skippedNote(picked.skipped) });
     return;
   }
   document.getElementById("choices")!.replaceChildren(
@@ -336,7 +377,7 @@ async function chooseAndStart(picked: Picked) {
       "div",
       { className: "list" },
       ...pool.slice(0, 40).map((path) =>
-        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, key: documentKey(picked, path), note: skippedNote(picked.skipped) }) }),
+        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, key: documentKey(picked, path), keyFor: (p) => documentKey(picked, p), note: skippedNote(picked.skipped) }) }),
       ),
     ),
   );
@@ -491,10 +532,15 @@ window.addEventListener("beforeunload", (event) => {
 
 window.addEventListener("popstate", (event) => {
   const state = event.state as HistoryState;
-  if (documentOpen && state?.meshfox !== "document") {
+  if (documentOpen && state?.meshfox === "document") {
+    // Back or Forward between two canvases of the same folder.
+    if (state.path !== undefined && state.path !== shown?.doc.path) {
+      switchTo(shown!.doc, shown!.backend, () => shown!.backend.open(state.path!), { push: false });
+    }
+  } else if (documentOpen) {
     if (unsaved() && !confirm("Leave without downloading? Your edits exist only in this tab.")) {
       // Back cannot be cancelled, only undone: put the document's entry back.
-      history.pushState({ meshfox: "document" } satisfies HistoryState, "");
+      history.pushState({ meshfox: "document", path: shown?.doc.path } satisfies HistoryState, "");
       return;
     }
     discarding = true;
