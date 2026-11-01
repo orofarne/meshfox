@@ -256,7 +256,11 @@ function launcher(note?: string) {
     const title = newName.value.trim().replace(/(\.canvas)?\.md$/, "") || "untitled";
     void newCanvas(title);
   };
-  newName.onkeydown = (e) => e.key === "Enter" && create();
+  newName.onkeydown = (e) => {
+    // A statement, not `&&`: an `on*` handler that returns `false` cancels the
+    // key, and then nothing could be typed.
+    if (e.key === "Enter") create();
+  };
   const fresh = el(
     "div",
     { className: "fresh" },

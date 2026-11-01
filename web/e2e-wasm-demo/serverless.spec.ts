@@ -498,9 +498,25 @@ test("the history panel lists the steps, and jumping back through it restores th
   await expect(page.getByText("added in the browser")).toBeVisible();
 });
 
+test("Enter in the new-canvas name starts it, like the button", async ({ page }) => {
+  await page.goto("/");
+  const name = page.locator("#new-name");
+  await name.click();
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("quick");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#launcher")).toHaveCount(0);
+  await expect(page.getByText("quick", { exact: true }).first()).toBeVisible();
+});
+
 test("a new canvas can be started, edited and downloaded without opening anything", async ({ page }) => {
   await page.goto("/");
-  await page.locator("#new-name").fill("my notes");
+  // Typed with real key presses (`fill` would not notice a field that eats keys).
+  const name = page.locator("#new-name");
+  await name.click();
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("my notes");
+  await expect(name).toHaveValue("my notes");
   await page.locator("#new-canvas").click();
   // The root is named after the file, as `meshfox create` does.
   await expect(page.getByText("my notes", { exact: true }).first()).toBeVisible();
