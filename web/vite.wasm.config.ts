@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 import fs from "node:fs";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
+import { headersFile, SECURITY_HEADERS } from "./wasm-demo/securityHeaders.ts";
 
 // The in-browser build: the same app as `vite.config.ts`, but its entry is
 // `editor.html`, whose script swaps the HTTP backend for the WebAssembly one
@@ -23,15 +24,26 @@ const pageAsIndex: Plugin = {
   },
 };
 
+// The headers the page must be served with (see securityHeaders.ts): written
+// next to the build, and applied by the preview server the tests use.
+const writeHeaders: Plugin = {
+  name: "editor-headers-file",
+  apply: "build",
+  closeBundle() {
+    fs.writeFileSync(path.resolve(import.meta.dirname, "dist-wasm", "_headers"), headersFile());
+  },
+};
+
 export default defineConfig({
   base: "./",
-  plugins: [react(), pageAsIndex],
+  plugins: [react(), pageAsIndex, writeHeaders],
   build: {
     outDir: "dist-wasm",
     emptyOutDir: true,
     chunkSizeWarningLimit: 4000,
     rollupOptions: { input: "editor.html" },
   },
+  preview: { headers: SECURITY_HEADERS },
   // The generated wasm package lives above `web/`.
   server: { fs: { allow: [".."] } },
 });

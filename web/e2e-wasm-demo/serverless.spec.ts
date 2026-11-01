@@ -920,3 +920,59 @@ test("a canvas node opens the other canvas of the folder; Back and Forward move 
   await page.goBack();
   await expect.poll(() => asked).toBe(true);
 });
+
+test("a link to an SVG from the folder shows its text; it never runs on the editor's origin", async ({ page, context }) => {
+  const dir = tmpDir();
+  fs.writeFileSync(
+    path.join(dir, "doc.canvas.md"),
+    '# Root\n<!-- meshfox:node id="root" -->\n\n[open the picture](./evil.svg)\n\n![shown](./evil.svg)\n',
+  );
+  fs.writeFileSync(
+    path.join(dir, "evil.svg"),
+    '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><script>document.title="RAN:"+location.origin</script><rect width="20" height="20"/></svg>',
+  );
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles([path.join(dir, "doc.canvas.md"), path.join(dir, "evil.svg")]);
+  await expect(page.getByText("open the picture")).toBeVisible();
+  // As a picture it is still drawn (an <img> runs no scripts) ...
+  await expect
+    .poll(() => page.evaluate(() => [...document.images].some((i) => i.alt === "shown" && i.naturalWidth > 0)))
+    .toBe(true);
+  // ... but followed as a link it is only text.
+  const [popup] = await Promise.all([context.waitForEvent("page"), page.getByText("open the picture").click()]);
+  await popup.waitForLoadState();
+  await popup.waitForTimeout(500);
+  expect(await popup.title()).not.toContain("RAN:");
+  expect(await popup.evaluate(() => document.contentType)).toBe("text/plain");
+});
+
+test("the page runs under its Content-Security-Policy, and a picture opened on its own stays inert", async ({ page, context }) => {
+  const violations: string[] = [];
+  page.on("console", (m) => /content security policy|violates the/i.test(m.text()) && violations.push(m.text()));
+  const response = await page.goto("/");
+  expect(response?.headers()["content-security-policy"]).toContain("script-src 'self' 'wasm-unsafe-eval'");
+  expect(response?.headers()["x-content-type-options"]).toBe("nosniff");
+
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "doc.canvas.md"), '# Root\n<!-- meshfox:node id="root" -->\n\nThe root.\n\n![shown](./evil.svg)\n\n```js\nlet a = 1;\n```\n');
+  fs.writeFileSync(
+    path.join(dir, "evil.svg"),
+    '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><script>document.title="RAN"</script><rect width="20" height="20"/></svg>',
+  );
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles([path.join(dir, "doc.canvas.md"), path.join(dir, "evil.svg")]);
+  await expect(page.getByText("The root.")).toBeVisible();
+  // Monaco (its worker) and the highlighter are the usual victims of a strict policy.
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+
+  // "Open image in new tab" navigates to the picture's own blob URL: a page of
+  // this origin, where the policy must still stop its script.
+  const src = await page.evaluate(() => [...document.images].find((i) => i.alt === "shown")!.src);
+  expect(src.startsWith("blob:")).toBe(true);
+  const popup = await context.newPage();
+  await popup.goto(src).catch(() => {});
+  await popup.waitForTimeout(500);
+  expect(await popup.title()).not.toBe("RAN");
+
+  expect(violations.filter((v) => !v.includes("evil") && !/inline script/i.test(v))).toEqual([]);
+});

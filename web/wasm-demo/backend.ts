@@ -4,6 +4,7 @@
 // by construction: the info endpoint says so, so the UI offers no editing or
 // running, and anything that would need a worker answers 501.
 import { VirtualFiles } from "./files";
+import { cleanSvg } from "./svg";
 import { EditSession, type UndoWasm } from "./session";
 
 export interface WasmApi extends UndoWasm {
@@ -94,6 +95,11 @@ export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
     },
   });
 }
+
+/** What a link may open as its own page: pictures and PDFs, which a browser
+ * shows without running anything. Every other type (SVG above all) is text. */
+const NAVIGABLE = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
+export const navigableType = (type: string): string => (NAVIGABLE.has(type) ? type : "text/plain; charset=utf-8");
 
 export interface Backend {
   /** The text being edited and its undo history (of the canvas now shown). */
@@ -457,23 +463,32 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     }
   };
   let swapped = new Map<string, string>();
-  const assetNow = (value: string | null): string | undefined => {
+  /** `link`: the URL is where a click goes (an `<a href>`), not what the page
+   * itself draws. A blob opened as its own page belongs to this page's origin,
+   * so anything a browser would run there (an SVG's `<script>`) must not carry
+   * its real type: it is shown as text instead. An `<img>` never runs scripts. */
+  const assetNow = (value: string | null, link = false): string | undefined => {
     const url = assetUrl(value);
     if (!url) return undefined;
-    const known = swapped.get(url.search);
+    const cacheKey = `${link ? "link" : "draw"}${url.search}`;
+    const known = swapped.get(cacheKey);
     if (known) return known;
     const path = assetPath(url.searchParams);
     const data = doc.files.get(path);
+    const type = link ? navigableType(mimeOf(path)) : mimeOf(path);
+    // A drawn SVG is cleaned of anything executable: opened on its own, its
+    // blob URL would be a page of this origin (see svg.ts).
+    const bytes = data !== undefined && type === "image/svg+xml" ? cleanSvg(data) : data;
     const out =
-      data !== undefined
-        ? URL.createObjectURL(new Blob([data as BlobPart], { type: mimeOf(path) }))
-        : doc.files.urlOf(path);
-    if (out) swapped.set(url.search, out);
+      bytes !== undefined ? URL.createObjectURL(new Blob([bytes as BlobPart], { type })) : doc.files.urlOf(path);
+    if (out) swapped.set(cacheKey, out);
     return out;
   };
+  // Only an `<img src>` draws; any other element could navigate to, frame or run it.
+  const isLink = (element: Element, attr: string) => !(attr.toLowerCase() === "src" && element instanceof HTMLImageElement);
   const nativeSetAttribute = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function (name: string, value: string) {
-    return nativeSetAttribute.call(this, name, ASSET_ATTRS.includes(name.toLowerCase()) ? (assetNow(value) ?? value) : value);
+    return nativeSetAttribute.call(this, name, ASSET_ATTRS.includes(name.toLowerCase()) ? (assetNow(value, isLink(this, name)) ?? value) : value);
   };
   const srcProperty = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
   if (srcProperty?.set) {
@@ -486,7 +501,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   }
   const fixElement = (element: Element) => {
     for (const attr of ASSET_ATTRS) {
-      const now = assetNow(element.getAttribute(attr));
+      const now = assetNow(element.getAttribute(attr), isLink(element, attr));
       if (now) nativeSetAttribute.call(element, attr, now);
     }
   };
