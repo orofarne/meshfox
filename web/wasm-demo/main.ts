@@ -1,33 +1,49 @@
-// Entry of the serverless prototype. Shows a small launcher (open a canvas, a
-// folder, drop files, or try a bundled example); once a document is chosen it
-// starts the WebAssembly model, swaps the app's HTTP backend for it, and then
-// loads the real meshfox UI unchanged.
+// Entry of the in-browser editor/viewer. Shows a small launcher (open a canvas,
+// a folder, or drop either); once a document is chosen it starts the
+// WebAssembly model, swaps the app's HTTP backend for it, and then loads the
+// real meshfox UI unchanged.
+//
+// Browser history: opening a document pushes an entry, so Back returns to the
+// launcher (a document lives only in memory, so "back" is a reload of the
+// launcher), and Forward to a document that is gone lands on the launcher with
+// a note instead of a blank page.
 import init, * as wasmApi from "../../crates/wasm/pkg/meshfox_wasm.js";
 import { createRenderer, installBackend, type Document } from "./backend";
-import { EXAMPLES, loadExample } from "./bundled";
-import type { VirtualFiles } from "./files";
 import { fromDrop, fromFileList, type Picked } from "./pick";
+import { applyThemePreference, getThemePreference } from "../src/theme";
+import "@fontsource/fira-code/400.css";
+import "@fontsource/fira-code/600.css";
+// The webui's own stylesheet: the launcher wears the same palette, font and
+// light/dark handling as the app it opens.
+import "../src/index.css";
 
 const STYLE = `
-  :root { color-scheme: light dark; --bg:#f6f7f9; --fg:#1d2330; --muted:#697386; --card:#fff; --line:#d9dde5; --accent:#3b6fe0; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#14171d; --fg:#e6e9ef; --muted:#97a0b0; --card:#1c2029; --line:#2d3340; --accent:#7ba2ff; } }
-  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
-  #launcher { max-width:720px; margin:0 auto; padding:40px 20px 64px; }
-  #launcher h1 { font-size:26px; margin:0 0 4px; }
-  #launcher p { color:var(--muted); margin:4px 0 20px; }
-  .drop { border:2px dashed var(--line); border-radius:14px; padding:28px; text-align:center; background:var(--card); transition:border-color .15s; }
-  .drop.over { border-color:var(--accent); }
-  .row { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-top:14px; }
-  button, select { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  h2 { font-size:16px; margin:28px 0 8px; }
-  .list { display:flex; flex-wrap:wrap; gap:8px; }
-  #status { margin-top:16px; min-height:1.4em; color:var(--muted); }
-  #status.error { color:#d64545; }
-  .note { font-size:13px; color:var(--muted); margin-top:28px; }
-  #wasm-pill { position:fixed; left:12px; bottom:12px; z-index:2147483000; font:12px system-ui, sans-serif; background:#1d2330; color:#fff; padding:5px 10px; border-radius:999px; opacity:.85; }
-  #wasm-pill a { color:#9db8ff; margin-left:8px; cursor:pointer; text-decoration:underline; }
+  .launcher { min-height:100%; display:flex; flex-direction:column; }
+  .launcher .toolbar .brand { font-weight:600; color:var(--accent); letter-spacing:.02em; display:flex; align-items:center; gap:.5rem; }
+  .launcher .toolbar .brand img { width:20px; height:20px; }
+  .launcher .toolbar .spacer { flex:1; }
+  .launcher main { width:min(640px, 100% - 2rem); margin:0 auto; padding:3rem 0 4rem; }
+  .launcher h1 { font-size:1.4rem; margin:0 0 .5rem; }
+  .launcher .lede { opacity:.75; margin:0 0 1.5rem; font-size:.9rem; line-height:1.55; }
+  .drop { border:1px dashed var(--node-border); border-radius:10px; padding:2rem 1.5rem; text-align:center; background:var(--node-bg); transition:border-color .15s, background .15s; }
+  .drop.over { border-color:var(--accent); background:color-mix(in srgb, var(--accent) 8%, var(--node-bg)); }
+  .drop .hint { font-size:.9rem; opacity:.85; }
+  .drop .sub { font-size:.78rem; opacity:.55; margin-top:.4rem; }
+  .row { display:flex; gap:.6rem; justify-content:center; flex-wrap:wrap; margin-top:1.1rem; }
+  .launcher button { font:inherit; font-size:.85rem; padding:.4rem .9rem; border-radius:6px; border:1px solid var(--node-border); background:transparent; color:var(--fg); cursor:pointer; }
+  .launcher button:hover { border-color:var(--accent); color:var(--accent); }
+  .launcher button.primary { background:var(--accent); border-color:var(--accent); color:var(--bg); }
+  .launcher button.primary:hover { color:var(--bg); filter:brightness(1.08); }
+  .launcher h2 { font-size:.9rem; margin:1.5rem 0 .5rem; }
+  .list { display:flex; flex-wrap:wrap; gap:.5rem; }
+  #status { margin-top:1rem; min-height:1.3em; font-size:.82rem; opacity:.75; }
+  #status.error { color:var(--fail); opacity:1; }
+  .launcher .note { font-size:.75rem; opacity:.55; margin-top:2rem; line-height:1.6; }
+  #wasm-pill { position:fixed; left:12px; bottom:12px; z-index:2147483000; font:12px "Fira Code", system-ui, sans-serif; background:var(--node-bg); color:var(--fg); border:1px solid var(--node-border); padding:4px 10px; border-radius:999px; opacity:.9; }
+  #wasm-pill a { color:var(--accent); margin-left:8px; cursor:pointer; text-decoration:underline; }
 `;
+
+type HistoryState = { meshfox: "launcher" | "document" } | null;
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -47,6 +63,8 @@ function status(message: string, isError = false) {
   }
 }
 
+let documentOpen = false;
+
 async function start(doc: Document) {
   status(`Loading the model…`);
   await init();
@@ -59,8 +77,12 @@ async function start(doc: Document) {
   }
   installBackend(wasmApi, doc, render);
   document.getElementById("launcher")?.remove();
-  const pill = el("div", { id: "wasm-pill", textContent: "serverless · read-only · wasm" });
-  pill.append(el("a", { textContent: "open another", onclick: () => location.assign(location.pathname) }));
+  // The URL stays as it is: the app's own relative `api/...` requests (and the
+  // fetch interception) depend on it.
+  history.pushState({ meshfox: "document" } satisfies HistoryState, "");
+  documentOpen = true;
+  const pill = el("div", { id: "wasm-pill", textContent: "in your browser · read-only" });
+  pill.append(el("a", { textContent: "open another", onclick: () => history.back() }));
   document.body.append(pill);
   await import("../src/main");
 }
@@ -90,8 +112,7 @@ async function chooseAndStart(picked: Picked) {
   status(`${picked.files.size} files read.`);
 }
 
-function launcher() {
-  document.head.append(el("style", { textContent: STYLE }));
+function launcher(note?: string) {
   const root = document.getElementById("root")!;
 
   const filePicker = el("input", { type: "file", multiple: true, hidden: true, accept: ".md,.json,.csv,.txt,.yaml,.yml,.toml,.png,.jpg,.jpeg,.gif,.svg,.webp" });
@@ -107,11 +128,12 @@ function launcher() {
   const drop = el(
     "div",
     { className: "drop", id: "drop" },
-    el("div", { textContent: "Drop a .canvas.md here — or a whole folder, so its include and file links resolve" }),
+    el("div", { className: "hint", textContent: "Drop a .canvas.md here" }),
+    el("div", { className: "sub", textContent: "or a whole folder, so its include, image and file links resolve" }),
     el(
       "div",
       { className: "row" },
-      el("button", { className: "primary", textContent: "Open file(s)…", onclick: () => filePicker.click() }),
+      el("button", { className: "primary", textContent: "Open file…", onclick: () => filePicker.click() }),
       el("button", { textContent: "Open folder…", onclick: () => folderPicker.click() }),
     ),
   );
@@ -123,49 +145,60 @@ function launcher() {
     if (e.dataTransfer) handle(fromDrop(e.dataTransfer.items));
   };
 
-  const examples = el("div", { className: "list" });
-  for (const example of EXAMPLES) {
-    examples.append(
-      el("button", {
-        textContent: example.label,
-        onclick: () => {
-          status("Reading the example…");
-          loadExample()
-            .then((files: VirtualFiles) => start({ path: example.path, files }))
-            .catch((e) => status(String(e), true));
-        },
-      }),
-    );
-  }
-
   root.append(
     el(
       "div",
-      { id: "launcher" },
-      el("h1", { textContent: "meshfox, without a server" }),
-      el("p", { textContent: "The real meshfox UI, with the document model running in your browser as WebAssembly. Nothing is uploaded; nothing runs." }),
-      drop,
-      filePicker,
-      folderPicker,
-      el("div", { id: "choices" }),
-      el("h2", { textContent: "…or try an example" }),
-      examples,
-      el("div", { id: "status" }),
-      el("p", { className: "note", textContent: "Prototype: read-only. Includes, file links, constraints and computed views work; running blocks, editing and tables do not." }),
+      { id: "launcher", className: "launcher" },
+      el(
+        "div",
+        { className: "toolbar" },
+        el("span", { className: "brand" }, el("img", { src: "favicon-32.png", alt: "" }), "meshfox"),
+        el("span", { className: "spacer" }),
+        el("span", { className: "mode-badge", textContent: "editor" }),
+      ),
+      el(
+        "main",
+        {},
+        el("h1", { textContent: "Open a canvas" }),
+        el("p", {
+          className: "lede",
+          textContent:
+            "meshfox runs entirely in this tab, as WebAssembly. The file you open is read here and never uploaded.",
+        }),
+        drop,
+        filePicker,
+        folderPicker,
+        el("div", { id: "choices" }),
+        el("div", { id: "status" }),
+        el("p", {
+          className: "note",
+          textContent:
+            "Preview: read-only for now. Includes, file links, images, constraints and computed views work; running blocks and tables need the meshfox app.",
+        }),
+      ),
     ),
   );
-
-  // `?example=hello` (or `?example=examples/hello.canvas.md`) skips the launcher.
-  const wanted = new URLSearchParams(location.search).get("example");
-  if (wanted) {
-    const match = EXAMPLES.find((e) => e.label === wanted || e.path === wanted);
-    if (match) {
-      status("Reading the example…");
-      void loadExample().then((files) => start({ path: match.path, files }));
-    } else {
-      status(`No bundled example "${wanted}".`, true);
-    }
-  }
+  if (note) status(note);
 }
 
-launcher();
+applyThemePreference(getThemePreference());
+document.head.append(el("style", { textContent: STYLE }));
+// This entry is the launcher; mark it so Back/Forward can tell it from a
+// document entry (a reload keeps `history.state`, which is how a stale
+// "document" entry is recognised).
+const arrivedOnDocument = (history.state as HistoryState)?.meshfox === "document";
+history.replaceState({ meshfox: "launcher" } satisfies HistoryState, "");
+launcher(arrivedOnDocument ? "That document was only in memory. Open it again to continue." : undefined);
+
+window.addEventListener("popstate", (event) => {
+  const state = event.state as HistoryState;
+  if (documentOpen && state?.meshfox !== "document") {
+    // Back out of a document: the app cannot be unmounted cleanly (its fetch
+    // and socket are replaced), so start over from the launcher.
+    location.reload();
+  } else if (!documentOpen && state?.meshfox === "document") {
+    // Forward onto a document that no longer exists.
+    history.replaceState({ meshfox: "launcher" } satisfies HistoryState, "");
+    status("That document was only in memory. Open it again to continue.");
+  }
+});

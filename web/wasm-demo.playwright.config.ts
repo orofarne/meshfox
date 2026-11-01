@@ -22,7 +22,7 @@ export default defineConfig({
   reporter: "list",
   webServer: {
     command: "npm run preview:wasm",
-    url: `http://localhost:${PORT}/wasm.html`,
+    url: `http://localhost:${PORT}/`,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
   },

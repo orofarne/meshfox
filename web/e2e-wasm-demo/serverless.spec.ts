@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // The page must work with no `meshfox` behind it: every real network request
 // to `/api/` is refused, so anything that still renders was answered by the
@@ -20,6 +21,19 @@ function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "mfx-wasm-demo-"));
 }
 
+const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+/** A temp folder holding copies of some of the repository's own documents,
+ * at the same relative paths, ready for the folder picker. */
+function repoFolder(...rel: string[]): string {
+  const dir = tmpDir();
+  for (const r of rel) {
+    fs.mkdirSync(path.dirname(path.join(dir, r)), { recursive: true });
+    fs.cpSync(path.join(REPO, r), path.join(dir, r), { recursive: true });
+  }
+  return dir;
+}
+
 const ROOT = '# Root\n<!-- meshfox:node id="root" -->\n\nThe root.\n\n';
 const INCLUDE = '## Notes\n<!-- meshfox:node id="notes" type="include" -->\n\n[notes](./notes.md)\n';
 
@@ -29,21 +43,27 @@ const PNG = Buffer.from(
   "base64",
 );
 
-test("a bundled example loads with no server behind it", async ({ page }) => {
-  await page.goto("wasm.html?example=hello");
+test("a repository example opens from a picked file, with no server behind it", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(path.join(REPO, "examples/hello.canvas.md"));
   await expect(page.getByText("Hello Project")).toBeVisible();
   await expect(page.getByText("read-only", { exact: true })).toBeVisible();
   await expect(page.getByText("noexec", { exact: true })).toBeVisible();
-  await expect(page.locator("#wasm-pill")).toContainText("serverless");
+  await expect(page.locator("#wasm-pill")).toContainText("in your browser");
 });
 
 test("constraint fences run in the page and badge the nodes", async ({ page }) => {
-  await page.goto("wasm.html?example=constraints");
+  await page.goto("/");
+  await page
+    .locator("input[webkitdirectory]")
+    .setInputFiles(repoFolder("examples/constraints.canvas.md", "examples/constraints-data"));
   await expect(page.getByText("3/3")).toBeVisible();
 });
 
-test("README resolves its include from the bundled files", async ({ page }) => {
-  await page.goto("wasm.html?example=README.md");
+test("README resolves its include from the picked folder", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("input[webkitdirectory]").setInputFiles(repoFolder("README.md", "TEMPLATES.md"));
+  await page.getByRole("button", { name: "README.md" }).click();
   await expect(page.locator(".react-flow__node").first()).toBeVisible();
   const canvas = await canvasJson(page);
   const included = canvas.nodes.find((n) => n.id === "static-site-templates")!;
@@ -65,7 +85,7 @@ test("opening a folder resolves includes, assets and file previews from it", asy
   fs.mkdirSync(path.join(dir, "node_modules"));
   fs.writeFileSync(path.join(dir, "node_modules", "skipped.md"), "# not read\n");
 
-  await page.goto("wasm.html");
+  await page.goto("/");
   await page.locator("input[webkitdirectory]").setInputFiles(dir);
   await expect(page.getByText("The root.")).toBeVisible();
 
@@ -94,7 +114,7 @@ test("images in a document are shown, not just fetchable", async ({ page }) => {
     '# Pics\n<!-- meshfox:node id="root" -->\n\n![a tiny picture](./pic.png)\n',
   );
   fs.writeFileSync(path.join(dir, "pic.png"), PNG);
-  await page.goto("wasm.html");
+  await page.goto("/");
   await page.locator("input[webkitdirectory]").setInputFiles(dir);
   await expect
     .poll(() =>
@@ -105,11 +125,15 @@ test("images in a document are shown, not just fetchable", async ({ page }) => {
     .toBe(true);
 });
 
-test("the bundled example with SVG diagrams shows them, with no failed requests", async ({ page }) => {
+test("a document with SVG diagrams shows them, with no failed requests", async ({ page }) => {
   const refused: string[] = [];
   page.on("requestfailed", (r) => refused.push(r.url()));
   page.on("response", (r) => r.status() >= 400 && refused.push(`${r.status()} ${r.url()}`));
-  await page.goto("wasm.html?example=canvas-call");
+  await page.goto("/");
+  await page
+    .locator("input[webkitdirectory]")
+    .setInputFiles(repoFolder("examples/canvas-call.canvas.md", "examples/canvas-call-data"));
+  await page.getByRole("button", { name: "examples/canvas-call.canvas.md" }).click();
   const node = page.locator(".react-flow__node", { hasText: "How the call works" }).first();
   await node.getByText("▸").first().click();
   await expect
@@ -131,7 +155,7 @@ test("a single file works when it needs nothing else", async ({ page }) => {
     '# Solo\n<!-- meshfox:node id="root" -->\n<!-- meshfox:tag-color tag="bug" color="1" -->\n\n' +
       '## Child\n<!-- meshfox:node id="child" tags="bug" -->\n\nbody\n',
   );
-  await page.goto("wasm.html");
+  await page.goto("/");
   await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
   await expect(page.getByText("Solo", { exact: true }).first()).toBeVisible();
   expect((await canvasJson(page)).nodes.find((n) => n.id === "child")!.effectiveColor).toBe("1");
@@ -141,7 +165,7 @@ test("a canvas whose include is missing is reported in the launcher, not loaded"
   const dir = tmpDir();
   const file = path.join(dir, "doc.canvas.md");
   fs.writeFileSync(file, ROOT + INCLUDE);
-  await page.goto("wasm.html");
+  await page.goto("/");
   await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
   await expect(page.locator("#status.error")).toContainText("notes.md");
   await expect(page.locator("#launcher")).toBeVisible();
@@ -152,15 +176,48 @@ test("a folder with several canvases asks which one", async ({ page }) => {
   const dir = tmpDir();
   fs.writeFileSync(path.join(dir, "a.canvas.md"), ROOT);
   fs.writeFileSync(path.join(dir, "b.canvas.md"), ROOT.replace("# Root", "# Second one"));
-  await page.goto("wasm.html");
+  await page.goto("/");
   await page.locator("input[webkitdirectory]").setInputFiles(dir);
   await page.getByRole("button", { name: "b.canvas.md" }).click();
   await expect(page.getByText("Second one").first()).toBeVisible();
 });
 
-test("an unknown example is reported, not a blank page", async ({ page }) => {
-  await page.goto("wasm.html?example=nope");
-  await expect(page.locator("#status.error")).toContainText("nope");
+test("Back returns to the launcher and Forward does not leave a blank page", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+
+  await page.goBack();
+  await expect(page.locator("#launcher")).toBeVisible();
+  await expect(page.locator(".react-flow__node")).toHaveCount(0);
+
+  await page.goForward();
+  await expect(page.locator("#launcher")).toBeVisible();
+  await expect(page.locator("#status")).toContainText("only in memory");
+  await expect(page.locator("#wasm-pill")).toHaveCount(0);
+});
+
+test("\"open another\" in the pill goes back to the launcher", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await page.locator("#wasm-pill a").click();
+  await expect(page.locator("#launcher")).toBeVisible();
+});
+
+test("reloading a document page lands on the launcher", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await page.reload();
+  await expect(page.locator("#launcher")).toBeVisible();
+  await expect(page.locator("#status")).toContainText("only in memory");
 });
 
 test("nothing was ever sent to a server", async ({ page }) => {
@@ -168,7 +225,10 @@ test("nothing was ever sent to a server", async ({ page }) => {
   page.on("request", (r) => {
     if (new URL(r.url()).pathname.includes("/api/")) sent.push(r.url());
   });
-  await page.goto("wasm.html?example=constraints");
+  await page.goto("/");
+  await page
+    .locator("input[webkitdirectory]")
+    .setInputFiles(repoFolder("examples/constraints.canvas.md", "examples/constraints-data"));
   await expect(page.getByText("3/3")).toBeVisible();
   expect(sent).toEqual([]);
 });

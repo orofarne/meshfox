@@ -1,4 +1,4 @@
-# Serverless prototype (WebAssembly)
+# In-browser meshfox (WebAssembly)
 
 The real meshfox UI, with no `meshfox` process behind it. The document model
 (`crates/model`, compiled to WebAssembly by `crates/wasm`) runs in the page and
@@ -12,13 +12,19 @@ cargo install wasm-bindgen-cli --version "$(grep -A1 '^name = "wasm-bindgen"$' .
 cd web
 npm install
 npm run build:wasm      # builds the wasm package, then the static site into web/dist-wasm
-npm run preview:wasm    # http://localhost:4600/wasm.html
+npm run preview:wasm    # http://localhost:4600/
 npm run test:wasm-demo  # Playwright, Chromium + Firefox
 ```
 
 Open a `.canvas.md`, a whole folder (so `include`s, images and `file` nodes
-resolve), drop either onto the page, or pick a bundled example.
-`wasm.html?example=hello` jumps straight into one.
+resolve), or drop either onto the page. The build is a static site with
+relative URLs, emitted as `index.html`, so it can be served from any path
+(the plan: `https://meshfox.orofarne.net/editor/`).
+
+Browser history: opening a document pushes a history entry (the URL is left
+alone, since the app's relative `api/...` requests depend on it), so Back
+returns to the launcher. A document lives only in memory, so a reload, or
+Forward onto a document that is gone, lands on the launcher with a note.
 
 ## How it works
 
@@ -32,8 +38,7 @@ resolve), drop either onto the page, or pick a bundled example.
   is a stub that only sends heartbeats. Anything that would need a worker
   (running, editing, tables) answers 501.
 - `files.ts`, `pick.ts` — the in-memory file tree the wasm model reads through
-  its `files.read(path)` callback, filled from the picker, a drop, or the
-  bundled examples (`bundled.ts`).
+  its `files.read(path)` callback, filled from the picker, a drop or a drop.
 
 ## Limits (it is a prototype)
 
