@@ -18,13 +18,26 @@ export async function fetchCanvas(): Promise<CanvasDoc> {
  * *this page* rather than the worker: it was reached through the gateway
  * (`meshfox serve --http`), so anything that opens a file on the server's
  * machine (the OS default application, the file manager) does nothing
- * useful and the page doesn't offer it.
+ * useful and the page doesn't offer it. `serverless` — there is no worker at
+ * all: the page answers its own requests (the in-browser build), so nothing
+ * was ever run and there is no run history to show — unlike `noExec`, where
+ * a worker may still hold the results of earlier runs.
  */
-export async function fetchWorkerInfo(): Promise<{ readOnly: boolean; noExec: boolean; remote: boolean }> {
+export async function fetchWorkerInfo(): Promise<{
+  readOnly: boolean;
+  noExec: boolean;
+  remote: boolean;
+  serverless: boolean;
+}> {
   const res = await fetch("api/info");
   if (!res.ok) throw new Error(`GET /api/info: ${res.status}`);
   const info = await res.json();
-  return { readOnly: info.readOnly === true, noExec: info.noExec === true, remote: info.remote === true };
+  return {
+    readOnly: info.readOnly === true,
+    noExec: info.noExec === true,
+    remote: info.remote === true,
+    serverless: info.serverless === true,
+  };
 }
 
 /**

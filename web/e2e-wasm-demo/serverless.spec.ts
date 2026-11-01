@@ -308,6 +308,9 @@ test("with execution disabled there is nothing to click that would run", async (
   await expect(page.locator(".mesh-node-quick-run-icon")).toHaveCount(0);
   await expect(page.locator(".mesh-button-block, .mesh-run-button")).toHaveCount(0);
   await expect(page.locator(".mesh-form-block")).toHaveCount(0);
+  // Nothing ever ran here, so there is no run history either (a `--no-exec`
+  // worker, by contrast, keeps the button: earlier runs may be on record).
+  await expect(page.getByRole("button", { name: "Run history" })).toHaveCount(0);
 
   // And nothing in the toolbar for runs.
   await expect(page.getByRole("button", { name: /Console/ })).toHaveCount(0);

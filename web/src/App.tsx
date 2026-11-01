@@ -497,17 +497,23 @@ export default function App() {
   // opening a file on the server's machine does nothing useful, so the file
   // nodes don't offer it (see `canOpenOnServer`).
   const [workerRemote, setWorkerRemote] = useState(false);
+  // No worker behind this page (the in-browser build): nothing ever ran, so
+  // there is no run history to offer — unlike `--no-exec`, where earlier
+  // runs' results may still be there.
+  const [workerServerless, setWorkerServerless] = useState(false);
   useEffect(() => {
     fetchWorkerInfo()
       .then((info) => {
         setWorkerReadOnly(info.readOnly);
         setWorkerNoExec(info.noExec);
         setWorkerRemote(info.remote);
+        setWorkerServerless(info.serverless);
       })
       .catch(() => {
         setWorkerReadOnly(false);
         setWorkerNoExec(false);
         setWorkerRemote(false);
+        setWorkerServerless(false);
       });
   }, []);
   // True while the toolbar's "Source" toggle has swapped the graph view for
@@ -2625,6 +2631,7 @@ export default function App() {
             onOpenFileFolder: () => handleOpenFileFolder(n.id),
             remote: workerRemote,
             noExec: workerNoExec,
+            serverless: workerServerless,
             onAddChild: () => handleAddChild(n.id),
             onFitSize: size => fitNodeSizeRef.current(n.id, size),
             onMoveUp:
@@ -2879,7 +2886,7 @@ export default function App() {
     // Deliberately excludes handleRun/handleKill/setNodes/setEdges: this effect should
     // only re-run when a fresh canvas doc arrives.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvas, workerRemote, workerNoExec]);
+  }, [canvas, workerRemote, workerNoExec, workerServerless]);
 
   // Keeps `measuredHeightsRef` current — cheap (a ref write, no state) so
   // this can safely depend on `nodes` directly, unlike the canvas-load

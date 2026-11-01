@@ -566,6 +566,9 @@ export interface MeshNodeData {
    * something is offered — run/chain/kill buttons, the ▷ quick-run, `button`
    * blocks, forms. Output a block already holds stays visible. */
   noExec: boolean;
+  /** No worker at all (the in-browser build): nothing ever ran, so there is no
+   * run history either. (`noExec` alone keeps it: earlier runs may exist.) */
+  serverless: boolean;
   /** Opens this node's body in a floating window (`NodeExpandPanel`) — same
    * live content (run/kill buttons, streaming output) as the inline box,
    * just bigger and not at the mercy of the canvas's current pan/zoom.
@@ -1587,7 +1590,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
             ‹/›
           </button>
         )}
-        {expanded && !seg.service && (
+        {expanded && !seg.service && !data.serverless && (
           <button
             type="button"
             className={
