@@ -976,3 +976,15 @@ test("the page runs under its Content-Security-Policy, and a picture opened on i
 
   expect(violations.filter((v) => !v.includes("evil") && !/inline script/i.test(v))).toEqual([]);
 });
+
+test("the first screen says what happens to a file, and the help explains it", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.locator(".lede")).toContainText("never uploaded");
+  await expect(page.getByText("Nothing is uploaded or tracked")).toBeVisible();
+  const help = page.locator("#help");
+  await expect(help.getByRole("heading", { name: "Privacy" })).toBeHidden();
+  await help.locator("summary").click();
+  await expect(help.getByRole("heading", { name: "Privacy" })).toBeVisible();
+  await expect(help.getByText(/draft of the text is kept in this browser/)).toBeVisible();
+  await expect(help.getByRole("heading", { name: "Not here" })).toBeVisible();
+});

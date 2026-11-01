@@ -53,6 +53,12 @@ const STYLE = `
   #engine.error { color:var(--fail); opacity:1; }
   #status { margin-top:1rem; min-height:1.3em; font-size:.82rem; opacity:.75; }
   #status.error { color:var(--fail); opacity:1; }
+  #help { margin-top:1rem; font-size:.82rem; line-height:1.55; }
+  #help summary { cursor:pointer; opacity:.8; }
+  #help summary:hover { color:var(--accent); }
+  #help h3 { font-size:.82rem; margin:1rem 0 .3rem; }
+  #help ul { margin:0; padding-left:1.1rem; opacity:.85; }
+  #help li { margin:.3rem 0; }
   .launcher .note { font-size:.75rem; opacity:.55; margin-top:2rem; line-height:1.6; }
   /* Floats over the app, bottom centre: React Flow's controls sit bottom left
      and its minimap bottom right, so the middle is the free place. */
@@ -389,6 +395,36 @@ async function chooseAndStart(picked: Picked) {
   status([`${picked.files.size} files read`, skippedNote(picked.skipped)].filter(Boolean).join("; ") + ".");
 }
 
+/** What the page does with a file, in plain words: the answer to "is this safe
+ * to open my notes in?" has to be on the first screen. */
+function help(): HTMLElement {
+  const section = (title: string, ...items: string[]) => [
+    el("h3", { textContent: title }),
+    el("ul", {}, ...items.map((text) => el("li", { textContent: text }))),
+  ];
+  return el(
+    "details",
+    { id: "help" },
+    el("summary", { textContent: "Help and privacy" }),
+    ...section(
+      "Privacy",
+      "Your files are read in this tab and never uploaded. The page has no server to send them to; it only downloads its own code, and runs no analytics.",
+      "Your edits live in this tab. While they are unsaved, a draft of the text is kept in this browser's storage on this device, so a closed tab or a crash does not lose them. It is removed when you save, discard it, or undo back to the saved text; clearing the site's data removes it too.",
+      "Nothing in a document is executed: code blocks are shown, not run, and HTML in Markdown is shown as text. A picture or link that points to another website is fetched from that website, which can tell that the document was opened; links leave without saying where you came from.",
+    ),
+    ...section(
+      "Using it",
+      "Open a folder, or drop it here, when the canvas includes other files, images or links to other canvases; for a single self-contained file, opening just that file is enough. “add files…” brings in what is missing later.",
+      "Edit changes nodes in place; Source edits the whole file. Undo, redo and the history list work on every edit, for each canvas separately.",
+      "Nothing changes your original until you save. “save” writes into a file you choose (Chrome and Edge), “download” hands you the text anywhere else. A canvas that links to another one in the folder opens it with ↗; Back returns.",
+    ),
+    ...section(
+      "Not here",
+      "Running code blocks, buttons and forms, services, tables (display=table), link preview cards, and editing the files a canvas includes. Those need the meshfox app (meshfox view).",
+    ),
+  );
+}
+
 function launcher(note?: string) {
   const root = document.getElementById("root")!;
 
@@ -473,8 +509,9 @@ function launcher(note?: string) {
         el("p", {
           className: "note",
           textContent:
-            "Preview: read-only for now. Includes, file links, images, constraints and computed views work; running blocks and tables need the meshfox app.",
+            "Nothing is uploaded or tracked. Unsaved edits are kept in this browser only. Running blocks, forms and tables need the meshfox app.",
         }),
+        help(),
       ),
     ),
   );
