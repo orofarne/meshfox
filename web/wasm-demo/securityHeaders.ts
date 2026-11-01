@@ -52,3 +52,14 @@ export function headersFile(): string {
     block("/*.wasm", { "Content-Type": "application/wasm" }),
   ].join("\n");
 }
+
+/** The same security headers as nginx `add_header` lines (an include file:
+ * `add_header` in a `location` replaces the ones above it, so every location
+ * that sets its own must include this too). */
+export function nginxHeaders(): string {
+  return (
+    Object.entries(SECURITY_HEADERS)
+      .map(([k, v]) => `add_header ${k} "${v}" always;`)
+      .join("\n") + "\n"
+  );
+}

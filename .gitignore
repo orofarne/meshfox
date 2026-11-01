@@ -57,3 +57,4 @@ examples/tables-data/events.*
 /crates/wasm/pkg/
 /crates/wasm/pkg-node/
 /web/dist-wasm/
+/editor-bundle/
