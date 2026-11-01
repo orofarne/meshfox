@@ -158,6 +158,9 @@ async function start(doc: Document) {
   await import("../src/main");
 }
 
+/** What tells this document from every other the page has opened. */
+const documentKey = (picked: Picked, path: string) => (picked.rootName ? `${picked.rootName}/${path}` : path);
+
 async function chooseAndStart(picked: Picked) {
   // Canvases first; any other Markdown file only if there is no canvas.
   const canvases = picked.candidates.filter((p) => p.endsWith(".canvas.md"));
@@ -167,7 +170,7 @@ async function chooseAndStart(picked: Picked) {
     return;
   }
   if (pool.length === 1) {
-    await start({ path: pool[0], files: picked.files, note: skippedNote(picked.skipped) });
+    await start({ path: pool[0], files: picked.files, key: documentKey(picked, pool[0]), note: skippedNote(picked.skipped) });
     return;
   }
   document.getElementById("choices")!.replaceChildren(
@@ -176,7 +179,7 @@ async function chooseAndStart(picked: Picked) {
       "div",
       { className: "list" },
       ...pool.slice(0, 40).map((path) =>
-        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, note: skippedNote(picked.skipped) }) }),
+        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, key: documentKey(picked, path), note: skippedNote(picked.skipped) }) }),
       ),
     ),
   );

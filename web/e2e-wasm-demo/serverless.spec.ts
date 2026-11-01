@@ -350,3 +350,16 @@ test("add files fills a missing include, wherever the picked file sits", async (
   await expect(page.locator(".markdown-alert-warning")).toHaveCount(0);
   await expect(page.getByText("from the added file")).toBeVisible();
 });
+
+test("what the page remembers about a document is keyed by the document, not just its root id", async ({ page }) => {
+  // Every document's default root id is `root`; two of them must not share
+  // their folded-nodes entry.
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "doc.canvas.md"), ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nbody\n');
+  await page.goto("/");
+  await page.locator("input[webkitdirectory]").setInputFiles(dir);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("meshfox-folded:"))))
+    .toEqual([`meshfox-folded:${path.basename(dir)}/doc.canvas.md:root`]);
+});

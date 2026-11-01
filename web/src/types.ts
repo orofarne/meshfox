@@ -155,6 +155,10 @@ export interface CanvasDoc {
    * then holds the merged body, not what was sent. */
   merged?: boolean;
   serverSession?: string;
+  /** Which document this is, when the page's own address does not already say
+   * (the in-browser build serves any file from one address). Scopes what the
+   * page remembers about the document, e.g. which nodes are folded. */
+  documentKey?: string;
   nodes: CanvasNode[];
   /** Every `<!-- meshfox:option name="..." -->` this document declares
    * (see `crates/core/src/options.rs`, SPEC.md's "Options" section) — e.g.

@@ -19,15 +19,18 @@ export interface Picked {
   files: VirtualFiles;
   /** Every Markdown file, most canvas-like first. */
   candidates: string[];
+  /** The picked folder's own name, `""` for loose files: with a canvas's path
+   * it identifies the document. */
+  rootName: string;
   /** What the guardrails left out (not what the ignore rules did). */
   skipped: { tooLarge: number; tooMany: number };
 }
 
-function finish(files: VirtualFiles, skipped: Picked["skipped"]): Picked {
+function finish(files: VirtualFiles, skipped: Picked["skipped"], rootName: string): Picked {
   const mds = files.paths().filter((p) => p.endsWith(".md"));
   const rank = (p: string) => (p.endsWith(".canvas.md") ? 0 : 1);
   mds.sort((a, b) => rank(a) - rank(b) || a.split("/").length - b.split("/").length || a.localeCompare(b));
-  return { files, candidates: mds, skipped };
+  return { files, candidates: mds, skipped, rootName };
 }
 
 const dirname = (path: string) => (path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
@@ -35,6 +38,7 @@ const dirname = (path: string) => (path.includes("/") ? path.slice(0, path.lastI
 class Reader {
   readonly files = new VirtualFiles();
   readonly skipped = { tooLarge: 0, tooMany: 0 };
+  rootName = "";
   constructor(readonly rules: IgnoreRules) {}
 
   /** Reads `file` into the tree unless a guardrail says no. */
@@ -53,7 +57,7 @@ class Reader {
   }
 
   done(): Picked {
-    return finish(this.files, this.skipped);
+    return finish(this.files, this.skipped, this.rootName);
   }
 }
 
@@ -67,6 +71,7 @@ export async function fromFileList(list: FileList, newRules: NewIgnoreRules): Pr
     return { file, path: rel ? rel.split("/").slice(1).join("/") : file.name };
   });
   const reader = new Reader(await newRules());
+  reader.rootName = Array.from(list).find((f) => f.webkitRelativePath)?.webkitRelativePath.split("/")[0] ?? "";
   // Shallow ignore files first: a deeper one only matters inside its own
   // directory, and a directory excluded from above is never entered.
   const ignoreFiles = entries
@@ -123,6 +128,7 @@ export async function fromDrop(items: DataTransferItemList, newRules: NewIgnoreR
     }
   };
 
+  if (rootIsFolder) reader.rootName = entries[0].name;
   for (const entry of entries) {
     if (rootIsFolder) await walkDir(entry as FileSystemDirectoryEntry, "");
     else if (entry.isDirectory) {

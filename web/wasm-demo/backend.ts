@@ -14,6 +14,9 @@ export interface Document {
   /** The canvas's own path inside `files`. */
   path: string;
   files: VirtualFiles;
+  /** Tells this document from others opened at the same address (the picked
+   * folder's name and the canvas's path): scopes what the page remembers. */
+  key?: string;
   /** Shown beside the "in your browser" pill, e.g. what was not read. */
   note?: string;
 }
@@ -121,7 +124,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
         case "canvas": {
           const r = render();
           if (r.json === undefined) return text(r.error, 422);
-          return json({ ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION });
+          return json({ ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION, documentKey: doc.key });
         }
         case "includes":
         case "services":

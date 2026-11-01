@@ -89,6 +89,7 @@ import { DeletableEdge } from "./DeletableEdge";
 import { distributeEdgePorts } from "./edgePorts";
 import { withEdgeGeometry } from "./edgeRouteLayout";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
+import { foldedStorageKey } from "./foldedStorageKey";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
 
@@ -456,7 +457,7 @@ export default function App() {
     if (!canvas) return;
     const rootId = findRoot(canvas)?.id;
     if (!rootId) return;
-    const key = `meshfox-folded:${rootId}`;
+    const key = foldedStorageKey(rootId, canvas.documentKey, new URL(".", document.baseURI).pathname);
     if (foldedStorageKeyRef.current === key) return;
     foldedStorageKeyRef.current = key;
     try {
