@@ -153,3 +153,48 @@ test("renderCanvasWithWarnings shows a missing include as a notice instead of fa
   // Strict stays strict.
   assert.throws(() => render(INCLUDE_DOC, "doc.canvas.md", () => null), /notes\.md/);
 });
+
+test("bodyRev is the server's fingerprint", () => {
+  assert.equal(wasm.bodyRev(""), "cbf29ce484222325");
+  assert.notEqual(wasm.bodyRev("a"), wasm.bodyRev("b"));
+});
+
+test("UndoLog: the model's undo log, in memory, walked by the page", () => {
+  const log = new wasm.UndoLog("v0");
+  assert.equal(log.canUndo(), false);
+  assert.equal(log.undo("v0"), undefined);
+  log.push("source", "v0", "v1");
+  log.push("source", "v1", "v2");
+  assert.deepEqual([log.cursor(), log.canUndo(), log.canRedo()], [2, true, false]);
+
+  assert.equal(log.undo("v2"), "v1");
+  assert.equal(log.undo("v1"), "v0");
+  assert.equal(log.undo("v0"), undefined, "nothing left to undo");
+  assert.deepEqual([log.cursor(), log.canUndo(), log.canRedo()], [0, false, true]);
+  assert.equal(log.redo("v0"), "v1");
+  assert.equal(log.jumpTo(2, "v1"), "v2");
+  assert.equal(log.jumpTo(2, "v2"), undefined, "already there");
+
+  // The listing is the server's: redo tail first, then applied, newest first.
+  log.undo("v2");
+  const listed = JSON.parse(log.history(10));
+  assert.deepEqual(listed.map((e) => [e.seq, e.applied, e.opKind]), [[2, false, "source"], [1, true, "source"]]);
+  assert.match(listed[0].createdAt, /^\d{4}-\d\d-\d\dT/);
+
+  // A fresh edit after an undo drops the redo tail, and numbers are never reused.
+  log.push("source", "v1", "v1b");
+  assert.equal(log.canRedo(), false);
+  assert.deepEqual(JSON.parse(log.history(10)).map((e) => e.seq), [3, 1]);
+  // A step that no longer fits the document is an error, not a silent no-op.
+  assert.throws(() => log.undo("something else entirely"), /no longer fits/);
+  assert.equal(log.cursor(), 3, "and nothing moved");
+  log.free();
+});
+
+test("newCanvasContent is the template `meshfox create` writes, and renders", () => {
+  const text = wasm.newCanvasContent("my notes");
+  assert.ok(text.startsWith("<!-- meshfox:canvas -->\n# my notes\n"));
+  const canvas = render(text, "my notes.canvas.md");
+  assert.equal(canvas.nodes.length, 1);
+  assert.equal(canvas.nodes[0].title, "my notes");
+});

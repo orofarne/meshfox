@@ -2627,24 +2627,13 @@ fn create(canvas_path: &Path) {
     println!("meshfox create: wrote {}", canvas_path.display());
 }
 
-/// A short note, wrapped in a `meshfox:comment` marker pair (see SPEC.md's
-/// "Comments"), that a freshly `create`d file's root body opens with:
-/// invisible in meshfox's own tooling (web UI, TUI, `static`/`pdf`), but
-/// shown normally by a plain Markdown renderer — exactly the audience that
-/// doesn't already know this is a meshfox document from looking at it.
-const NEW_CANVAS_NOTE: &str = "<!-- meshfox:comment -->\n> This is a [meshfox](https://meshfox.orofarne.net/) document — open it with `meshfox view` (or `meshfox tui`) for the interactive canvas. This note is only visible here, in a plain Markdown viewer.\n<!-- /meshfox:comment -->";
-
 /// The empty-canvas template shared by `create`, `view --create`, and MCP's
-/// `canvas_open`'s own `create` flag: the `meshfox:canvas` marker, a lone
-/// root heading named after the file itself (so the new file is
-/// immediately valid and auto-discoverable), and `NEW_CANVAS_NOTE` as the
-/// root's own body.
+/// `canvas_open`'s own `create` flag (see `meshfox_model::mdcanvas::
+/// new_canvas_content`): the `meshfox:canvas` marker, a lone root heading named
+/// after the file itself (so the new file is immediately valid and
+/// auto-discoverable), and a note as the root's own body.
 pub(crate) fn canvas_template_content(canvas_path: &Path) -> String {
-    let title = canvas_title(canvas_path);
-    format!(
-        "{}\n# {title}\n\n{NEW_CANVAS_NOTE}\n",
-        mdcanvas::CANVAS_MARKER
-    )
+    mdcanvas::new_canvas_content(&canvas_title(canvas_path))
 }
 
 /// If `canvas_path` exists but is empty (or only whitespace) — e.g. a file a

@@ -113,7 +113,9 @@ fn resolve_inner(
             Ok(ok) => ok,
             Err(error) if lenient => {
                 let reason = match &error {
-                    IncludeError::NotFound(..) => "it is not among the files that were opened".to_string(),
+                    IncludeError::NotFound(..) => {
+                        "it is not among the files that were opened".to_string()
+                    }
                     other => other.to_string(),
                 };
                 node.node_type = NodeType::Text;

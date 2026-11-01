@@ -3532,6 +3532,7 @@ dependencies = [
  "futures-util",
  "libc",
  "meshfox-core",
+ "meshfox-model",
  "mime_guess",
  "open",
  "portable-pty",

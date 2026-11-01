@@ -979,6 +979,12 @@ fn undo_redo_response(
     }))
 }
 
+impl From<std::io::Error> for ApiError {
+    fn from(e: std::io::Error) -> Self {
+        io_err(e)
+    }
+}
+
 fn io_err(e: std::io::Error) -> ApiError {
     if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
         return ApiError(StatusCode::FORBIDDEN, e.to_string());
@@ -1042,63 +1048,27 @@ fn read_only_error(canvas_path: &std::path::Path) -> std::io::Error {
 /// intermediate events a client never asked to see individually. Returns
 /// the final document text and whether anything actually moved.
 fn jump_to(state: &AppState, target_seq: i64) -> Result<(String, bool), ApiError> {
-    const MAX_STEPS: u32 = 10_000;
-    let mut raw = state.raw.lock().unwrap().clone();
-    let mut steps = 0u32;
-    loop {
-        let cursor = state.undo_log.cursor().map_err(io_err)?;
-        if cursor == target_seq {
-            break;
-        }
-        if steps >= MAX_STEPS {
-            eprintln!(
-                "meshfox: jump_to gave up after {MAX_STEPS} steps trying to reach seq {target_seq} \
-                 (stuck oscillating around an unreachable target — this is a bug, not normal use)"
-            );
-            break;
-        }
-        let undo = cursor > target_seq;
-        let entry = if undo {
-            state.undo_log.peek_undo().map_err(io_err)?
-        } else {
-            state.undo_log.peek_redo().map_err(io_err)?
-        };
-        let Some(entry) = entry else {
-            // Nothing left in that direction — `target_seq` was never
-            // reachable (most likely out of range). Stop here rather than
-            // erroring; the caller's own response still reports exactly
-            // where this landed.
-            break;
-        };
-        let next = apply_history_entry(&raw, &entry, undo).ok_or_else(|| {
-            ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!(
-                    "can't reach seq {target_seq} — step {} ({:?}) no longer matches the document",
-                    entry.seq, entry.op_kind,
-                ),
-            )
+    let raw = state.raw.lock().unwrap().clone();
+    let (raw, moved) = state
+        .undo_log
+        .jump_to(target_seq, raw, |entry, current, undo| {
+            let next = apply_history_entry(current, entry, undo).ok_or_else(|| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "can't reach seq {target_seq} — step {} ({:?}) no longer matches the document",
+                        entry.seq, entry.op_kind,
+                    ),
+                )
+            })?;
+            state.write_raw(&next).map_err(io_err)?;
+            Ok::<String, ApiError>(next)
         })?;
-        state.write_raw(&next).map_err(io_err)?;
-        if undo {
-            state
-                .undo_log
-                .commit_undo(entry.seq, &next)
-                .map_err(io_err)?;
-        } else {
-            state
-                .undo_log
-                .commit_redo(entry.seq, &next)
-                .map_err(io_err)?;
-        }
-        raw = next;
-        steps += 1;
-    }
-    if steps > 0 {
+    if moved {
         state.canvas_events.push(ServerEvent::Changed);
         broadcast_undo_state(state);
     }
-    Ok((raw, steps > 0))
+    Ok((raw, moved))
 }
 
 /// `POST /api/undo` — reverts the most recent still-undoable edit this

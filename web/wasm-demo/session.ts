@@ -1,11 +1,12 @@
-/** The document being edited in the page: its text, and the snapshots that
- * undo/redo walk. The page has no disk, so this is the source of truth until
- * the user downloads the result.
+/** The document being edited in the page: its text, and the undo/redo history
+ * over it. The page has no disk, so this is the source of truth until the user
+ * downloads the result.
  *
- * Revisions are opaque ids, one per snapshot (what the Source editor sends
- * back as `If-Match`). History "seq" numbers follow the server's undo log:
- * the initial text is seq 0, each edit is the next seq, and the cursor is
- * the seq of the state shown. */
+ * The history is `meshfox_model::undo` itself, compiled into the wasm module —
+ * the log `meshfox view` keeps in SQLite, here over memory — so what undo
+ * means (cursor, redo tail, `seq` numbering, depth cap, replay) is the same on
+ * both. This class only adds what a page needs around it: the current text, a
+ * revision for `If-Match`, "unsaved", and change callbacks. */
 export interface HistoryEntry {
   seq: number;
   createdAt: string;
@@ -14,44 +15,62 @@ export interface HistoryEntry {
   summary: string;
 }
 
-interface Snapshot {
-  id: number;
-  raw: string;
-  opKind: string;
-  summary: string;
-  createdAt: string;
+/** The part of the wasm module this needs. */
+export interface UndoWasm {
+  UndoLog: new (initial: string) => {
+    push(opKind: string, before: string, after: string): void;
+    cursor(): number;
+    canUndo(): boolean;
+    canRedo(): boolean;
+    undo(current: string): string | undefined;
+    redo(current: string): string | undefined;
+    jumpTo(seq: number, current: string): string | undefined;
+    history(limit: number): string;
+  };
+  bodyRev(text: string): string;
 }
 
+/** What the history panel says about a step, by what kind of step it was. */
+const SUMMARIES: Record<string, string> = {
+  source: "edited the source",
+  external_edit: "changed outside the editor",
+};
+
 export class EditSession {
-  private readonly snapshots: Snapshot[];
-  private cursor = 0;
-  private nextId = 1;
-  private savedId = 0;
+  private readonly log: InstanceType<UndoWasm["UndoLog"]>;
+  private current: string;
+  private savedRev: string;
   private listeners: Array<() => void> = [];
 
-  constructor(initial: string) {
-    this.snapshots = [{ id: 0, raw: initial, opKind: "open", summary: "opened", createdAt: new Date().toISOString() }];
+  constructor(
+    private readonly wasm: UndoWasm,
+    initial: string,
+  ) {
+    this.log = new wasm.UndoLog(initial);
+    this.current = initial;
+    this.savedRev = wasm.bodyRev(initial);
   }
 
   get raw(): string {
-    return this.snapshots[this.cursor].raw;
+    return this.current;
   }
-  /** Identifies the text as it is now; changes with every edit/undo/redo. */
+  /** Identifies the text as it is now (an `ETag`): its fingerprint, as the
+   * server computes it. */
   get rev(): string {
-    return `"mfx-${this.snapshots[this.cursor].id}"`;
+    return `"${this.wasm.bodyRev(this.current)}"`;
   }
   get canUndo(): boolean {
-    return this.cursor > 0;
+    return this.log.canUndo();
   }
   get canRedo(): boolean {
-    return this.cursor < this.snapshots.length - 1;
+    return this.log.canRedo();
   }
   get seq(): number {
-    return this.cursor;
+    return this.log.cursor();
   }
   /** Whether what is shown differs from what was last downloaded (or opened). */
   get dirty(): boolean {
-    return this.snapshots[this.cursor].id !== this.savedId;
+    return this.wasm.bodyRev(this.current) !== this.savedRev;
   }
 
   /** Whether `header` (an `If-Match` value) names the current text. */
@@ -61,49 +80,46 @@ export class EditSession {
 
   /** Records `raw` as the next state; the redo tail is dropped. No-op (false)
    * when it is the text already shown. */
-  edit(raw: string, opKind: string, summary: string): boolean {
-    if (raw === this.raw) return false;
-    this.snapshots.length = this.cursor + 1;
-    this.snapshots.push({ id: this.nextId++, raw, opKind, summary, createdAt: new Date().toISOString() });
-    this.cursor++;
+  edit(raw: string, opKind: string): boolean {
+    if (raw === this.current) return false;
+    this.log.push(opKind, this.current, raw);
+    this.current = raw;
     this.changed();
     return true;
   }
 
   undo(): boolean {
-    return this.goto(this.cursor - 1);
+    return this.move(this.log.undo(this.current));
   }
   redo(): boolean {
-    return this.goto(this.cursor + 1);
+    return this.move(this.log.redo(this.current));
   }
   goto(seq: number): boolean {
-    if (!Number.isInteger(seq) || seq < 0 || seq >= this.snapshots.length || seq === this.cursor) return false;
-    this.cursor = seq;
-    this.changed();
-    return true;
+    return this.move(this.log.jumpTo(seq, this.current));
   }
 
   /** The state shown is the one that was saved (downloaded). */
   markSaved(): void {
-    this.savedId = this.snapshots[this.cursor].id;
+    this.savedRev = this.wasm.bodyRev(this.current);
     this.changed();
   }
 
   /** The last `limit` applied steps plus the whole redo tail, most-future first
    * (what `GET /api/history` lists). */
   history(limit: number): HistoryEntry[] {
-    const firstApplied = Math.max(1, this.cursor - limit + 1);
-    const out: HistoryEntry[] = [];
-    for (let seq = this.snapshots.length - 1; seq >= 1; seq--) {
-      if (seq <= this.cursor && seq < firstApplied) break;
-      const s = this.snapshots[seq];
-      out.push({ seq, createdAt: s.createdAt, opKind: s.opKind, applied: seq <= this.cursor, summary: s.summary });
-    }
-    return out;
+    const entries = JSON.parse(this.log.history(limit)) as Omit<HistoryEntry, "summary">[];
+    return entries.map((e) => ({ ...e, summary: SUMMARIES[e.opKind] ?? e.opKind }));
   }
 
   onChange(listener: () => void): void {
     this.listeners.push(listener);
+  }
+
+  private move(next: string | undefined): boolean {
+    if (next === undefined) return false;
+    this.current = next;
+    this.changed();
+    return true;
   }
 
   private changed(): void {

@@ -157,13 +157,20 @@ mod tests {
             "## Here\n<!-- meshfox:node id=\"here\" type=\"include\" -->\n\n[here](./here.md)\n",
         );
         let path = dir.join("x.canvas.md");
-        assert!(render_canvas(raw, &path, &DiskFiles).is_err(), "strict stays strict");
+        assert!(
+            render_canvas(raw, &path, &DiskFiles).is_err(),
+            "strict stays strict"
+        );
         let (canvas, warnings) = render_canvas_lenient(raw, &path, &DiskFiles).unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].node_id, "gone");
         assert_eq!(warnings[0].target, "./gone.md");
         let gone = canvas.node("gone").unwrap();
-        assert!(gone.text.contains("[!WARNING]") && gone.text.contains("./gone.md"), "{}", gone.text);
+        assert!(
+            gone.text.contains("[!WARNING]") && gone.text.contains("./gone.md"),
+            "{}",
+            gone.text
+        );
         assert!(!gone.plain_markdown_include);
         assert_eq!(gone.fold, Some(false));
         assert!(canvas.node("here").unwrap().text.contains("present"));

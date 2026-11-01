@@ -46,6 +46,22 @@ use thiserror::Error;
 /// document.
 pub const CANVAS_MARKER: &str = "<!-- meshfox:canvas -->";
 
+/// A short note, wrapped in a `meshfox:comment` marker pair (see SPEC.md's
+/// "Comments"), that a new canvas's root body opens with: invisible in
+/// meshfox's own tooling (web UI, TUI, `static`/`pdf`), but shown normally by a
+/// plain Markdown renderer — exactly the audience that doesn't already know
+/// this is a meshfox document from looking at it.
+const NEW_CANVAS_NOTE: &str = "<!-- meshfox:comment -->\n> This is a [meshfox](https://meshfox.orofarne.net/) document — open it with `meshfox view` (or `meshfox tui`) for the interactive canvas. This note is only visible here, in a plain Markdown viewer.\n<!-- /meshfox:comment -->";
+
+/// The empty canvas every front door starts from (`meshfox create`,
+/// `view --create`, MCP's `canvas_open` with `create`, the in-browser editor's
+/// "new canvas"): the `meshfox:canvas` marker, a lone root heading named
+/// `title`, and the note above as the root's body. Immediately valid and
+/// auto-discoverable.
+pub fn new_canvas_content(title: &str) -> String {
+    format!("{CANVAS_MARKER}\n# {title}\n\n{NEW_CANVAS_NOTE}\n")
+}
+
 /// Whether `markdown` opens with the `meshfox:canvas` marker line.
 pub fn has_marker(markdown: &str) -> bool {
     let first_line = markdown.lines().next().unwrap_or("");

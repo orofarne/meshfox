@@ -377,7 +377,7 @@ async function typeInSource(page: Page, text: string, replace = false) {
   const editor = page.locator(".mesh-source-editor-body .monaco-editor");
   await editor.waitFor();
   // Only once the document's text is in the editor does a key press mean anything.
-  await expect(page.locator(".mesh-source-editor-body .view-lines")).toContainText("Root");
+  await expect(page.locator(".mesh-source-editor-body .view-lines")).toContainText("meshfox:");
   await editor.click();
   await page.keyboard.press(replace ? `${MOD}+A` : END_OF_DOCUMENT);
   // Inserted in one go, not typed: typing makes Monaco complete and commit words.
@@ -474,4 +474,45 @@ test("leaving a document with unsaved edits asks first; staying keeps it", async
   page.once("dialog", (d) => void d.accept());
   await page.goBack();
   await expect(page.locator("#launcher")).toBeVisible();
+});
+
+test("the history panel lists the steps, and jumping back through it restores the text", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+
+  await page.getByRole("button", { name: /history/ }).click();
+  const entry = page.getByRole("button", { name: /edited the source/ });
+  await expect(entry).toHaveCount(1);
+  // Jump to the start through the panel itself: the text goes...
+  await page.getByRole("button", { name: "Start of history" }).click();
+  await expect(page.getByText("added in the browser")).toHaveCount(0);
+  // ...the undone step stays listed (the redo tail, until a fresh edit drops it)...
+  await expect(entry).toHaveCount(1);
+  // ...and jumping to it brings the text back.
+  await entry.click();
+  await expect(page.getByText("added in the browser")).toBeVisible();
+});
+
+test("a new canvas can be started, edited and downloaded without opening anything", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("#new-name").fill("my notes");
+  await page.locator("#new-canvas").click();
+  // The root is named after the file, as `meshfox create` does.
+  await expect(page.getByText("my notes", { exact: true }).first()).toBeVisible();
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  const downloading = page.waitForEvent("download");
+  await page.locator("#wasm-download").click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe("my notes.canvas.md");
+  const saved = fs.readFileSync((await download.path())!, "utf8");
+  expect(saved.startsWith("<!-- meshfox:canvas -->\n# my notes\n")).toBe(true);
+  expect(saved.endsWith(ADDED)).toBe(true);
 });

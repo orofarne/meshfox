@@ -36,6 +36,9 @@ pub mod svg;
 pub mod tag_colors;
 pub mod timestamp;
 pub mod tree;
+pub mod undo;
+#[doc(hidden)]
+pub mod undo_conformance;
 
 #[cfg(test)]
 mod test_disk;

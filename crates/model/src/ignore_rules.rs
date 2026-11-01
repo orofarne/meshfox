@@ -27,7 +27,9 @@ pub struct IgnoreRules {
 }
 
 fn parts(path: &str) -> Vec<&str> {
-    path.split('/').filter(|p| !p.is_empty() && *p != ".").collect()
+    path.split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect()
 }
 
 impl IgnoreRules {
@@ -121,7 +123,10 @@ mod tests {
         assert!(r.is_ignored("a/run.log", false));
         assert!(!r.is_ignored("keep.log", false));
         assert!(r.is_ignored("drafts/x.md", false));
-        assert!(!r.is_ignored("a/drafts/x.md", false), "anchored to the root");
+        assert!(
+            !r.is_ignored("a/drafts/x.md", false),
+            "anchored to the root"
+        );
         // `dir/` only matches directories.
         assert!(!r.is_ignored("node_modules", false));
     }

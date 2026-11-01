@@ -598,7 +598,10 @@ mod tests {
             .collect();
         expected.sort();
         assert_eq!(rels(&index), expected);
-        assert!(expected.contains(&"docs/old.canvas.md".to_string()), "the deeper file brings it back");
+        assert!(
+            expected.contains(&"docs/old.canvas.md".to_string()),
+            "the deeper file brings it back"
+        );
     }
 
     #[test]

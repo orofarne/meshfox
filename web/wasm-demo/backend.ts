@@ -4,9 +4,9 @@
 // by construction: the info endpoint says so, so the UI offers no editing or
 // running, and anything that would need a worker answers 501.
 import { VirtualFiles } from "./files";
-import { EditSession } from "./session";
+import { EditSession, type UndoWasm } from "./session";
 
-export interface WasmApi {
+export interface WasmApi extends UndoWasm {
   renderCanvasWithWarnings(source: string, path: string, files?: unknown): string;
   version(): string;
 }
@@ -107,7 +107,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   let version = 1;
   let seq = 0;
   const watchers = new Set<{ push(event: unknown): void }>();
-  const session = new EditSession(doc.files.text(doc.path) ?? "");
+  const session = new EditSession(wasm, doc.files.text(doc.path) ?? "");
 
   /** Tells every open page what a server would after a save: the undo state,
    * and (when the document moved) that it changed. */
@@ -127,7 +127,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   };
   /** A new text for the document, if it renders; otherwise nothing changes and
    * the reason comes back. */
-  const commit = (raw: string, opKind: string, summary: string): string | undefined => {
+  const commit = (raw: string, opKind: string): string | undefined => {
     const before = session.raw;
     doc.files.set(doc.path, raw);
     render.reset();
@@ -137,7 +137,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       render.reset();
       return result.error;
     }
-    session.edit(raw, opKind, summary);
+    session.edit(raw, opKind);
     announce(true);
     return undefined;
   };
@@ -247,31 +247,27 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
           412,
         );
       }
-      const problem = commit(body ?? "", "source", "edited the source");
+      const problem = commit(body ?? "", "source");
       if (problem !== undefined) return text(problem, 422);
       return new Response(null, { status: 204, headers: { ETag: session.rev } });
     }
     if (method === "POST") {
       switch (route) {
-        case "undo": {
-          const changed = session.undo();
-          if (changed) {
-            show();
-            announce(true);
-          }
-          return stepResult(changed);
-        }
-        case "redo": {
-          const changed = session.redo();
-          if (changed) {
-            show();
-            announce(true);
-          }
-          return stepResult(changed);
-        }
+        case "undo":
+        case "redo":
         case "history/goto": {
-          const target = Number(JSON.parse(body ?? "{}").seq);
-          const changed = session.goto(target);
+          let changed: boolean;
+          try {
+            changed =
+              route === "undo"
+                ? session.undo()
+                : route === "redo"
+                  ? session.redo()
+                  : session.goto(Number(JSON.parse(body ?? "{}").seq));
+          } catch (e) {
+            // A step that no longer fits the document: nothing moved.
+            return text(e instanceof Error ? e.message : String(e), 422);
+          }
           if (changed) {
             show();
             announce(true);

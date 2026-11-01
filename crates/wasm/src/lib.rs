@@ -17,6 +17,7 @@
 
 use meshfox_model::file_source::{ConfineError, FileSource};
 use meshfox_model::ignore_rules::IgnoreRules;
+use meshfox_model::undo::{MemoryStorage, Payload, UndoLog};
 use meshfox_model::{host, render};
 use std::path::{Component, Path, PathBuf};
 use wasm_bindgen::prelude::*;
@@ -75,7 +76,11 @@ pub fn render_canvas(source: &str, path: &str, files: JsValue) -> Result<String,
 /// `{ "canvas": <the canvas>, "warnings": [{ "nodeId", "target", "reason" }] }`.
 /// A document that does not parse is still an error.
 #[wasm_bindgen(js_name = renderCanvasWithWarnings)]
-pub fn render_canvas_with_warnings(source: &str, path: &str, files: JsValue) -> Result<String, JsError> {
+pub fn render_canvas_with_warnings(
+    source: &str,
+    path: &str,
+    files: JsValue,
+) -> Result<String, JsError> {
     let provider = Provider::from_js(&files)?;
     let (canvas, warnings) = render::render_canvas_lenient(source, Path::new(path), &provider)
         .map_err(|e| JsError::new(&e.to_string()))?;
@@ -280,4 +285,119 @@ impl Default for JsIgnoreRules {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The fingerprint of a text as the server computes it (`body_rev`): what an
+/// `ETag` is made of, so two sides agree on "the same document".
+#[wasm_bindgen(js_name = bodyRev)]
+pub fn body_rev(text: &str) -> String {
+    meshfox_model::body_rev::body_rev(text)
+}
+
+/// A document's undo/redo history, held in the page: the very same log the
+/// server keeps in SQLite (`meshfox_model::undo`), over memory. Every step is
+/// a document-wide splice, so it costs the size of the change, and replays
+/// exactly. Sequence numbers are small integers, passed as JS numbers.
+#[wasm_bindgen(js_name = UndoLog)]
+pub struct JsUndoLog(UndoLog<MemoryStorage>);
+
+fn js_err(e: impl std::fmt::Display) -> JsError {
+    JsError::new(&e.to_string())
+}
+
+#[wasm_bindgen(js_class = UndoLog)]
+impl JsUndoLog {
+    /// A log whose starting point is `initial`, the text as opened.
+    #[wasm_bindgen(constructor)]
+    pub fn new(initial: &str) -> Result<JsUndoLog, JsError> {
+        let log = UndoLog::new(MemoryStorage::new());
+        log.reconcile_startup_drift(initial).map_err(js_err)?;
+        Ok(JsUndoLog(log))
+    }
+
+    /// Records that `before` became `after`; a redo tail is dropped.
+    pub fn push(&self, op_kind: &str, before: &str, after: &str) -> Result<(), JsError> {
+        self.0
+            .push(op_kind, Payload::Raw { before }, after)
+            .map_err(js_err)
+    }
+
+    /// The sequence number of the step the document is at, `0` at the start.
+    pub fn cursor(&self) -> Result<f64, JsError> {
+        Ok(self.0.cursor().map_err(js_err)? as f64)
+    }
+
+    #[wasm_bindgen(js_name = canUndo)]
+    pub fn can_undo(&self) -> Result<bool, JsError> {
+        self.0.can_undo().map_err(js_err)
+    }
+
+    #[wasm_bindgen(js_name = canRedo)]
+    pub fn can_redo(&self) -> Result<bool, JsError> {
+        self.0.can_redo().map_err(js_err)
+    }
+
+    /// Walks to step `seq` from the document `current`; the document there, or
+    /// `undefined` when nothing moved (already there, or out of range). A step
+    /// that no longer fits `current` is an error, and nothing is moved.
+    #[wasm_bindgen(js_name = jumpTo)]
+    pub fn jump_to(&self, seq: f64, current: &str) -> Result<Option<String>, JsError> {
+        let (raw, moved) = self
+            .0
+            .jump_to(seq as i64, current.to_string(), |entry, at, undo| {
+                entry
+                    .replay_document(at, undo)
+                    .ok_or_else(|| std::io::Error::other("a step no longer fits the document"))
+            })
+            .map_err(js_err)?;
+        Ok(moved.then_some(raw))
+    }
+
+    /// One step back from `current`, if there is one.
+    pub fn undo(&self, current: &str) -> Result<Option<String>, JsError> {
+        let cursor = self.0.cursor().map_err(js_err)?;
+        match self.0.peek_undo().map_err(js_err)? {
+            Some(entry) => {
+                let target = self.0.cursor_after_undoing(entry.seq).map_err(js_err)?;
+                debug_assert!(target < cursor);
+                self.jump_to(target as f64, current)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// One step forward from `current`, if there is one.
+    pub fn redo(&self, current: &str) -> Result<Option<String>, JsError> {
+        match self.0.peek_redo().map_err(js_err)? {
+            Some(entry) => self.jump_to(entry.seq as f64, current),
+            None => Ok(None),
+        }
+    }
+
+    /// The last `limit` applied steps and the whole redo tail, most-future
+    /// first, as JSON: `[{ "seq", "createdAt", "opKind", "applied" }]`.
+    pub fn history(&self, limit: u32) -> Result<String, JsError> {
+        let entries: Vec<serde_json::Value> = self
+            .0
+            .history_around(limit as usize)
+            .map_err(js_err)?
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "seq": h.entry.seq,
+                    "createdAt": h.entry.created_at,
+                    "opKind": h.entry.op_kind,
+                    "applied": h.applied,
+                })
+            })
+            .collect();
+        serde_json::to_string(&entries).map_err(js_err)
+    }
+}
+
+/// The text of a new, empty canvas whose root heading is `title`: the same
+/// template `meshfox create` writes.
+#[wasm_bindgen(js_name = newCanvasContent)]
+pub fn new_canvas_content(title: &str) -> String {
+    meshfox_model::mdcanvas::new_canvas_content(title)
 }

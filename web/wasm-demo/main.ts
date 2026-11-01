@@ -31,6 +31,10 @@ const STYLE = `
   .drop.over { border-color:var(--accent); background:color-mix(in srgb, var(--accent) 8%, var(--node-bg)); }
   .drop .hint { font-size:.9rem; opacity:.85; }
   .drop .sub { font-size:.78rem; opacity:.55; margin-top:.4rem; }
+  .fresh { display:flex; gap:.5rem; align-items:center; justify-content:center; flex-wrap:wrap; margin-top:1rem; font-size:.85rem; }
+  .fresh span { opacity:.65; }
+  .fresh .suffix { opacity:.5; margin-left:-.4rem; }
+  .fresh input { font:inherit; font-size:.85rem; padding:.35rem .6rem; border-radius:6px; border:1px solid var(--node-border); background:var(--node-bg); color:var(--fg); width:10rem; }
   .row { display:flex; gap:.6rem; justify-content:center; flex-wrap:wrap; margin-top:1.1rem; }
   .launcher button { font:inherit; font-size:.85rem; padding:.4rem .9rem; border-radius:6px; border:1px solid var(--node-border); background:transparent; color:var(--fg); cursor:pointer; }
   .launcher button:hover { border-color:var(--accent); color:var(--accent); }
@@ -178,6 +182,16 @@ async function start(doc: Document) {
 /** What tells this document from every other the page has opened. */
 const documentKey = (picked: Picked, path: string) => (picked.rootName ? `${picked.rootName}/${path}` : path);
 
+/** A new, empty canvas: its text is the template `meshfox create` writes. */
+async function newCanvas(title: string) {
+  status("Loading the model…");
+  await ready;
+  const path = `${title}.canvas.md`;
+  const files = new VirtualFiles();
+  files.set(path, wasmApi.newCanvasContent(title));
+  await start({ path, files, key: `new:${path}` });
+}
+
 async function chooseAndStart(picked: Picked) {
   // Canvases first; any other Markdown file only if there is no canvas.
   const canvases = picked.candidates.filter((p) => p.endsWith(".canvas.md"));
@@ -236,6 +250,22 @@ function launcher(note?: string) {
     if (e.dataTransfer) handle(fromDrop(e.dataTransfer.items, newRules));
   };
 
+  const newName = el("input", { id: "new-name", type: "text", value: "untitled", ariaLabel: "name of the new canvas" });
+  newName.spellcheck = false;
+  const create = () => {
+    const title = newName.value.trim().replace(/(\.canvas)?\.md$/, "") || "untitled";
+    void newCanvas(title);
+  };
+  newName.onkeydown = (e) => e.key === "Enter" && create();
+  const fresh = el(
+    "div",
+    { className: "fresh" },
+    el("span", { textContent: "or start a new canvas:" }),
+    newName,
+    el("span", { className: "suffix", textContent: ".canvas.md" }),
+    el("button", { id: "new-canvas", textContent: "New canvas", onclick: create }),
+  );
+
   root.append(
     el(
       "div",
@@ -257,6 +287,7 @@ function launcher(note?: string) {
             "meshfox runs entirely in this tab, as WebAssembly. The file you open is read here and never uploaded.",
         }),
         drop,
+        fresh,
         filePicker,
         folderPicker,
         el("div", { id: "choices" }),

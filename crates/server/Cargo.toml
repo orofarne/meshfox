@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 meshfox-core = { path = "../core" }
+meshfox-model = { path = "../model" }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "sync", "io-util", "time", "signal", "fs"] }
 tower-http = { version = "0.5", features = ["cors"] }
