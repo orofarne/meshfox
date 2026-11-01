@@ -54,10 +54,15 @@ export type Rendered =
 
 /** Renders the document once (it never changes) — also how the launcher finds
  * out, before loading the UI, that a document cannot be shown. */
-export function createRenderer(wasm: WasmApi, doc: Document): () => Rendered {
+export type Renderer = (() => Rendered) & {
+  /** Forget the result: the files changed, render again on the next call. */
+  reset(): void;
+};
+
+export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
   const provider = { read: (path: string) => doc.files.get(path) ?? null };
   let rendered: Rendered | undefined;
-  return () => {
+  const render = () => {
     if (rendered === undefined) {
       try {
         const source = doc.files.text(doc.path);
@@ -72,13 +77,28 @@ export function createRenderer(wasm: WasmApi, doc: Document): () => Rendered {
     }
     return rendered;
   };
+  return Object.assign(render, {
+    reset() {
+      rendered = undefined;
+    },
+  });
 }
 
-export function installBackend(wasm: WasmApi, doc: Document, render: () => Rendered): void {
+export interface Backend {
+  /** The files changed: render again and tell the page, which reloads the
+   * canvas as it does when a file changes under a real server. */
+  refresh(): Rendered;
+}
+
+export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): Backend {
   const nativeFetch = window.fetch.bind(window);
   const NativeWebSocket = window.WebSocket;
   const base = new URL(".", document.baseURI).pathname;
   const canvasDir = VirtualFiles.dirname(doc.path);
+  // Bumped by every `refresh`: the page compares it to know the canvas moved on.
+  let version = 1;
+  let seq = 0;
+  const watchers = new Set<{ push(event: unknown): void }>();
 
   const canvas = (): { nodes: Array<{ id: string; target?: string | null }> } | undefined => {
     const r = render();
@@ -101,7 +121,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: () => Rende
         case "canvas": {
           const r = render();
           if (r.json === undefined) return text(r.error, 422);
-          return json({ ...JSON.parse(r.json), canvasVersion: 1, serverSession: SESSION });
+          return json({ ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION });
         }
         case "includes":
         case "services":
@@ -155,7 +175,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: () => Rende
       return undefined;
     }
   };
-  const swapped = new Map<string, string>();
+  let swapped = new Map<string, string>();
   const assetNow = (value: string | null): string | undefined => {
     const url = assetUrl(value);
     if (!url) return undefined;
@@ -241,6 +261,11 @@ export function installBackend(wasm: WasmApi, doc: Document, render: () => Rende
       this.onopen?.(new Event("open"));
       this.emit({ type: "connected", seq: 0 });
       this.timer = setInterval(() => this.emit({ type: "heartbeat" }), 10_000);
+      watchers.add(this);
+    }
+
+    push(event: unknown) {
+      this.emit(event);
     }
 
     private fail() {
@@ -254,6 +279,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: () => Rende
     close() {
       if (this.readyState === 3) return;
       clearInterval(this.timer);
+      watchers.delete(this);
       this.readyState = 3;
       this.onclose?.(new CloseEvent("close", { code: 1000 }));
     }
@@ -268,4 +294,16 @@ export function installBackend(wasm: WasmApi, doc: Document, render: () => Rende
     return new NativeWebSocket(url, protocols);
   } as unknown as typeof WebSocket;
   Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+
+  return {
+    refresh() {
+      render.reset();
+      swapped = new Map(); // blob URLs of the old bytes
+      version++;
+      const result = render();
+      // The same event a real server sends when the file changes under it.
+      for (const socket of watchers) socket.push({ type: "changed", seq: ++seq });
+      return result;
+    },
+  };
 }

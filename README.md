@@ -1465,6 +1465,24 @@ export FORCE_COLOR=1
 cd web && npm run test:unit
 ```
 
+`meshfox-model` is the document model with no disk and no OS under it, and `meshfox-wasm` is its WebAssembly binding (see `web/wasm-demo/README.md`). `wasm-prep` adds the `wasm32-unknown-unknown` compile target and the `wasm-bindgen` CLI at the exact version `Cargo.lock` pins (the CLI and the library must match) — both idempotent, so re-running once done costs nothing, the same arrangement as `e2e-prep` below; the CLI is a one-time `cargo install`, a few minutes. `wasm` then checks the model still builds for `wasm32-unknown-unknown` (nothing but pure Rust may creep back into it) and runs the binding's Node tests against the real `.wasm` (`scripts/test-wasm.sh`):
+
+```sh name="wasm-prep"
+set -e
+rustup target add wasm32-unknown-unknown
+want=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$want" ]; then
+  cargo install wasm-bindgen-cli --version "$want" --locked
+fi
+```
+
+```sh name="wasm" deps="wasm-prep"
+set -e
+export CARGO_TERM_COLOR=always
+cargo check -p meshfox-model --target wasm32-unknown-unknown
+scripts/test-wasm.sh
+```
+
 ### End-to-end tests
 <!-- meshfox:node id="e2e-tests" -->
 
@@ -1498,6 +1516,14 @@ Computed Starlark views have a focused real-worker/browser suite in `web/e2e/sta
 export FORCE_COLOR=1
 cd web
 npm run test:starlark-render
+```
+
+The in-browser build (the real UI over the WebAssembly model, no `meshfox` process; `web/wasm-demo/`, `web/e2e-wasm-demo/`) has its own suite, in Chromium and Firefox: `wasm-demo` builds the wasm package and the static site (`npm run build:wasm`) and then drives it from a file or folder picker. It needs `wasm-prep` (from "Unit tests") and `e2e-prep`, and serves on port 4600, which must be free (or already serving this build):
+
+```sh name="wasm-demo" deps="unit-tests/wasm-prep,e2e-prep"
+export FORCE_COLOR=1
+cd web
+npm run test:wasm-demo
 ```
 
 ### VS Code end-to-end tests
@@ -1656,9 +1682,9 @@ echo "binary: target/release/meshfox"
 ### Full check
 <!-- meshfox:node id="full-check" -->
 
-Run unit tests (macOS host and the Linux VM), typecheck, and e2e tests:
+Run unit tests (macOS host and the Linux VM), the WebAssembly model's checks, typecheck, and e2e tests (including the in-browser build's):
 
-```bash name="full-check" deps="unit-tests/run!,linux-tests/run!,linting/typecheck!,e2e-tests/run!,release-build/release-build!"
+```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,e2e-tests/run!,e2e-tests/wasm-demo!,release-build/release-build!"
 echo "done"
 ```
 

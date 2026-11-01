@@ -8,7 +8,9 @@
 // launcher), and Forward to a document that is gone lands on the launcher with
 // a note instead of a blank page.
 import init, * as wasmApi from "../../crates/wasm/pkg/meshfox_wasm.js";
-import { createRenderer, installBackend, type Document } from "./backend";
+import { addPicked } from "./add";
+import { createRenderer, installBackend, type Backend, type Document, type IncludeWarning } from "./backend";
+import { VirtualFiles } from "./files";
 import { fromDrop, fromFileList, type Picked } from "./pick";
 import { applyThemePreference, getThemePreference } from "../src/theme";
 import "@fontsource/fira-code/400.css";
@@ -81,6 +83,61 @@ const skippedNote = (skipped: Picked["skipped"]): string | undefined => {
   return parts.length > 0 ? `not read: ${parts.join(", ")}` : undefined;
 };
 
+/** The strip at the bottom of a document: what is missing, and ways to add it. */
+function pill(doc: Document, backend: Backend, firstWarnings: IncludeWarning[]): HTMLElement {
+  let warnings = firstWarnings;
+  let problem: string | undefined;
+  const label = el("span");
+  const draw = () => {
+    const names = [...new Set(warnings.map((w) => w.target.replace(/^\.\//, "")))];
+    label.textContent = [
+      "in your browser · read-only",
+      doc.note,
+      names.length > 0 &&
+        `${names.length} include${names.length === 1 ? "" : "s"} missing: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""}`,
+      problem,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  };
+  const canvasDir = VirtualFiles.dirname(doc.path);
+  const add = async (task: Promise<Picked>, loose: boolean) => {
+    try {
+      const picked = await task;
+      const n = addPicked(doc.files, canvasDir, warnings.map((w) => w.target), picked.files, loose);
+      problem = n === 0 ? "nothing to add in that" : undefined;
+      const result = backend.refresh();
+      if (result.error !== undefined) problem = result.error;
+      else warnings = result.warnings;
+    } catch (e) {
+      problem = String(e);
+    }
+    draw();
+  };
+  const filePicker = el("input", { type: "file", multiple: true, hidden: true });
+  const folderPicker = el("input", { type: "file", hidden: true });
+  folderPicker.setAttribute("webkitdirectory", "");
+  filePicker.onchange = () => {
+    if (filePicker.files) void add(fromFileList(filePicker.files, newRules), true);
+    filePicker.value = "";
+  };
+  folderPicker.onchange = () => {
+    if (folderPicker.files) void add(fromFileList(folderPicker.files, newRules), false);
+    folderPicker.value = "";
+  };
+  draw();
+  return el(
+    "div",
+    { id: "wasm-pill" },
+    label,
+    filePicker,
+    folderPicker,
+    el("a", { id: "wasm-add-files", textContent: "add files…", onclick: () => filePicker.click() }),
+    el("a", { id: "wasm-add-folder", textContent: "add folder…", onclick: () => folderPicker.click() }),
+    el("a", { textContent: "open another", onclick: () => history.back() }),
+  );
+}
+
 async function start(doc: Document) {
   status(`Loading the model…`);
   await ready;
@@ -91,20 +148,13 @@ async function start(doc: Document) {
     status(`${doc.path}: ${first.error}`, true);
     return;
   }
-  installBackend(wasmApi, doc, render);
-  const missing = first.warnings;
-  if (missing.length > 0) {
-    const names = [...new Set(missing.map((w) => w.target.replace(/^\.\//, "")))];
-    doc = { ...doc, note: [doc.note, `${names.length} include${names.length === 1 ? "" : "s"} missing: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""}`].filter(Boolean).join(" · ") };
-  }
+  const backend = installBackend(wasmApi, doc, render);
   document.getElementById("launcher")?.remove();
   // The URL stays as it is: the app's own relative `api/...` requests (and the
   // fetch interception) depend on it.
   history.pushState({ meshfox: "document" } satisfies HistoryState, "");
   documentOpen = true;
-  const pill = el("div", { id: "wasm-pill", textContent: ["in your browser · read-only", doc.note].filter(Boolean).join(" · ") });
-  pill.append(el("a", { textContent: "open another", onclick: () => history.back() }));
-  document.body.append(pill);
+  document.body.append(pill(doc, backend, first.warnings));
   await import("../src/main");
 }
 

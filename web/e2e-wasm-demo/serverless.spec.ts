@@ -255,7 +255,7 @@ test("\"open another\" in the pill goes back to the launcher", async ({ page }) 
   await page.goto("/");
   await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
   await expect(page.getByText("The root.")).toBeVisible();
-  await page.locator("#wasm-pill a").click();
+  await page.locator("#wasm-pill").getByText("open another").click();
   await expect(page.locator("#launcher")).toBeVisible();
 });
 
@@ -313,4 +313,37 @@ test("with execution disabled there is nothing to click that would run", async (
   await expect(page.getByRole("button", { name: /Console/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /reset session/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /search/ })).toBeVisible();
+});
+
+test("add files fills a missing include, wherever the picked file sits", async ({ page }) => {
+  const dir = tmpDir();
+  const doc = path.join(dir, "doc.canvas.md");
+  fs.writeFileSync(
+    doc,
+    ROOT +
+      '## Notes\n<!-- meshfox:node id="notes" type="include" -->\n\n[notes](./docs/notes.md)\n\n' +
+      '## Other\n<!-- meshfox:node id="other" type="include" -->\n\n[other](./other.md)\n',
+  );
+  const notes = path.join(dir, "notes.md");
+  fs.writeFileSync(notes, "# Notes\n\nfrom the added file\n");
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(doc);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("2 includes missing: docs/notes.md, other.md");
+  await expect(page.locator(".markdown-alert-warning")).toHaveCount(2);
+
+  // `notes.md` alone goes to `docs/notes.md`, where the include looks.
+  await page.locator("#wasm-pill input[type=file]:not([webkitdirectory])").setInputFiles(notes);
+  await expect(page.locator("#wasm-pill")).toContainText("1 include missing: other.md");
+  await expect(page.getByText("from the added file")).toBeVisible();
+  await expect(page.locator(".markdown-alert-warning")).toHaveCount(1);
+
+  // A whole folder fills the rest, and the page never reloaded.
+  const more = tmpDir();
+  fs.writeFileSync(path.join(more, "other.md"), "# Other\n\nfrom the added folder\n");
+  await page.locator("#wasm-pill input[webkitdirectory]").setInputFiles(more);
+  await expect(page.locator("#wasm-pill")).not.toContainText("missing");
+  await expect(page.getByText("from the added folder")).toBeVisible();
+  await expect(page.locator(".markdown-alert-warning")).toHaveCount(0);
+  await expect(page.getByText("from the added file")).toBeVisible();
 });

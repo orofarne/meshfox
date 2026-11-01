@@ -21,6 +21,13 @@ resolve), or drop either onto the page. The build is a static site with
 relative URLs, emitted as `index.html`, so it can be served from any path
 (the plan: `https://meshfox.orofarne.net/editor/`).
 
+A document with an `include` (or image, or file link) whose file was not
+picked still opens: the node shows a notice and the strip at the bottom lists
+what is missing. "add files…" / "add folder…" there put more files in place and
+the page refreshes in place (a file lands where the missing target points when
+its name matches, otherwise beside the canvas; a folder is taken as the same
+root as the first pick).
+
 Browser history: opening a document pushes a history entry (the URL is left
 alone, since the app's relative `api/...` requests depend on it), so Back
 returns to the launcher. A document lives only in memory, so a reload, or
