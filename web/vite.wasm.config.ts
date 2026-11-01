@@ -2,7 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 import fs from "node:fs";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
-import { headersFile, nginxHeaders, SECURITY_HEADERS } from "./wasm-demo/securityHeaders.ts";
+import { headersFile, SECURITY_HEADERS } from "./wasm-demo/securityHeaders.ts";
 
 // The in-browser build: the same app as `vite.config.ts`, but its entry is
 // `editor.html`, whose script swaps the HTTP backend for the WebAssembly one
@@ -30,9 +30,7 @@ const writeHeaders: Plugin = {
   name: "editor-headers-file",
   apply: "build",
   closeBundle() {
-    const dir = path.resolve(import.meta.dirname, "dist-wasm");
-    fs.writeFileSync(path.join(dir, "_headers"), headersFile());
-    fs.writeFileSync(path.join(dir, "security-headers.conf"), nginxHeaders());
+    fs.writeFileSync(path.resolve(import.meta.dirname, "dist-wasm", "_headers"), headersFile());
   },
 };
 

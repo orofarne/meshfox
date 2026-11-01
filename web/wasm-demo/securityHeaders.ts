@@ -1,6 +1,6 @@
 // The headers the editor must be served with. One list, used by the preview
 // server the tests run against and written into the build as `_headers`
-// (Netlify / Cloudflare Pages format; the README shows the nginx equivalent),
+// (Cloudflare Pages format),
 // so what is tested is what is deployed.
 //
 // The Content-Security-Policy is the second line of defence: a blob URL
@@ -49,17 +49,5 @@ export function headersFile(): string {
   return [
     block("/*", SECURITY_HEADERS),
     ...CACHE_RULES.map((r) => block(r.path, r.headers)),
-    block("/*.wasm", { "Content-Type": "application/wasm" }),
   ].join("\n");
-}
-
-/** The same security headers as nginx `add_header` lines (an include file:
- * `add_header` in a `location` replaces the ones above it, so every location
- * that sets its own must include this too). */
-export function nginxHeaders(): string {
-  return (
-    Object.entries(SECURITY_HEADERS)
-      .map(([k, v]) => `add_header ${k} "${v}" always;`)
-      .join("\n") + "\n"
-  );
 }

@@ -79,23 +79,12 @@ that node, as `meshfox view` does.
 
 ## Serving it (security headers)
 
-The build writes `dist-wasm/_headers` (Netlify / Cloudflare Pages format) from
-`securityHeaders.ts`; the preview server the tests run against sends the same
-headers, so the suite runs under the Content-Security-Policy. On nginx:
+`scripts/package-editor.sh` builds the site into `editor-bundle/`, ready for
+Cloudflare Pages. The build writes `_headers` (from `securityHeaders.ts`; Pages
+reads it itself); the preview server the tests run against sends the same
+headers, so the suite runs under the Content-Security-Policy.
 
-```nginx
-add_header Content-Security-Policy "<the line from dist-wasm/_headers>" always;
-add_header X-Content-Type-Options nosniff always;
-add_header Referrer-Policy no-referrer always;
-add_header Cross-Origin-Opener-Policy same-origin always;
-add_header X-Frame-Options DENY always;
-location /assets/ { add_header Cache-Control "public, max-age=31536000, immutable"; }
-location = /index.html { add_header Cache-Control no-cache; }
-types { application/wasm wasm; }
-```
-
-(`add_header` in a `location` replaces the server-level ones: repeat the
-security headers there.) Serve it from its **own origin** (a subdomain such as
+Serve it from its **own origin** (a subdomain such as
 `editor.meshfox.orofarne.net`): drafts live in that origin's IndexedDB, and
 nothing else may run beside them. What a document can make the page do:
 Markdown HTML is escaped; a link to an SVG opens it as text; a drawn SVG is
