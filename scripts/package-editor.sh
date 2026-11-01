@@ -90,7 +90,7 @@ for a while — a tab opened before the update still names them.
 DOC
 
 # Pre-compressed copies. Already-compressed formats are left alone.
-find "$out" -type f \( -name '*.js' -o -name '*.css' -o -name '*.wasm' -o -name '*.html' -o -name '*.svg' -o -name '*.json' -o -name '*.ico' -o -name '*.conf' \) |
+find "$out" -type f \( -name '*.js' -o -name '*.css' -o -name '*.wasm' -o -name '*.html' -o -name '*.svg' -o -name '*.json' -o -name '*.ico' \) |
   while read -r f; do
     brotli -q 11 -f -k "$f" -o "$f.br"
     gzip -9 -f -k -n "$f"
