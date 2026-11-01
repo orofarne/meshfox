@@ -85,7 +85,7 @@ reads it itself); the preview server the tests run against sends the same
 headers, so the suite runs under the Content-Security-Policy.
 
 Serve it from its **own origin** (a subdomain such as
-`editor.meshfox.orofarne.net`): drafts live in that origin's IndexedDB, and
+`meshfox-editor.orofarne.net`): drafts live in that origin's IndexedDB, and
 nothing else may run beside them. What a document can make the page do:
 Markdown HTML is escaped; a link to an SVG opens it as text; a drawn SVG is
 cleaned of scripts before it gets a URL; remote images load (a document can see
