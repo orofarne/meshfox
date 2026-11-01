@@ -4,6 +4,7 @@
 // by construction: the info endpoint says so, so the UI offers no editing or
 // running, and anything that would need a worker answers 501.
 import { VirtualFiles } from "./files";
+import { EditSession } from "./session";
 
 export interface WasmApi {
   renderCanvasWithWarnings(source: string, path: string, files?: unknown): string;
@@ -88,6 +89,10 @@ export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
 }
 
 export interface Backend {
+  /** The text being edited and its undo history. */
+  session: EditSession;
+  /** The document as rendered now. */
+  current(): Rendered;
   /** The files changed: render again and tell the page, which reloads the
    * canvas as it does when a file changes under a real server. */
   refresh(): Rendered;
@@ -102,6 +107,47 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   let version = 1;
   let seq = 0;
   const watchers = new Set<{ push(event: unknown): void }>();
+  const session = new EditSession(doc.files.text(doc.path) ?? "");
+
+  /** Tells every open page what a server would after a save: the undo state,
+   * and (when the document moved) that it changed. */
+  const announce = (changed: boolean) => {
+    version++;
+    for (const socket of watchers) {
+      socket.push({ type: "undo-state-changed", canUndo: session.canUndo, canRedo: session.canRedo, seq: ++seq });
+      if (changed) socket.push({ type: "changed", seq: ++seq });
+    }
+  };
+  /** Makes the session's text the document: the file the renderer reads, then
+   * a fresh render. */
+  const show = (): Rendered => {
+    doc.files.set(doc.path, session.raw);
+    render.reset();
+    return render();
+  };
+  /** A new text for the document, if it renders; otherwise nothing changes and
+   * the reason comes back. */
+  const commit = (raw: string, opKind: string, summary: string): string | undefined => {
+    const before = session.raw;
+    doc.files.set(doc.path, raw);
+    render.reset();
+    const result = render();
+    if (result.error !== undefined) {
+      doc.files.set(doc.path, before);
+      render.reset();
+      return result.error;
+    }
+    session.edit(raw, opKind, summary);
+    announce(true);
+    return undefined;
+  };
+  const canvasResponse = (extra: Record<string, unknown> = {}): Response => {
+    const r = render();
+    if (r.json === undefined) return text(r.error, 422);
+    return json({ ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION, documentKey: doc.key, ...extra });
+  };
+  const stepResult = (changed: boolean): Response =>
+    canvasResponse({ changed, canUndo: session.canUndo, canRedo: session.canRedo });
 
   const canvas = (): { nodes: Array<{ id: string; target?: string | null }> } | undefined => {
     const r = render();
@@ -113,18 +159,38 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     VirtualFiles.join(params.get("dir") || canvasDir, params.get("file") ?? "");
   const mimeOf = (path: string): string => MIME[path.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
 
-  const handle = async (route: string, params: URLSearchParams, method: string): Promise<Response> => {
+  const handle = async (
+    route: string,
+    params: URLSearchParams,
+    method: string,
+    body: string | undefined,
+    headers: Headers,
+  ): Promise<Response> => {
     if (method === "GET") {
       switch (route) {
         case "ping":
           return text("ok");
         case "info":
           // `remote`: nothing here can open a file on "the server's machine".
-          return json({ readOnly: true, noExec: true, remote: true, serverless: true, version: wasm.version() });
-        case "canvas": {
-          const r = render();
-          if (r.json === undefined) return text(r.error, 422);
-          return json({ ...JSON.parse(r.json), canvasVersion: version, serverSession: SESSION, documentKey: doc.key });
+          return json({ readOnly: false, noExec: true, remote: true, serverless: true, version: wasm.version() });
+        case "canvas":
+          return canvasResponse();
+        case "canvas/raw": {
+          const include = params.get("include");
+          if (include === null) {
+            return new Response(session.raw, {
+              headers: { "Content-Type": "text/plain; charset=utf-8", ETag: session.rev, "x-meshfox-read-only": "false" },
+            });
+          }
+          // An included file: shown, not editable here yet.
+          const node = canvas()?.nodes.find((n) => n.id === include);
+          const target = node?.target;
+          const path = target ? VirtualFiles.join(canvasDir, target.split("#")[0]) : undefined;
+          const data = path === undefined ? undefined : doc.files.get(path);
+          if (data === undefined) return text(`no readable include ${include}`, 404);
+          return new Response(data as BodyInit, {
+            headers: { "Content-Type": "text/plain; charset=utf-8", ETag: '"mfx-include"', "x-meshfox-read-only": "true" },
+          });
         }
         case "includes":
         case "services":
@@ -132,8 +198,15 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
         case "syntax":
         case "vars":
           return json([]);
-        case "history":
-          return json({ cursor: 0, canUndo: false, canRedo: false, entries: [] });
+        case "history": {
+          const limit = Number(params.get("limit") ?? 50);
+          return json({
+            cursor: session.seq,
+            canUndo: session.canUndo,
+            canRedo: session.canRedo,
+            entries: session.history(Number.isFinite(limit) ? limit : 50),
+          });
+        }
         case "link-preview":
           return json({ preview: null });
         case "asset": {
@@ -159,7 +232,60 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
         return json({ content, truncated });
       }
     }
-    return text("not available in the serverless viewer (read-only, nothing runs here)", 501);
+    if (method === "PUT" && route === "canvas/raw") {
+      if (params.get("include") !== null) {
+        return text("an included file cannot be edited in the browser yet", 403);
+      }
+      if (!session.matches(headers.get("if-match"))) {
+        return json(
+          {
+            error: "sourceConflict",
+            message: "the document changed since it was read — reread, then retry with the current ETag",
+            currentText: session.raw,
+            currentRev: session.rev,
+          },
+          412,
+        );
+      }
+      const problem = commit(body ?? "", "source", "edited the source");
+      if (problem !== undefined) return text(problem, 422);
+      return new Response(null, { status: 204, headers: { ETag: session.rev } });
+    }
+    if (method === "POST") {
+      switch (route) {
+        case "undo": {
+          const changed = session.undo();
+          if (changed) {
+            show();
+            announce(true);
+          }
+          return stepResult(changed);
+        }
+        case "redo": {
+          const changed = session.redo();
+          if (changed) {
+            show();
+            announce(true);
+          }
+          return stepResult(changed);
+        }
+        case "history/goto": {
+          const target = Number(JSON.parse(body ?? "{}").seq);
+          const changed = session.goto(target);
+          if (changed) {
+            show();
+            announce(true);
+          }
+          return stepResult(changed);
+        }
+      }
+    }
+    return text(
+      method === "GET"
+        ? "not available in the browser (nothing runs here)"
+        : "this edit is not available in the browser editor yet — Source mode can change anything",
+      501,
+    );
   };
 
   // `fetch` is only half of it: an `<img src="api/asset?...">` is loaded by the
@@ -231,7 +357,9 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       return nativeFetch(input, init);
     }
     const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
-    return handle(url.pathname.slice(base.length + "api/".length), url.searchParams, method);
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    const body = typeof init?.body === "string" ? init.body : undefined;
+    return handle(url.pathname.slice(base.length + "api/".length), url.searchParams, method, body, headers);
   };
 
   // `api/watch` is the live-update channel: nothing ever changes here, so it
@@ -299,6 +427,8 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   Object.assign(window.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
 
   return {
+    session,
+    current: () => render(),
     refresh() {
       render.reset();
       swapped = new Map(); // blob URLs of the old bytes

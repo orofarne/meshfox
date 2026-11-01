@@ -66,6 +66,9 @@ function status(message: string, isError = false) {
 }
 
 let documentOpen = false;
+/** Whether the open document has edits that were never downloaded. */
+let unsaved: () => boolean = () => false;
+let discarding = false;
 
 // Loaded as soon as the page is: a folder pick needs the model's ignore rules,
 // and a drop must hand over its entries before its first `await`.
@@ -83,15 +86,27 @@ const skippedNote = (skipped: Picked["skipped"]): string | undefined => {
   return parts.length > 0 ? `not read: ${parts.join(", ")}` : undefined;
 };
 
+/** The edited text as a file: the page has no disk, so this is how it leaves. */
+function download(doc: Document, backend: Backend) {
+  const blob = new Blob([backend.session.raw], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = el("a", { href: url, download: doc.path.split("/").pop() ?? "canvas.canvas.md" });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  backend.session.markSaved();
+}
+
 /** The strip at the bottom of a document: what is missing, and ways to add it. */
-function pill(doc: Document, backend: Backend, firstWarnings: IncludeWarning[]): HTMLElement {
-  let warnings = firstWarnings;
+function pill(doc: Document, backend: Backend): HTMLElement {
   let problem: string | undefined;
   const label = el("span");
+  const warnings = (): IncludeWarning[] => backend.current().warnings ?? [];
   const draw = () => {
-    const names = [...new Set(warnings.map((w) => w.target.replace(/^\.\//, "")))];
+    const names = [...new Set(warnings().map((w) => w.target.replace(/^\.\//, "")))];
     label.textContent = [
-      "in your browser · read-only",
+      backend.session.dirty ? "in your browser · unsaved changes" : "in your browser",
       doc.note,
       names.length > 0 &&
         `${names.length} include${names.length === 1 ? "" : "s"} missing: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""}`,
@@ -104,11 +119,10 @@ function pill(doc: Document, backend: Backend, firstWarnings: IncludeWarning[]):
   const add = async (task: Promise<Picked>, loose: boolean) => {
     try {
       const picked = await task;
-      const n = addPicked(doc.files, canvasDir, warnings.map((w) => w.target), picked.files, loose);
+      const n = addPicked(doc.files, canvasDir, warnings().map((w) => w.target), picked.files, loose);
       problem = n === 0 ? "nothing to add in that" : undefined;
       const result = backend.refresh();
       if (result.error !== undefined) problem = result.error;
-      else warnings = result.warnings;
     } catch (e) {
       problem = String(e);
     }
@@ -125,6 +139,7 @@ function pill(doc: Document, backend: Backend, firstWarnings: IncludeWarning[]):
     if (folderPicker.files) void add(fromFileList(folderPicker.files, newRules), false);
     folderPicker.value = "";
   };
+  backend.session.onChange(draw);
   draw();
   return el(
     "div",
@@ -132,6 +147,7 @@ function pill(doc: Document, backend: Backend, firstWarnings: IncludeWarning[]):
     label,
     filePicker,
     folderPicker,
+    el("a", { id: "wasm-download", textContent: "download", onclick: () => download(doc, backend) }),
     el("a", { id: "wasm-add-files", textContent: "add files…", onclick: () => filePicker.click() }),
     el("a", { id: "wasm-add-folder", textContent: "add folder…", onclick: () => folderPicker.click() }),
     el("a", { textContent: "open another", onclick: () => history.back() }),
@@ -154,7 +170,8 @@ async function start(doc: Document) {
   // fetch interception) depend on it.
   history.pushState({ meshfox: "document" } satisfies HistoryState, "");
   documentOpen = true;
-  document.body.append(pill(doc, backend, first.warnings));
+  document.body.append(pill(doc, backend));
+  unsaved = () => backend.session.dirty;
   await import("../src/main");
 }
 
@@ -264,9 +281,22 @@ const arrivedOnDocument = (history.state as HistoryState)?.meshfox === "document
 history.replaceState({ meshfox: "launcher" } satisfies HistoryState, "");
 launcher(arrivedOnDocument ? "That document was only in memory. Open it again to continue." : undefined);
 
+window.addEventListener("beforeunload", (event) => {
+  if (documentOpen && !discarding && unsaved()) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
 window.addEventListener("popstate", (event) => {
   const state = event.state as HistoryState;
   if (documentOpen && state?.meshfox !== "document") {
+    if (unsaved() && !confirm("Leave without downloading? Your edits exist only in this tab.")) {
+      // Back cannot be cancelled, only undone: put the document's entry back.
+      history.pushState({ meshfox: "document" } satisfies HistoryState, "");
+      return;
+    }
+    discarding = true;
     // Back out of a document: the app cannot be unmounted cleanly (its fetch
     // and socket are replaced), so start over from the launcher.
     location.reload();

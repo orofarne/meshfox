@@ -47,8 +47,8 @@ test("a repository example opens from a picked file, with no server behind it", 
   await page.goto("/");
   await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(path.join(REPO, "examples/hello.canvas.md"));
   await expect(page.getByText("Hello Project")).toBeVisible();
-  await expect(page.getByText("read-only", { exact: true })).toBeVisible();
   await expect(page.getByText("noexec", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
   await expect(page.locator("#wasm-pill")).toContainText("in your browser");
 });
 
@@ -362,4 +362,116 @@ test("what the page remembers about a document is keyed by the document, not jus
   await expect
     .poll(() => page.evaluate(() => Object.keys(localStorage).filter((k) => k.startsWith("meshfox-folded:"))))
     .toEqual([`meshfox-folded:${path.basename(dir)}/doc.canvas.md:root`]);
+});
+
+// Monaco's shortcuts follow the browser's reported platform, and Playwright's
+// desktop presets report Linux/Windows whatever the host: always Control.
+const MOD = "Control";
+const END_OF_DOCUMENT = "Control+End";
+
+/** Opens Source mode and types into Monaco: `replace` swaps the whole text,
+ * otherwise `text` goes at the end. */
+async function typeInSource(page: Page, text: string, replace = false) {
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.getByRole("button", { name: "Source" }).click();
+  const editor = page.locator(".mesh-source-editor-body .monaco-editor");
+  await editor.waitFor();
+  // Only once the document's text is in the editor does a key press mean anything.
+  await expect(page.locator(".mesh-source-editor-body .view-lines")).toContainText("Root");
+  await editor.click();
+  await page.keyboard.press(replace ? `${MOD}+A` : END_OF_DOCUMENT);
+  // Inserted in one go, not typed: typing makes Monaco complete and commit words.
+  // Chromium takes a (synthetic) paste event; Firefox's Monaco ignores that and
+  // doubles `insertText`, so it pastes from the real clipboard.
+  if (page.context().browser()?.browserType().name() === "firefox") {
+    await page.evaluate((value) => navigator.clipboard.writeText(value), text);
+    await page.keyboard.press("Control+V");
+  } else {
+    await page.locator(".mesh-source-editor-body textarea").evaluate((el, value) => {
+      const data = new DataTransfer();
+      data.setData("text/plain", value);
+      el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+    }, text);
+  }
+}
+
+async function editSource(page: Page, addition: string) {
+  await typeInSource(page, addition);
+  const save = page.locator(".mesh-source-editor-actions button", { hasText: "Save" });
+  await expect(save).toBeEnabled();
+  await save.click();
+  // A saved edit closes the source editor, back to the canvas.
+  await expect(page.locator(".mesh-source-editor")).toHaveCount(0);
+}
+
+const ADDED = '\n## Added\n<!-- meshfox:node id="added" -->\n\nadded in the browser\n';
+
+test("edit the source, download the result, undo", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+
+  // What leaves the page is the edited file, byte for byte.
+  const downloading = page.waitForEvent("download");
+  await page.locator("#wasm-download").click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe("doc.canvas.md");
+  const saved = fs.readFileSync((await download.path())!, "utf8");
+  expect(saved).toBe(ROOT + ADDED);
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+
+  // Undo walks back through the edit; the shown text follows, and the page is
+  // "unsaved" again: it no longer matches what was downloaded. Redo returns to
+  // the downloaded text, so it is clean again.
+  await page.getByRole("button", { name: /undo/ }).click();
+  await expect(page.getByText("added in the browser")).toHaveCount(0);
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+  await page.getByRole("button", { name: /redo/ }).click();
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+});
+
+test("a source edit that does not parse is refused and changes nothing", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await typeInSource(page, "---\n", true); // no letters: nothing for Monaco to autocomplete
+  const save = page.locator(".mesh-source-editor-actions button", { hasText: "Save" });
+  await expect(save).toBeEnabled();
+  await save.click();
+  await expect(page.locator(".mesh-source-editor-toolbar .error")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved");
+});
+
+test("leaving a document with unsaved edits asks first; staying keeps it", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await editSource(page, ADDED);
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+
+  const asked: string[] = [];
+  page.once("dialog", (d) => {
+    asked.push(d.message());
+    void d.dismiss();
+  });
+  await page.goBack();
+  await expect.poll(() => asked.length).toBe(1);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect(page.locator("#launcher")).toHaveCount(0);
+
+  page.once("dialog", (d) => void d.accept());
+  await page.goBack();
+  await expect(page.locator("#launcher")).toBeVisible();
 });
