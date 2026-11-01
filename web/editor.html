@@ -6,9 +6,15 @@
     <title>meshfox editor</title>
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <style>
+      /* Shown until the launcher's own script and stylesheet arrive. */
+      body { margin: 0; background: #faf7f4; color: #3b3530; font: 13px system-ui, sans-serif; }
+      @media (prefers-color-scheme: dark) { body { background: #0a0a0c; color: #d8d8dc; } }
+      .boot { text-align: center; margin-top: 30vh; opacity: 0.6; }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><p class="boot">meshfox editor · loading…</p></div>
     <script type="module" src="/wasm-demo/main.ts"></script>
   </body>
 </html>

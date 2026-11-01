@@ -9,11 +9,13 @@
 // a note instead of a blank page.
 import init, * as wasmApi from "../../crates/wasm/pkg/meshfox_wasm.js";
 import { addPicked } from "./add";
+import { describeProgress, fetchWithProgress, fraction, type EngineProgress } from "./engine";
 import { createRenderer, installBackend, type Backend, type Document, type IncludeWarning } from "./backend";
 import { ago, deleteDraft, getDraft, listDrafts, putDraft, type Draft } from "./drafts";
 import { VirtualFiles } from "./files";
 import { fromDrop, fromFileList, type Picked } from "./pick";
 import { applyThemePreference, getThemePreference } from "../src/theme";
+import wasmUrl from "../../crates/wasm/pkg/meshfox_wasm_bg.wasm?url";
 import "@fontsource/fira-code/400.css";
 import "@fontsource/fira-code/600.css";
 // The webui's own stylesheet: the launcher wears the same palette, font and
@@ -45,6 +47,10 @@ const STYLE = `
   .launcher button.primary:hover { color:var(--bg); filter:brightness(1.08); }
   .launcher h2 { font-size:.9rem; margin:1.5rem 0 .5rem; }
   .list { display:flex; flex-wrap:wrap; gap:.5rem; }
+  #engine { margin-top:1rem; display:flex; gap:.6rem; align-items:center; font-size:.8rem; opacity:.8; }
+  #engine[hidden] { display:none; }
+  #engine progress { width:8rem; accent-color:var(--accent); }
+  #engine.error { color:var(--fail); opacity:1; }
   #status { margin-top:1rem; min-height:1.3em; font-size:.82rem; opacity:.75; }
   #status.error { color:var(--fail); opacity:1; }
   .launcher .note { font-size:.75rem; opacity:.55; margin-top:2rem; line-height:1.6; }
@@ -81,7 +87,33 @@ let discarding = false;
 
 // Loaded as soon as the page is: a folder pick needs the model's ignore rules,
 // and a drop must hand over its entries before its first `await`.
-const ready = init();
+let engine: EngineProgress = { loaded: 0, done: false };
+let engineFailed: string | undefined;
+/** Paints the engine's progress wherever the launcher has a place for it. */
+function drawEngine() {
+  const box = document.getElementById("engine");
+  if (!box) return;
+  box.hidden = engine.done && !engineFailed;
+  const bar = box.querySelector("progress");
+  const label = box.querySelector("span");
+  const f = fraction(engine);
+  if (bar) {
+    if (f === undefined) bar.removeAttribute("value");
+    else bar.value = f;
+  }
+  if (label) label.textContent = engineFailed ?? `Loading the engine… ${describeProgress(engine)}`;
+  box.classList.toggle("error", !!engineFailed);
+}
+const ready = init({
+  module_or_path: fetchWithProgress(wasmUrl, (p) => {
+    engine = p;
+    drawEngine();
+  }),
+}).catch((e) => {
+  engineFailed = `The engine could not be loaded: ${e instanceof Error ? e.message : String(e)}. Reload the page to try again.`;
+  drawEngine();
+  throw e;
+});
 const newRules = async () => {
   await ready;
   return new wasmApi.IgnoreRules();
@@ -238,8 +270,9 @@ function keepDraft(doc: Document, backend: Backend, waiting: () => boolean) {
 }
 
 async function start(doc: Document) {
-  status(`Loading the model…`);
+  status(engine.done ? "Reading the document…" : "Waiting for the engine…");
   await ready;
+  status("Reading the document…");
   // Find out now, with the launcher still on screen, whether this can be shown.
   const render = createRenderer(wasmApi, doc);
   const first = render();
@@ -260,7 +293,16 @@ async function start(doc: Document) {
   document.body.append(pill(doc, backend, pending));
   unsaved = () => backend.session.dirty;
   if (doc.key) keepDraft(doc, backend, () => pending !== undefined && document.getElementById("wasm-restore") !== null);
-  await import("../src/main");
+  // The app is the next heavy download; until it has mounted the page would
+  // be empty, so say what is happening.
+  const booting = el("p", { id: "booting", textContent: "Loading the app…" });
+  booting.style.cssText = "font:13px 'Fira Code', system-ui, sans-serif; opacity:.7; text-align:center; margin-top:30vh";
+  document.body.append(booting);
+  try {
+    await import("../src/main");
+  } finally {
+    booting.remove();
+  }
 }
 
 /** What tells this document from every other the page has opened. */
@@ -268,7 +310,7 @@ const documentKey = (picked: Picked, path: string) => (picked.rootName ? `${pick
 
 /** A new, empty canvas: its text is the template `meshfox create` writes. */
 async function newCanvas(title: string) {
-  status("Loading the model…");
+  status(engine.done ? "Reading…" : "Waiting for the engine…");
   await ready;
   const path = `${title}.canvas.md`;
   const files = new VirtualFiles();
@@ -308,7 +350,7 @@ function launcher(note?: string) {
   const folderPicker = el("input", { type: "file", hidden: true });
   folderPicker.setAttribute("webkitdirectory", "");
   const handle = (task: Promise<Picked>) => {
-    status("Reading…");
+    status(engine.done ? "Reading…" : "Waiting for the engine…");
     task.then(chooseAndStart).catch((e) => status(String(e), true));
   };
   filePicker.onchange = () => filePicker.files && handle(fromFileList(filePicker.files, newRules));
@@ -354,7 +396,7 @@ function launcher(note?: string) {
     el("button", { id: "new-canvas", textContent: "New canvas", onclick: create }),
   );
 
-  root.append(
+  root.replaceChildren(
     el(
       "div",
       { id: "launcher", className: "launcher" },
@@ -380,6 +422,7 @@ function launcher(note?: string) {
         filePicker,
         folderPicker,
         el("div", { id: "choices" }),
+        el("div", { id: "engine" }, el("progress", { max: 1 }), el("span")),
         el("div", { id: "status" }),
         el("p", {
           className: "note",
@@ -390,6 +433,7 @@ function launcher(note?: string) {
     ),
   );
   if (note) status(note);
+  drawEngine();
   void showDrafts();
 }
 

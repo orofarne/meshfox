@@ -836,3 +836,32 @@ test("nodes that need a server say so plainly, and offer no button that cannot w
   // A table says it is not supported here, not that something is broken.
   await expect(page.getByText(/not supported in the browser editor/)).toBeVisible();
 });
+
+test("a cold start shows the engine loading, and a file picked meanwhile opens once it is there", async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((ok) => (release = ok));
+  await page.route("**/*.wasm", async (route) => {
+    await gate;
+    await route.continue();
+  });
+  const file = path.join(tmpDir(), "slow.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  // Not blank: the launcher is there and says what it is waiting for.
+  await expect(page.getByRole("heading", { name: "Open a canvas" })).toBeVisible();
+  await expect(page.locator("#engine")).toBeVisible();
+  await expect(page.locator("#engine")).toContainText("Loading the engine");
+
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.locator("#status")).toContainText("Waiting for the engine");
+  release();
+
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator("#booting")).toHaveCount(0);
+});
+
+test("when the engine cannot be fetched the launcher says so", async ({ page }) => {
+  await page.route("**/*.wasm", (route) => route.abort());
+  await page.goto("/");
+  await expect(page.locator("#engine")).toContainText("could not be loaded");
+});
