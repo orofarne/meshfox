@@ -873,14 +873,17 @@ test("a canvas node opens the other canvas of the folder; Back and Forward move 
     path.join(dir, "a.canvas.md"),
     [
       '# Alpha\n<!-- meshfox:node id="root" -->\n<!-- meshfox:option name="unfold" -->\n\nFirst canvas.\n',
-      '## To B\n<!-- meshfox:node id="tob" type="file" -->\n\n[b](./sub/b.canvas.md)\n',
+      '## To B\n<!-- meshfox:node id="tob" type="file" -->\n\n[b](./sub/b.canvas.md#deep)\n',
       '## Nowhere\n<!-- meshfox:node id="nowhere" type="file" -->\n\n[missing](./missing.canvas.md)\n',
     ].join("\n"),
   );
   fs.mkdirSync(path.join(dir, "sub"));
   fs.writeFileSync(
     path.join(dir, "sub", "b.canvas.md"),
-    '# Beta\n<!-- meshfox:node id="root" -->\n\nSecond canvas.\n',
+    [
+      '# Beta\n<!-- meshfox:node id="root" -->\n\nSecond canvas.\n',
+      '## Deep\n<!-- meshfox:node id="deep" x="4000" y="4000" width="300" height="100" -->\n\nthe linked node\n',
+    ].join("\n"),
   );
   await page.goto("/");
   await page.locator("input[webkitdirectory]").setInputFiles(dir);
@@ -895,6 +898,8 @@ test("a canvas node opens the other canvas of the folder; Back and Forward move 
   await page.getByTitle("Open this file in the default application").first().click();
   await expect(page.getByText("Second canvas.")).toBeVisible();
   await expect(page.getByText("First canvas.")).toHaveCount(0);
+  // The link named a node (`#deep`): the view is on it.
+  await expect(page.getByText("the linked node")).toBeInViewport();
 
   // Edit it, go Back to the first, Forward again: the edit is still there.
   await editSource(page, ADDED);

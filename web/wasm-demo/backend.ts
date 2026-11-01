@@ -98,6 +98,8 @@ export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
 export interface Backend {
   /** The text being edited and its undo history (of the canvas now shown). */
   readonly session: EditSession;
+  /** Counts the changes of what is shown; a canvas response carries it as `canvasVersion`. */
+  readonly version: number;
   /** Whether any canvas opened so far has edits that were never saved. */
   readonly dirty: boolean;
   /** Makes another canvas of the opened files the one shown, the way a
@@ -579,6 +581,9 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   const backend: Backend = {
     get session() {
       return session;
+    },
+    get version() {
+      return version;
     },
     get dirty() {
       return [...sessions.values()].some((x) => x.dirty);

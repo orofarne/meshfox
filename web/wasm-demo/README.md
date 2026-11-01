@@ -74,5 +74,5 @@ canvas in the same page (nothing else can be opened from a page, so a plain
 file has no such button). Each canvas keeps its own edits and undo history for
 as long as the page lives, Back and Forward move between them, and the draft
 (see above) is kept per canvas. A canvas that is not among the opened files
-says so; "add files…" brings it in. The `#fragment` of a link is not followed
+says so; "add files…" brings it in. A `#fragment` in the link
 yet.

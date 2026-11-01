@@ -581,9 +581,26 @@ export default function App() {
   // back for `api.ts`'s `openNodeFile` to open). Read once, at mount —
   // there's nothing to react to afterward, since navigating around the
   // canvas by hand never rewrites the URL.
-  const [deepLinkNodeId] = useState<string | null>(() =>
+  const [deepLinkNodeId, setDeepLinkNodeId] = useState<string | null>(() =>
     window.location.hash ? decodeURIComponent(window.location.hash.slice(1)) : null,
   );
+  // The browser editor shows another canvas in this same page (no new tab to
+  // load): its host says so with a `meshfox:canvas-opened` event, and from
+  // then on a canvas older than `openedAt` is the one being left. The view is
+  // placed again as on a first load, on the linked node if there is one.
+  const openedAt = useRef(0);
+  const hasFocusedDeepLink = useRef(false);
+  useEffect(() => {
+    const onOpened = (e: Event) => {
+      const { fragment, version } = (e as CustomEvent<{ fragment: string | null; version: number }>).detail;
+      openedAt.current = version;
+      hasSetInitialView.current = false;
+      hasFocusedDeepLink.current = false;
+      setDeepLinkNodeId(fragment);
+    };
+    window.addEventListener("meshfox:canvas-opened", onOpened);
+    return () => window.removeEventListener("meshfox:canvas-opened", onOpened);
+  }, []);
   // Snapshot, not live-tracked: the 60%/40% viewport-relative widths
   // `autolayout.ts` computes are read once per app load, not recomputed on
   // window resize (deliberate — see autolayout.ts's module doc comment).
@@ -3035,6 +3052,7 @@ export default function App() {
   // the linked node instead, once `focusNode` exists to call.
   useEffect(() => {
     if (hasSetInitialView.current || !flowInstance || !canvas || deepLinkNodeId) return;
+    if ((canvas.canvasVersion ?? 0) < openedAt.current) return;
     const root = canvas.nodes.find((n) => !n.parent);
     const rootNode = root && nodes.find((n) => n.id === root.id);
     if (!rootNode) return;
@@ -3146,8 +3164,8 @@ export default function App() {
   // change instead of computing the resulting layout up front — there's no
   // race to avoid, unlike `revealAndFocus`'s search-highlight case, since
   // nothing else is trying to move the camera at the same time.
-  const hasFocusedDeepLink = useRef(false);
   useEffect(() => {
+    if ((canvas?.canvasVersion ?? 0) < openedAt.current) return;
     if (hasFocusedDeepLink.current || !deepLinkNodeId || !canvas || !flowInstance) return;
     if (!canvas.nodes.some((n) => n.id === deepLinkNodeId)) {
       hasFocusedDeepLink.current = true; // no such node — bad/stale link, give up quietly

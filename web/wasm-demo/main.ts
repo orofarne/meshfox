@@ -301,7 +301,7 @@ async function mount(doc: Document, backend: Backend) {
 
 /** Shows another canvas of the opened files. Edits to the one left stay in the
  * page (and in its draft); going back finds them as they were. */
-function switchTo(doc: Document, backend: Backend, open: () => string | undefined, how: { push: boolean }): string | undefined {
+function switchTo(doc: Document, backend: Backend, open: () => string | undefined, how: { push: boolean; fragment?: string | null }): string | undefined {
   const left = mounted;
   mounted = undefined;
   left?.dispose();
@@ -310,6 +310,11 @@ function switchTo(doc: Document, backend: Backend, open: () => string | undefine
     history.pushState({ meshfox: "document", path: doc.path } satisfies HistoryState, "");
   }
   void mount(doc, backend);
+  if (problem === undefined) {
+    // The app is told which canvas is now shown, to place the view on it.
+    const detail = { fragment: how.fragment ? decodeURIComponent(how.fragment) : null, version: backend.version };
+    window.dispatchEvent(new CustomEvent("meshfox:canvas-opened", { detail }));
+  }
   return problem;
 }
 
@@ -331,7 +336,7 @@ async function start(doc: Document) {
   history.pushState({ meshfox: "document", path: doc.path } satisfies HistoryState, "");
   documentOpen = true;
   shown = { doc, backend };
-  backend.navigate = (path) => switchTo(doc, backend, () => backend.open(path), { push: true });
+  backend.navigate = (path, fragment) => switchTo(doc, backend, () => backend.open(path), { push: true, fragment });
   unsaved = () => backend.dirty;
   await mount(doc, backend);
   // The app is the next heavy download; until it has mounted the page would
