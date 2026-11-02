@@ -10,13 +10,13 @@ if (process.platform === "darwin" && !process.env.CFFIXED_USER_HOME) {
   process.env.CFFIXED_USER_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "meshfox-e2e-firefox-home-"));
 }
 
-// E2E for the serverless prototype (`wasm-demo/`): a static build served by
-// `vite preview`, no `meshfox` process anywhere. `npm run test:wasm-demo`
+// E2E for the in-browser editor (`wasm-editor/`): a static build served by
+// `vite preview`, no `meshfox` process anywhere. `npm run test:wasm-editor`
 // builds it first.
 const PORT = 4600;
 
 export default defineConfig({
-  testDir: "./e2e-wasm-demo",
+  testDir: "./e2e-wasm-editor",
   timeout: 45_000,
   fullyParallel: true,
   reporter: "list",

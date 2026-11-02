@@ -30,7 +30,7 @@ export interface Document {
   note?: string;
 }
 
-const SESSION = "wasm-demo";
+const SESSION = "wasm-editor";
 const FILE_PREVIEW_MAX_BYTES = 1_000_000;
 
 const MIME: Record<string, string> = {

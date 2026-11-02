@@ -1,4 +1,4 @@
-# In-browser meshfox (WebAssembly)
+# meshfox editor (in the browser, WebAssembly)
 
 The real meshfox UI, with no `meshfox` process behind it. The document model
 (`crates/model`, compiled to WebAssembly by `crates/wasm`) runs in the page and
@@ -13,13 +13,13 @@ cd web
 npm install
 npm run build:wasm      # builds the wasm package, then the static site into web/dist-wasm
 npm run preview:wasm    # http://localhost:4600/
-npm run test:wasm-demo  # Playwright, Chromium + Firefox
+npm run test:wasm-editor  # Playwright, Chromium + Firefox
 ```
 
 Open a `.canvas.md`, a whole folder (so `include`s, images and `file` nodes
 resolve), or drop either onto the page. The build is a static site with
 relative URLs, emitted as `index.html`, so it can be served from any path
-(the plan: `https://meshfox.orofarne.net/editor/`).
+(published at `https://meshfox-editor.orofarne.net/`).
 
 A document with an `include` (or image, or file link) whose file was not
 picked still opens: the node shows a notice and the strip at the bottom lists
@@ -49,21 +49,26 @@ Forward onto a document that is gone, lands on the launcher with a note.
   checks the document renders, installs the backend, then loads `src/main.tsx`
   (the app, unchanged).
 - `backend.ts` — replaces `window.fetch` and `window.WebSocket` for the page's
-  own `api/...` URLs: `canvas` (rendered once by `renderCanvas`), `info`
-  (read-only, no exec), `asset`, `nodes/:id/file-content`, and empty answers for
-  history/services/runs/includes/syntax. The live-update socket (`api/watch`)
-  is a stub that only sends heartbeats. Anything that would need a worker
-  (running, editing, tables) answers 501.
+  own `api/...` URLs and answers them with the wasm model: the canvas, every
+  document edit (`meshfox_model::edit`, the same code `meshfox view` runs),
+  undo/redo/history (`session.ts`, over the model's `UndoLog`), `asset`,
+  `nodes/:id/file-content`, opening another canvas of the folder, and empty
+  answers for services/runs/includes/syntax. The live-update socket
+  (`api/watch`) only sends heartbeats and the `changed` events the page itself
+  causes. Anything that would need a worker (running, tables) answers 501.
+- `engine.ts` — fetches the wasm with progress; `drafts.ts`, `svg.ts`,
+  `securityHeaders.ts` — see the sections above and below.
 - `files.ts`, `pick.ts` — the in-memory file tree the wasm model reads through
   its `files.read(path)` callback, filled from the picker, a drop or a drop.
 
-## Limits (it is a prototype)
+## Limits
 
-- Read-only. No running blocks, no editing, no `display="table"` (needs DuckDB),
-  no link previews, no live reload.
-- The toolbar still shows buttons that make no sense here (Console, reset
-  session); they do nothing.
-- The whole document is rendered once at load; a changed file needs a reload.
+- No running blocks, forms or services (the page says `noexec`), no
+  `display="table"` (needs DuckDB), no link preview cards.
+- Files a canvas includes are shown but not edited here; only the canvas text
+  is.
+- The whole opened folder is read into memory (limits: 20 000 files, 25 MB
+  each).
 - `asset_base` for included files is the included file's directory inside the
   opened tree; images beside an include resolve, deeper cases are untested.
 

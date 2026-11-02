@@ -18,7 +18,7 @@ const canvasJson = (page: Page) =>
   }>;
 
 function tmpDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "mfx-wasm-demo-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "mfx-wasm-editor-"));
 }
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");

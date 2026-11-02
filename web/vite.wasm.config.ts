@@ -2,11 +2,11 @@ import { defineConfig, type Plugin } from "vite";
 import fs from "node:fs";
 import path from "node:path";
 import react from "@vitejs/plugin-react";
-import { headersFile, SECURITY_HEADERS } from "./wasm-demo/securityHeaders.ts";
+import { headersFile, SECURITY_HEADERS } from "./wasm-editor/securityHeaders.ts";
 
 // The in-browser build: the same app as `vite.config.ts`, but its entry is
 // `editor.html`, whose script swaps the HTTP backend for the WebAssembly one
-// (see `wasm-demo/`). A separate build, into `dist-wasm/`, so the `web/dist`
+// (see `wasm-editor/`). A separate build, into `dist-wasm/`, so the `web/dist`
 // that `meshfox view` embeds is untouched. Run `scripts/build-wasm.sh web
 // crates/wasm/pkg` first (`npm run build:wasm` does both).
 //
