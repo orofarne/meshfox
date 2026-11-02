@@ -1250,7 +1250,7 @@ fn reveal_header_scroll(scroll: u16, height: u16, header: u16) -> u16 {
 }
 
 /// Bitmap protocols render one cached crop; Kitty/Halfblocks use native slicing.
-fn render_document_image(
+pub(super) fn render_document_image(
     image: &super::image_render::DocumentImage,
     skip: u16,
     area: Rect,
@@ -4445,6 +4445,62 @@ mod tests {
                         if !area.contains((x, y).into()) {
                             assert_eq!(buffer[(x, y)].symbol(), ".", "{kind:?} escaped viewport");
                         }
+                    }
+                }
+                // The selection overlay must preserve the same protocol cells,
+                // including clips after scrolling its frozen snapshot.
+                let mut selection = super::super::selection::Selection::new(
+                    Focus::Document,
+                    (0..4)
+                        .map(|_| super::super::selection::Row::blank())
+                        .collect(),
+                    area,
+                    usize::from(skip),
+                    0,
+                )
+                .unwrap();
+                selection.images.push((
+                    0,
+                    Arc::new(
+                        prepared_image(
+                            &picker,
+                            image::DynamicImage::ImageRgba8(pixels.clone()),
+                            ratatui::layout::Size::new(4, 4),
+                        )
+                        .unwrap(),
+                    ),
+                ));
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(6, 6)).unwrap();
+                let mut selected = Buffer::empty(Rect::new(0, 0, 6, 6));
+                terminal
+                    .draw(|f| {
+                        selection.render(f);
+                        selected = f.buffer_mut().clone();
+                    })
+                    .unwrap();
+                let mut expected_image = Buffer::empty(Rect::new(0, 0, 6, 6));
+                render_document_image(&protocol, skip, area, &mut expected_image);
+                for y in area.y..area.bottom() {
+                    for x in area.x..area.right() {
+                        let expected = &expected_image[(x, y)];
+                        let actual = &selected[(x, y)];
+                        if kind == ProtocolType::Kitty {
+                            // Kitty assigns random image ids and transmits pixels
+                            // only on first use; compare placement presence.
+                            assert_eq!(
+                                actual.symbol().contains('\u{10eeee}'),
+                                expected.symbol().contains('\u{10eeee}')
+                            );
+                        } else {
+                            assert_eq!(actual.symbol(), expected.symbol(), "{kind:?} skip={skip}");
+                        }
+                        assert_eq!(actual.fg, expected.fg, "{kind:?} skip={skip}");
+                        assert_eq!(actual.bg, expected.bg, "{kind:?} skip={skip}");
+                        assert_eq!(
+                            actual.diff_option, expected.diff_option,
+                            "{kind:?} skip={skip}"
+                        );
                     }
                 }
                 if kind == ProtocolType::Halfblocks && skip == 1 {

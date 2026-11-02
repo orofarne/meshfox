@@ -1467,6 +1467,7 @@ impl App {
         if !self.selection_allowed() {
             return;
         }
+        let mut images = Vec::new();
         let (rows, area, top, left) = match self.focus {
             Focus::Document => {
                 let area = self.copy_document_area;
@@ -1487,12 +1488,11 @@ impl App {
                             ));
                         }
                     } else if let super::markdown::Segment::Image { path, .. } = segment {
-                        let height = self
-                            .doc_images
-                            .get(path)
-                            .and_then(|p| p.as_ref())
-                            .map(|p| p.size().height as usize)
-                            .unwrap_or(1);
+                        let image = self.doc_images.get(path).and_then(|p| p.as_ref());
+                        let height = image.map(|p| p.size().height as usize).unwrap_or(1);
+                        if let Some(image) = image {
+                            images.push((rows.len(), Arc::clone(image)));
+                        }
                         rows.extend(std::iter::repeat_with(selection::Row::blank).take(height));
                     }
                 }
@@ -1519,6 +1519,9 @@ impl App {
             }
         };
         self.text_selection = Selection::new(self.focus, rows, area, top, left);
+        if let Some(selection) = &mut self.text_selection {
+            selection.images = images;
+        }
         if let (Some(selection), Some((pane, node, point))) =
             (&mut self.text_selection, &self.read_cursor)
         {

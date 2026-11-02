@@ -247,3 +247,50 @@ fn keyboard_cursor_can_choose_and_replace_a_middle_selection_without_exiting() {
     session.send_keys("q");
     assert!(session.wait_for_exit(WAIT));
 }
+
+#[test]
+#[ignore = "pty-based e2e"]
+fn text_selection_preserves_images() {
+    let canvas = format!("{CANVAS}\n![selection image](image.svg)\n\nafter image\n");
+    let (path, dir) = fixtures::write_fixture(&canvas);
+    std::fs::write(dir.join("image.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="32"><rect width="80" height="32" fill="#ff0000"/></svg>"##).unwrap();
+    std::fs::create_dir_all(dir.join(".meshfox")).unwrap();
+    std::fs::write(
+        dir.join(".meshfox/config.toml"),
+        "[tui]\nimage_protocol = \"halfblocks\"\n",
+    )
+    .unwrap();
+    let mut session = TuiSession::spawn(&path, dir, 30, 110);
+    session.wait_for("after image", WAIT).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let (row, col) = loop {
+        if let Some(position) = (0..28)
+            .flat_map(|r| (33..108).map(move |c| (r, c)))
+            .find(|&(r, c)| session.bgcolor_at(r, c) == Some(vt100::Color::Rgb(255, 0, 0)))
+        {
+            break position;
+        }
+        assert!(std::time::Instant::now() < deadline, "image did not load");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let color = session.bgcolor_at(row, col);
+    session.send_keys("\tv");
+    session.wait_for("CURSOR", WAIT).unwrap();
+    assert_eq!(
+        session.bgcolor_at(row, col),
+        color,
+        "image vanished in cursor mode"
+    );
+    session.send_keys(" ");
+    session.wait_for("SELECT", WAIT).unwrap();
+    assert_eq!(
+        session.bgcolor_at(row, col),
+        color,
+        "image vanished while selecting"
+    );
+    session.send_keys("\x1b");
+    session.wait_for("v select text", WAIT).unwrap();
+    assert_eq!(session.bgcolor_at(row, col), color);
+    session.send_keys("q");
+    assert!(session.wait_for_exit(WAIT));
+}
