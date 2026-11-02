@@ -3865,3 +3865,16 @@ a {
 .monaco-editor .iPadShowKeyboard {
   display: none !important;
 }
+
+/* iOS Safari (and every browser on iOS) zooms the whole page when a field
+ * with text smaller than 16px gets the focus, and leaves it zoomed. On a touch
+ * screen no field may be smaller; the rest of the layout is unaffected.
+ * (Monaco's own hidden input is left alone: it is not a field one can see.) */
+@media (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
+  select,
+  textarea:not(.inputarea) {
+    /* !important: fields set their own, more specific, smaller sizes. */
+    font-size: max(16px, 1em) !important;
+  }
+}

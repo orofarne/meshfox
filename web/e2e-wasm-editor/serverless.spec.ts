@@ -1226,3 +1226,33 @@ test("on a wide screen the preview stays beside the source", async ({ page }) =>
   expect(preview.x).toBeGreaterThanOrEqual(source.x + source.width - 1);
   expect(Math.abs(preview.y - source.y)).toBeLessThan(2);
 });
+
+test.describe("touch fields", () => {
+  test.use({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 780 } });
+
+  test("no field the person can focus is smaller than 16px (iOS zooms the page on those)", async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium", "pointer: coarse is only emulated in Chromium");
+    const file = path.join(tmpDir(), "doc.canvas.md");
+    fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+    await page.goto("/");
+    // The launcher's own field ...
+    const small = (selector: string) =>
+      page.evaluate(
+        (sel) =>
+          [...document.querySelectorAll<HTMLElement>(sel)]
+            .filter((el) => el.offsetParent !== null && !el.classList.contains("inputarea"))
+            .map((el) => ({ el: el.tagName + (el.className ? "." + el.className : ""), size: parseFloat(getComputedStyle(el).fontSize) }))
+            .filter((f) => f.size < 16),
+        selector,
+      );
+    expect(await small("input, select, textarea")).toEqual([]);
+    // ... and the node settings dialog's.
+    await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+    await expect(page.getByText("The root.")).toBeVisible();
+    await page.getByRole("button", { name: "Edit", exact: true }).click();
+    await page.locator('.react-flow__node[data-id="root"] .mesh-node-title-text').first().click();
+    await page.locator('.mesh-node-toolbar button[title*="settings" i]').click();
+    await expect(page.locator(".node-settings-modal")).toBeVisible();
+    expect(await small("input, select, textarea")).toEqual([]);
+  });
+});
