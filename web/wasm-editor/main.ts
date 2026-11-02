@@ -10,7 +10,7 @@
 import init, * as wasmApi from "../../crates/wasm/pkg/meshfox_wasm.js";
 import { addPicked } from "./add";
 import { describeProgress, fetchWithProgress, fraction, type EngineProgress } from "./engine";
-import { createRenderer, installBackend, type Backend, type Document, type IncludeWarning } from "./backend";
+import { createRenderer, installBackend, unsupportedBrowser, type Backend, type Document, type IncludeWarning } from "./backend";
 import { ago, deleteDraft, getDraft, listDrafts, putDraft, type Draft } from "./drafts";
 import { VirtualFiles } from "./files";
 import { fromDrop, fromFileList, type Picked } from "./pick";
@@ -352,6 +352,11 @@ async function start(doc: Document) {
   const first = render();
   if (first.error !== undefined) {
     status(`${doc.path}: ${first.error}`, true);
+    return;
+  }
+  const unsupported = unsupportedBrowser();
+  if (unsupported !== undefined) {
+    status(unsupported, true);
     return;
   }
   const backend = installBackend(wasmApi, doc, render);

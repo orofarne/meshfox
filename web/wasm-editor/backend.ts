@@ -101,6 +101,24 @@ export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
 const NAVIGABLE = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 export const navigableType = (type: string): string => (NAVIGABLE.has(type) ? type : "text/plain; charset=utf-8");
 
+/** Why the page cannot take over `fetch`, `WebSocket` and image loading here,
+ * or `undefined` when it can. Some browsers and privacy tools lock those down
+ * (iOS content blockers lock `img.src`); trying anyway fails half-way with a
+ * message nobody can act on, so it is checked, and said, before anything starts. */
+export function unsupportedBrowser(): string | undefined {
+  const locked = (target: object, name: string, writable = false) => {
+    const d = Object.getOwnPropertyDescriptor(target, name);
+    return d !== undefined && !d.configurable && (!writable || !d.writable);
+  };
+  const what = [
+    locked(HTMLImageElement.prototype, "src") && "image loading",
+    (locked(window, "fetch", true) || locked(window, "WebSocket", true)) && "network requests",
+    locked(Element.prototype, "setAttribute", true) && "page attributes",
+  ].filter(Boolean);
+  if (what.length === 0) return undefined;
+  return `This browser does not let the editor take over ${what.join(" and ")} (a content blocker or privacy setting may be locking them). Try another browser, or turn the blocker off for this site.`;
+}
+
 export interface Backend {
   /** The text being edited and its undo history (of the canvas now shown). */
   readonly session: EditSession;
@@ -490,21 +508,15 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   Element.prototype.setAttribute = function (name: string, value: string) {
     return nativeSetAttribute.call(this, name, ASSET_ATTRS.includes(name.toLowerCase()) ? (assetNow(value, isLink(this, name)) ?? value) : value);
   };
-  // Some browsers (iOS WebKit with a content blocker, for one) have already
-  // locked `img.src`: then the swap is left to `setAttribute` and the observer
-  // below, which fix the URL a moment after the browser first saw it.
+  // `unsupportedBrowser()` has already refused a browser where this cannot be done.
   const srcProperty = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
-  if (srcProperty?.set && srcProperty.configurable) {
-    try {
-      Object.defineProperty(HTMLImageElement.prototype, "src", {
-        ...srcProperty,
-        set(value: string) {
-          srcProperty.set!.call(this, assetNow(String(value)) ?? value);
-        },
-      });
-    } catch {
-      /* locked after all */
-    }
+  if (srcProperty?.set) {
+    Object.defineProperty(HTMLImageElement.prototype, "src", {
+      ...srcProperty,
+      set(value: string) {
+        srcProperty.set!.call(this, assetNow(String(value)) ?? value);
+      },
+    });
   }
   const fixElement = (element: Element) => {
     for (const attr of ASSET_ATTRS) {

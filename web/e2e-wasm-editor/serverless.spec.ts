@@ -1015,17 +1015,16 @@ test("on a phone-sized screen the strip is a bar across the bottom and covers no
   }
 });
 
-test("where the browser has locked img.src (iOS content blockers) the page still opens and shows its pictures", async ({ page }) => {
+test("where the browser has locked img.src (iOS content blockers) the launcher says so, plainly", async ({ page }) => {
   await page.addInitScript(() => {
     const d = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")!;
     Object.defineProperty(HTMLImageElement.prototype, "src", { ...d, configurable: false });
   });
-  const dir = tmpDir();
-  fs.writeFileSync(path.join(dir, "pics.canvas.md"), '# Pics\n<!-- meshfox:node id="root" -->\n\n![a tiny picture](./pic.png)\n');
-  fs.writeFileSync(path.join(dir, "pic.png"), PNG);
+  const file = path.join(tmpDir(), "any.canvas.md");
+  fs.writeFileSync(file, ROOT);
   await page.goto("/");
-  await page.locator("input[webkitdirectory]").setInputFiles(dir);
-  await expect
-    .poll(() => page.evaluate(() => [...document.images].some((i) => i.alt === "a tiny picture" && i.src.startsWith("blob:") && i.naturalWidth > 0)))
-    .toBe(true);
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.locator("#status.error")).toContainText("does not let the editor take over image loading");
+  // Still the launcher: nothing was half-started.
+  await expect(page.getByRole("heading", { name: "Open a canvas" })).toBeVisible();
 });

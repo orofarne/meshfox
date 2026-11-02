@@ -70,6 +70,9 @@ Forward onto a document that is gone, lands on the launcher with a note.
 - Safari's folder picker leaves out every dot-file, so a *picked* folder cannot
   honour `.meshfoxignore` there (a dropped one can). The suite also runs on
   WebKit (Safari's engine, which every iOS browser uses).
+- A browser or privacy tool that locks `img.src`, `fetch`, `WebSocket` or
+  `setAttribute` (iOS content blockers do) cannot run the editor: the launcher
+  says so and starts nothing (`unsupportedBrowser` in `backend.ts`).
 - The whole opened folder is read into memory (limits: 20 000 files, 25 MB
   each).
 - `asset_base` for included files is the included file's directory inside the
