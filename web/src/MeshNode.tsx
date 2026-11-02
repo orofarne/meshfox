@@ -3150,9 +3150,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   // `null` when neither applies (nothing to quick-run) — the button just
   // isn't shown.
   const quickRunBlock = isTextNode ? defaultBlock(data.text, id) : null;
-  const quickRunBlockName = data.noExec
-    ? null
-    : (quickRunBlock?.name ?? (data.nodeType === "file" && data.interpreter && data.target ? id : null));
+  const fileRunName = data.nodeType === "file" && data.interpreter && data.target ? id : null;
+  const quickRunBlockName = data.noExec ? null : (quickRunBlock?.name ?? fileRunName);
   // A `tty` block needs `onRunTty` (opens a real terminal over its own
   // WebSocket), not `onRun` (the plain captured/streamed-output path) —
   // the server rejects a `tty` block run over `/api/run` outright (see

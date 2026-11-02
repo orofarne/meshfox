@@ -323,7 +323,12 @@ async function mount(doc: Document, backend: Backend) {
   const stopKeeping = doc.key
     ? keepDraft(doc, backend, () => pending !== undefined && document.getElementById("wasm-restore") !== null)
     : () => {};
-  mounted = { dispose: () => (stopKeeping(), strip.dispose()) };
+  mounted = {
+    dispose: () => {
+      stopKeeping();
+      strip.dispose();
+    },
+  };
 }
 
 /** Shows another canvas of the opened files. Edits to the one left stay in the

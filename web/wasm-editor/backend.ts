@@ -99,6 +99,12 @@ export function createRenderer(wasm: WasmApi, doc: Document): Renderer {
 /** What a link may open as its own page: pictures and PDFs, which a browser
  * shows without running anything. Every other type (SVG above all) is text. */
 const NAVIGABLE = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
+/** The address a `fetch` call names, whichever way it was given. */
+function requestHref(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  return input instanceof URL ? input.href : input.url;
+}
+
 export const navigableType = (type: string): string => (NAVIGABLE.has(type) ? type : "text/plain; charset=utf-8");
 
 /** Why the page cannot take over `fetch`, `WebSocket` and image loading here,
@@ -385,7 +391,8 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
         }
       };
       const idRoute = /^nodes\/([^/]+)\/(reparent|move|rename-id|clear-id|append|clear-layout)$/.exec(route);
-      const id = idRoute ? decodeURIComponent(idRoute[1]) : nodeRoute ? decodeURIComponent(nodeRoute[1]) : "";
+      const idMatch = idRoute ?? nodeRoute;
+      const id = idMatch ? decodeURIComponent(idMatch[1]) : "";
       let result: { response: Response } | { out: { raw: string; newId?: string } } | undefined;
       let respond: ((out: { raw: string; newId?: string }) => Response) | undefined;
       if (method === "POST" && route === "nodes") {
@@ -436,17 +443,20 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
         case "undo":
         case "redo":
         case "history/goto": {
+          const step = (): boolean => {
+            if (route === "undo") return session.undo();
+            if (route === "redo") return session.redo();
+            return session.goto(Number(JSON.parse(body ?? "{}").seq));
+          };
           let changed: boolean;
           try {
-            changed =
-              route === "undo"
-                ? session.undo()
-                : route === "redo"
-                  ? session.redo()
-                  : session.goto(Number(JSON.parse(body ?? "{}").seq));
+            changed = step();
           } catch (e) {
-            // A step that no longer fits the document: nothing moved.
-            return text(e instanceof Error ? e.message : String(e), 422);
+            // A step that no longer fits the document: nothing moved. What the
+            // exception says is for whoever debugs this, so it goes to the
+            // console, and the answer carries only the fixed sentence.
+            console.warn("meshfox editor: an undo/redo step was refused", e);
+            return text("that step no longer fits the document", 422);
           }
           if (changed) {
             show();
@@ -537,7 +547,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ASSET_ATTRS });
 
   window.fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const href = requestHref(input);
     const url = new URL(href, document.baseURI);
     if (url.origin !== location.origin || !url.pathname.startsWith(`${base}api/`)) {
       return nativeFetch(input, init);
@@ -591,7 +601,9 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       this.onclose?.(new CloseEvent("close", { code: 1006 }));
     }
 
-    send() {}
+    send() {
+      // The page only listens to this socket; nothing it sends is of interest.
+    }
 
     close() {
       if (this.readyState === 3) return;

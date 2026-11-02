@@ -9,7 +9,7 @@ export class VirtualFiles {
   /** Folds `.`/`..`, drops empty segments and any leading `/`. */
   static norm(path: string): string {
     const out: string[] = [];
-    for (const part of path.replace(/\\/g, "/").split("/")) {
+    for (const part of path.replaceAll("\\", "/").split("/")) {
       if (part === "" || part === ".") continue;
       if (part === "..") out.pop();
       else out.push(part);
@@ -48,7 +48,7 @@ export class VirtualFiles {
   }
 
   paths(): string[] {
-    return [...this.bytes.keys()].sort();
+    return [...this.bytes.keys()].sort((a, b) => a.localeCompare(b));
   }
 
   get size(): number {

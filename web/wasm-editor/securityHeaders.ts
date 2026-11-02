@@ -44,8 +44,11 @@ export const CACHE_RULES: Array<{ path: string; headers: Record<string, string> 
 
 /** The `_headers` file for the build. */
 export function headersFile(): string {
-  const block = (path: string, headers: Record<string, string>) =>
-    `${path}\n${Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join("\n")}\n`;
+  const lines = (headers: Record<string, string>) =>
+    Object.entries(headers)
+      .map(([k, v]) => `  ${k}: ${v}`)
+      .join("\n");
+  const block = (path: string, headers: Record<string, string>) => `${path}\n${lines(headers)}\n`;
   return [
     block("/*", SECURITY_HEADERS),
     ...CACHE_RULES.map((r) => block(r.path, r.headers)),

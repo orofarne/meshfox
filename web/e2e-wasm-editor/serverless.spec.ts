@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { expectNever } from "../e2e/helpers";
 
 // The page must work with no `meshfox` behind it: every real network request
 // to `/api/` is refused, so anything that still renders was answered by the
@@ -727,8 +728,7 @@ test("opening the same file again offers the draft, and keeps it until the user 
   await expect(page.locator("#wasm-pill")).toContainText("unsaved edits from");
   await expect(page.getByText("added in the browser")).toHaveCount(0);
   // Not touched, not deleted, though the document in the page is clean.
-  await page.waitForTimeout(800);
-  expect(await drafts(page)).toHaveLength(1);
+  await expectNever(800, async () => (await drafts(page)).length !== 1, "the draft was touched or deleted");
 
   await page.locator("#wasm-restore").click();
   await expect(page.getByText("added in the browser")).toBeVisible();

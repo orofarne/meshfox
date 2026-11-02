@@ -29,7 +29,7 @@ if ! command -v wasm-bindgen >/dev/null; then
   exit 1
 fi
 have=$(wasm-bindgen --version | awk '{print $2}')
-if [ "$have" != "$locked" ]; then
+if [[ "$have" != "$locked" ]]; then
   echo "wasm-bindgen CLI is $have but Cargo.lock pins $locked; they must match:" >&2
   echo "  cargo install wasm-bindgen-cli --version $locked --locked" >&2
   exit 1

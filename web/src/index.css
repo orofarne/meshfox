@@ -3863,7 +3863,7 @@ a {
  * the text already does that, and the button is placed wherever the editor's
  * corner happens to be — here over the text, doing nothing. */
 .monaco-editor .iPadShowKeyboard {
-  display: none !important;
+  display: none;
 }
 
 /* iOS Safari (and every browser on iOS) zooms the whole page when a field

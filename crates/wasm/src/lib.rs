@@ -188,70 +188,6 @@ impl FileSource for Provider {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    /// The same lexical rules over an in-memory map, so the binding's
-    /// confinement and the model's include handling are testable natively.
-    struct Mem(HashMap<&'static str, &'static str>);
-
-    impl FileSource for Mem {
-        fn confine(&self, dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
-            lexical_confine(dir, target)
-        }
-        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-            self.0
-                .get(path.to_string_lossy().as_ref())
-                .map(|s| s.as_bytes().to_vec())
-                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
-        }
-    }
-
-    fn confine(dir: &str, target: &str) -> Result<String, ConfineError> {
-        lexical_confine(Path::new(dir), target).map(|p| p.to_string_lossy().into_owned())
-    }
-
-    #[test]
-    fn folds_dots_and_stays_inside_the_canvas_directory() {
-        assert_eq!(confine(".", "./notes.md").unwrap(), "notes.md");
-        assert_eq!(confine("", "a/b/../c.md").unwrap(), "a/c.md");
-        assert_eq!(confine("docs", "./x/../y.md").unwrap(), "docs/y.md");
-    }
-
-    #[test]
-    fn refuses_anything_that_leaves_the_directory() {
-        for (dir, target) in [
-            (".", "../secret.md"),
-            ("docs", "../../x.md"),
-            (".", "/etc/passwd"),
-            ("docs", "a/../../b.md"),
-            // Climbing out of `docs` and back into a sibling is still out.
-            ("docs", "../other/x.md"),
-        ] {
-            assert!(
-                matches!(confine(dir, target), Err(ConfineError::Outside(_))),
-                "{dir:?} + {target:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn includes_resolve_through_the_provider_and_missing_ones_error() {
-        let files = Mem(HashMap::from([("notes.md", "# Notes\n\nfrom the host\n")]));
-        let raw = concat!(
-            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
-            "## Notes\n<!-- meshfox:node id=\"notes\" type=\"include\" -->\n\n[notes](./notes.md)\n",
-        );
-        let canvas = render::render_canvas(raw, Path::new("doc.canvas.md"), &files).unwrap();
-        assert!(canvas.node("notes").unwrap().text.contains("from the host"));
-
-        let empty = Mem(HashMap::new());
-        assert!(render::render_canvas(raw, Path::new("doc.canvas.md"), &empty).is_err());
-    }
-}
-
 /// What meshfox leaves out of a tree it walks (names starting with `.`, and what
 /// `.meshfoxignore` files exclude): the same rules as `meshfox serve --http`.
 /// A host picking a folder feeds it each `.meshfoxignore` it finds, then asks
@@ -585,4 +521,68 @@ pub fn apply_block_attrs(raw: &str, id: &str, block_name: &str, request_json: &s
         }
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The same lexical rules over an in-memory map, so the binding's
+    /// confinement and the model's include handling are testable natively.
+    struct Mem(HashMap<&'static str, &'static str>);
+
+    impl FileSource for Mem {
+        fn confine(&self, dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
+            lexical_confine(dir, target)
+        }
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            self.0
+                .get(path.to_string_lossy().as_ref())
+                .map(|s| s.as_bytes().to_vec())
+                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        }
+    }
+
+    fn confine(dir: &str, target: &str) -> Result<String, ConfineError> {
+        lexical_confine(Path::new(dir), target).map(|p| p.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn folds_dots_and_stays_inside_the_canvas_directory() {
+        assert_eq!(confine(".", "./notes.md").unwrap(), "notes.md");
+        assert_eq!(confine("", "a/b/../c.md").unwrap(), "a/c.md");
+        assert_eq!(confine("docs", "./x/../y.md").unwrap(), "docs/y.md");
+    }
+
+    #[test]
+    fn refuses_anything_that_leaves_the_directory() {
+        for (dir, target) in [
+            (".", "../secret.md"),
+            ("docs", "../../x.md"),
+            (".", "/etc/passwd"),
+            ("docs", "a/../../b.md"),
+            // Climbing out of `docs` and back into a sibling is still out.
+            ("docs", "../other/x.md"),
+        ] {
+            assert!(
+                matches!(confine(dir, target), Err(ConfineError::Outside(_))),
+                "{dir:?} + {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn includes_resolve_through_the_provider_and_missing_ones_error() {
+        let files = Mem(HashMap::from([("notes.md", "# Notes\n\nfrom the host\n")]));
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "## Notes\n<!-- meshfox:node id=\"notes\" type=\"include\" -->\n\n[notes](./notes.md)\n",
+        );
+        let canvas = render::render_canvas(raw, Path::new("doc.canvas.md"), &files).unwrap();
+        assert!(canvas.node("notes").unwrap().text.contains("from the host"));
+
+        let empty = Mem(HashMap::new());
+        assert!(render::render_canvas(raw, Path::new("doc.canvas.md"), &empty).is_err());
+    }
 }
