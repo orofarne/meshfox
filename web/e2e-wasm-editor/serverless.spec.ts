@@ -988,3 +988,24 @@ test("the first screen says what happens to a file, and the help explains it", a
   await expect(help.getByText(/draft of the text is kept in this browser/)).toBeVisible();
   await expect(help.getByRole("heading", { name: "Not here" })).toBeVisible();
 });
+
+test("on a phone-sized screen the strip is a bar across the bottom and covers nothing", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 780 });
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.locator(".react-flow__controls")).toBeVisible();
+  const box = async (selector: string) => (await page.locator(selector).first().boundingBox())!;
+  const pill = await box("#wasm-pill");
+  // Across the width, not squeezed into a sliver ...
+  expect(pill.width).toBeGreaterThan(300);
+  expect(pill.height).toBeLessThan(140);
+  // ... with the text on one readable block, and nothing of React Flow under it.
+  for (const selector of [".react-flow__controls", ".react-flow__minimap"]) {
+    if ((await page.locator(selector).count()) === 0) continue;
+    const other = await box(selector);
+    expect(other.y + other.height, `${selector} must end above the strip`).toBeLessThanOrEqual(pill.y + 1);
+  }
+});

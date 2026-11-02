@@ -63,6 +63,13 @@ const STYLE = `
   /* Floats over the app, bottom centre: React Flow's controls sit bottom left
      and its minimap bottom right, so the middle is the free place. */
   #wasm-pill { position:fixed; left:50%; transform:translateX(-50%); bottom:12px; z-index:2147483000; max-width:calc(100vw - 460px); font:12px "Fira Code", system-ui, sans-serif; background:var(--node-bg); color:var(--fg); border:1px solid var(--node-border); padding:4px 10px; border-radius:999px; opacity:.9; }
+  /* A narrow screen has no free middle: the strip becomes a bar across the
+     bottom, and React Flow's controls and minimap sit above it (--wasm-pill-h
+     is its height, kept by pill()). */
+  @media (max-width: 900px) {
+    #wasm-pill { left:8px; right:8px; bottom:8px; transform:none; max-width:none; border-radius:12px; padding:6px 10px; line-height:1.7; }
+    .react-flow__panel.bottom { margin-bottom: calc(var(--wasm-pill-h, 0px) + 15px) !important; }
+  }
   #wasm-pill a { color:var(--accent); margin-left:8px; cursor:pointer; text-decoration:underline; }
 `;
 
@@ -245,7 +252,19 @@ function pill(doc: Document, backend: Backend, pending?: Draft): { element: HTML
     el("a", { id: "wasm-add-folder", textContent: "add folder…", onclick: () => folderPicker.click() }),
     el("a", { textContent: "open another", onclick: () => history.back() }),
   );
-  return { element, dispose: () => (unsubscribe(), element.remove()) };
+  // The height the bar takes at the bottom, for the rules above.
+  const watcher = new ResizeObserver(() =>
+    document.documentElement.style.setProperty("--wasm-pill-h", `${element.offsetHeight + 8}px`),
+  );
+  watcher.observe(element);
+  return {
+    element,
+    dispose: () => {
+      unsubscribe();
+      watcher.disconnect();
+      element.remove();
+    },
+  };
 }
 
 /** Keeps the unsaved text as a draft while it differs from what was saved, and
