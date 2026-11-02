@@ -1256,3 +1256,21 @@ test.describe("touch fields", () => {
     expect(await small("input, select, textarea")).toEqual([]);
   });
 });
+
+test("closing the tab with unsaved edits asks first (beforeunload)", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await editSource(page, ADDED);
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+
+  const dialog = page.waitForEvent("dialog", { timeout: 5000 });
+  const closing = page.close({ runBeforeUnload: true });
+  const d = await dialog;
+  expect(d.type()).toBe("beforeunload");
+  await d.dismiss();
+  await closing;
+  expect(page.isClosed(), "staying keeps the tab open").toBe(false);
+});

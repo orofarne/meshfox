@@ -598,8 +598,9 @@ launcher(arrivedOnDocument ? "That document was only in memory. Open it again to
 
 window.addEventListener("beforeunload", (event) => {
   if (documentOpen && !discarding && unsaved()) {
+    // `preventDefault` is the standard way to ask for the "leave this page?"
+    // prompt; the old `returnValue = ""` is deprecated and no longer needed.
     event.preventDefault();
-    event.returnValue = "";
   }
 });
 
