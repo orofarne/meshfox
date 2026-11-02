@@ -1113,3 +1113,34 @@ test("an arrow's label keeps its shape wherever the view is, and moves with the 
   expect(Math.round(after.b.x - before.b.x)).toBe(Math.round(after.n.x - before.n.x));
   expect(Math.round(after.b.y - before.b.y)).toBe(Math.round(after.n.y - before.n.y));
 });
+
+test("the strip stays under the node text editor: its buttons can be pressed", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 780 });
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.locator('.react-flow__node[data-id="root"] .mesh-node-title-text').first().click();
+  await page.getByTitle("Edit this node's Markdown text").click();
+  await expect(page.locator(".mesh-text-editor-source .monaco-editor")).toBeVisible();
+  // The strip is below the editor's backdrop, whatever the screen's height ...
+  const zs = await page.evaluate(() => ({
+    strip: Number(getComputedStyle(document.getElementById("wasm-pill")!).zIndex),
+    editor: Number(getComputedStyle(document.querySelector(".mesh-text-editor-backdrop")!).zIndex),
+  }));
+  expect(zs.strip).toBeLessThan(zs.editor);
+  // ... so nothing it holds is under it. Whatever is at the middle of each button must be that button (a disabled
+  // one included: Playwright's own click check refuses those).
+  for (const name of ["Cancel", "Apply", "Save & close"]) {
+    const covered = await page
+      .getByRole("button", { name, exact: true })
+      .evaluate((button) => {
+        const r = button.getBoundingClientRect();
+        const top = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+        return top !== null && !button.contains(top);
+      });
+    expect(covered, `"${name}" must not be covered`).toBe(false);
+  }
+});

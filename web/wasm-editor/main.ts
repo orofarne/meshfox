@@ -60,9 +60,11 @@ const STYLE = `
   #help ul { margin:0; padding-left:1.1rem; opacity:.85; }
   #help li { margin:.3rem 0; }
   .launcher .note { font-size:.75rem; opacity:.55; margin-top:2rem; line-height:1.6; }
+  /* Above the canvas but below every editor, dialog and backdrop of the app
+     (z-index 2000 and up): where one is open, it is what the person is using. */
   /* Floats over the app, bottom centre: React Flow's controls sit bottom left
      and its minimap bottom right, so the middle is the free place. */
-  #wasm-pill { position:fixed; left:50%; transform:translateX(-50%); bottom:12px; z-index:2147483000; max-width:calc(100vw - 460px); font:12px "Fira Code", system-ui, sans-serif; background:var(--node-bg); color:var(--fg); border:1px solid var(--node-border); padding:4px 10px; border-radius:999px; opacity:.9; }
+  #wasm-pill { position:fixed; left:50%; transform:translateX(-50%); bottom:12px; z-index:1000; max-width:calc(100vw - 460px); font:12px "Fira Code", system-ui, sans-serif; background:var(--node-bg); color:var(--fg); border:1px solid var(--node-border); padding:4px 10px; border-radius:999px; opacity:.9; }
   /* A narrow screen has no free middle: the strip becomes a bar across the
      bottom, and React Flow's controls and minimap sit above it (--wasm-pill-h
      is its height, kept by pill()). */
