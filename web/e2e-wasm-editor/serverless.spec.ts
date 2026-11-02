@@ -1028,3 +1028,41 @@ test("where the browser has locked img.src (iOS content blockers) the launcher s
   // Still the launcher: nothing was half-started.
   await expect(page.getByRole("heading", { name: "Open a canvas" })).toBeVisible();
 });
+
+test.describe("touch", () => {
+  test.use({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 780 } });
+
+  test("a finger dragging from on a node pans the canvas, like one dragging from the gap", async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium", "synthetic touch drags go through the DevTools protocol");
+    const file = path.join(tmpDir(), "doc.canvas.md");
+    fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+    await page.goto("/");
+    await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+    await expect(page.getByText("The root.")).toBeVisible();
+    // The node's text must not opt out of panning (it does on a mouse).
+    await expect(page.locator(".mesh-node-body.nopan, .mesh-node-title-text.nopan")).toHaveCount(0);
+
+    const viewport = () => page.locator(".react-flow__viewport").evaluate((el) => (el as HTMLElement).style.transform);
+    const text = page.getByText("The root.");
+    const at = (await text.boundingBox())!;
+    const x = at.x + at.width / 2;
+    const y = at.y + at.height / 2;
+    const before = await viewport();
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x, y }] });
+    for (let i = 1; i <= 8; i++) {
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: x + i * 8, y: y + i * 8 }] });
+    }
+    await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await expect.poll(viewport).not.toBe(before);
+  });
+});
+
+test("with a mouse, a drag on a node's text still selects instead of panning", async ({ page }) => {
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  expect(await page.locator(".mesh-node-body.nopan").count()).toBeGreaterThan(0);
+});

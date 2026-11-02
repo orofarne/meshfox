@@ -48,6 +48,18 @@ import { resolveAssetHref } from "./assetHref";
 import { canOpenOnServer } from "./openUrl";
 
 /**
+ * Text in a node (its title and prose body) opts out of React Flow's
+ * pan-on-drag with `nopan`, so a mouse drag that starts on it selects the
+ * text instead of moving the canvas. A finger has no such drag: it can only
+ * scroll or pan, and with `nopan` here a touch that lands on a node does
+ * nothing at all — the canvas moved only from the gaps between nodes. So on a
+ * touch screen (`pointer: coarse`) the text does not opt out. Code blocks,
+ * forms and the like keep `nopan` everywhere: they scroll or take input.
+ */
+const TEXT_NOPAN =
+  typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches ? "" : "nopan";
+
+/**
  * `react-markdown`'s own `defaultUrlTransform` strips any URL scheme
  * outside `http(s)`/`irc(s)`/`mailto`/`xmpp` down to `""` — a sensible
  * default (blocks a `javascript:`/`data:text/html` link), but it also
@@ -2436,7 +2448,7 @@ function FileCodePreview({ nodeId, target, lang }: { nodeId: string; target?: st
 
   if (state.status === "error") {
     return (
-      <div className="mesh-node-body nopan">
+      <div className={`mesh-node-body ${TEXT_NOPAN}`}>
         {target ? (
           <a href={resolveAssetHref(target, undefined)} target="_blank" rel="noreferrer">
             {target}
@@ -2531,7 +2543,7 @@ export function NodeBodyPreview({ text }: { text: string }) {
   const segments = parseBody(text, "preview");
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   return (
-    <div className="mesh-node-body nopan" ref={wheelRef}>
+    <div className={`mesh-node-body ${TEXT_NOPAN}`} ref={wheelRef}>
       {segments.map((seg, i) => {
         if (seg.type === "markdown") {
           return (
@@ -2672,7 +2684,7 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
   let constraintIdx = 0;
   let renderIdx = 0;
   return (
-    <div className="mesh-node-body nopan" ref={wheelRef}>
+    <div className={`mesh-node-body ${TEXT_NOPAN}`} ref={wheelRef}>
       {segments.map((seg) => {
         if (seg.type === "markdown") {
           return (
@@ -2892,7 +2904,7 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
   if (data.nodeType === "file" && data.interpreter && data.target) {
     return (
       <>
-        <div className="mesh-node-body nopan">
+        <div className={`mesh-node-body ${TEXT_NOPAN}`}>
           <FileTargetRow data={data} />
           {data.caption && <FileLinkCaption caption={data.caption} />}
         </div>
@@ -2907,7 +2919,7 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
          * heading/intro for the file content that follows, not a footnote
          * on it (unlike the plain-link display mode, where the caption
          * naturally reads as elaborating on the link above it). */}
-        {data.caption && <div className="mesh-node-body nopan"><FileLinkCaption caption={data.caption} /></div>}
+        {data.caption && <div className={`mesh-node-body ${TEXT_NOPAN}`}><FileLinkCaption caption={data.caption} /></div>}
         <FileCodePreview nodeId={nodeId} target={data.target} lang={data.lang} />
       </>
     );
@@ -2915,14 +2927,14 @@ export function NodeBodyContent({ data, nodeId }: { data: MeshNodeData; nodeId: 
   if (data.nodeType === "file" && data.display === "table") {
     return (
       <>
-        {data.caption && <div className="mesh-node-body mesh-table-caption nopan"><FileLinkCaption caption={data.caption} /></div>}
+        {data.caption && <div className={`mesh-node-body mesh-table-caption ${TEXT_NOPAN}`}><FileLinkCaption caption={data.caption} /></div>}
         <FileTablePreview nodeId={nodeId} target={data.target} />
       </>
     );
   }
   if (data.nodeType === "file" || data.nodeType === "link") {
     return (
-      <div className="mesh-node-body nopan">
+      <div className={`mesh-node-body ${TEXT_NOPAN}`}>
         <FileTargetRow data={data} />
         {data.nodeType === "link" && data.preview && data.target && (
           <LinkPreviewCard target={data.target} />
@@ -3360,7 +3372,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       {isTitleOnly ? (
         <div
           ref={setTitleOnlyRef}
-          className="mesh-node-title mesh-node-title-centered nopan"
+          className={`mesh-node-title mesh-node-title-centered ${TEXT_NOPAN}`}
           data-level={data.level}
           data-autofit={data.fixedSize || undefined}
           data-overflowing={autoFitOverflowing || undefined}
@@ -3408,7 +3420,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
             <input {...titleEditInputProps} />
           ) : (
             <span
-              className="mesh-node-title-text nopan"
+              className={`mesh-node-title-text ${TEXT_NOPAN}`}
               onMouseEnter={(event) => {
                 const title = event.currentTarget;
                 if (title.scrollWidth > title.clientWidth) title.title = data.title;
