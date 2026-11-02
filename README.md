@@ -8,7 +8,7 @@
   c c
 ```
 
-[Website](https://meshfox.orofarne.net/) · [GitHub](https://github.com/orofarne/meshfox) · [Download binary](https://github.com/orofarne/meshfox/releases)
+[Website](https://meshfox.orofarne.net/) · [Online editor](https://meshfox-editor.orofarne.net/) · [GitHub](https://github.com/orofarne/meshfox) · [Download binary](https://github.com/orofarne/meshfox/releases)
 
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=orofarne_meshfox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=orofarne_meshfox)
 
@@ -449,6 +449,19 @@ Options:
   -h, --help             Print help
 ```
 <!-- /meshfox:output -->
+
+### Online editor (in the browser)
+<!-- meshfox:node id="online-editor-in-the-browser" -->
+
+[meshfox-editor.orofarne.net](https://meshfox-editor.orofarne.net/) is the same web UI with no `meshfox` process behind it: the document model (`crates/model`, compiled to WebAssembly by `crates/wasm`) runs in the page and answers the UI's `api/...` requests itself, with the same edit and undo code the server uses. Open a `.canvas.md`, a whole folder (so includes, images, linked files and other canvases resolve) or drop either onto the page, or start a new canvas.
+
+**Privacy.** Files are read in the tab and never uploaded; there is no analytics. Unsaved edits are kept as a draft in the browser's own storage (IndexedDB) on that device, until you save, discard them or undo back to the saved text.
+
+**What works.** Reading; Edit mode (node text, title, settings, arrows, layout, adding, moving and deleting nodes); Source mode for the whole file; undo, redo and the history list, for each canvas separately; `include`s, constraints and computed views; `file` nodes that link to another canvas of the opened folder (↗, Back and Forward move between them). Saving: "save" writes into a file you choose (Chromium browsers), "download" hands you the text anywhere else; nothing changes your original until you do.
+
+**What does not.** Running blocks, forms, services, `display="table"` tables, link preview cards and editing the files a canvas includes — the page runs as `noexec`, like `meshfox --no-exec view`. Safari's folder picker leaves out dot-files, so a picked (not dropped) folder cannot honour `.meshfoxignore` there; a browser or privacy tool that locks `img.src`, `fetch` or `WebSocket` cannot run it and says so.
+
+**Build and run it yourself.** With the `wasm-prep` block from "Unit tests" done, `cd web && npm run build:wasm && npm run preview:wasm` serves it on `http://localhost:4600/`. `scripts/package-editor.sh` builds the directory to upload (the site plus `_headers` with the Content-Security-Policy; Cloudflare Pages reads it as it is) and should be served from its own origin, because drafts live in that origin's storage. The browser tests are the `wasm-editor` block under "End-to-end tests", the model's own the `wasm` block under "Unit tests". How it works, and its limits, in [web/wasm-editor/README.md](./web/wasm-editor/README.md).
 
 ### macOS menu-bar app (`server_socket`, experimental)
 <!-- meshfox:node id="macos-menu-bar-app-open-experimental" -->
