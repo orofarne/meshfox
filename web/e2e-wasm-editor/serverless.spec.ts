@@ -1197,3 +1197,32 @@ test.describe("iOS", () => {
     expect(shown).toBe(0);
   });
 });
+
+async function openTextEditor(page: Page, width: number) {
+  await page.setViewportSize({ width, height: width < 700 ? 780 : 900 });
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+  await page.locator('.react-flow__node[data-id="root"] .mesh-node-title-text').first().click();
+  await page.getByTitle("Edit this node's Markdown text").click();
+  await expect(page.locator(".mesh-text-editor-source .monaco-editor")).toBeVisible();
+  const box = async (selector: string) => (await page.locator(selector).first().boundingBox())!;
+  return { source: await box(".mesh-text-editor-source"), preview: await box(".mesh-text-editor-preview"), panel: await box(".mesh-text-editor") };
+}
+
+test("the node text editor stacks its preview under the source on a narrow screen", async ({ page }) => {
+  const { source, preview, panel } = await openTextEditor(page, 390);
+  expect(preview.y, "preview below the source").toBeGreaterThanOrEqual(source.y + source.height - 1);
+  expect(Math.abs(preview.x - source.x), "same column").toBeLessThan(2);
+  expect(source.width, "each uses the full width").toBeGreaterThan(panel.width - 4);
+  expect(source.height, "the source gets the larger share").toBeGreaterThan(preview.height);
+});
+
+test("on a wide screen the preview stays beside the source", async ({ page }) => {
+  const { source, preview } = await openTextEditor(page, 1200);
+  expect(preview.x).toBeGreaterThanOrEqual(source.x + source.width - 1);
+  expect(Math.abs(preview.y - source.y)).toBeLessThan(2);
+});

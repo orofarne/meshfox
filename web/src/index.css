@@ -1639,6 +1639,28 @@ a {
   padding: 0.5rem 0.75rem;
 }
 
+/* A narrow screen cannot hold two columns of text: the editor takes the
+ * whole screen and the preview goes under the source instead of beside it
+ * (the source gets the larger share: it is what is being typed into). */
+@media (max-width: 700px) {
+  .mesh-text-editor {
+    width: 100vw;
+    height: 100dvh;
+    border-radius: 0;
+    border: 0;
+  }
+
+  .mesh-text-editor-panes {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
+  }
+
+  .mesh-text-editor-source {
+    border-right: 0;
+    border-bottom: 1px solid var(--node-border);
+  }
+}
+
 /* Shown over the panes when the node's body was changed elsewhere while
  * this editor held unsaved edits — nothing is written until a side is
  * picked. Uses the accent colour rather than a new one: it's the same
