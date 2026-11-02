@@ -40,10 +40,17 @@ fn entropy() -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-/// The version of this build, for a host that wants to show or check it.
+/// The version of this build, for a host that wants to show or check it:
+/// `<tag> (<date>)` for a build made from a release tag, `commit <hash>
+/// (<date>)` otherwise — what `meshfox --version` says, not the crate's own
+/// version, which does not change between releases.
 #[wasm_bindgen]
 pub fn version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    format!(
+        "{} ({})",
+        env!("MESHFOX_VERSION_LABEL"),
+        env!("MESHFOX_GIT_DATE")
+    )
 }
 
 /// The current time as the model stamps it (`createdAt`/`updatedAt`, UTC

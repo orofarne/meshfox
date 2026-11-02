@@ -992,6 +992,8 @@ test("the first screen says what happens to a file, and the help explains it", a
   await expect(help.getByRole("heading", { name: "Privacy" })).toBeVisible();
   await expect(help.getByText(/draft of the text is kept in this browser/)).toBeVisible();
   await expect(help.getByRole("heading", { name: "Not here" })).toBeVisible();
+  // The build, as `meshfox --version` names it: a tag or a commit, and a date.
+  await expect(help.locator("#version")).toHaveText(/^meshfox editor (v\d+\.\d+\.\d+\S*|commit [0-9a-f]+) \(\d{4}-\d{2}-\d{2}\)$/);
 });
 
 test("on a phone-sized screen the strip is a bar across the bottom and covers nothing", async ({ page }) => {

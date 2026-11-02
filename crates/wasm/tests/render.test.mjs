@@ -20,7 +20,7 @@ const INCLUDE_DOC = [
 ].join("");
 
 test("the module reports a version", () => {
-  assert.match(wasm.version(), /^\d+\.\d+\.\d+/);
+  assert.match(wasm.version(), /^(v\d+\.\d+\.\d+\S*|commit \S+) \(.+\)$/);
 });
 
 test("the host clock is wired: the model can stamp the current time", () => {

@@ -429,6 +429,9 @@ async function chooseAndStart(picked: Picked) {
 /** What the page does with a file, in plain words: the answer to "is this safe
  * to open my notes in?" has to be on the first screen. */
 function help(): HTMLElement {
+  // Which build this is, for a bug report: what `meshfox --version` would say.
+  const version = el("p", { id: "version", className: "note" });
+  void ready.then(() => (version.textContent = `meshfox editor ${wasmApi.version()}`)).catch(() => {});
   const section = (title: string, ...items: string[]) => [
     el("h3", { textContent: title }),
     el("ul", {}, ...items.map((text) => el("li", { textContent: text }))),
@@ -453,6 +456,7 @@ function help(): HTMLElement {
       "Not here",
       "Running code blocks, buttons and forms, services, tables (display=table), link preview cards, and editing the files a canvas includes. Those need the meshfox app (meshfox view).",
     ),
+    version,
   );
 }
 
