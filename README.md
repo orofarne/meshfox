@@ -87,15 +87,7 @@ This document is itself a valid meshfox canvas — every `##` section here is a 
 
 Rough checklist for what's needed before a 1.0.0 release:
 
-- [x] Linux server support (`meshfox serve` under `systemd --user` socket activation, see "macOS menu-bar app" below)
-- [x] Serving canvases to a browser over HTTP (`meshfox serve --http`, see "Serving canvases over HTTP")
-- [x] Persistent sessions (runs/services/tty survive a core restart)
-- [x] Undo/redo
-- [x] Full canvas-geometry support in the TUI
-- [x] A unified interface for external renderers
-- [x] LaTeX, Vega, Mermaid/PlantUML sub-render support (as SVG output from external renderers, see "Showing a diagram, formula or chart")
-- [x] Conflict resolution for concurrent editing
-- [x] Encryption for stored secrets (macOS Keychain, Linux Secret Service; Windows Credential Manager comes with Windows support)
+- [ ] Windows support (the CLI, TUI and web UI natively, and the Windows Credential Manager for stored secrets)
 - [ ] Rewrite docs
 
 ## Concept
