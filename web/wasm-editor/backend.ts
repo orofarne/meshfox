@@ -237,6 +237,233 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     VirtualFiles.join(params.get("dir") || canvasDir(), params.get("file") ?? "");
   const mimeOf = (path: string): string => MIME[path.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
 
+  type Handled = Response | Promise<Response> | undefined;
+  type EditOut = { raw: string; newId?: string };
+
+  /** `GET api/<route>`: the document, its files and the empty lists. */
+  const handleGet = (route: string, params: URLSearchParams): Handled => {
+    switch (route) {
+      case "ping":
+        return text("ok");
+      case "info":
+        // `remote`: nothing here can open a file on "the server's machine".
+        return json({ readOnly: false, noExec: true, remote: true, serverless: true, version: wasm.version() });
+      case "canvas":
+        return canvasResponse();
+      case "canvas/raw":
+        return rawResponse(params.get("include"));
+      case "includes":
+      case "services":
+      case "runs":
+      case "syntax":
+      case "vars":
+        return json([]);
+      case "history": {
+        const limit = Number(params.get("limit") ?? 50);
+        return json({
+          cursor: session.seq,
+          canUndo: session.canUndo,
+          canRedo: session.canRedo,
+          entries: session.history(Number.isFinite(limit) ? limit : 50),
+        });
+      }
+      case "link-preview":
+        return json({ preview: null });
+      case "asset":
+        return assetResponse(params);
+    }
+    const fileContent = /^nodes\/([^/]+)\/file-content$/.exec(route);
+    return fileContent ? fileContentResponse(decodeURIComponent(fileContent[1])) : undefined;
+  };
+
+  /** The canvas text, or (with `include`) an included file, which is shown but not editable here yet. */
+  const rawResponse = (include: string | null): Response => {
+    if (include === null) {
+      return new Response(session.raw, {
+        headers: { "Content-Type": "text/plain; charset=utf-8", ETag: session.rev, "x-meshfox-read-only": "false" },
+      });
+    }
+    const target = canvas()?.nodes.find((n) => n.id === include)?.target;
+    const path = target ? VirtualFiles.join(canvasDir(), target.split("#")[0]) : undefined;
+    const data = path === undefined ? undefined : doc.files.get(path);
+    if (data === undefined) return text(`no readable include ${include}`, 404);
+    return new Response(data as BodyInit, {
+      headers: { "Content-Type": "text/plain; charset=utf-8", ETag: '"mfx-include"', "x-meshfox-read-only": "true" },
+    });
+  };
+
+  const assetResponse = (params: URLSearchParams): Response | Promise<Response> => {
+    const path = assetPath(params);
+    const data = doc.files.get(path);
+    if (data !== undefined) return new Response(data as BodyInit, { headers: { "Content-Type": mimeOf(path) } });
+    const url = doc.files.urlOf(path);
+    return url !== undefined ? nativeFetch(url) : text(`${path}: not found`, 404);
+  };
+
+  const fileContentResponse = (id: string): Response => {
+    const node = canvas()?.nodes.find((n) => n.id === id);
+    if (!node?.target) return text(`no file node ${id}`, 404);
+    const path = VirtualFiles.join(canvasDir(), node.target.split("#")[0]);
+    const data = doc.files.get(path);
+    if (data === undefined) return text(`${path}: not among the opened files`, 404);
+    const truncated = data.length > FILE_PREVIEW_MAX_BYTES;
+    const content = new TextDecoder().decode(truncated ? data.slice(0, FILE_PREVIEW_MAX_BYTES) : data);
+    return json({ content, truncated });
+  };
+
+  /** `PUT canvas/raw`: the whole text, from Source mode. */
+  const putRaw = (params: URLSearchParams, body: string | undefined, headers: Headers): Response => {
+    if (params.get("include") !== null) {
+      return text("an included file cannot be edited in the browser yet", 403);
+    }
+    if (!session.matches(headers.get("if-match"))) {
+      return json(
+        {
+          error: "sourceConflict",
+          message: "the document changed since it was read — reread, then retry with the current ETag",
+          currentText: session.raw,
+          currentRev: session.rev,
+        },
+        412,
+      );
+    }
+    const problem = commit(body ?? "", "source");
+    if (problem !== undefined) return text(problem, 422);
+    return new Response(null, { status: 204, headers: { ETag: session.rev } });
+  };
+
+  type Applied = {
+    raw?: string;
+    conflict?: { currentText: string; currentRev: string; currentTitle: string };
+    error?: { kind: string; message: string };
+  };
+
+  /** What a model edit that returns the new text answers with: the failure, or the committed document. */
+  const commitApplied = (out: Applied): Response => {
+    if (out.conflict) {
+      return json(
+        {
+          error: "bodyConflict",
+          message: "the node's body changed since it was read — reread, then retry with the current revision",
+          ...out.conflict,
+        },
+        409,
+      );
+    }
+    if (out.error) return text(out.error.message, out.error.kind === "notFound" ? 404 : 422);
+    const problem = commit(out.raw!, "node_upserted");
+    return problem === undefined ? canvasResponse() : text(problem, 422);
+  };
+
+  /** `PATCH nodes/:id` and `PATCH nodes/:id/block/:name`: the edits `meshfox view` makes (`meshfox_model::edit`). */
+  const patch = (route: string, body: string | undefined): Handled => {
+    const blockRoute = /^nodes\/([^/]+)\/block\/([^/]+)$/.exec(route);
+    if (blockRoute) {
+      const id = decodeURIComponent(blockRoute[1]);
+      const block = decodeURIComponent(blockRoute[2]);
+      return commitApplied(JSON.parse(wasm.applyBlockAttrs(session.raw, id, block, body ?? "{}")));
+    }
+    const nodeRoute = /^nodes\/([^/]+)$/.exec(route);
+    if (!nodeRoute) return undefined;
+    return commitApplied(JSON.parse(wasm.applyNodeUpdate(session.raw, decodeURIComponent(nodeRoute[1]), body ?? "{}")));
+  };
+
+  /** "↗ open" on a file node that is a canvas: another canvas of the opened
+   * files, shown in this page (nothing else can be opened from a page). */
+  const openCanvas = (route: string): Handled => {
+    const openRoute = /^nodes\/([^/]+)\/open$/.exec(route);
+    if (!openRoute) return undefined;
+    const node = canvas()?.nodes.find((n) => n.id === decodeURIComponent(openRoute[1]));
+    if (!node?.target) return text(`no file node ${openRoute[1]}`, 404);
+    const [target, fragment] = node.target.split("#");
+    if (!target.endsWith(".canvas.md")) return text("only a canvas can be opened in the browser editor", 422);
+    const problem = backend.navigate?.(VirtualFiles.join(canvasDir(), target), fragment ?? null);
+    return problem === undefined ? json({ action: "done" }) : text(problem, 404);
+  };
+
+  type EditSpec = { op: string; args: Record<string, unknown>; kind: string; quiet?: boolean; respond: (out: EditOut) => Response };
+  const done = (): Response => canvasResponse();
+  const noContent = (): Response => new Response(null, { status: 204 });
+  const parsedBody = (body: string | undefined): Record<string, unknown> => {
+    try {
+      return JSON.parse(body || "{}");
+    } catch {
+      return {};
+    }
+  };
+
+  /** Each document edit, by the request that asks for it: the model operation, its arguments, how it is logged and answered. */
+  const EDITS: Record<string, (id: string, params: URLSearchParams, body: string | undefined) => EditSpec> = {
+    "POST nodes": (_id, _p, body) => ({
+      op: "create", args: parsedBody(body), kind: "node_created", respond: (out) => canvasResponse({ newId: out.newId }),
+    }),
+    "DELETE nodes/:id": (id, params) => ({
+      op: "remove", args: { id, reparent: params.get("children") === "reparent" }, kind: "node_removed", respond: done,
+    }),
+    "POST nodes/:id/reparent": (id, _p, body) => ({ op: "reparent", args: { id, ...parsedBody(body) }, kind: "node_moved", respond: done }),
+    "POST nodes/:id/move": (id, _p, body) => ({ op: "move", args: { id, ...parsedBody(body) }, kind: "node_moved", respond: done }),
+    "POST nodes/:id/rename-id": (id, _p, body) => ({
+      op: "renameId", args: { id, ...parsedBody(body) }, kind: "node_id_renamed", respond: done,
+    }),
+    "POST nodes/:id/clear-id": (id) => ({
+      op: "clearId", args: { id }, kind: "node_id_renamed",
+      respond: (out) => {
+        const c = canvasObject();
+        return typeof c === "string" ? text(c, 422) : json({ id: out.newId, canvas: c });
+      },
+    }),
+    "POST nodes/:id/append": (id, _p, body) => ({
+      op: "append", args: { id, text: body ?? "" }, kind: "node_upserted", respond: noContent,
+    }),
+    "POST nodes/:id/clear-layout": (id) => ({ op: "clearNodeLayout", args: { id }, kind: "layout_cleared", respond: done }),
+    "PUT options": (_id, _p, body) => ({ op: "options", args: parsedBody(body), kind: "options_changed", respond: done }),
+    // A drag or a resize: the page already shows it.
+    "PUT canvas": (_id, _p, body) => ({ op: "layout", args: parsedBody(body), kind: "layout", quiet: true, respond: noContent }),
+    "POST canvas/clear-layout": () => ({ op: "clearLayout", args: {}, kind: "layout_cleared", respond: done }),
+    "POST canvas/reorder-siblings": () => ({ op: "reorder", args: {}, kind: "node_moved", respond: done }),
+  };
+
+  /** The request's shape: `nodes/abc/move` is `nodes/:id/move`, and carries the id. */
+  const editKey = (method: string, route: string): { key: string; id: string } => {
+    const node = /^nodes\/([^/]+)(\/(?:reparent|move|rename-id|clear-id|append|clear-layout))?$/.exec(route);
+    if (!node) return { key: `${method} ${route}`, id: "" };
+    return { key: `${method} nodes/:id${node[2] ?? ""}`, id: decodeURIComponent(node[1]) };
+  };
+
+  /** The document edits: the same ones `meshfox view`'s endpoints make (`meshfox_model::edit`), recorded in the undo log. */
+  const documentEdit = (method: string, route: string, params: URLSearchParams, body: string | undefined): Handled => {
+    const { key, id } = editKey(method, route);
+    const spec = EDITS[key]?.(id, params, body);
+    if (spec === undefined) return undefined;
+    const result = edit(spec.op, spec.args, spec.kind, spec.quiet);
+    return "response" in result ? result.response : spec.respond(result.out);
+  };
+
+  /** `POST undo`, `redo` and `history/goto`. */
+  const undoStep = (route: string, body: string | undefined): Handled => {
+    if (route !== "undo" && route !== "redo" && route !== "history/goto") return undefined;
+    const step = (): boolean => {
+      if (route === "undo") return session.undo();
+      if (route === "redo") return session.redo();
+      return session.goto(Number(JSON.parse(body ?? "{}").seq));
+    };
+    let changed: boolean;
+    try {
+      changed = step();
+    } catch (e) {
+      // A step that no longer fits the document: nothing moved. What the
+      // exception says is for whoever debugs this, so it goes to the
+      // console, and the answer carries only the fixed sentence.
+      console.warn("meshfox editor: an undo/redo step was refused", e);
+      return text("that step no longer fits the document", 422);
+    }
+    if (changed) {
+      show();
+      announce(true);
+    }
+    return stepResult(changed);
+  };
+
   const handle = async (
     route: string,
     params: URLSearchParams,
@@ -244,228 +471,13 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     body: string | undefined,
     headers: Headers,
   ): Promise<Response> => {
-    if (method === "GET") {
-      switch (route) {
-        case "ping":
-          return text("ok");
-        case "info":
-          // `remote`: nothing here can open a file on "the server's machine".
-          return json({ readOnly: false, noExec: true, remote: true, serverless: true, version: wasm.version() });
-        case "canvas":
-          return canvasResponse();
-        case "canvas/raw": {
-          const include = params.get("include");
-          if (include === null) {
-            return new Response(session.raw, {
-              headers: { "Content-Type": "text/plain; charset=utf-8", ETag: session.rev, "x-meshfox-read-only": "false" },
-            });
-          }
-          // An included file: shown, not editable here yet.
-          const node = canvas()?.nodes.find((n) => n.id === include);
-          const target = node?.target;
-          const path = target ? VirtualFiles.join(canvasDir(), target.split("#")[0]) : undefined;
-          const data = path === undefined ? undefined : doc.files.get(path);
-          if (data === undefined) return text(`no readable include ${include}`, 404);
-          return new Response(data as BodyInit, {
-            headers: { "Content-Type": "text/plain; charset=utf-8", ETag: '"mfx-include"', "x-meshfox-read-only": "true" },
-          });
-        }
-        case "includes":
-        case "services":
-        case "runs":
-        case "syntax":
-        case "vars":
-          return json([]);
-        case "history": {
-          const limit = Number(params.get("limit") ?? 50);
-          return json({
-            cursor: session.seq,
-            canUndo: session.canUndo,
-            canRedo: session.canRedo,
-            entries: session.history(Number.isFinite(limit) ? limit : 50),
-          });
-        }
-        case "link-preview":
-          return json({ preview: null });
-        case "asset": {
-          const path = assetPath(params);
-          const data = doc.files.get(path);
-          if (data !== undefined) {
-            return new Response(data as BodyInit, { headers: { "Content-Type": mimeOf(path) } });
-          }
-          const url = doc.files.urlOf(path);
-          return url !== undefined ? nativeFetch(url) : text(`${path}: not found`, 404);
-        }
-      }
-      const fileContent = /^nodes\/([^/]+)\/file-content$/.exec(route);
-      if (fileContent) {
-        const id = decodeURIComponent(fileContent[1]);
-        const node = canvas()?.nodes.find((n) => n.id === id);
-        if (!node?.target) return text(`no file node ${id}`, 404);
-        const path = VirtualFiles.join(canvasDir(), node.target.split("#")[0]);
-        const data = doc.files.get(path);
-        if (data === undefined) return text(`${path}: not among the opened files`, 404);
-        const truncated = data.length > FILE_PREVIEW_MAX_BYTES;
-        const content = new TextDecoder().decode(truncated ? data.slice(0, FILE_PREVIEW_MAX_BYTES) : data);
-        return json({ content, truncated });
-      }
-    }
-    if (method === "PUT" && route === "canvas/raw") {
-      if (params.get("include") !== null) {
-        return text("an included file cannot be edited in the browser yet", 403);
-      }
-      if (!session.matches(headers.get("if-match"))) {
-        return json(
-          {
-            error: "sourceConflict",
-            message: "the document changed since it was read — reread, then retry with the current ETag",
-            currentText: session.raw,
-            currentRev: session.rev,
-          },
-          412,
-        );
-      }
-      const problem = commit(body ?? "", "source");
-      if (problem !== undefined) return text(problem, 422);
-      return new Response(null, { status: 204, headers: { ETag: session.rev } });
-    }
-    const nodeRoute = /^nodes\/([^/]+)$/.exec(route);
-    const blockRoute = /^nodes\/([^/]+)\/block\/([^/]+)$/.exec(route);
-    if (method === "PATCH" && blockRoute) {
-      const out = JSON.parse(
-        wasm.applyBlockAttrs(
-          session.raw,
-          decodeURIComponent(blockRoute[1]),
-          decodeURIComponent(blockRoute[2]),
-          body ?? "{}",
-        ),
-      ) as { raw?: string; error?: { kind: string; message: string } };
-      if (out.error) return text(out.error.message, out.error.kind === "notFound" ? 404 : 422);
-      const problem = commit(out.raw!, "node_upserted");
-      if (problem !== undefined) return text(problem, 422);
-      return canvasResponse();
-    }
-    if (method === "PATCH" && nodeRoute) {
-      // The same edit `PATCH /api/nodes/:id` makes (`meshfox_model::edit`).
-      const id = decodeURIComponent(nodeRoute[1]);
-      const out = JSON.parse(wasm.applyNodeUpdate(session.raw, id, body ?? "{}")) as {
-        raw?: string;
-        conflict?: { currentText: string; currentRev: string; currentTitle: string };
-        error?: { kind: string; message: string };
-      };
-      if (out.conflict) {
-        return json(
-          {
-            error: "bodyConflict",
-            message: "the node's body changed since it was read — reread, then retry with the current revision",
-            ...out.conflict,
-          },
-          409,
-        );
-      }
-      if (out.error) return text(out.error.message, out.error.kind === "notFound" ? 404 : 422);
-      const problem = commit(out.raw!, "node_upserted");
-      if (problem !== undefined) return text(problem, 422);
-      return canvasResponse();
-    }
-    // "↗ open" on a file node that is a canvas: another canvas of the opened
-    // files, shown in this page (nothing else can be opened from a page).
-    const openRoute = /^nodes\/([^/]+)\/open$/.exec(route);
-    if (method === "POST" && openRoute) {
-      const node = canvas()?.nodes.find((n) => n.id === decodeURIComponent(openRoute[1]));
-      if (!node?.target) return text(`no file node ${openRoute[1]}`, 404);
-      const [target, fragment] = node.target.split("#");
-      if (!target.endsWith(".canvas.md")) return text("only a canvas can be opened in the browser editor", 422);
-      const path = VirtualFiles.join(canvasDir(), target);
-      const problem = backend.navigate?.(path, fragment ?? null);
-      return problem === undefined ? json({ action: "done" }) : text(problem, 404);
-    }
-    // The document edits: the same ones `meshfox view`'s endpoints make
-    // (`meshfox_model::edit`), recorded in the undo log.
-    {
-      const json_ = (): Record<string, unknown> => {
-        try {
-          return JSON.parse(body || "{}");
-        } catch {
-          return {};
-        }
-      };
-      const idRoute = /^nodes\/([^/]+)\/(reparent|move|rename-id|clear-id|append|clear-layout)$/.exec(route);
-      const idMatch = idRoute ?? nodeRoute;
-      const id = idMatch ? decodeURIComponent(idMatch[1]) : "";
-      let result: { response: Response } | { out: { raw: string; newId?: string } } | undefined;
-      let respond: ((out: { raw: string; newId?: string }) => Response) | undefined;
-      if (method === "POST" && route === "nodes") {
-        result = edit("create", json_(), "node_created");
-        respond = (out) => canvasResponse({ newId: out.newId });
-      } else if (method === "DELETE" && nodeRoute) {
-        result = edit("remove", { id, reparent: params.get("children") === "reparent" }, "node_removed");
-        respond = () => canvasResponse();
-      } else if (method === "POST" && idRoute?.[2] === "reparent") {
-        result = edit("reparent", { id, ...json_() }, "node_moved");
-        respond = () => canvasResponse();
-      } else if (method === "POST" && idRoute?.[2] === "move") {
-        result = edit("move", { id, ...json_() }, "node_moved");
-        respond = () => canvasResponse();
-      } else if (method === "POST" && idRoute?.[2] === "rename-id") {
-        result = edit("renameId", { id, ...json_() }, "node_id_renamed");
-        respond = () => canvasResponse();
-      } else if (method === "POST" && idRoute?.[2] === "clear-id") {
-        result = edit("clearId", { id }, "node_id_renamed");
-        respond = (out) => {
-          const c = canvasObject();
-          return typeof c === "string" ? text(c, 422) : json({ id: out.newId, canvas: c });
-        };
-      } else if (method === "POST" && idRoute?.[2] === "append") {
-        result = edit("append", { id, text: body ?? "" }, "node_upserted");
-        respond = () => new Response(null, { status: 204 });
-      } else if (method === "POST" && idRoute?.[2] === "clear-layout") {
-        result = edit("clearNodeLayout", { id }, "layout_cleared");
-        respond = () => canvasResponse();
-      } else if (method === "PUT" && route === "options") {
-        result = edit("options", json_(), "options_changed");
-        respond = () => canvasResponse();
-      } else if (method === "PUT" && route === "canvas") {
-        // A drag or a resize: the page already shows it.
-        result = edit("layout", json_(), "layout", true);
-        respond = () => new Response(null, { status: 204 });
-      } else if (method === "POST" && route === "canvas/clear-layout") {
-        result = edit("clearLayout", {}, "layout_cleared");
-        respond = () => canvasResponse();
-      } else if (method === "POST" && route === "canvas/reorder-siblings") {
-        result = edit("reorder", {}, "node_moved");
-        respond = () => canvasResponse();
-      }
-      if (result !== undefined) return "response" in result ? result.response : respond!(result.out);
-    }
-    if (method === "POST") {
-      switch (route) {
-        case "undo":
-        case "redo":
-        case "history/goto": {
-          const step = (): boolean => {
-            if (route === "undo") return session.undo();
-            if (route === "redo") return session.redo();
-            return session.goto(Number(JSON.parse(body ?? "{}").seq));
-          };
-          let changed: boolean;
-          try {
-            changed = step();
-          } catch (e) {
-            // A step that no longer fits the document: nothing moved. What the
-            // exception says is for whoever debugs this, so it goes to the
-            // console, and the answer carries only the fixed sentence.
-            console.warn("meshfox editor: an undo/redo step was refused", e);
-            return text("that step no longer fits the document", 422);
-          }
-          if (changed) {
-            show();
-            announce(true);
-          }
-          return stepResult(changed);
-        }
-      }
-    }
+    let answer: Handled;
+    if (method === "GET") answer = handleGet(route, params);
+    else if (method === "PUT" && route === "canvas/raw") answer = putRaw(params, body, headers);
+    else if (method === "PATCH") answer = patch(route, body);
+    else if (method === "POST") answer = openCanvas(route) ?? documentEdit(method, route, params, body) ?? undoStep(route, body);
+    else answer = documentEdit(method, route, params, body);
+    if (answer !== undefined) return answer;
     return text(
       method === "GET"
         ? "this is not supported in the browser editor"
