@@ -3835,3 +3835,11 @@ a {
   z-index: 100;
   pointer-events: none;
 }
+
+/* Monaco adds a keyboard button (a bare textarea with a picture) to every
+ * editable editor on iOS, meant to bring up the on-screen keyboard. Tapping
+ * the text already does that, and the button is placed wherever the editor's
+ * corner happens to be — here over the text, doing nothing. */
+.monaco-editor .iPadShowKeyboard {
+  display: none !important;
+}

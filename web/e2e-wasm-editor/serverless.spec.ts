@@ -1168,3 +1168,32 @@ test("the toolbar scrolls sideways on its own when it does not fit; the page doe
   expect(last.x + last.width).toBeLessThanOrEqual(391);
   expect(last.x).toBeGreaterThanOrEqual(0);
 });
+
+test.describe("iOS", () => {
+  test.use({
+    userAgent:
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    viewport: { width: 390, height: 780 },
+    hasTouch: true, // Monaco takes a Mac/iPhone user agent *with* touch points for iOS
+  });
+
+  test("Monaco's on-screen-keyboard button (a dead textarea over the text) is not shown", async ({ page, browserName }) => {
+    // Only Chromium reports touch points under emulation, which Monaco needs to believe it is on iOS.
+    test.skip(browserName !== "chromium", "touch points are not emulated");
+    const file = path.join(tmpDir(), "doc.canvas.md");
+    fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+    await page.goto("/");
+    await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+    await expect(page.getByText("The root.")).toBeVisible();
+    await page.getByRole("button", { name: "Edit", exact: true }).click();
+    await page.locator('.react-flow__node[data-id="root"] .mesh-node-title-text').first().click();
+    await page.getByTitle("Edit this node's Markdown text").click();
+    await expect(page.locator(".mesh-text-editor-source .monaco-editor")).toBeVisible();
+    // It is created on iOS only: first make sure this really is that case.
+    await expect.poll(() => page.evaluate(() => navigator.maxTouchPoints)).toBeGreaterThan(0);
+    const shown = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>(".iPadShowKeyboard")].filter((el) => getComputedStyle(el).display !== "none").length,
+    );
+    expect(shown).toBe(0);
+  });
+});
