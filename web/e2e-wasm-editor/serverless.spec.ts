@@ -1066,3 +1066,50 @@ test("with a mouse, a drag on a node's text still selects instead of panning", a
   await expect(page.getByText("The root.")).toBeVisible();
   expect(await page.locator(".mesh-node-body.nopan").count()).toBeGreaterThan(0);
 });
+
+test("an arrow's label keeps its shape wherever the view is, and moves with the canvas for free", async ({ page }) => {
+  const file = path.join(tmpDir(), "labels.canvas.md");
+  fs.writeFileSync(
+    file,
+    [
+      '# Root\n<!-- meshfox:node id="root" -->\n<!-- meshfox:option name="unfold" -->\n\nThe root.\n',
+      '## Left\n<!-- meshfox:node id="left" -->\n\nleft body\n',
+      '## Right\n<!-- meshfox:node id="right" -->\n<!-- meshfox:edge from="left" label="a cheap alternative for everyone" -->\n\nright body\n',
+    ].join("\n"),
+  );
+  await page.setViewportSize({ width: 420, height: 700 });
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  const badge = page.locator(".mesh-edge-label-badge");
+  await expect(badge).toHaveCount(1);
+
+  const shape = async () => {
+    const r = (await badge.boundingBox())!;
+    return { r, text: await badge.evaluate((el) => (el as HTMLElement).innerText) };
+  };
+  // Not squeezed into a column of single letters, at any scroll position.
+  for (const dx of [0, -120, 90]) {
+    const pane = page.locator(".react-flow__pane");
+    const box = (await pane.boundingBox())!;
+    // The top corner: the strip across the bottom would take the press.
+    await page.mouse.move(box.x + 30, box.y + 12);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 30 + dx, box.y + 12, { steps: 4 });
+    await page.mouse.up();
+    const { r } = await shape();
+    expect(r.width, "wide enough to read").toBeGreaterThan(r.height * 1.5);
+  }
+
+  // It travels with the canvas: panning moves it by exactly what moves a node.
+  const node = page.locator('.react-flow__node[data-id="right"]');
+  const before = { b: (await badge.boundingBox())!, n: (await node.boundingBox())! };
+  const pane = (await page.locator(".react-flow__pane").boundingBox())!;
+  await page.mouse.move(pane.x + 60, pane.y + 12);
+  await page.mouse.down();
+  await page.mouse.move(pane.x + 60 - 40, pane.y + 12 + 25, { steps: 4 });
+  await page.mouse.up();
+  const after = { b: (await badge.boundingBox())!, n: (await node.boundingBox())! };
+  expect(Math.round(after.b.x - before.b.x)).toBe(Math.round(after.n.x - before.n.x));
+  expect(Math.round(after.b.y - before.b.y)).toBe(Math.round(after.n.y - before.n.y));
+});

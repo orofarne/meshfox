@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { BaseEdge, Position, getBezierPath, getSmoothStepPath, useReactFlow, useStore, useViewport, type Edge, type EdgeProps, type Node } from "@xyflow/react";
+import { BaseEdge, Position, getBezierPath, getSmoothStepPath, useReactFlow, useStore, type Edge, type EdgeProps, type Node } from "@xyflow/react";
 import type { ExtraEdgeDto } from "./types";
 import type { EdgeSide } from "./edgePorts";
 import type { MeshNodeData } from "./MeshNode";
@@ -104,6 +104,9 @@ function getParallelBezierPath(
  * above the canvas. The toolbar opens settings, resets the route, or deletes
  * the edge when deletion is allowed. Labels remain visible in either mode.
  */
+/** What an unselected edge subscribes to instead of the viewport: it never changes. */
+const IDLE_TRANSFORM: [number, number, number] = [0, 0, 1];
+
 export function DeletableEdge({
   id,
   source,
@@ -125,7 +128,12 @@ export function DeletableEdge({
   const renderer = useStore((state) => state.domNode?.querySelector(".react-flow__renderer"));
   const flowNodes = useStore((state) => state.nodes);
   const flowEdges = useStore((state) => state.edges);
-  const viewport = useViewport(); // Reposition the portal controls when the canvas pans or zooms.
+  // The route handles and toolbar of a *selected* edge are drawn in screen
+  // coordinates, so only that edge has to follow every pan/zoom frame. (Every
+  // edge following it, as `useViewport()` made them, re-rendered all of them
+  // on each frame for the sake of labels that need no such thing: see below.)
+  useStore((state) => (selected ? state.transform : IDLE_TRANSFORM));
+  const viewportLayer = useStore((state) => state.domNode?.querySelector(".react-flow__viewport"));
   const [draggingRoute, setDraggingRoute] = useState(false);
   const [draggingLabelAt, setDraggingLabelAt] = useState<number | null>(null);
   const [draggingEndpoint, setDraggingEndpoint] = useState<{
@@ -434,11 +442,16 @@ export function DeletableEdge({
           })}
         </div>, renderer,
       )}
-      {renderer && hasBadge && createPortal(
+      {viewportLayer && hasBadge && createPortal(
+        // Placed in flow coordinates, inside the layer React Flow itself pans
+        // and zooms: moving the view costs nothing here, and the badge is
+        // never squeezed by the edge of the screen (it used to be positioned
+        // against the visible area, which narrowed it to one letter a line
+        // near the right edge).
         <div className="mesh-edge-label-layer">
           <div className={`mesh-edge-label-badge nodrag nopan${canOpen ? " mesh-edge-label-draggable" : ""}`}
             data-edge-id={id}
-            style={{ left: localPoint(labelPoint).x, top: localPoint(labelPoint).y, transform: `translate(-50%, -50%) scale(${viewport.zoom})` }}
+            style={{ left: labelPoint.x, top: labelPoint.y }}
             title={canOpen ? "Drag label along arrow" : undefined}
             onPointerDown={dragLabel}>
             {edgeData!.label}
@@ -448,7 +461,7 @@ export function DeletableEdge({
               </span>
             ))}
           </div>
-        </div>, renderer,
+        </div>, viewportLayer,
       )}
       {open && canOpen && <EdgeEditorPanel data={edgeData!} onClose={() => setOpen(false)} />}
     </>

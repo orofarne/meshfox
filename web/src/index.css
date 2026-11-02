@@ -2596,10 +2596,16 @@ a {
 /* Labels share the renderer portal with the route controls, above edge SVGs
  * and nodes. The wrapper lets the badge receive drags in edit mode without
  * capturing pointer events anywhere else on the canvas. */
+/* Lives inside React Flow's own viewport layer (flow coordinates, panned and
+ * zoomed with everything else); the zero-size box has to sit above the nodes,
+ * whose z-index React Flow raises for selected ones. */
 .mesh-edge-label-layer {
   position: absolute;
-  inset: 0;
-  z-index: 90;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  z-index: 100000;
   pointer-events: none;
 }
 
@@ -2607,6 +2613,8 @@ a {
   overflow-wrap: anywhere;
   position: absolute;
   transform: translate(-50%, -50%);
+  /* The layer has no width of its own: size to the text (up to max-width). */
+  width: max-content;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
