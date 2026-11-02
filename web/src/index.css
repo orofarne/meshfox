@@ -221,6 +221,26 @@ a {
   gap: 0.75rem;
   padding: 0.5rem 1rem;
   border-bottom: 1px solid var(--node-border);
+  /* More buttons than a narrow screen has room for: the bar scrolls sideways
+   * on its own (a finger, or the wheel), instead of making the whole page
+   * wider than the screen and pushing the canvas out of view. */
+  overflow-x: auto;
+  min-width: 0;
+  flex-shrink: 0;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+.toolbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Buttons keep their shape (one line, natural width) rather than shrinking
+ * and wrapping their labels ("Auto-" / "layout"). */
+.toolbar > * {
+  flex: none;
+  white-space: nowrap;
 }
 
 .toolbar .error {

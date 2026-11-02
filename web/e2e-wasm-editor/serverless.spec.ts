@@ -1144,3 +1144,27 @@ test("the strip stays under the node text editor: its buttons can be pressed", a
     expect(covered, `"${name}" must not be covered`).toBe(false);
   }
 });
+
+test("the toolbar scrolls sideways on its own when it does not fit; the page does not get wider", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 780 });
+  const file = path.join(tmpDir(), "doc.canvas.md");
+  fs.writeFileSync(file, ROOT + '## Child\n<!-- meshfox:node id="child" -->\n\nchild body\n');
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(file);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await page.getByRole("button", { name: "Edit", exact: true }).click();
+
+  const bar = page.locator(".toolbar");
+  const m = await bar.evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth }));
+  expect(m.scroll, "edit mode has more buttons than 390px holds").toBeGreaterThan(m.client);
+  // The page itself stays the width of the screen.
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  // Labels stay on one line.
+  const heights = await bar.locator("button").evaluateAll((bs) => bs.map((b) => b.getBoundingClientRect().height));
+  expect(Math.max(...heights) - Math.min(...heights)).toBeLessThan(12);
+  // The last button is reachable by scrolling the bar.
+  await bar.evaluate((el) => (el.scrollLeft = el.scrollWidth));
+  const last = (await bar.locator("button").last().boundingBox())!;
+  expect(last.x + last.width).toBeLessThanOrEqual(391);
+  expect(last.x).toBeGreaterThanOrEqual(0);
+});
