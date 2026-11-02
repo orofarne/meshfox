@@ -1523,6 +1523,7 @@ The in-browser editor (the real UI over the WebAssembly model, no `meshfox` proc
 ```sh name="wasm-editor" deps="unit-tests/wasm-prep,e2e-prep"
 export FORCE_COLOR=1
 cd web
+npx playwright install webkit
 npm run test:wasm-editor
 ```
 

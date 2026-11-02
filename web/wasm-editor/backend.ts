@@ -490,14 +490,21 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
   Element.prototype.setAttribute = function (name: string, value: string) {
     return nativeSetAttribute.call(this, name, ASSET_ATTRS.includes(name.toLowerCase()) ? (assetNow(value, isLink(this, name)) ?? value) : value);
   };
+  // Some browsers (iOS WebKit with a content blocker, for one) have already
+  // locked `img.src`: then the swap is left to `setAttribute` and the observer
+  // below, which fix the URL a moment after the browser first saw it.
   const srcProperty = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
-  if (srcProperty?.set) {
-    Object.defineProperty(HTMLImageElement.prototype, "src", {
-      ...srcProperty,
-      set(value: string) {
-        srcProperty.set!.call(this, assetNow(String(value)) ?? value);
-      },
-    });
+  if (srcProperty?.set && srcProperty.configurable) {
+    try {
+      Object.defineProperty(HTMLImageElement.prototype, "src", {
+        ...srcProperty,
+        set(value: string) {
+          srcProperty.set!.call(this, assetNow(String(value)) ?? value);
+        },
+      });
+    } catch {
+      /* locked after all */
+    }
   }
   const fixElement = (element: Element) => {
     for (const attr of ASSET_ATTRS) {

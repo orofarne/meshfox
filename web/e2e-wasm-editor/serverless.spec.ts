@@ -106,6 +106,9 @@ test("opening a folder resolves includes, assets and file previews from it", asy
 });
 
 test("a picked folder is read by the model's ignore rules: dots and .meshfoxignore, nothing by name", async ({ page }) => {
+  // Safari's folder picker leaves out every dot-file, `.meshfoxignore` included,
+  // so a *picked* folder there cannot honour it (a dropped one can).
+  test.skip(isWebkit(page), "Safari's folder picker omits dot-files");
   const dir = tmpDir();
   const put = (rel: string, text: string) => {
     fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
@@ -366,8 +369,10 @@ test("what the page remembers about a document is keyed by the document, not jus
 
 // Monaco's shortcuts follow the browser's reported platform, and Playwright's
 // desktop presets report Linux/Windows whatever the host: always Control.
-const MOD = "Control";
-const END_OF_DOCUMENT = "Control+End";
+// The device presets report Linux/Windows (Control) except Safari's, which is a Mac (Meta).
+const isWebkit = (page: Page) => page.context().browser()?.browserType().name() === "webkit";
+const selectAll = (page: Page) => (isWebkit(page) ? "Meta+A" : "Control+A");
+const endOfDocument = (page: Page) => (isWebkit(page) ? "Meta+ArrowDown" : "Control+End");
 
 /** Opens Source mode and types into Monaco: `replace` swaps the whole text,
  * otherwise `text` goes at the end. */
@@ -383,7 +388,7 @@ async function typeInSource(page: Page, text: string, replace = false) {
   // Only once the document's text is in the editor does a key press mean anything.
   await expect(page.locator(".mesh-source-editor-body .view-lines")).toContainText("meshfox:");
   await editor.click();
-  await page.keyboard.press(replace ? `${MOD}+A` : END_OF_DOCUMENT);
+  await page.keyboard.press(replace ? selectAll(page) : endOfDocument(page));
   // Inserted in one go, not typed: typing makes Monaco complete and commit words.
   // Chromium takes a (synthetic) paste event; Firefox's Monaco ignores that and
   // doubles `insertText`, so it pastes from the real clipboard.
