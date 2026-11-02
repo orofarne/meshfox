@@ -390,57 +390,7 @@ pub fn apply_node_update(
     req: &NodeUpdate,
     resolve_from: &dyn Fn(&str) -> Result<String, EditError>,
 ) -> Result<String, EditError> {
-    struct EdgeOpsLocal {
-        add: Vec<String>,
-        patch: Vec<EdgePatch>,
-        remove: Vec<String>,
-    }
-    let edge_ops_local = req
-        .edges
-        .as_ref()
-        .map(|ops| -> Result<EdgeOpsLocal, EditError> {
-            // Every patch is checked now, against a scratch edge, so a bad
-            // value is an error whether or not the edge it names still exists.
-            for p in &ops.patch {
-                apply_edge_patch(&mut ExtraEdge::default(), p)?;
-            }
-            let patch = ops
-                .patch
-                .iter()
-                .map(|p| EdgePatch {
-                    // A source that no longer exists has no edge to patch; its
-                    // id then simply matches nothing below.
-                    from: resolve_from(&p.from).unwrap_or_else(|_| p.from.clone()),
-                    label: p.label.clone(),
-                    label_at: p.label_at,
-                    color: p.color.clone(),
-                    style: p.style.clone(),
-                    arrow_start: p.arrow_start.clone(),
-                    arrow_end: p.arrow_end.clone(),
-                    source_side: p.source_side.clone(),
-                    target_side: p.target_side.clone(),
-                    via: p.via.clone(),
-                    tags: p.tags.as_ref().map(|t| TagOps {
-                        add: t.add.clone(),
-                        remove: t.remove.clone(),
-                    }),
-                })
-                .collect();
-            Ok(EdgeOpsLocal {
-                add: ops
-                    .add
-                    .iter()
-                    .map(|f| resolve_from(f))
-                    .collect::<Result<_, _>>()?,
-                patch,
-                remove: ops
-                    .remove
-                    .iter()
-                    .map(|f| resolve_from(f).unwrap_or_else(|_| f.clone()))
-                    .collect(),
-            })
-        })
-        .transpose()?;
+    let edge_ops = resolve_edge_ops(req, resolve_from)?;
 
     let not_found = || EditError::NotFound(format!("no node {local_id:?}"));
     let parse =
@@ -471,35 +421,6 @@ pub fn apply_node_update(
              here to change which file it links to instead)"
         ));
     }
-    let (
-        x,
-        y,
-        width,
-        height,
-        existing_color,
-        existing_display,
-        existing_lang,
-        existing_interpreter,
-        existing_preview,
-        existing_tags,
-        existing_fold,
-        existing_edge_label,
-        existing_created_at,
-    ) = (
-        initial_node.x,
-        initial_node.y,
-        initial_node.width,
-        initial_node.height,
-        initial_node.color.clone(),
-        initial_node.display,
-        initial_node.lang.clone(),
-        initial_node.interpreter.clone(),
-        initial_node.preview,
-        initial_node.tags.clone(),
-        initial_node.fold,
-        initial_node.edge_label.clone(),
-        initial_node.created_at.clone(),
-    );
     // `display`/`lang`/`interpreter` only mean anything on a `file` node —
     // clear them (rather than leave a stale attribute behind) whenever this
     // request moves the node to some other type. `preview` is the same idea
@@ -516,6 +437,111 @@ pub fn apply_node_update(
         title = new_title.clone();
     }
 
+    check_update_shape(req, final_type)?;
+
+    if changes_metadata(req) {
+        // This also has the side effect of pinning the node's `id=` attribute
+        // explicitly the moment any of its metadata changes, same as any other
+        // first write-back.
+        let meta = patched_meta(req, initial_node, final_type)?;
+        raw = mdcanvas::set_node_meta(&raw, local_id, &meta).ok_or_else(not_found)?;
+    }
+
+    if let Some(target) = &req.target {
+        // Preserves an existing caption rather than silently dropping it —
+        // this patch only ever means "change the link", never "clear whatever
+        // explanatory text was under it".
+        let body = match &initial_node.caption {
+            Some(caption) => format!("[{title}]({target})\n\n{caption}"),
+            None => format!("[{title}]({target})"),
+        };
+        raw = mdcanvas::set_node_body(&raw, local_id, &body).ok_or_else(not_found)?;
+    }
+
+    if let Some(text) = &req.text {
+        raw = mdcanvas::set_node_body(&raw, local_id, text).ok_or_else(not_found)?;
+    }
+
+    if let Some(ops) = &edge_ops {
+        let mut edges = initial_node.extra_parents.clone();
+        edges.retain(|e| !ops.remove.contains(&e.from));
+        for from in &ops.add {
+            if !edges.iter().any(|e| &e.from == from) {
+                edges.push(ExtraEdge::new(from.as_str()));
+            }
+        }
+        for patch in &ops.patch {
+            if let Some(edge) = edges.iter_mut().find(|e| e.from == patch.from) {
+                apply_edge_patch(edge, patch)?;
+            }
+        }
+        raw = mdcanvas::set_node_edges(&raw, local_id, &edges).ok_or_else(not_found)?;
+    }
+
+    // Validate the whole patched document before handing it back.
+    parse(&raw)?;
+    Ok(raw)
+}
+
+/// A request's edge operations, with every source named by the id it is
+/// written under in this document.
+struct ResolvedEdgeOps {
+    add: Vec<String>,
+    patch: Vec<EdgePatch>,
+    remove: Vec<String>,
+}
+
+fn resolve_edge_ops(
+    req: &NodeUpdate,
+    resolve_from: &dyn Fn(&str) -> Result<String, EditError>,
+) -> Result<Option<ResolvedEdgeOps>, EditError> {
+    let Some(ops) = req.edges.as_ref() else {
+        return Ok(None);
+    };
+    // Every patch is checked now, against a scratch edge, so a bad
+    // value is an error whether or not the edge it names still exists.
+    for p in &ops.patch {
+        apply_edge_patch(&mut ExtraEdge::default(), p)?;
+    }
+    let patch = ops
+        .patch
+        .iter()
+        .map(|p| EdgePatch {
+            // A source that no longer exists has no edge to patch; its
+            // id then simply matches nothing below.
+            from: resolve_from(&p.from).unwrap_or_else(|_| p.from.clone()),
+            label: p.label.clone(),
+            label_at: p.label_at,
+            color: p.color.clone(),
+            style: p.style.clone(),
+            arrow_start: p.arrow_start.clone(),
+            arrow_end: p.arrow_end.clone(),
+            source_side: p.source_side.clone(),
+            target_side: p.target_side.clone(),
+            via: p.via.clone(),
+            tags: p.tags.as_ref().map(|t| TagOps {
+                add: t.add.clone(),
+                remove: t.remove.clone(),
+            }),
+        })
+        .collect();
+    Ok(Some(ResolvedEdgeOps {
+        add: ops
+            .add
+            .iter()
+            .map(|f| resolve_from(f))
+            .collect::<Result<_, _>>()?,
+        patch,
+        remove: ops
+            .remove
+            .iter()
+            .map(|f| resolve_from(f).unwrap_or_else(|_| f.clone()))
+            .collect(),
+    }))
+}
+
+/// What a request may not combine, whatever the document holds.
+fn check_update_shape(req: &NodeUpdate, final_type: NodeType) -> Result<(), EditError> {
     // A group's box is always derived from its children, never stored — reject
     // an explicit width/height for one outright (whether it already is a group,
     // or is becoming one via `nodeType` in this same request) rather than
@@ -538,166 +564,149 @@ pub fn apply_node_update(
             ));
         }
     }
+    Ok(())
+}
 
-    if req.title.is_some()
-        || req.node_type.is_some()
-        || req.color.is_some()
-        || req.display.is_some()
-        || req.lang.is_some()
-        || req.interpreter.is_some()
-        || req.preview.is_some()
-        || req.tags.is_some()
-        || req.fold.is_some()
-        || req.edge_label.is_some()
-        || req.edge_label_at.is_some()
-        || req.edge_source_side.is_some()
-        || req.edge_target_side.is_some()
-        || req.edge_via.is_some()
-        || req.x.is_some()
-        || req.y.is_some()
-        || req.width.is_some()
-        || req.height.is_some()
-        || req.clear_position
-        || req.created_at.is_some()
-    {
-        // This also has the side effect of pinning the node's `id=` attribute
-        // explicitly the moment any of its metadata changes, same as any other
-        // first write-back.
-        let (display, lang, interpreter) = if final_type == NodeType::File {
-            (
-                req.display.or(existing_display),
-                req.lang.clone().or(existing_lang),
-                req.interpreter.clone().or(existing_interpreter),
-            )
-        } else {
-            (None, None, None)
-        };
-        let preview = if final_type == NodeType::Link {
-            Some(req.preview.unwrap_or(existing_preview))
-        } else {
-            None
-        };
-        // Unlike `color` (which would happily store and write back a literal
-        // `color=""` if sent empty), an empty `edgeLabel` clears the attribute
-        // entirely rather than leaving that cruft behind — the client always
-        // sends this key explicitly (never omitted) whenever the label
-        // actually changed, including changing it *to* empty, so there's no
-        // "not sent at all" case to conflate this with.
-        let edge_label = match &req.edge_label {
-            None => existing_edge_label,
-            Some(s) if s.trim().is_empty() => None,
-            Some(s) => Some(s.clone()),
-        };
-        // Groups never store a width/height regardless of what's in `x`/`y`
-        // here (already rejected above if the request tried to set one) —
-        // carrying `existing` width/height forward for a group would just
-        // re-write whatever stray value was already there instead of actually
-        // clearing it, so force both to `None` for one.
-        let (final_width, final_height) = if final_type == NodeType::Group {
-            (None, None)
-        } else {
-            (
-                if req.clear_position {
-                    req.width
-                } else {
-                    req.width.or(width)
-                },
-                if req.clear_position {
-                    req.height
-                } else {
-                    req.height.or(height)
-                },
-            )
-        };
-        let meta = NodeMeta {
-            block_attrs: None,
-            x: if req.clear_position {
-                req.x
-            } else {
-                req.x.or(x)
-            },
-            y: if req.clear_position {
-                req.y
-            } else {
-                req.y.or(y)
-            },
-            width: final_width,
-            height: final_height,
-            color: req.color.clone().or(existing_color),
-            node_type: req.node_type,
-            display,
-            lang,
-            interpreter,
-            preview,
-            edge_label,
-            edge_label_at: match req.edge_label_at {
-                None => initial_node.edge_label_at,
-                Some(500) => None,
-                Some(at @ 0..=1000) => Some(at),
-                Some(_) => return invalid("edgeLabelAt must be between 0 and 1000"),
-            },
-            edge_source_side: match req.edge_source_side.as_deref() {
-                None => initial_node.edge_source_side,
-                Some("auto") => None,
-                Some(side) => Some(EdgeSide::parse(side).ok_or_else(|| {
-                    EditError::Invalid(format!("invalid edgeSourceSide {side:?}"))
-                })?),
-            },
-            edge_target_side: match req.edge_target_side.as_deref() {
-                None => initial_node.edge_target_side,
-                Some("auto") => None,
-                Some(side) => Some(EdgeSide::parse(side).ok_or_else(|| {
-                    EditError::Invalid(format!("invalid edgeTargetSide {side:?}"))
-                })?),
-            },
-            edge_via: req
-                .edge_via
-                .clone()
-                .unwrap_or_else(|| initial_node.edge_via.clone()),
-            fold: resolve_fold_override(req.fold.as_deref(), existing_fold)?,
-            tags: match &req.tags {
-                Some(ops) => apply_tag_ops(existing_tags, ops),
-                None => existing_tags,
-            },
-            created_at: req.created_at.clone().or(existing_created_at),
-        };
-        raw = mdcanvas::set_node_meta(&raw, local_id, &meta).ok_or_else(not_found)?;
+/// Whether the request changes anything stored in the node's metadata comment.
+fn changes_metadata(req: &NodeUpdate) -> bool {
+    req.clear_position
+        || [
+            req.title.is_some(),
+            req.node_type.is_some(),
+            req.color.is_some(),
+            req.display.is_some(),
+            req.lang.is_some(),
+            req.interpreter.is_some(),
+            req.preview.is_some(),
+            req.tags.is_some(),
+            req.fold.is_some(),
+            req.edge_label.is_some(),
+            req.edge_label_at.is_some(),
+            req.edge_source_side.is_some(),
+            req.edge_target_side.is_some(),
+            req.edge_via.is_some(),
+            req.x.is_some(),
+            req.y.is_some(),
+            req.width.is_some(),
+            req.height.is_some(),
+            req.created_at.is_some(),
+        ]
+        .contains(&true)
+}
+
+/// A value the request sets, or else the one the node has; with
+/// `clearPosition` the request's value is taken even when it sets none.
+fn carry<T>(requested: Option<T>, existing: Option<T>, clear: bool) -> Option<T> {
+    if clear {
+        requested
+    } else {
+        requested.or(existing)
     }
+}
 
-    if let Some(target) = &req.target {
-        // Preserves an existing caption rather than silently dropping it —
-        // this patch only ever means "change the link", never "clear whatever
-        // explanatory text was under it".
-        let body = match &initial_node.caption {
-            Some(caption) => format!("[{title}]({target})\n\n{caption}"),
-            None => format!("[{title}]({target})"),
-        };
-        raw = mdcanvas::set_node_body(&raw, local_id, &body).ok_or_else(not_found)?;
+/// `auto` clears an edge side; anything else must name one.
+fn edge_side(
+    requested: Option<&str>,
+    current: Option<EdgeSide>,
+    field: &str,
+) -> Result<Option<EdgeSide>, EditError> {
+    match requested {
+        None => Ok(current),
+        Some("auto") => Ok(None),
+        Some(side) => EdgeSide::parse(side)
+            .map(Some)
+            .ok_or_else(|| EditError::Invalid(format!("invalid {field} {side:?}"))),
     }
+}
 
-    if let Some(text) = &req.text {
-        raw = mdcanvas::set_node_body(&raw, local_id, text).ok_or_else(not_found)?;
+/// The middle of the arrow is the default, so it is stored as nothing.
+fn edge_label_position(
+    requested: Option<u16>,
+    current: Option<u16>,
+) -> Result<Option<u16>, EditError> {
+    match requested {
+        None => Ok(current),
+        Some(500) => Ok(None),
+        Some(at @ 0..=1000) => Ok(Some(at)),
+        Some(_) => invalid("edgeLabelAt must be between 0 and 1000"),
     }
+}
 
-    if let Some(ops) = &edge_ops_local {
-        let mut edges = initial_node.extra_parents.clone();
-        edges.retain(|e| !ops.remove.contains(&e.from));
-        for from in &ops.add {
-            if !edges.iter().any(|e| &e.from == from) {
-                edges.push(ExtraEdge::new(from.as_str()));
-            }
-        }
-        for patch in &ops.patch {
-            if let Some(edge) = edges.iter_mut().find(|e| e.from == patch.from) {
-                apply_edge_patch(edge, patch)?;
-            }
-        }
-        raw = mdcanvas::set_node_edges(&raw, local_id, &edges).ok_or_else(not_found)?;
-    }
-
-    // Validate the whole patched document before handing it back.
-    parse(&raw)?;
-    Ok(raw)
+/// The node's metadata as the request leaves it.
+fn patched_meta(
+    req: &NodeUpdate,
+    node: &crate::canvas::Node,
+    final_type: NodeType,
+) -> Result<NodeMeta, EditError> {
+    let (display, lang, interpreter) = if final_type == NodeType::File {
+        (
+            req.display.or(node.display),
+            req.lang.clone().or_else(|| node.lang.clone()),
+            req.interpreter.clone().or_else(|| node.interpreter.clone()),
+        )
+    } else {
+        (None, None, None)
+    };
+    let preview = (final_type == NodeType::Link).then(|| req.preview.unwrap_or(node.preview));
+    // Unlike `color` (which would happily store and write back a literal
+    // `color=""` if sent empty), an empty `edgeLabel` clears the attribute
+    // entirely rather than leaving that cruft behind — the client always
+    // sends this key explicitly (never omitted) whenever the label
+    // actually changed, including changing it *to* empty, so there's no
+    // "not sent at all" case to conflate this with.
+    let edge_label = match &req.edge_label {
+        None => node.edge_label.clone(),
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.clone()),
+    };
+    // Groups never store a width/height regardless of what's in `x`/`y`
+    // here (already rejected above if the request tried to set one) —
+    // carrying `existing` width/height forward for a group would just
+    // re-write whatever stray value was already there instead of actually
+    // clearing it, so force both to `None` for one.
+    let (width, height) = if final_type == NodeType::Group {
+        (None, None)
+    } else {
+        (
+            carry(req.width, node.width, req.clear_position),
+            carry(req.height, node.height, req.clear_position),
+        )
+    };
+    Ok(NodeMeta {
+        block_attrs: None,
+        x: carry(req.x, node.x, req.clear_position),
+        y: carry(req.y, node.y, req.clear_position),
+        width,
+        height,
+        color: req.color.clone().or_else(|| node.color.clone()),
+        node_type: req.node_type,
+        display,
+        lang,
+        interpreter,
+        preview,
+        edge_label,
+        edge_label_at: edge_label_position(req.edge_label_at, node.edge_label_at)?,
+        edge_source_side: edge_side(
+            req.edge_source_side.as_deref(),
+            node.edge_source_side,
+            "edgeSourceSide",
+        )?,
+        edge_target_side: edge_side(
+            req.edge_target_side.as_deref(),
+            node.edge_target_side,
+            "edgeTargetSide",
+        )?,
+        edge_via: req
+            .edge_via
+            .clone()
+            .unwrap_or_else(|| node.edge_via.clone()),
+        fold: resolve_fold_override(req.fold.as_deref(), node.fold)?,
+        tags: match &req.tags {
+            Some(ops) => apply_tag_ops(node.tags.clone(), ops),
+            None => node.tags.clone(),
+        },
+        created_at: req.created_at.clone().or_else(|| node.created_at.clone()),
+    })
 }
 
 // ---- the rest of the document-editing endpoints: each one validates, calls a
