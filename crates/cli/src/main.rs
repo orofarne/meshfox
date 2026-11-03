@@ -147,7 +147,8 @@ enum Command {
     /// only files below each canvas's own directory: a reference that leads
     /// outside it, to a directory, to a missing file or to a variable or
     /// `@tmp` fails the command and writes nothing. The worker does the
-    /// reading, with the same file access every other front end has. Open the
+    /// reading, with the same file access every other front end has, in a
+    /// private read-only worker: nothing is written next to the canvas. Open the
     /// result with `meshfox view` (read-only, nothing runs) or in the browser
     /// editor, or extract it with `meshfox unpack`.
     Pack {
@@ -2874,6 +2875,13 @@ fn view_pack(pack_path: PathBuf, port: u16, no_open: bool, no_auto_exit: bool) {
 
 /// `meshfox pack`.
 fn pack_cmd(canvas_path: &Path, out: Option<PathBuf>, shallow: bool, list: bool, force: bool) {
+    // Packing only reads. Its worker is a private, read-only one, so nothing is
+    // written next to the canvas (`.meshfox/`, the session database, the lock
+    // file) and a worker already serving the canvas is not touched.
+    meshfox_core::capabilities::set_requested(meshfox_core::capabilities::Capabilities {
+        read_only: true,
+        no_exec: false,
+    });
     let out = out.unwrap_or_else(|| PathBuf::from(pack::default_pack_name(canvas_path)));
     if !list && out.exists() && !force {
         eprintln!(

@@ -131,6 +131,35 @@ fn pack_lists_writes_and_unpacks_what_the_canvas_reads() {
 }
 
 #[test]
+fn packing_writes_nothing_next_to_the_canvas_but_the_pack() {
+    let dir = project();
+    let before = names(&dir);
+    for args in [
+        &["doc.canvas.md", "pack", "--list"][..],
+        &["doc.canvas.md", "pack", "-o", "elsewhere.canvas.tar.xz"][..],
+    ] {
+        let out = run(&dir, args);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    let mut expected = before;
+    expected.push("elsewhere.canvas.tar.xz".into());
+    expected.sort();
+    // No `.meshfox/`, session database or lock file left by the worker.
+    assert_eq!(names(&dir), expected);
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "home")
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
 fn the_pack_is_a_plain_xz_compressed_tar_the_system_tools_read() {
     let dir = project();
     assert!(run(&dir, &["doc.canvas.md", "pack"]).status.success());

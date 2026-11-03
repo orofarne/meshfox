@@ -2100,7 +2100,10 @@ so a pack is opened as untrusted:
   in cached output) is reported on stderr as a warning. A failure leaves no
   partial file. The reading is the canvas's worker's job (`GET /api/pack` and
   `GET /api/pack/archive`), like every other read of a canvas and what it
-  references; the command stores the result.
+  references; the command stores the result. That worker is a private,
+  read-only one (as with `--read-only`), so packing writes nothing next to the
+  canvas (no `.meshfox/`, session database or lock file) and does not disturb a
+  worker that is already serving it.
 - `meshfox unpack PACK [DIR]` checks the pack as above and extracts it. `DIR`
   defaults to the pack's name without `.canvas.tar.xz`; it must not exist or
   must be empty, and no existing file is overwritten. It prints the path of the
