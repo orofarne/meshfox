@@ -3293,11 +3293,20 @@ pub struct PackPlanFile {
     pub size: u64,
 }
 
-fn pack_url(port: u16, path: &str, shallow: bool) -> Result<reqwest::Url, String> {
+fn pack_url(
+    port: u16,
+    path: &str,
+    shallow: bool,
+    root: Option<&std::path::Path>,
+) -> Result<reqwest::Url, String> {
     let mut url =
         reqwest::Url::parse(&format!("{}{path}", base_url(port))).map_err(|e| e.to_string())?;
     if shallow {
         url.query_pairs_mut().append_pair("shallow", "1");
+    }
+    if let Some(root) = root {
+        url.query_pairs_mut()
+            .append_pair("root", &root.to_string_lossy());
     }
     Ok(url)
 }
@@ -3314,9 +3323,13 @@ async fn error_text(res: reqwest::Response) -> String {
 
 /// What a pack of the worker's canvas would hold, without making one. The
 /// worker is the one that reads the canvas and what it references.
-pub async fn pack_plan(port: u16, shallow: bool) -> Result<PackPlan, String> {
+pub async fn pack_plan(
+    port: u16,
+    shallow: bool,
+    root: Option<&std::path::Path>,
+) -> Result<PackPlan, String> {
     let res = client()
-        .get(pack_url(port, "/api/pack", shallow)?)
+        .get(pack_url(port, "/api/pack", shallow, root)?)
         .timeout(time_limit(PACK))
         .send()
         .await
@@ -3329,8 +3342,13 @@ pub async fn pack_plan(port: u16, shallow: bool) -> Result<PackPlan, String> {
 
 /// The bytes of a `.canvas.tar.xz` of the worker's canvas. `created_by` is the
 /// label of this meshfox, stored in the pack's manifest.
-pub async fn pack_archive(port: u16, shallow: bool, created_by: &str) -> Result<Vec<u8>, String> {
-    let mut url = pack_url(port, "/api/pack/archive", shallow)?;
+pub async fn pack_archive(
+    port: u16,
+    shallow: bool,
+    root: Option<&std::path::Path>,
+    created_by: &str,
+) -> Result<Vec<u8>, String> {
+    let mut url = pack_url(port, "/api/pack/archive", shallow, root)?;
     url.query_pairs_mut().append_pair("created_by", created_by);
     let res = client()
         .get(url)

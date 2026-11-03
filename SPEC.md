@@ -1976,10 +1976,14 @@ magic bytes (`FD 37 7A 58 5A 00`), not by the name.
 
 ### Layout
 
-The archive root is the directory of the **entry canvas** (the canvas `pack`
-was given); every other path is relative to it. Entries are regular files and
-directories only (`pack` writes files only; a reader accepts directory
-entries); a reader refuses symbolic links, hard links, devices and FIFOs. The first entry is the manifest, `.meshfox-pack.json`:
+The archive root is the pack's **root**: by default the directory of the
+**entry canvas** (the canvas `pack` was given), or a directory above it that
+`pack --root` names. Every other path is relative to it, the entry canvas's
+included: with a wider root it sits below the root (`co2/README.canvas.md`) and
+the manifest's `entry` says where. Entries are regular files and directories
+only (`pack` writes files only; a reader accepts directory entries); a reader
+refuses symbolic links, hard links, devices and FIFOs. The first entry is the
+manifest, `.meshfox-pack.json`:
 
 ```json
 {
@@ -2033,19 +2037,19 @@ output is derived data its author cannot edit. Nothing else of a run goes in:
 no `.meshfox/` state, no files a block wrote. Collecting follows references and
 never walks a directory, so `.meshfoxignore` plays no part in it.
 
-**Every reference stays inside the directory of the file that holds it.** A
-reference is resolved against the file it is written in and must land inside
-that file's directory tree: the canvas's directory for a reference written in a
-canvas (the entry canvas, or a nested one), the included file's directory for
-one written in a Markdown file an `include` pulls in. A reference that lands
-outside fails `pack` with an error naming the canvas, the node and the path,
-and writes nothing. This is the strictest rule any front end applies (the
-browser editor applies it always, `meshfox` when no `[files] allow` widens it),
-so a pack behaves the same wherever it is opened. It covers `../` paths that
-leave that directory, including a nested canvas reaching a sibling directory,
-absolute and `~` paths, and symbolic links that lead out, also when
-`[files] allow` would let meshfox read them on the sender's machine. A pack is
-complete or it does not exist.
+**Every reference stays inside the pack's root.** A reference is resolved
+against the file it is written in and must land below the root: by default the
+entry canvas's own directory, so `../docs/x.png` from `co2/README.canvas.md`
+needs the root widened to the directory that holds `co2/` and `docs/`
+(`--root ..`). A reference that lands outside fails `pack` with an error naming
+the canvas, the node and the path, and the root that would make it work, and
+writes nothing. It covers `../` paths that climb above the root, absolute and
+`~` paths, and symbolic links that lead out, also when `[files] allow` would
+let meshfox read them on the sender's machine. A pack is complete or it does
+not exist. Inside the root nothing is rewritten: the canvases are packed byte
+for byte, at the places they were, and read the same files through the same
+relative paths. `--root` must be an existing directory above (or equal to) the
+entry canvas's own.
 The same goes for a local reference whose target is missing, and for a target
 that names a `dir` variable or `@tmp`: a pack must not depend on the sender's
 environment. External URLs and `#anchors` are not references to files. The
@@ -2081,18 +2085,26 @@ so a pack is opened as untrusted:
   entry canvas with `--read-only --no-exec` (see "Restricting a core"); the
   directory is removed when the view ends. The restrictions are handed on to
   every core started from it, so a nested canvas opened by clicking its `file`
-  node is read-only and no-exec too. The pack carries no configuration
-  (`.meshfox/` is never in it), so nothing in the pack widens what its canvases
-  may read.
+  node is read-only and no-exec too. The unpacked directory is the one place
+  its canvases may read outside their own directories: `view` names it in
+  `MESHFOX_TRUSTED_ROOT` (see "Configured file access"), which every core it
+  starts inherits. That comes from the person running the command, never from
+  the pack, which carries no configuration (`.meshfox/` is never in it); and
+  the pack's files are all there is below it.
 - The browser editor opens a pack like a folder: the unpacked files are its
-  virtual directory, so includes, images, links and nested canvases resolve
-  inside the pack. It runs as `noexec` already. Edits are saved by
-  downloading a new pack; the file that was opened never changes.
+  virtual directory, and the root of that directory is the boundary a canvas
+  reads within (as it is for any folder picked or dropped there), so includes,
+  images, links and nested canvases resolve inside the pack, `../` included. It
+  runs as `noexec` already. Edits are saved by downloading a new pack; the file
+  that was opened never changes.
 
 ### Commands
 
-- `meshfox pack CANVAS [-o FILE] [--shallow] [--list] [-f]` writes the pack.
-  `FILE` defaults to the canvas's name without `.canvas.md` (or `.md`) plus
+- `meshfox pack CANVAS [-o FILE] [--root DIR] [--shallow] [--list] [-f]` writes
+  the pack. `--root DIR` sets the pack's root (see "What goes in"); it is
+  handed to the worker as an absolute path, and the worker reads below it with
+  the same checks as for the canvas's own directory, plus that root, which the
+  person running the command has chosen. `FILE` defaults to the canvas's name without `.canvas.md` (or `.md`) plus
   `.canvas.tar.xz`, in the current directory. An existing file is not replaced
   without `-f`. `--list` prints what would go in (path, a tab, size in bytes,
   one file per line) and writes nothing; it fails in the same cases `pack`
@@ -2108,9 +2120,11 @@ so a pack is opened as untrusted:
   defaults to the pack's name without `.canvas.tar.xz`; it must not exist or
   must be empty, and no existing file is overwritten. It prints the path of the
   entry canvas. The result is an ordinary directory: it is not read-only and
-  not `no-exec`, and has no `.meshfox/`. Because `pack` only follows references
-  that stay inside their canvas's directory, the unpacked canvases read exactly
-  what they did in the pack.
+  not `no-exec`, and has no `.meshfox/`. When the pack was made with a root
+  above the entry canvas's directory, the canvases read files outside their own
+  directories, which meshfox allows for such a directory only where
+  `[files] allow` says so; `unpack` then prints a note saying so, with the line
+  to add (it writes no configuration itself). `meshfox view PACK` needs none.
 - `meshfox view PACK` as above; `--read-only` and `--no-exec` are always on and
   cannot be turned off.
 
@@ -2645,6 +2659,14 @@ configuration file itself never implicitly grants its enclosing directory;
 `allow = ["."]` does so explicitly. Grant paths are relative to the owner
 of `.meshfox`, with absolute and `~/...` paths also supported. The global
 file's owner is the user's home directory.
+
+`MESHFOX_TRUSTED_ROOT` in the environment of a meshfox process names one more
+directory tree that process's canvases may read below, besides their own
+directory and the grants above. Like `MESHFOX_READ_ONLY` it is the process
+owner's to set (never a file's, so a canvas cannot widen itself by what it
+says), and every core the process starts inherits it. `meshfox view PACK` sets
+it to the directory it unpacked a pack into; it is read-only for meshfox, like
+every root.
 
 The nearest explicitly configured `allow` replaces the entire inherited
 array, including with `[]`; it does not revoke the canvas directory or

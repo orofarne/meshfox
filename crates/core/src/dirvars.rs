@@ -26,6 +26,13 @@ use crate::canvas::Canvas;
 use crate::file_read::{self, ConfineError, FilePreview, PreviewError};
 use crate::vars::{VarDecl, VarType};
 
+/// A directory tree every canvas of this process may read from, besides its own
+/// directory, named by the process owner in the environment (never by a file).
+/// `meshfox view PACK` sets it to the directory it unpacked into, so that a
+/// canvas in a subdirectory of a pack can read the pack's other directories
+/// (SPEC.md, "Packed canvases"); every core started from it inherits it.
+pub const ENV_TRUSTED_ROOT: &str = "MESHFOX_TRUSTED_ROOT";
+
 /// Whether `value` is `@tmp` itself or a path under it (`@tmp/...`);
 /// `@tmpfoo` is an ordinary relative path. A `..` component disqualifies
 /// it: `@tmp/../..` would otherwise be taken silently as "inside the
@@ -241,6 +248,9 @@ impl FileAccess {
     pub fn from_values(canvas_path: &Path, values: HashMap<String, String>) -> FileAccess {
         let mut roots: Vec<PathBuf> = values.values().map(PathBuf::from).collect();
         roots.push(tmp_dir(canvas_path));
+        if let Some(root) = std::env::var_os(ENV_TRUSTED_ROOT).filter(|v| !v.is_empty()) {
+            roots.push(PathBuf::from(root));
+        }
         let config = crate::config::file_roots(
             canvas_path
                 .parent()
@@ -262,6 +272,14 @@ impl FileAccess {
             pending: Vec::new(),
             config_error,
         }
+    }
+
+    /// Also lets this access read below `root`, a directory the caller (not
+    /// the canvas) has chosen to trust: what `meshfox pack --root` reads
+    /// through. Like every root it is read-only for meshfox.
+    pub fn with_root(mut self, root: PathBuf) -> FileAccess {
+        self.roots.push(root);
+        self
     }
 
     /// Adds the resolved `file` variable `values` (name -> expanded path):

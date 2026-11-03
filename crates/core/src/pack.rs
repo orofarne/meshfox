@@ -24,11 +24,15 @@ use crate::dirvars::FileAccess;
 use crate::file_source::ConfineError;
 
 /// What [`collect`] was asked for.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CollectOptions {
     /// Do not follow references to other canvases: they stay out of the pack,
     /// and so does everything only they reference.
     pub shallow: bool,
+    /// The pack's root: a directory above (or equal to) the entry canvas's own,
+    /// below which every reference has to stay. `None`: the entry canvas's
+    /// directory.
+    pub root: Option<PathBuf>,
 }
 
 /// Everything a pack is made of.
@@ -94,7 +98,8 @@ struct Holder<'a> {
     canvas: &'a str,
     /// The node the text belongs to.
     node: &'a str,
-    /// The directory references are resolved against, and may not leave.
+    /// The directory references are resolved against (that of the file that
+    /// holds them).
     dir: &'a Path,
     access: &'a FileAccess,
     /// A reference from cached output: left out with a warning instead of
@@ -115,8 +120,25 @@ struct Walk {
 /// Collects the files of the pack whose entry canvas is `entry`.
 pub fn collect(entry: &Path, options: CollectOptions) -> Result<Collected, PackProblem> {
     let entry_path = normalize(entry);
-    let Some(root) = entry_path.parent().map(Path::to_path_buf) else {
+    let Some(entry_dir) = entry_path.parent().map(Path::to_path_buf) else {
         return problem(format!("{}: not a file", entry.display()));
+    };
+    let root = match &options.root {
+        None => entry_dir.clone(),
+        Some(chosen) => {
+            let chosen = normalize(chosen);
+            if !chosen.is_dir() {
+                return problem(format!("--root {}: not a directory", chosen.display()));
+            }
+            if !entry_dir.starts_with(&chosen) {
+                return problem(format!(
+                    "--root {} is not a directory above {}",
+                    chosen.display(),
+                    entry.display()
+                ));
+            }
+            chosen
+        }
     };
     let bytes =
         std::fs::read(&entry_path).map_err(|e| PackProblem(format!("{}: {e}", entry.display())))?;
@@ -140,10 +162,12 @@ pub fn collect(entry: &Path, options: CollectOptions) -> Result<Collected, PackP
         seen_canvases: HashSet::from([entry_path.clone()]),
         warnings: Vec::new(),
     };
+    // Where the entry canvas sits in the pack: its name, below the root.
+    let entry_rel = walk.rel_of(&entry_path);
     walk.add(
-        name.clone(),
+        entry_rel.clone(),
         PackFile {
-            path: name.clone(),
+            path: entry_rel.clone(),
             data: bytes,
             executable: is_executable(&entry_path),
         },
@@ -152,7 +176,7 @@ pub fn collect(entry: &Path, options: CollectOptions) -> Result<Collected, PackP
         walk.walk_canvas(&canvas_path)?;
     }
     Ok(Collected {
-        entry: name,
+        entry: entry_rel,
         files: walk.files.into_values().collect(),
         warnings: walk.warnings,
     })
@@ -180,7 +204,9 @@ impl Walk {
             std::fs::read_to_string(canvas_path).map_err(|e| PackProblem(format!("{rel}: {e}")))?;
         let canvas: Canvas = crate::mdcanvas::parse(&text)
             .map_err(|e| PackProblem(format!("{rel}: not a valid canvas: {e}")))?;
-        let access = FileAccess::for_canvas_path(&canvas, canvas_path);
+        // The pack's root is trusted by whoever asked for the pack, so a canvas
+        // in a subdirectory can reach the rest of it; nothing outside it.
+        let access = FileAccess::for_canvas_path(&canvas, canvas_path).with_root(self.root.clone());
         let dir = canvas_path.parent().unwrap_or(Path::new("/")).to_path_buf();
 
         for node in &canvas.nodes {
@@ -279,15 +305,19 @@ impl Walk {
             ));
         }
         let lexical = normalize(&holder.dir.join(target));
-        if !lexical.starts_with(holder.dir) {
-            let dir = self.rel_of(holder.dir);
-            let dir = if dir.is_empty() {
-                "the canvas's directory".to_string()
+        if !lexical.starts_with(&self.root) {
+            let widened = common_ancestor(&self.root, &lexical);
+            let advice = if widened.components().count() > 1 {
+                format!(
+                    "; to include it, widen the pack's root: --root {}",
+                    widened.display()
+                )
             } else {
-                format!("{dir}/")
+                String::new()
             };
             return problem(format!(
-                "{at} leads outside {dir}; a reference may not leave the directory of the file that holds it"
+                "{at} leads outside the pack's root {}{advice}",
+                self.root.display()
             ));
         }
         let real = match holder.access.confine(holder.dir, target) {
@@ -310,11 +340,11 @@ impl Walk {
             }
             Err(ConfineError::Config(e)) => return problem(format!("{at}: {e}")),
         };
-        let floor_real = std::fs::canonicalize(holder.dir)
-            .map_err(|e| PackProblem(format!("{}: {e}", holder.dir.display())))?;
+        let floor_real = std::fs::canonicalize(&self.root)
+            .map_err(|e| PackProblem(format!("{}: {e}", self.root.display())))?;
         if !real.starts_with(&floor_real) {
             return problem(format!(
-                "{at} is a symbolic link that leads outside its directory"
+                "{at} is a symbolic link that leads outside the pack's root"
             ));
         }
         let metadata = std::fs::metadata(&real).map_err(|e| PackProblem(format!("{at}: {e}")))?;
@@ -357,6 +387,18 @@ impl Walk {
         );
         Ok(Some(found))
     }
+}
+
+/// The longest directory both `a` and `b` are below.
+fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for (x, y) in a.components().zip(b.components()) {
+        if x != y {
+            break;
+        }
+        out.push(x.as_os_str());
+    }
+    out
 }
 
 /// What a resolved reference turned out to be.
@@ -430,6 +472,11 @@ pub struct Unpacked {
     pub dir: PathBuf,
     /// The entry canvas, inside `dir`.
     pub entry: PathBuf,
+    /// Some file of the pack is outside the directory of the entry canvas: a
+    /// pack made with `--root` above it. The canvases read those files through
+    /// `..`, which meshfox only allows for a pack opened with `meshfox view`
+    /// (or where `[files] allow` says so).
+    pub outside_entry_dir: bool,
 }
 
 /// Checks `pack` (the bytes of a `.canvas.tar.xz`) completely, then puts its
@@ -490,9 +537,16 @@ pub fn unpack(pack: &[u8], dir: &Path) -> Result<Unpacked, PackProblem> {
         }
         return problem(format!("{}: {e}", dir.display()));
     }
+    let entry_dir = parsed
+        .entry
+        .rsplit_once('/')
+        .map(|(d, _)| format!("{d}/"))
+        .unwrap_or_default();
+    let outside_entry_dir = parsed.files.iter().any(|f| !f.path.starts_with(&entry_dir));
     Ok(Unpacked {
         dir: dir.to_path_buf(),
         entry: dir.join(&parsed.entry),
+        outside_entry_dir,
     })
 }
 
@@ -725,8 +779,14 @@ mod tests {
             &canvas("![x](only-child.png)", &[]),
         );
         write(&dir, "only-child.png", "x");
-        let collected =
-            collect(&dir.join("doc.canvas.md"), CollectOptions { shallow: true }).unwrap();
+        let collected = collect(
+            &dir.join("doc.canvas.md"),
+            CollectOptions {
+                shallow: true,
+                ..CollectOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(paths(&collected), ["doc.canvas.md"]);
         assert!(collected.warnings.iter().any(|w| w.contains("--shallow")));
     }
@@ -765,11 +825,48 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_canvas_may_not_reach_a_sibling_directory() {
+    fn a_nested_canvas_and_an_include_may_reach_anywhere_below_the_root() {
         let dir = temp();
         write(
             &dir,
             "doc.canvas.md",
+            &canvas(
+                "",
+                &[
+                    ("child", "type=\"file\"", "[child](./sub/child.canvas.md)"),
+                    ("inc", "type=\"include\"", "[n](./docs/n.md)"),
+                ],
+            ),
+        );
+        // A sibling directory, and a file above the include's own directory:
+        // both inside the root, so both fine.
+        write(
+            &dir,
+            "sub/child.canvas.md",
+            &canvas("![x](../shared/x.png)", &[]),
+        );
+        write(&dir, "shared/x.png", "x");
+        write(&dir, "docs/n.md", "![x](../top.png)\n");
+        write(&dir, "top.png", "x");
+        let collected = collect(&dir.join("doc.canvas.md"), CollectOptions::default()).unwrap();
+        assert_eq!(
+            paths(&collected),
+            [
+                "doc.canvas.md",
+                "docs/n.md",
+                "shared/x.png",
+                "sub/child.canvas.md",
+                "top.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_canvas_may_not_climb_above_the_root() {
+        let dir = temp();
+        write(
+            &dir,
+            "main/doc.canvas.md",
             &canvas(
                 "",
                 &[("child", "type=\"file\"", "[child](./sub/child.canvas.md)")],
@@ -777,26 +874,109 @@ mod tests {
         );
         write(
             &dir,
-            "sub/child.canvas.md",
-            &canvas("![x](../shared/x.png)", &[]),
+            "main/sub/child.canvas.md",
+            &canvas("![x](../../outside.png)", &[]),
         );
-        write(&dir, "shared/x.png", "x");
-        let message = fail(&dir, "doc.canvas.md");
+        write(&dir, "outside.png", "x");
+        let message = fail(&dir, "main/doc.canvas.md");
         assert!(message.contains("sub/child.canvas.md"), "{message}");
-        assert!(message.contains("../shared/x.png"), "{message}");
+        assert!(message.contains("../../outside.png"), "{message}");
+        assert!(message.contains("--root"), "{message}");
     }
 
     #[test]
-    fn included_markdown_may_not_climb_out_of_its_own_directory() {
+    fn a_wider_root_keeps_the_layout_and_the_canvas_where_it_was() {
         let dir = temp();
         write(
             &dir,
-            "doc.canvas.md",
-            &canvas("", &[("inc", "type=\"include\"", "[n](./docs/n.md)")]),
+            "co2/README.canvas.md",
+            &canvas(
+                "![sensor](../docs/sensor.png)",
+                &[("inc", "type=\"include\"", "[n](../docs/notes.md)")],
+            ),
         );
-        write(&dir, "docs/n.md", "![x](../top.png)\n");
-        write(&dir, "top.png", "x");
-        assert!(fail(&dir, "doc.canvas.md").contains("../top.png"));
+        write(&dir, "docs/sensor.png", "png");
+        write(&dir, "docs/notes.md", "# Notes\n![fig](fig.png)\n");
+        write(&dir, "docs/fig.png", "fig");
+        write(&dir, "co2/unrelated.txt", "left out");
+
+        // The default root is the canvas's own directory: refused, with the
+        // root that would make it work.
+        let message = fail(&dir, "co2/README.canvas.md");
+        assert!(message.contains("--root"), "{message}");
+        assert!(message.contains(dir.to_str().unwrap()), "{message}");
+
+        let options = CollectOptions {
+            root: Some(dir.clone()),
+            ..CollectOptions::default()
+        };
+        let collected = collect(&dir.join("co2/README.canvas.md"), options).unwrap();
+        assert_eq!(collected.entry, "co2/README.canvas.md");
+        assert_eq!(
+            paths(&collected),
+            [
+                "co2/README.canvas.md",
+                "docs/fig.png",
+                "docs/notes.md",
+                "docs/sensor.png"
+            ]
+        );
+        // The canvas text is the author's, byte for byte.
+        let canvas_file = collected
+            .files
+            .iter()
+            .find(|f| f.path == "co2/README.canvas.md")
+            .unwrap();
+        assert_eq!(
+            canvas_file.data,
+            std::fs::read(dir.join("co2/README.canvas.md")).unwrap()
+        );
+
+        // Unpacked, the tree is the same, and unpack says the canvas reads
+        // outside its own directory.
+        let bytes = pack_bytes(&collected, "t").unwrap();
+        let out = temp().join("out");
+        let unpacked = unpack(&bytes, &out).unwrap();
+        assert_eq!(unpacked.entry, out.join("co2/README.canvas.md"));
+        assert!(unpacked.outside_entry_dir);
+        assert!(out.join("docs/fig.png").exists());
+        // A pack whose files all sit below the entry's directory does not.
+        let plain = temp();
+        write(&plain, "doc.canvas.md", &canvas("![x](x.png)", &[]));
+        write(&plain, "x.png", "x");
+        let bytes = pack_bytes(
+            &collect(&plain.join("doc.canvas.md"), CollectOptions::default()).unwrap(),
+            "t",
+        )
+        .unwrap();
+        assert!(!unpack(&bytes, &temp().join("o")).unwrap().outside_entry_dir);
+    }
+
+    #[test]
+    fn a_root_must_be_a_directory_above_the_canvas() {
+        let dir = temp();
+        write(&dir, "main/doc.canvas.md", &canvas("", &[]));
+        write(&dir, "other/x.txt", "x");
+        for root in [
+            dir.join("other"),
+            dir.join("main/doc.canvas.md"),
+            dir.join("nope"),
+        ] {
+            let options = CollectOptions {
+                root: Some(root.clone()),
+                ..CollectOptions::default()
+            };
+            let message = collect(&dir.join("main/doc.canvas.md"), options)
+                .expect_err("not a valid root")
+                .to_string();
+            assert!(message.contains("--root"), "{root:?}: {message}");
+        }
+        // The canvas's own directory is a root like any other.
+        let options = CollectOptions {
+            root: Some(dir.join("main")),
+            ..CollectOptions::default()
+        };
+        assert!(collect(&dir.join("main/doc.canvas.md"), options).is_ok());
     }
 
     #[test]

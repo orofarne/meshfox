@@ -96,10 +96,13 @@ pub fn render_canvas_with_warnings(
 }
 
 /// Lexically resolves `target` against `dir` and refuses anything that
-/// leaves `dir`: the host's files are a virtual tree, so there is no disk to
-/// canonicalize against, only `.`/`..` to fold. A `..` may undo what the
-/// target itself added but never climbs above `dir` — checked at every step,
-/// not just at the end.
+/// leaves the host's tree: the files are a virtual tree (a picked or dropped
+/// folder, or the files of a packed canvas), so there is no disk to
+/// canonicalize against, only `.`/`..` to fold. The tree's root is the
+/// boundary, not the canvas's own directory: whoever picked the folder gave the
+/// page all of it, so `../docs/x.png` from a canvas in a subdirectory reads
+/// `docs/x.png`. A `..` may undo what the path itself added but never climbs
+/// above the root — checked at every step, not just at the end.
 fn lexical_confine(dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
     fn fold(path: &Path, parts: &mut Vec<String>, floor: usize) -> bool {
         for component in path.components() {
@@ -124,8 +127,7 @@ fn lexical_confine(dir: &Path, target: &str) -> Result<PathBuf, ConfineError> {
     if !fold(dir, &mut parts, 0) {
         return Err(outside());
     }
-    let floor = parts.len();
-    if !fold(Path::new(target), &mut parts, floor) {
+    if !fold(Path::new(target), &mut parts, 0) {
         return Err(outside());
     }
     Ok(parts.iter().collect())
@@ -632,21 +634,31 @@ mod tests {
     }
 
     #[test]
-    fn folds_dots_and_stays_inside_the_canvas_directory() {
+    fn folds_dots_and_stays_inside_the_tree() {
         assert_eq!(confine(".", "./notes.md").unwrap(), "notes.md");
         assert_eq!(confine("", "a/b/../c.md").unwrap(), "a/c.md");
         assert_eq!(confine("docs", "./x/../y.md").unwrap(), "docs/y.md");
     }
 
     #[test]
-    fn refuses_anything_that_leaves_the_directory() {
+    fn a_canvas_may_reach_other_directories_of_the_same_tree() {
+        // The root of the picked folder is the boundary, not the canvas's own
+        // directory: a canvas in `co2` reads its sibling `docs`.
+        assert_eq!(confine("co2", "../docs/x.png").unwrap(), "docs/x.png");
+        assert_eq!(confine("docs", "a/../../b.md").unwrap(), "b.md");
+        assert_eq!(confine("docs", "../other/x.md").unwrap(), "other/x.md");
+    }
+
+    #[test]
+    fn refuses_anything_that_leaves_the_tree() {
         for (dir, target) in [
             (".", "../secret.md"),
+            ("", "../secret.md"),
             ("docs", "../../x.md"),
             (".", "/etc/passwd"),
-            ("docs", "a/../../b.md"),
-            // Climbing out of `docs` and back into a sibling is still out.
-            ("docs", "../other/x.md"),
+            ("docs", "a/../../../b.md"),
+            // Climbing above the root and back down is still out.
+            ("docs", "../../tree/x.md"),
         ] {
             assert!(
                 matches!(confine(dir, target), Err(ConfineError::Outside(_))),

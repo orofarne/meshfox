@@ -180,6 +180,156 @@ fn pack_and_unpack_do_not_offer_the_global_restriction_flags_but_accept_them() {
     );
 }
 
+/// A project whose canvas sits one level down and shows a picture and an
+/// include from a sibling directory.
+fn sibling_project() -> PathBuf {
+    let dir = unique_dir();
+    write(
+        &dir,
+        "co2/README.canvas.md",
+        concat!(
+            "<!-- meshfox:canvas -->\n# Sensor\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "![sensor](../docs/sensor.png)\n\n",
+            "## Notes\n<!-- meshfox:node id=\"notes\" type=\"include\" -->\n\n[n](../docs/notes.md)\n",
+        ),
+    );
+    write(&dir, "docs/sensor.png", "png");
+    write(&dir, "docs/notes.md", "# Notes from the docs directory\n");
+    write(&dir, "unrelated.txt", "never referenced");
+    dir
+}
+
+#[test]
+fn a_reference_above_the_default_root_names_the_root_that_would_cover_it() {
+    let dir = sibling_project();
+    let out = run(
+        &dir,
+        &["co2/README.canvas.md", "pack", "-o", "x.canvas.tar.xz"],
+    );
+    assert!(!out.status.success());
+    let message = text(&out);
+    assert!(message.contains("../docs/sensor.png"), "{message}");
+    assert!(
+        message.contains(&format!("--root {}", dir.display())),
+        "{message}"
+    );
+    assert!(!dir.join("x.canvas.tar.xz").exists());
+}
+
+#[test]
+fn a_wider_root_packs_the_layout_as_it_is_and_unpack_says_so() {
+    let dir = sibling_project();
+    let packed = run(
+        &dir,
+        &[
+            "co2/README.canvas.md",
+            "pack",
+            "--root",
+            ".",
+            "-o",
+            "wide.canvas.tar.xz",
+        ],
+    );
+    assert!(packed.status.success(), "{}", text(&packed));
+    let listing = run(
+        &dir,
+        &["co2/README.canvas.md", "pack", "--root", ".", "--list"],
+    );
+    let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let paths: Vec<&str> = listing
+        .lines()
+        .map(|l| l.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        ["co2/README.canvas.md", "docs/notes.md", "docs/sensor.png"]
+    );
+
+    let unpacked = run(&dir, &["unpack", "wide.canvas.tar.xz", "out"]);
+    assert!(unpacked.status.success(), "{}", text(&unpacked));
+    assert_eq!(
+        String::from_utf8_lossy(&unpacked.stdout).trim(),
+        "out/co2/README.canvas.md"
+    );
+    assert!(dir.join("out/docs/sensor.png").exists());
+    let note = String::from_utf8_lossy(&unpacked.stderr).into_owned();
+    assert!(note.contains("files outside its own directory"), "{note}");
+    assert!(note.contains("allow"), "{note}");
+
+    // A root that is not above the canvas is refused.
+    let bad = run(
+        &dir,
+        &["co2/README.canvas.md", "pack", "--root", "docs", "--list"],
+    );
+    assert!(!bad.status.success());
+    assert!(text(&bad).contains("--root"), "{}", text(&bad));
+}
+
+/// Waits for the view `child` writes to `log` to say where it serves, and
+/// returns the port and the log so far.
+fn wait_for_view(dir: &Path, log: &str) -> (u16, String) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let log_text = std::fs::read_to_string(dir.join(log)).unwrap_or_default();
+        if let Some(port) = log_text
+            .split("on http://127.0.0.1:")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|p| p.parse::<u16>().ok())
+        {
+            return (port, log_text);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the view never came up:\n{log_text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn view_reads_the_whole_pack_but_nothing_outside_it() {
+    let dir = sibling_project();
+    assert!(run(
+        &dir,
+        &[
+            "co2/README.canvas.md",
+            "pack",
+            "--root",
+            ".",
+            "-o",
+            "wide.canvas.tar.xz"
+        ]
+    )
+    .status
+    .success());
+    let log = std::fs::File::create(dir.join("wide.log")).unwrap();
+    let mut child = meshfox(&dir, &["view", "wide.canvas.tar.xz", "--no-open"])
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (port, _) = wait_for_view(&dir, "wide.log");
+
+    // The include lives in `docs/`, a sibling of the canvas's own directory:
+    // read, because the unpacked pack is the one tree it may read below.
+    let (status, canvas) = http_get(port, "/api/canvas");
+    assert_eq!(status, 200);
+    assert!(canvas.contains("Notes from the docs directory"), "{canvas}");
+    assert!(!canvas.contains("could not be read"), "{canvas}");
+
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the view did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()

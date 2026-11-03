@@ -4858,6 +4858,10 @@ struct PackQuery {
     /// Which meshfox the client is, for the manifest (informational).
     #[serde(default)]
     created_by: Option<String>,
+    /// The pack's root, an absolute directory above the canvas's own: what
+    /// the person running `meshfox pack --root` asked to include below.
+    #[serde(default)]
+    root: Option<String>,
 }
 
 /// Collects the files a pack of this canvas would hold, on a blocking thread
@@ -4868,8 +4872,13 @@ async fn collect_pack(
 ) -> Result<meshfox_core::pack::Collected, ApiError> {
     let path = state.canvas_path.clone();
     let shallow = matches!(query.shallow.as_deref(), Some("1" | "true"));
+    let root = query
+        .root
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .map(std::path::PathBuf::from);
     tokio::task::spawn_blocking(move || {
-        meshfox_core::pack::collect(&path, meshfox_core::pack::CollectOptions { shallow })
+        meshfox_core::pack::collect(&path, meshfox_core::pack::CollectOptions { shallow, root })
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -14684,6 +14693,7 @@ mod include_edit_tests {
         let query = || PackQuery {
             shallow: None,
             created_by: Some("meshfox test".into()),
+            root: None,
         };
 
         let Json(plan) = pack_plan(State(state.clone()), Query(query()))
@@ -14714,6 +14724,48 @@ mod include_edit_tests {
     }
 
     #[tokio::test]
+    async fn the_worker_packs_below_a_root_the_client_chose() {
+        let dir = pack_test_dir("root");
+        std::fs::create_dir_all(dir.join("main")).unwrap();
+        std::fs::create_dir_all(dir.join("shared")).unwrap();
+        std::fs::write(dir.join("shared/pic.png"), "png").unwrap();
+        std::fs::write(
+            dir.join("main/doc.canvas.md"),
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n![p](../shared/pic.png)\n",
+        )
+        .unwrap();
+        let state = build_state(dir.join("main/doc.canvas.md"), false, None)
+            .await
+            .expect("valid test canvas");
+        let with_root = |root: Option<&std::path::Path>| PackQuery {
+            shallow: None,
+            created_by: None,
+            root: root.map(|r| r.to_string_lossy().into_owned()),
+        };
+        // Its own directory is the default root: refused, and the answer names
+        // the root that would work.
+        let ApiError(status, message) = pack_plan(State(state.clone()), Query(with_root(None)))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(message.contains("--root"), "{message}");
+        // The directory above is what the person asked for.
+        let Json(plan) = pack_plan(State(state), Query(with_root(Some(&dir))))
+            .await
+            .unwrap();
+        assert_eq!(plan["entry"], "main/doc.canvas.md");
+        let listed: Vec<&str> = plan["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, ["main/doc.canvas.md", "shared/pic.png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn the_worker_refuses_a_pack_that_would_leave_the_directory() {
         let dir = pack_test_dir("out");
         std::fs::write(dir.join("secret.txt"), "x").unwrap();
@@ -14731,6 +14783,7 @@ mod include_edit_tests {
             Query(PackQuery {
                 shallow: None,
                 created_by: None,
+                root: None,
             }),
         )
         .await

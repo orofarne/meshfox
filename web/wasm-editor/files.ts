@@ -17,6 +17,21 @@ export class VirtualFiles {
     return out.join("/");
   }
 
+  /** `rel` taken from `dir`, or `undefined` when it climbs above the root of the
+   * tree: unlike `join`, which stops at the root, this refuses, so a reference
+   * to `../../../x` is never answered with a file that merely has that name. */
+  static within(dir: string, rel: string): string | undefined {
+    const out: string[] = [];
+    for (const part of (dir ? `${dir}/${rel}` : rel).replaceAll("\\", "/").split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") {
+        if (out.length === 0) return undefined;
+        out.pop();
+      } else out.push(part);
+    }
+    return out.join("/");
+  }
+
   static dirname(path: string): string {
     const i = path.lastIndexOf("/");
     return i < 0 ? "" : path.slice(0, i);

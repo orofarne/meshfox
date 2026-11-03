@@ -17,7 +17,9 @@ npm run test:wasm-editor  # Playwright, Chromium + Firefox + WebKit
 ```
 
 Open a `.canvas.md`, a whole folder (so `include`s, images and `file` nodes
-resolve), or drop either onto the page. The build is a static site with
+resolve), or drop either onto the page. The root of what was opened is the
+boundary a canvas reads within: one in a subdirectory shows `../docs/x.png` of
+the folder, and nothing above the folder is reachable. The build is a static site with
 relative URLs, emitted as `index.html`, so it can be served from any path
 (published at `https://meshfox-editor.orofarne.net/`).
 

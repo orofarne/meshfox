@@ -1340,3 +1340,42 @@ test("a damaged pack is refused with a reason and nothing is opened", async ({ p
   await expect(page.locator("#status")).toHaveClass(/error/);
   await expect(page.locator("#launcher")).toHaveCount(1);
 });
+
+// --- ../ inside what was opened: a folder's root, or a pack's root ---
+
+const PACK_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/pack-root.canvas.tar.xz");
+
+test("a pack made with a wider root opens, its canvas reading the sibling directory through ../", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(PACK_ROOT);
+  await expect(page.getByText("This canvas reads its sibling directory.")).toBeVisible();
+  await expect(page.getByText("Included through a ../ path.")).toBeVisible();
+  await expect(page.locator('img[alt="dot"]')).toBeVisible();
+  expect(await page.locator('img[alt="dot"]').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+});
+
+test("a canvas in a picked folder reads the folder's other directories through ../, and nothing above the folder", async ({ page }) => {
+  const dir = tmpDir();
+  fs.mkdirSync(path.join(dir, "main"));
+  fs.mkdirSync(path.join(dir, "shared"));
+  fs.writeFileSync(path.join(dir, "shared/pic.png"), PNG);
+  fs.writeFileSync(path.join(dir, "shared/notes.md"), "# Shared notes\n\nThe notes live next door.\n");
+  fs.writeFileSync(
+    path.join(dir, "main/doc.canvas.md"),
+    `${ROOT}![pic](../shared/pic.png)\n\n## Notes\n<!-- meshfox:node id="notes" type="include" -->\n\n[notes](../shared/notes.md)\n`,
+  );
+  await page.goto("/");
+  await page.locator("input[webkitdirectory]").setInputFiles(dir);
+  await expect(page.getByText("The root.")).toBeVisible();
+  await expect(page.getByText("The notes live next door.")).toBeVisible();
+  await expect(page.locator('img[alt="pic"]')).toBeVisible();
+  expect(await page.locator('img[alt="pic"]').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+
+  // Above the folder there is nothing to read: refused, not clamped to a
+  // file of the same name inside it.
+  const status = (file: string) =>
+    page.evaluate((f) => fetch(`api/asset?file=${encodeURIComponent(f)}`).then((r) => r.status), file);
+  expect(await status("../shared/pic.png")).toBe(200);
+  expect(await status("../../shared/pic.png")).toBe(404);
+  expect(await status("../../../../etc/passwd")).toBe(404);
+});

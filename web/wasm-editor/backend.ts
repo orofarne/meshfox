@@ -238,9 +238,12 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     return r.json === undefined ? undefined : JSON.parse(r.json);
   };
 
-  /** Where an `api/asset?file=&dir=` request points, inside the opened files. */
-  const assetPath = (params: URLSearchParams): string =>
-    VirtualFiles.join(params.get("dir") || canvasDir(), params.get("file") ?? "");
+  /** Where an `api/asset?file=&dir=` request points, inside the opened files;
+   * `undefined` when it climbs above their root. The root of the opened tree is
+   * the boundary (a canvas may reach `../docs/x.png` of the folder it was
+   * opened with), never the canvas's own directory. */
+  const assetPath = (params: URLSearchParams): string | undefined =>
+    VirtualFiles.within(params.get("dir") || canvasDir(), params.get("file") ?? "");
   const mimeOf = (path: string): string => MIME[path.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream";
 
   type Handled = Response | Promise<Response> | undefined;
@@ -300,6 +303,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
 
   const assetResponse = (params: URLSearchParams): Response | Promise<Response> => {
     const path = assetPath(params);
+    if (path === undefined) return text("outside the opened files", 404);
     const data = doc.files.get(path);
     if (data !== undefined) return new Response(data as BodyInit, { headers: { "Content-Type": mimeOf(path) } });
     const url = doc.files.urlOf(path);
@@ -520,6 +524,7 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
     const known = swapped.get(cacheKey);
     if (known) return known;
     const path = assetPath(url.searchParams);
+    if (path === undefined) return undefined;
     const data = doc.files.get(path);
     const type = link ? navigableType(mimeOf(path)) : mimeOf(path);
     // A drawn SVG is cleaned of anything executable: opened on its own, its

@@ -162,6 +162,12 @@ enum Command {
         /// pack, and so does everything only they reference.
         #[arg(long)]
         shallow: bool,
+        /// The pack's root: a directory above the canvas's own. References
+        /// may lead anywhere below it (`../docs/x.png`), and the pack keeps
+        /// the layout, with the canvas where it is below the root. Default:
+        /// the canvas's own directory, below which everything must stay.
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
         /// Print what would go in (path and size, tab-separated, one file
         /// per line) and write nothing. Fails in the same cases `pack` does.
         #[arg(long)]
@@ -1923,11 +1929,12 @@ fn main() {
             canvas,
             out,
             shallow,
+            root,
             list,
             force,
         } => {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
-            pack_cmd(&canvas_path, out, shallow, list, force)
+            pack_cmd(&canvas_path, out, shallow, root, list, force)
         }
         Command::Unpack { pack, dir } => unpack_cmd(&pack, dir),
         Command::Pdf {
@@ -2886,6 +2893,9 @@ fn view_pack(pack_path: PathBuf, port: u16, no_open: bool, no_auto_exit: bool) {
         std::process::exit(1);
     });
     let entry = temp.unpacked.entry.clone();
+    // The pack's own files are all it can read, wherever its canvases sit in
+    // them; every core started from here inherits this.
+    std::env::set_var(meshfox_core::dirvars::ENV_TRUSTED_ROOT, &temp.unpacked.dir);
     eprintln!(
         "meshfox view: {} is a packed canvas: opened read-only, and nothing in it runs",
         pack_path.display()
@@ -2900,7 +2910,16 @@ fn view_pack(pack_path: PathBuf, port: u16, no_open: bool, no_auto_exit: bool) {
 }
 
 /// `meshfox pack`.
-fn pack_cmd(canvas_path: &Path, out: Option<PathBuf>, shallow: bool, list: bool, force: bool) {
+fn pack_cmd(
+    canvas_path: &Path,
+    out: Option<PathBuf>,
+    shallow: bool,
+    root: Option<PathBuf>,
+    list: bool,
+    force: bool,
+) {
+    // The worker runs elsewhere, so a root has to be said absolutely.
+    let root = root.map(|r| std::path::absolute(&r).unwrap_or(r));
     // Packing only reads. Its worker is a private, read-only one, so nothing is
     // written next to the canvas (`.meshfox/`, the session database, the lock
     // file) and a worker already serving the canvas is not touched.
@@ -2922,7 +2941,7 @@ fn pack_cmd(canvas_path: &Path, out: Option<PathBuf>, shallow: bool, list: bool,
     });
     let port = worker_port_or_exit(&runtime, canvas_path);
     let plan = runtime
-        .block_on(worker_client::pack_plan(port, shallow))
+        .block_on(worker_client::pack_plan(port, shallow, root.as_deref()))
         .unwrap_or_else(|e| {
             eprintln!("meshfox pack: {e}");
             std::process::exit(1);
@@ -2938,7 +2957,12 @@ fn pack_cmd(canvas_path: &Path, out: Option<PathBuf>, shallow: bool, list: bool,
     }
     let label = format!("meshfox {}", env!("MESHFOX_VERSION_LABEL"));
     let bytes = runtime
-        .block_on(worker_client::pack_archive(port, shallow, &label))
+        .block_on(worker_client::pack_archive(
+            port,
+            shallow,
+            root.as_deref(),
+            &label,
+        ))
         .unwrap_or_else(|e| {
             eprintln!("meshfox pack: {e}");
             std::process::exit(1);
@@ -2964,7 +2988,19 @@ fn unpack_cmd(pack_path: &Path, dir: Option<PathBuf>) {
     });
     let dir = dir.unwrap_or_else(|| pack::default_unpack_dir(pack_path));
     match pack::unpack(&bytes, &dir) {
-        Ok(unpacked) => println!("{}", unpacked.entry.display()),
+        Ok(unpacked) => {
+            println!("{}", unpacked.entry.display());
+            if unpacked.outside_entry_dir {
+                eprintln!(
+                    "meshfox unpack: note: the entry canvas reads files outside its own directory \
+                     (the pack was made with --root). `meshfox view {}` opens it as it was; to \
+                     open the extracted copy with meshfox, allow it with `[files]\nallow = [\".\"]` \
+                     in {}",
+                    pack_path.display(),
+                    unpacked.dir.join(".meshfox/config.toml").display()
+                );
+            }
+        }
         Err(e) => {
             eprintln!("meshfox unpack: {}: {e}", pack_path.display());
             std::process::exit(1);
