@@ -1338,6 +1338,32 @@ enum NodeCommand {
     },
 }
 
+/// Parses the command line. `--read-only` and `--no-exec` are global flags every
+/// command accepts, but `pack` always works read-only and `unpack` starts no
+/// worker at all, so their help should not offer the two. Declaring them on
+/// those subcommands, hidden, keeps them accepted there (clap only passes a
+/// global flag on to a subcommand that does not have one of that name) without
+/// listing them. They take no effect on these two commands, which already do
+/// what the flags ask for.
+fn parse_cli(args: Vec<String>) -> Cli {
+    use clap::{Arg, ArgAction, CommandFactory, FromArgMatches};
+    let hidden = |id: &'static str, long: &'static str| {
+        Arg::new(id)
+            .long(long)
+            .action(ArgAction::SetTrue)
+            .hide(true)
+    };
+    let mut command = Cli::command();
+    for name in ["pack", "unpack"] {
+        command = command.mut_subcommand(name, |sub| {
+            sub.arg(hidden("read_only", "read-only"))
+                .arg(hidden("no_exec", "no-exec"))
+        });
+    }
+    let matches = command.get_matches_from(args);
+    Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
 /// A leading `meshfox test.md run new-node-6` canvas path — recognized by
 /// the same ".md" convention `run`'s own leading-arg sniffing already uses
 /// (node ids/subcommand names never end in .md, see slugify) — spliced into
@@ -1514,7 +1540,7 @@ fn main() {
         return view_watcher(PathBuf::from(&args[1]), 0, true, true);
     }
 
-    let cli = Cli::parse_from(args);
+    let cli = parse_cli(args);
 
     meshfox_core::capabilities::set_requested(meshfox_core::capabilities::Capabilities {
         read_only: cli.read_only,

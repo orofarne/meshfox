@@ -148,6 +148,38 @@ fn packing_writes_nothing_next_to_the_canvas_but_the_pack() {
     assert_eq!(names(&dir), expected);
 }
 
+#[test]
+fn pack_and_unpack_do_not_offer_the_global_restriction_flags_but_accept_them() {
+    let dir = project();
+    for command in ["pack", "unpack"] {
+        let help = run(&dir, &[command, "--help"]);
+        assert!(help.status.success(), "{}", text(&help));
+        let help = text(&help);
+        assert!(!help.contains("--read-only"), "{command}: {help}");
+        assert!(!help.contains("--no-exec"), "{command}: {help}");
+    }
+    // Still accepted, before or after the subcommand.
+    for args in [
+        &[
+            "doc.canvas.md",
+            "pack",
+            "--list",
+            "--read-only",
+            "--no-exec",
+        ][..],
+        &["--no-exec", "pack", "--canvas", "doc.canvas.md", "--list"][..],
+    ] {
+        let out = run(&dir, args);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+    }
+    // The commands that do start a core keep offering them.
+    let view = text(&run(&dir, &["view", "--help"]));
+    assert!(
+        view.contains("--read-only") && view.contains("--no-exec"),
+        "{view}"
+    );
+}
+
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
