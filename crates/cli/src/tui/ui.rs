@@ -428,7 +428,61 @@ fn render_screen(f: &mut Frame, app: &mut App) {
         render_search(f, layout.footer, app);
     }
 
-    if let Some(picker) = &mut app.select_picker {
+    if let Some(picker) = &mut app.link_picker {
+        // Two lines per link: its text, then where it goes (dimmed).
+        let width = area.width.min(90);
+        let height = area.height.min((picker.links.len() * 2 + 2) as u16);
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Open link in the browser · Enter open · Esc cancel ")
+            .title_bottom(" ↑/↓ move · 1-9 open that one ");
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        picker.rows = inner;
+        let visible = (inner.height as usize / 2).max(1);
+        picker.offset = picker
+            .selected
+            .saturating_sub(visible - 1)
+            .min(picker.links.len().saturating_sub(visible));
+        let selected = picker.selected;
+        let items = picker.links.iter().enumerate().map(|(i, (text, url))| {
+            let number = if i < 9 {
+                format!("{} ", i + 1)
+            } else {
+                "  ".to_string()
+            };
+            ListItem::new(vec![
+                Line::from(format!("{number}{text}")),
+                // The selected row keeps the highlight's own colours.
+                Line::from(Span::styled(
+                    format!("  {url}"),
+                    if i == selected {
+                        Style::default()
+                    } else {
+                        Style::default().fg(super::theme::muted())
+                    },
+                )),
+            ])
+        });
+        let list = List::new(items)
+            .highlight_style(
+                Style::default()
+                    .bg(super::theme::accent())
+                    .fg(super::theme::on_accent()),
+            )
+            .highlight_symbol("› ");
+        let mut state = ListState::default();
+        state.select(Some(picker.selected));
+        *state.offset_mut() = picker.offset;
+        f.render_stateful_widget(list, inner, &mut state);
+    } else if let Some(picker) = &mut app.select_picker {
         let width = area.width.min(60);
         let height = area.height.min((picker.filtered.len().max(1) + 5) as u16);
         let popup = Rect::new(

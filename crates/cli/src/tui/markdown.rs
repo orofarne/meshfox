@@ -2264,6 +2264,51 @@ impl<'a> Renderer<'a> {
     }
 }
 
+/// Every link of a Markdown body, in document order: the visible text and
+/// where it points. Images are not links; an empty destination is skipped.
+/// Used by the `o` key's link list.
+pub fn links(md: &str) -> Vec<(String, String)> {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    let mut found = Vec::new();
+    // The open link's destination and the text collected so far.
+    let mut open: Option<(String, String)> = None;
+    for event in Parser::new_ext(md, options) {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                open = Some((dest_url.to_string(), String::new()));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((url, text)) = open.take() {
+                    if !url.is_empty() {
+                        let text = if text.trim().is_empty() {
+                            url.clone()
+                        } else {
+                            text
+                        };
+                        found.push((text, url));
+                    }
+                }
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some((_, text)) = &mut open {
+                    text.push_str(&t);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, text)) = &mut open {
+                    text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3698,5 +3743,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn links_lists_every_link_with_its_text() {
+        let md = "See [the **docs**](https://a.example/x) and <https://b.example>, \
+                  ![img](p.png) then [local](other.canvas.md#n).";
+        assert_eq!(
+            links(md),
+            vec![
+                ("the docs".to_string(), "https://a.example/x".to_string()),
+                ("https://b.example".to_string(), "https://b.example".to_string()),
+                ("local".to_string(), "other.canvas.md#n".to_string()),
+            ]
+        );
+        assert!(links("no links here").is_empty());
     }
 }

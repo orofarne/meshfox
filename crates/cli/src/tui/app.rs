@@ -111,6 +111,17 @@ impl SelectPickerState {
     }
 }
 
+/// The list `o` shows before anything is opened: every link of the selected
+/// node. Shown even for a single link, so leaving the TUI is always a
+/// deliberate step that shows where it goes.
+pub struct LinkPickerState {
+    /// (visible text, destination)
+    pub links: Vec<(String, String)>,
+    pub selected: usize,
+    pub rows: Rect,
+    pub offset: usize,
+}
+
 /// Edit even malformed pasted numbers so validation never traps the user.
 fn edit_number(
     input: &mut String,
@@ -695,6 +706,8 @@ pub struct App {
     /// waiting on an answer — see `PendingHttpRun`'s own doc comment.
     pub pending_http_run: Option<PendingHttpRun>,
     pub run_confirmation: Option<RunConfirmation>,
+    /// The `o` link list — see `LinkPickerState`.
+    pub link_picker: Option<LinkPickerState>,
     run_confirmation_approved: bool,
     pub run: Option<RunState>,
     /// Live per-step output from the most recent run, kept around after
@@ -1362,6 +1375,7 @@ impl App {
             no_exec,
             pending_http_run: None,
             run_confirmation: None,
+            link_picker: None,
             run_confirmation_approved: false,
             run: None,
             step_output: HashMap::new(),
@@ -1648,6 +1662,10 @@ impl App {
         }
         if self.table_mode.is_some() {
             self.on_table_key(key).await;
+            return;
+        }
+        if self.link_picker.is_some() {
+            self.on_link_picker_key(key).await;
             return;
         }
         if self.select_picker.is_some() {
@@ -2800,6 +2818,35 @@ impl App {
     }
 
     async fn on_mouse_normal(&mut self, mouse: MouseEvent) {
+        if let Some(picker) = &mut self.link_picker {
+            let key = match mouse.kind {
+                MouseEventKind::ScrollUp => Some(KeyCode::Up),
+                MouseEventKind::ScrollDown => Some(KeyCode::Down),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if picker
+                        .rows
+                        .contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    {
+                        let index = picker.offset + (mouse.row - picker.rows.y) as usize / 2;
+                        if index < picker.links.len() {
+                            picker.selected = index;
+                            Some(KeyCode::Enter)
+                        } else {
+                            None
+                        }
+                    } else {
+                        self.link_picker = None;
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(code) = key {
+                self.on_link_picker_key(KeyEvent::new(code, KeyModifiers::NONE))
+                    .await;
+            }
+            return;
+        }
         if let Some(picker) = &mut self.select_picker {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -4583,7 +4630,14 @@ impl App {
         self.rows
             .get(self.selected)
             .and_then(|row| self.display_canvas.node(&row.node_id))
-            .is_some_and(|node| node.node_type == NodeType::File && node.target.is_some())
+            .is_some_and(|node| {
+                if node.node_type == NodeType::File {
+                    node.target.is_some()
+                } else {
+                    // Any other node: `o` lists the links of its text.
+                    !super::markdown::links(&node.text).is_empty()
+                }
+            })
     }
 
     /// Open via the worker: it owns target resolution, file access and
@@ -4593,26 +4647,24 @@ impl App {
             return;
         };
         let node_id = row.node_id.clone();
-        let link = self
+        // Every node but a `file` one opens its links — always through the
+        // list, so a link is never followed without being shown first.
+        if let Some(node) = self
             .display_canvas
             .node(&node_id)
-            .filter(|n| n.node_type == NodeType::Link)
-            .map(|n| n.target.clone());
-        if let Some(target) = link {
-            let Some(url) = target.filter(|t| !t.is_empty()) else {
-                self.status = "link has no target".into();
-                return;
-            };
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                self.status = format!("not opening non-http link: {url}");
-                return;
+            .filter(|n| n.node_type != NodeType::File)
+        {
+            let links = super::markdown::links(&node.text);
+            if links.is_empty() {
+                self.status = "no links in this node".into();
+            } else {
+                self.link_picker = Some(LinkPickerState {
+                    links,
+                    selected: 0,
+                    rows: Rect::default(),
+                    offset: 0,
+                });
             }
-            let shown = url.clone();
-            self.status = match tokio::task::spawn_blocking(move || open::that(&url)).await {
-                Ok(Ok(())) => format!("opened {shown}"),
-                Ok(Err(e)) => format!("failed to open: {e}"),
-                Err(e) => format!("failed to open: {e}"),
-            };
             return;
         }
         let Some(port) = self.worker_port else {
@@ -4637,6 +4689,57 @@ impl App {
             }
             Err(e) => self.status = format!("failed to open: {e}"),
         }
+    }
+
+    async fn on_link_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = &mut self.link_picker else {
+            return;
+        };
+        let count = picker.links.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.link_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = (picker.selected + count - 1) % count;
+            }
+            KeyCode::Down | KeyCode::Char('j') => picker.selected = (picker.selected + 1) % count,
+            KeyCode::Home => picker.selected = 0,
+            KeyCode::End => picker.selected = count - 1,
+            // 1-9 pick that row directly.
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < count => {
+                picker.selected = c as usize - '1' as usize;
+                Box::pin(self.on_link_picker_key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )))
+                .await;
+            }
+            KeyCode::Enter => {
+                let picker = self.link_picker.take().unwrap();
+                let url = picker.links[picker.selected].1.clone();
+                self.open_link_url(url).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Hands a link from the list to the OS. Only web and mail links leave
+    /// the TUI; a relative or `file` destination is not something to start
+    /// an application for.
+    async fn open_link_url(&mut self, url: String) {
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("mailto:"))
+        {
+            self.status = format!("not opening non-web link: {url}");
+            return;
+        }
+        let shown = url.clone();
+        self.status = match tokio::task::spawn_blocking(move || open::that(&url)).await {
+            Ok(Ok(())) => format!("opened {shown}"),
+            Ok(Err(e)) => format!("failed to open: {e}"),
+            Err(e) => format!("failed to open: {e}"),
+        };
     }
 
     /// Opens a plain file the way `[tui.open]` says (see
@@ -9407,6 +9510,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn o_lists_the_links_of_a_text_node_even_when_there_is_one() {
+        let mut app = app_with_blocks(
+            "link-list",
+            "See [docs](https://example.org/d) and [mail](mailto:a@b.c) and [x](rel.md).\n",
+        )
+        .await;
+        app.on_key(key(KeyCode::Char('o'))).await;
+        let picker = app.link_picker.as_ref().expect("link list is open");
+        assert_eq!(picker.links.len(), 3);
+        assert_eq!(picker.links[0].1, "https://example.org/d");
+        // Moving and cancelling opens nothing.
+        app.on_key(key(KeyCode::Down)).await;
+        assert_eq!(app.link_picker.as_ref().unwrap().selected, 1);
+        app.on_key(key(KeyCode::Esc)).await;
+        assert!(app.link_picker.is_none());
+        // A relative link is listed but never handed to the OS.
+        app.on_key(key(KeyCode::Char('o'))).await;
+        app.on_key(key(KeyCode::Char('3'))).await;
+        assert!(app.link_picker.is_none());
+        assert!(app.status.starts_with("not opening non-web link"), "{}", app.status);
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn o_on_a_text_node_without_links_says_so() {
+        let mut app = app_with_blocks("link-none", "plain text\n").await;
+        app.on_key(key(KeyCode::Char('o'))).await;
+        assert!(app.link_picker.is_none());
+        assert_eq!(app.status, "no links in this node");
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn open_uses_worker_action_without_reading_the_returned_path() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -9416,6 +9552,8 @@ mod tests {
             r#"{"action":"open_canvas","path":"/api-only/other.canvas.md","fragment":"child","port":4242}"#,
         ] {
             let mut app = app_with_blocks("api-open", "").await;
+            // `o` on a text node lists its links; only a `file` node asks the worker.
+            app.display_canvas.node_mut("root").unwrap().node_type = NodeType::File;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             app.worker_port = Some(listener.local_addr().unwrap().port());
             let request = tokio::spawn(async move {

@@ -3878,3 +3878,11 @@ a {
     font-size: max(16px, 1em) !important;
   }
 }
+
+/* On a narrow screen the minimap covers a large part of the canvas and
+ * the pan/zoom gestures already do its job: hide it. */
+@media (max-width: 700px) {
+  .react-flow__minimap {
+    display: none;
+  }
+}

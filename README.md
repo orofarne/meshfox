@@ -461,6 +461,11 @@ Options:
 
 **Build and run it yourself.** With the `wasm-prep` block from "Unit tests" done, `cd web && npm run build:wasm && npm run preview:wasm` serves it on `http://localhost:4600/`. `scripts/package-editor.sh` builds the directory to upload (the site plus `_headers` with the Content-Security-Policy; Cloudflare Pages reads it as it is) and should be served from its own origin, because drafts live in that origin's storage. The browser tests are the `wasm-editor` block under "End-to-end tests", the model's own the `wasm` block under "Unit tests". How it works, and its limits, in [web/wasm-editor/README.md](./web/wasm-editor/README.md).
 
+#### How the browser editor works
+<!-- meshfox:node id="wasm-editor-readme" type="file" -->
+
+[web/wasm-editor/README.md](./web/wasm-editor/README.md)
+
 ### macOS menu-bar app (`server_socket`, experimental)
 <!-- meshfox:node id="macos-menu-bar-app-open-experimental" -->
 
@@ -586,6 +591,8 @@ target/release/meshfox theme-preview --html -o site-template-archive/tui-editor-
 
 **External editor.** With `[tui] editor` set (local or global `.meshfox/config.toml`, same merge as `theme`), `e` edits the source in that program instead of the built-in editor: the TUI writes the file's text to a scratch file, hands the terminal to the command until it exits, reads the result back and saves it straight away through the ordinary save — so a file that changed meanwhile is merged or compared exactly as for `Ctrl-s` in the built-in editor. The scratch file is always named `*.canvas.md` (so editors apply the meshfox syntax) and removed afterwards. The command is split like a shell would (quotes and backslashes, no expansion or pipes) and `{file}`, `{line}`, `{col}` are replaced inside each word; the cursor starts on the selected node. A command without `{file}` gets the file appended, with the position in the form the editor is known to take (`vim`/`nvim`/`vi`/`nano`/`emacs`/`kak`: `+LINE`; `hx`/`subl`/`zed`: `FILE:LINE:COL`; `code`/`codium`/`cursor`: `--wait -g FILE:LINE:COL`). The command must not return before editing is finished: GUI editors need their wait flag (`code --wait`). A non-zero exit (`:cq` in vim) discards the edit; an edit that doesn't parse as a canvas lands in the built-in editor with the error shown, and `Ctrl-o` there reopens the external one. Example: `[tui] editor = "nvim +{line} {file}"`.
 
+
+**Opening links.** `o` on any other node (text, `link`) lists the links of its text — always, even when there is one, so nothing is opened without showing where it goes. `↑`/`↓` (or `j`/`k`) move, `Enter` or a click opens the web or `mailto:` link in the OS default handler, `1`–`9` open that row, `Esc` cancels. Relative links are listed but not opened.
 
 **Opening files.** `o` on a `file` node opens its target. By default that is the OS default application; `[tui.open]` in `.meshfox/config.toml` (local or global; `[open]` is the fallback table for every client) picks a program per file type instead:
 
@@ -724,6 +731,11 @@ npm install -g @modelcontextprotocol/inspector
 mcp-inspector meshfox mcp
 ```
 
+#### Agent help
+<!-- meshfox:node id="agent-help-doc" type="file" -->
+
+[AGENT_HELP.md](./AGENT_HELP.md)
+
 ### VS Code extension
 <!-- meshfox:node id="vs-code-extension-experimental" -->
 
@@ -732,6 +744,11 @@ mcp-inspector meshfox mcp
 Also ships a small TextMate injection grammar that highlights meshfox's own bookkeeping comments (`meshfox:node`/`meshfox:edge`/`meshfox:var`/...) wherever the raw file is shown as plain text instead of through the canvas editor — git diffs/blame, "Open With... → Text Editor".
 
 On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode) — install straight from there, or see [editors/vscode/README.md](./editors/vscode/README.md) for building/installing the `.vsix` locally instead, and the extension's own limitations (macOS/Linux only for now, same watcher-socket protocol as the macOS daemon above).
+
+#### VS Code extension README
+<!-- meshfox:node id="vscode-extension-readme" type="file" -->
+
+[editors/vscode/README.md](./editors/vscode/README.md)
 
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->
@@ -796,6 +813,11 @@ style.css
 tui-editor-themes.html
 ```
 <!-- /meshfox:output -->
+
+#### Static export templates
+<!-- meshfox:node id="static-export-templates-doc" type="file" -->
+
+[TEMPLATES.md](./TEMPLATES.md)
 
 ### PDF export (experimental)
 <!-- meshfox:node id="pdf-export-experimental" -->
@@ -999,6 +1021,11 @@ both `require` and `import`. Blocks then say `interpreter="$NODE"`.
 
 [examples/python-venv.canvas.md](./examples/python-venv.canvas.md)
 
+#### Example: Node environment
+<!-- meshfox:node id="example-node-env" type="file" -->
+
+[examples/node-env.canvas.md](./examples/node-env.canvas.md)
+
 ### Rendering rich output (a pandas DataFrame preview)
 <!-- meshfox:node id="rendering-rich-output-a-pandas-dataframe-preview" -->
 
@@ -1053,6 +1080,16 @@ Docker Compose stack. Ordinary `service` blocks now receive SIGTERM with a
 <!-- meshfox:node id="example-2" type="file" -->
 
 [examples/interpreters.canvas.md](./examples/interpreters.canvas.md)
+
+#### Example: runnable files
+<!-- meshfox:node id="example-runnable-files" type="file" -->
+
+[examples/runnable-files.canvas.md](./examples/runnable-files.canvas.md)
+
+#### Example: services
+<!-- meshfox:node id="example-services" type="file" -->
+
+[examples/services.canvas.md](./examples/services.canvas.md)
 
 ### Importing a file that sits beside the canvas
 <!-- meshfox:node id="importing-a-file-that-sits-beside-the-canvas" -->
@@ -1123,6 +1160,11 @@ matching row in that file's license tables — the same mechanism
 
 [LICENSE.canvas.md](./LICENSE.canvas.md)
 
+#### Example: constraints
+<!-- meshfox:node id="example-constraints-doc" type="file" -->
+
+[examples/constraints.canvas.md](./examples/constraints.canvas.md)
+
 ### Publishing a canvas as a static site
 <!-- meshfox:node id="publishing-a-canvas-as-a-static-site" -->
 
@@ -1188,6 +1230,11 @@ live example ("Related Canvas") — opening it takes you to
 <!-- meshfox:node id="example-6" type="file" -->
 
 [examples/hello.canvas.md#related-canvas](./examples/hello.canvas.md#related-canvas)
+
+#### Example: related canvas
+<!-- meshfox:node id="example-vars" type="file" -->
+
+[examples/vars.canvas.md](./examples/vars.canvas.md)
 
 ### Calling an AI agent from a block
 <!-- meshfox:node id="calling-an-ai-agent-from-a-block" -->
@@ -1332,6 +1379,11 @@ A native `meshfox` fence describes a child invocation as YAML: `canvas`, `run`, 
 <!-- meshfox:node id="example-12" type="file" -->
 
 [examples/canvas-call.canvas.md](./examples/canvas-call.canvas.md)
+
+#### Example: child canvas
+<!-- meshfox:node id="example-canvas-call-child" type="file" -->
+
+[examples/canvas-call-data/child.canvas.md](./examples/canvas-call-data/child.canvas.md)
 
 ### Computing a Markdown table from document tags
 <!-- meshfox:node id="computing-a-markdown-table-from-document-tags" -->
