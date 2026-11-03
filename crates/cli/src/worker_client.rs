@@ -1420,9 +1420,17 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 let event = match parsed {
                     WatchMsg::Heartbeat => continue,
                     WatchMsg::Connected => WatchEvent::ImagesChanged,
+                    WatchMsg::Resync => {
+                        // A gap can have swallowed ImagesChanged while the
+                        // canvas itself stayed identical. Reloading only the
+                        // document would leave those image bytes cached forever.
+                        if tx.send(WatchEvent::ImagesChanged).is_err() {
+                            return;
+                        }
+                        WatchEvent::Changed
+                    }
                     WatchMsg::Changed
                     | WatchMsg::FilesChanged
-                    | WatchMsg::Resync
                     | WatchMsg::NodeUpserted
                     | WatchMsg::NodeRemoved
                     | WatchMsg::NodesReordered
@@ -3092,6 +3100,31 @@ mod tests {
             .expect("the later change never arrived")
             .unwrap();
         assert!(matches!(event, WatchEvent::Changed));
+    }
+
+    #[tokio::test]
+    async fn watch_resync_invalidates_images_as_well_as_the_document() {
+        use tokio_tungstenite::tungstenite::Message;
+        let port = fake_ws_worker(|mut ws| async move {
+            use futures_util::SinkExt;
+            ws.send(Message::Text(r#"{"type":"resync"}"#.into()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+        let mut events = watch(port);
+        let mut images = false;
+        let mut document = false;
+        for _ in 0..2 {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
+                Ok(Some(WatchEvent::ImagesChanged)) => images = true,
+                Ok(Some(WatchEvent::Changed)) => document = true,
+                _ => break,
+            }
+        }
+        assert!(images, "resync left potentially changed SVG bytes cached");
+        assert!(document, "resync must also reload the canvas");
     }
 }
 

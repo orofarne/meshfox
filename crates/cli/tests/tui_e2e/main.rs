@@ -29,6 +29,7 @@ mod file_node_run;
 mod fixtures;
 mod harness;
 mod history;
+mod image_reload;
 mod include_reload;
 mod markdown_output;
 mod mouse_deps_line;
