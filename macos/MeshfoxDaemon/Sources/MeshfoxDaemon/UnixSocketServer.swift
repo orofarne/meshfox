@@ -38,12 +38,12 @@ private let launchSocketName = "Listener"
 final class UnixSocketServer {
     private let path: String
     private let onLine: (String) -> Void
-    private let onGetPort: (String, @escaping (PortReply) -> Void) -> Void
+    private let onGetPort: (String, Bool, @escaping (PortReply) -> Void) -> Void
     /// `.open`'s own handler: canvas path, optional deep-link fragment,
     /// completion. Like `onGetPort`, replies on the same connection instead
     /// of falling through to `onLine` — see `watcher_protocol.rs`'s own
     /// doc comment for why `Open` stopped being fire-and-forget.
-    private let onOpen: (String, String?, @escaping (AckReply) -> Void) -> Void
+    private let onOpen: (String, String?, Bool, @escaping (AckReply) -> Void) -> Void
     /// `.openFile`'s own handler — same reply-on-the-same-connection
     /// treatment as `onOpen`, just with no fragment/spawn-and-wait
     /// lifecycle to speak of.
@@ -64,8 +64,8 @@ final class UnixSocketServer {
     init(
         path: String,
         onLine: @escaping (String) -> Void,
-        onGetPort: @escaping (String, @escaping (PortReply) -> Void) -> Void,
-        onOpen: @escaping (String, String?, @escaping (AckReply) -> Void) -> Void,
+        onGetPort: @escaping (String, Bool, @escaping (PortReply) -> Void) -> Void,
+        onOpen: @escaping (String, String?, Bool, @escaping (AckReply) -> Void) -> Void,
         onOpenFile: @escaping (String, @escaping (AckReply) -> Void) -> Void,
         onListCores: @escaping () -> CoresReply,
         onKill: @escaping (String, @escaping (AckReply) -> Void) -> Void
@@ -307,11 +307,11 @@ final class UnixSocketServer {
                 // would just hang this thread. `ready` alone still falls
                 // through to the EOF-then-`onLine` path below, unchanged.
                 switch foundLine.flatMap(WatcherMessage.parse(line:)) {
-                case .getPort(let canvasPath):
-                    replyToGetPort(fd: fd, canvasPath: canvasPath)
+                case .getPort(let canvasPath, let noExec):
+                    replyToGetPort(fd: fd, canvasPath: canvasPath, noExec: noExec)
                     return
-                case .open(let canvasPath, let fragment):
-                    replyToOpen(fd: fd, canvasPath: canvasPath, fragment: fragment)
+                case .open(let canvasPath, let fragment, let noExec):
+                    replyToOpen(fd: fd, canvasPath: canvasPath, fragment: fragment, noExec: noExec)
                     return
                 case .openFile(let path):
                     replyToOpenFile(fd: fd, path: path)
@@ -343,10 +343,10 @@ final class UnixSocketServer {
     /// possibly async — see `SessionStore.getPort`, which may need to wait
     /// for a freshly-spawned worker's own `Ready`), then writes the one
     /// JSON reply line and returns, closing the connection.
-    private func replyToGetPort(fd: Int32, canvasPath: String) {
+    private func replyToGetPort(fd: Int32, canvasPath: String, noExec: Bool) {
         let semaphore = DispatchSemaphore(value: 0)
         var reply: PortReply = .error("no response")
-        onGetPort(canvasPath) { result in
+        onGetPort(canvasPath, noExec) { result in
             reply = result
             semaphore.signal()
         }
@@ -358,10 +358,10 @@ final class UnixSocketServer {
     /// own completion (`SessionStore.openCanvas`, which may itself wait on
     /// a freshly-spawned worker's `Ready`, same as `getPort` does) before
     /// replying.
-    private func replyToOpen(fd: Int32, canvasPath: String, fragment: String?) {
+    private func replyToOpen(fd: Int32, canvasPath: String, fragment: String?, noExec: Bool) {
         let semaphore = DispatchSemaphore(value: 0)
         var reply: AckReply = .error("no response")
-        onOpen(canvasPath, fragment) { result in
+        onOpen(canvasPath, fragment, noExec) { result in
             reply = result
             semaphore.signal()
         }

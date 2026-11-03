@@ -25,6 +25,10 @@ export interface OpenMessage {
   canvas_path: string;
   /** A deep link's own `#node-id`, or absent/null for the target's root. */
   fragment?: string | null;
+  /** The sender runs with `--no-exec` and must not be handed a core that can
+   * run code. Absent means unrestricted. This extension starts only ordinary
+   * workers, so it refuses such a request instead of honouring it. */
+  no_exec?: boolean;
 }
 
 /** A "↗ open" on a plain (non-canvas) file node's target — see

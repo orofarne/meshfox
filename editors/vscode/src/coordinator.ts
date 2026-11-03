@@ -138,6 +138,15 @@ export class Coordinator implements vscode.Disposable {
       const waiters = entry.waiters.splice(0);
       waiters.forEach((w) => w.resolve(msg.port));
     } else if (msg.op === "open") {
+      if (msg.no_exec) {
+        // The workers this extension starts can run code, so it cannot give
+        // a no-exec requester what it asked for; opening it would be the
+        // restriction silently lost.
+        this.output.appendLine(
+          `meshfox: refused to open ${msg.canvas_path}: the request is no-exec and this extension only starts workers that can run code`,
+        );
+        return;
+      }
       this.openCanvas(msg.canvas_path, msg.fragment ?? undefined);
     }
   }

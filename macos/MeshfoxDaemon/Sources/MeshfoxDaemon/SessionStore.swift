@@ -18,6 +18,9 @@ final class Session {
     var port: UInt16?
     var pendingOpen: PendingOpen
     let process: Process
+    /// Whether the worker was started with `--no-exec`. A request that asks for
+    /// a no-exec core is never answered with one that can run code.
+    let noExec: Bool
     /// Every still-unanswered `get_port` request waiting on this session's
     /// own `Ready` — drained (each called exactly once) by `markReady`.
     /// Empty for a session nobody's asked `getPort` about yet.
@@ -37,10 +40,11 @@ final class Session {
     /// since it's only ever touched alongside other session state anyway.
     var capturedStderr = ""
 
-    init(canvasPath: String, process: Process, pendingOpen: PendingOpen) {
+    init(canvasPath: String, process: Process, pendingOpen: PendingOpen, noExec: Bool) {
         self.canvasPath = canvasPath
         self.process = process
         self.pendingOpen = pendingOpen
+        self.noExec = noExec
     }
 
     var displayTitle: String {
@@ -102,12 +106,12 @@ final class SessionStore {
             onLine: { [weak self] line in
                 self?.handleLine(line)
             },
-            onGetPort: { [weak self] canvasPath, completion in
-                self?.getPort(path: canvasPath, completion: completion)
+            onGetPort: { [weak self] canvasPath, noExec, completion in
+                self?.getPort(path: canvasPath, noExec: noExec, completion: completion)
                     ?? completion(.error("daemon is shutting down"))
             },
-            onOpen: { [weak self] canvasPath, fragment, completion in
-                self?.openCanvas(path: canvasPath, fragment: fragment, completion: completion)
+            onOpen: { [weak self] canvasPath, fragment, noExec, completion in
+                self?.openCanvas(path: canvasPath, fragment: fragment, noExec: noExec, completion: completion)
                     ?? completion(.error("daemon is shutting down"))
             },
             onOpenFile: { [weak self] path, completion in
@@ -157,11 +161,16 @@ final class SessionStore {
     /// `openCanvas`'s own job. `completion` may run synchronously (a port's
     /// already known) or later, from `markReady` (still spawning) —
     /// exactly once either way.
-    func getPort(path canvasPath: String, completion: @escaping (PortReply) -> Void) {
+    func getPort(path canvasPath: String, noExec: Bool = false, completion: @escaping (PortReply) -> Void) {
         let canonical = Self.canonicalize(canvasPath)
 
         lock.lock()
         if let existing = sessions[canonical] {
+            if noExec && !existing.noExec {
+                lock.unlock()
+                completion(.error(Self.cannotRestrict(canonical)))
+                return
+            }
             if let port = existing.port {
                 lock.unlock()
                 completion(.port(port))
@@ -173,7 +182,7 @@ final class SessionStore {
         }
         lock.unlock()
 
-        spawnWorker(canonicalPath: canonical, pendingOpen: .none, initialPortRequest: completion)
+        spawnWorker(canonicalPath: canonical, pendingOpen: .none, noExec: noExec, initialPortRequest: completion)
     }
 
     /// A worker's own `Ready` arrived — record its port, open a tab now if
@@ -222,11 +231,16 @@ final class SessionStore {
     /// start, wait the same way. `completion` fires exactly once either
     /// way, `.ok` once a tab's actually been (or is about to be) opened,
     /// `.error` if the worker involved never came up.
-    func openCanvas(path canvasPath: String, fragment: String?, completion: @escaping (AckReply) -> Void) {
+    func openCanvas(path canvasPath: String, fragment: String?, noExec: Bool = false, completion: @escaping (AckReply) -> Void) {
         let canonical = Self.canonicalize(canvasPath)
 
         lock.lock()
         if let existing = sessions[canonical] {
+            if noExec && !existing.noExec {
+                lock.unlock()
+                completion(.error(Self.cannotRestrict(canonical)))
+                return
+            }
             if let port = existing.port {
                 lock.unlock()
                 openBrowserTab(port: port, fragment: fragment)
@@ -243,6 +257,7 @@ final class SessionStore {
         spawnWorker(
             canonicalPath: canonical,
             pendingOpen: .wanted(fragment: fragment),
+            noExec: noExec,
             initialPortRequest: nil,
             initialOpenAck: completion
         )
@@ -277,6 +292,12 @@ final class SessionStore {
     /// `resolvingSymlinksInPath` would drop the `/private` prefix. A path
     /// that doesn't resolve (a deleted canvas, say) is kept as given, which
     /// is also what the Rust side does.
+    /// Reply to a `--no-exec` request for a canvas whose worker can run code
+    /// (one worker serves a canvas at a time); mirrors `watcher.rs`'s message.
+    private static func cannotRestrict(_ canonicalPath: String) -> String {
+        "the worker serving \(canonicalPath) was not started with --no-exec; stop it or ask for the canvas with --read-only"
+    }
+
     private static func canonicalize(_ path: String) -> String {
         var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
         guard realpath(path, &buffer) != nil else { return path }
@@ -294,12 +315,17 @@ final class SessionStore {
     private func spawnWorker(
         canonicalPath: String,
         pendingOpen: PendingOpen,
+        noExec: Bool = false,
         initialPortRequest: ((PortReply) -> Void)?,
         initialOpenAck: ((AckReply) -> Void)? = nil
     ) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: meshfoxPath)
         process.arguments = ["view", canonicalPath, "--port", "0", "--watcher-socket", socketPath]
+        // The requester runs with `--no-exec`: so does the core it asked for.
+        if noExec {
+            process.arguments?.append("--no-exec")
+        }
         process.standardInput = FileHandle.nullDevice
 
         // Captured (capped) so a caller waiting on this worker's own
@@ -322,7 +348,7 @@ final class SessionStore {
             self.lock.unlock()
         }
 
-        let session = Session(canvasPath: canonicalPath, process: process, pendingOpen: pendingOpen)
+        let session = Session(canvasPath: canonicalPath, process: process, pendingOpen: pendingOpen, noExec: noExec)
         if let initialPortRequest {
             session.pendingPortRequests = [initialPortRequest]
         }

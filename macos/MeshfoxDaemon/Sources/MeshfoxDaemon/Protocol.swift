@@ -9,7 +9,10 @@ import Foundation
 /// specifically so a coordinator in any language can speak it).
 enum WatcherMessage {
     case ready(canvasPath: String, port: UInt16)
-    case open(canvasPath: String, fragment: String?)
+    /// `noExec`: the requester runs with `--no-exec` and must not be handed
+    /// (or have started) a core that can run code; absent on the wire means
+    /// false. Mirrors the Rust side's `no_exec` field on `Message::Open`.
+    case open(canvasPath: String, fragment: String?, noExec: Bool)
     /// A "↗ open" on a plain (non-canvas) file node's target — see the
     /// Rust side's `Message::OpenFile` doc comment for why this is a
     /// separate case rather than a reused field on `.open`.
@@ -19,7 +22,8 @@ enum WatcherMessage {
     /// same connection instead of being fire-and-forget; see the Rust
     /// side's `Message::GetPort`/`PortResponse` doc comments and
     /// `UnixSocketServer`'s own handling of this case specifically.
-    case getPort(canvasPath: String)
+    /// `noExec` as on `.open`.
+    case getPort(canvasPath: String, noExec: Bool)
     /// "List the workers you're managing" — answered with a `CoresReply`.
     /// Mirrors the Rust side's `Message::ListCores`.
     case listCores
@@ -36,6 +40,7 @@ extension WatcherMessage: Decodable {
         case port
         case fragment
         case path
+        case noExec = "no_exec"
     }
 
     init(from decoder: Decoder) throws {
@@ -49,13 +54,15 @@ extension WatcherMessage: Decodable {
         case "open":
             let path = try container.decode(String.self, forKey: .canvasPath)
             let fragment = try container.decodeIfPresent(String.self, forKey: .fragment)
-            self = .open(canvasPath: path, fragment: fragment)
+            let noExec = try container.decodeIfPresent(Bool.self, forKey: .noExec) ?? false
+            self = .open(canvasPath: path, fragment: fragment, noExec: noExec)
         case "open_file":
             let path = try container.decode(String.self, forKey: .path)
             self = .openFile(path: path)
         case "get_port":
             let path = try container.decode(String.self, forKey: .canvasPath)
-            self = .getPort(canvasPath: path)
+            let noExec = try container.decodeIfPresent(Bool.self, forKey: .noExec) ?? false
+            self = .getPort(canvasPath: path, noExec: noExec)
         case "list_cores":
             self = .listCores
         case "kill":
