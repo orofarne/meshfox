@@ -64,6 +64,7 @@ impl CanvasResolver for LocalResolver {
             &self.socket_path,
             canvas,
             None,
+            false,
         ))
     }
 

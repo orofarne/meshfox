@@ -65,6 +65,9 @@ struct Entry {
     /// Asks this worker's own task to stop it (`Registry::kill`); taken on
     /// first use. `None` once used, or for an entry nobody can kill.
     kill: Option<oneshot::Sender<()>>,
+    /// Whether the worker was started with `--no-exec`. A request that asks
+    /// for a no-exec core is never answered with one that can run code.
+    no_exec: bool,
 }
 
 /// How `serve --http` shows a canvas to the user: at
@@ -361,6 +364,9 @@ struct WorkerSpec {
     pending_open: Option<Option<String>>,
     auto_exit: bool,
     initial_waiter: Option<oneshot::Sender<Result<(), String>>>,
+    /// The requester asked for a core that runs nothing, on top of whatever
+    /// this process is itself restricted to.
+    no_exec: bool,
 }
 
 fn spawn_worker(
@@ -375,7 +381,10 @@ fn spawn_worker(
         pending_open,
         auto_exit,
         initial_waiter,
+        no_exec,
     } = spec;
+    let mut caps = meshfox_core::capabilities::requested();
+    caps.no_exec |= no_exec;
     let mut command = Command::new(exe);
     command
         .arg("view")
@@ -388,8 +397,9 @@ fn spawn_worker(
         command.arg("--no-auto-exit");
     }
     // A worker's restrictions are the process's own, so a watcher started with
-    // `--read-only`/`--no-exec` hands them on to every worker it spawns.
-    command.args(meshfox_core::capabilities::requested().args());
+    // `--read-only`/`--no-exec` hands them on to every worker it spawns; a
+    // request can add `--no-exec` for the worker it asks for.
+    command.args(caps.args());
     let mut child = command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -430,6 +440,7 @@ fn spawn_worker(
             waiters: initial_waiter.into_iter().collect(),
             pid,
             kill: Some(kill_tx),
+            no_exec: caps.no_exec,
         },
     );
 
@@ -567,11 +578,19 @@ async fn handle_connection(
         Message::Open {
             canvas_path,
             fragment,
+            no_exec,
         } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
-            let result = ensure_core(&registry, &exe, &socket_path, canonical, Some(fragment))
-                .await
-                .map(|_| ());
+            let result = ensure_core(
+                &registry,
+                &exe,
+                &socket_path,
+                canonical,
+                Some(fragment),
+                no_exec,
+            )
+            .await
+            .map(|_| ());
             let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
         }
         Message::OpenFile { path } => {
@@ -583,12 +602,16 @@ async fn handle_connection(
         // a web page's "↗ open" on a canvas target needs the target's port
         // to open in a new tab of the page's own browser (`open_node_file`,
         // `context=web`). Get-or-spawn, no browser tab opened here.
-        Message::GetPort { canvas_path } => {
+        Message::GetPort {
+            canvas_path,
+            no_exec,
+        } => {
             let canonical = canvas_path.canonicalize().unwrap_or(canvas_path);
-            let reply = match ensure_core(&registry, &exe, &socket_path, canonical, None).await {
-                Ok(port) => PortResponse::Port { port },
-                Err(error) => PortResponse::Error { error },
-            };
+            let reply =
+                match ensure_core(&registry, &exe, &socket_path, canonical, None, no_exec).await {
+                    Ok(port) => PortResponse::Port { port },
+                    Err(error) => PortResponse::Error { error },
+                };
             let _ = write_half.write_all(json_line(&reply).as_bytes()).await;
         }
         Message::ListCores if registry.persistent => {
@@ -633,15 +656,21 @@ pub(crate) async fn ensure_core(
     socket_path: &Path,
     canonical: PathBuf,
     open: Option<Option<String>>,
+    no_exec: bool,
 ) -> Result<u16, String> {
     enum Action {
         Ready(u16),
         Wait,
         Spawn,
+        Refuse,
     }
     let action = {
         let mut entries = registry.entries.lock().unwrap();
         match entries.get_mut(&canonical) {
+            // The worker already serving this canvas can run code, and the
+            // caller asked for one that cannot: say so instead of handing it
+            // over (the lock lets one worker serve a canvas at a time).
+            Some(entry) if no_exec && !entry.no_exec => Action::Refuse,
             Some(entry) => match entry.port {
                 Some(port) => Action::Ready(port),
                 None => {
@@ -655,6 +684,13 @@ pub(crate) async fn ensure_core(
         }
     };
     let rx = match action {
+        Action::Refuse => {
+            return Err(format!(
+                "the worker serving {} was not started with --no-exec; stop it or ask for the \
+                 canvas with --read-only",
+                canonical.display()
+            ));
+        }
         Action::Ready(port) => {
             if let Some(fragment) = &open {
                 registry.open_browser_tab(&canonical, port, fragment.as_deref());
@@ -678,6 +714,7 @@ pub(crate) async fn ensure_core(
                     pending_open: open,
                     auto_exit: true,
                     initial_waiter: Some(tx),
+                    no_exec,
                 },
             )
             .map_err(|e| format!("couldn't spawn a worker for the requested canvas: {e}"))?;
@@ -775,6 +812,7 @@ pub async fn run(
             pending_open: initial_open,
             auto_exit,
             initial_waiter: None,
+            no_exec: false,
         },
     )?;
 
@@ -832,6 +870,7 @@ mod tests {
             waiters: Vec::new(),
             pid: 0,
             kill: None,
+            no_exec: false,
         }
     }
 

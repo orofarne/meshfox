@@ -77,13 +77,42 @@ pub async fn resolve(canvas_path: &Path) -> io::Result<Resolved> {
         let canonical = canvas_path
             .canonicalize()
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", canvas_path.display())))?;
+        // The request itself says if this process runs with `--no-exec` (see
+        // `watcher_protocol::Message::GetPort`), but a coordinator that
+        // predates the field ignores it, so the answer is checked as well.
         let port = watcher_protocol::request_port(&socket, &canonical).await?;
+        refuse_worker_that_can_run_code(port).await?;
         return Ok(Resolved::Other(port));
     }
     match worker_lock::try_acquire(canvas_path)? {
         Acquired::Us(guard) => Ok(Resolved::Us(guard)),
-        Acquired::Other { port } => Ok(Resolved::Other(port)),
+        Acquired::Other { port } => {
+            refuse_worker_that_can_run_code(port).await?;
+            Ok(Resolved::Other(port))
+        }
     }
+}
+
+/// A process started with `--no-exec` (or `MESHFOX_NO_EXEC`) must never end up
+/// as the client of a worker that can run code: the restriction is the
+/// caller's, and a shared worker (an editor's, a coordinator's, an earlier
+/// `view`) was started by someone else. A worker that is already gone is not
+/// refused here; the caller looks one up again, and that lookup is checked
+/// the same way.
+async fn refuse_worker_that_can_run_code(port: u16) -> io::Result<()> {
+    if !meshfox_core::capabilities::requested().no_exec {
+        return Ok(());
+    }
+    if matches!(crate::worker_client::ping(port).await, WorkerHealth::Gone) {
+        return Ok(());
+    }
+    if crate::worker_client::info(port).await.no_exec {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "the worker on port {port} can run code, and this process runs with --no-exec; stop that \
+         worker, or open the canvas with --read-only to get a private one"
+    )))
 }
 
 /// Find a running worker. Never asks the coordinator to start one.
@@ -195,6 +224,18 @@ pub async fn hand_off_to_configured_coordinator(
     let Some(socket) = meshfox_core::config::server_socket(canvas_root) else {
         return Ok(None);
     };
+    // A read-only core is always private (see `resolve`): handing it to a
+    // coordinator would start one that shares state and is not restricted.
+    // Said out loud, because a configured coordinator is otherwise the rule.
+    if meshfox_core::capabilities::requested().read_only {
+        eprintln!(
+            "meshfox view: --read-only: the configured external coordinator ({}) is not used; \
+             serving {} in a private worker",
+            socket.display(),
+            canvas_path.display()
+        );
+        return Ok(None);
+    }
     let canonical = canvas_path
         .canonicalize()
         .map_err(|e| format!("{}: {e}", canvas_path.display()))?;

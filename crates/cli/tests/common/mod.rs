@@ -76,6 +76,38 @@ pub fn get_port(socket: &Path, canvas: &Path) -> u16 {
         .unwrap_or_else(|| panic!("get_port failed: {reply}")) as u16
 }
 
+/// `get_port` with an explicit restriction; returns the whole reply.
+pub fn request_port(socket: &Path, canvas: &Path, no_exec: bool) -> serde_json::Value {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    let extra = if no_exec { ",\"no_exec\":true" } else { "" };
+    writeln!(
+        stream,
+        "{{\"op\":\"get_port\",\"canvas_path\":{}{extra}}}",
+        serde_json::to_string(canvas).unwrap()
+    )
+    .unwrap();
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    serde_json::from_str(reply.trim()).unwrap()
+}
+
+/// `noExec` as the worker on `port` reports it in `GET /api/info`.
+pub fn worker_is_no_exec(port: u16) -> bool {
+    use std::io::Read;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "GET /api/info HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+    let json: serde_json::Value = serde_json::from_str(body.trim())
+        .unwrap_or_else(|e| panic!("/api/info is not JSON ({e}): {response}"));
+    json["noExec"] == true
+}
+
 /// Kills the wrapped process when dropped, so a test that fails halfway
 /// doesn't leave a coordinator running.
 pub struct Reaper(pub Child);
@@ -153,4 +185,39 @@ pub fn run_scenario(dir: &Path, socket: &Path) {
         String::from_utf8_lossy(&out.stderr).contains("no such core"),
         "{out:?}"
     );
+
+    // A request that says `no_exec` gets a core that runs nothing, and joining
+    // it later without the field is still fine.
+    let reply = request_port(socket, &canvas, true);
+    let port = reply["port"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no-exec get_port failed: {reply}")) as u16;
+    assert!(
+        worker_is_no_exec(port),
+        "the core was not started --no-exec"
+    );
+    assert_eq!(request_port(socket, &canvas, false)["port"], port);
+    kill_and_wait(dir, socket, canvas_arg);
+
+    // A core that can run code is never handed to a `no_exec` request.
+    let port = get_port(socket, &canvas);
+    assert!(!worker_is_no_exec(port));
+    let reply = request_port(socket, &canvas, true);
+    assert!(
+        reply.get("port").is_none(),
+        "an unrestricted core was handed out: {reply}"
+    );
+    assert!(
+        reply["error"].as_str().unwrap_or("").contains("--no-exec"),
+        "the refusal should say why: {reply}"
+    );
+    kill_and_wait(dir, socket, canvas_arg);
+}
+
+fn kill_and_wait(dir: &Path, socket: &Path, canvas_arg: &str) {
+    let out = cores(dir, socket, &["kill", canvas_arg]);
+    assert!(out.status.success(), "{out:?}");
+    wait_for("the core to disappear from `cores list`", || {
+        stdout(&cores(dir, socket, &["ls"])) == "no cores running\n"
+    });
 }

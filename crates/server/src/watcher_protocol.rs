@@ -93,6 +93,11 @@ pub enum Message {
     Open {
         canvas_path: PathBuf,
         fragment: Option<String>,
+        /// The requester runs with `--no-exec` and must not be handed (or
+        /// have started) a core that can run code. Absent means no
+        /// restriction, so an older coordinator reads the message as before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_exec: bool,
     },
     /// "Open `path` — a plain file, not a canvas — however this
     /// coordinator opens plain files." Sent by `open_node_file` for a
@@ -103,7 +108,12 @@ pub enum Message {
     OpenFile { path: PathBuf },
     /// "Get-or-spawn a worker for `canvas_path`, don't open a browser tab,
     /// just tell me its port" — see this module's own doc comment.
-    GetPort { canvas_path: PathBuf },
+    GetPort {
+        canvas_path: PathBuf,
+        /// As on [`Message::Open`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_exec: bool,
+    },
     /// "List the workers you're managing" — see [`CoreInfo`].
     ListCores,
     /// "Kill the worker for `canvas_path`" — canonicalized by the
@@ -341,6 +351,7 @@ async fn request_port_with_timeout(
 async fn request_port_inner(socket_path: &Path, canvas_path: &Path) -> io::Result<u16> {
     let msg = Message::GetPort {
         canvas_path: canvas_path.to_path_buf(),
+        no_exec: meshfox_core::capabilities::requested().no_exec,
     };
     let reply = request_and_await_reply(socket_path, &msg).await?;
     match serde_json::from_str::<PortResponse>(reply.trim()) {
@@ -391,6 +402,7 @@ async fn request_open_with_timeout(
     let msg = Message::Open {
         canvas_path: canvas_path.to_path_buf(),
         fragment,
+        no_exec: meshfox_core::capabilities::requested().no_exec,
     };
     match tokio::time::timeout(timeout, request_and_await_reply(socket_path, &msg)).await {
         Ok(reply) => parse_ack(&reply?),
@@ -577,9 +589,11 @@ mod tests {
             Message::Open {
                 canvas_path: p,
                 fragment,
+                no_exec,
             } => {
                 assert_eq!(p, canvas_path);
                 assert_eq!(fragment.as_deref(), Some("some-node"));
+                assert!(!no_exec, "an unrestricted process asks for no restriction");
             }
             other => panic!("expected Open, got {other:?}"),
         }
@@ -643,7 +657,7 @@ mod tests {
 
         let msg = accept_and_reply(&listener, "{\"port\":4242}\n").await;
         match msg {
-            Message::GetPort { canvas_path: p } => assert_eq!(p, canvas_path),
+            Message::GetPort { canvas_path: p, .. } => assert_eq!(p, canvas_path),
             other => panic!("expected GetPort, got {other:?}"),
         }
 

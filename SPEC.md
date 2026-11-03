@@ -1930,6 +1930,34 @@ its status line; `meshfox mcp` forwards the worker's refusal text. A core
 started with `--no-exec` is joined by later commands like any other core, so
 they are refused too — the restriction belongs to the worker, not the client.
 
+**Restrictions and shared or external cores.** A restriction is never lost on
+the way to a core, and a process started with `--no-exec` is never the client
+of a core that can run code:
+
+- A `--read-only` command never asks a `server_socket` coordinator for
+  anything. `meshfox view` (which otherwise hands the canvas to the
+  coordinator and exits) serves the canvas in a private worker instead, and
+  says so on stderr ("the configured external coordinator … is not used").
+- A `--no-exec` command that does use a coordinator says so in its request:
+  the watcher protocol's `open` and `get_port` messages carry
+  `"no_exec": true` (absent means unrestricted, so a coordinator that
+  predates the field reads them as before). A coordinator starts the core it
+  creates with `--no-exec`, and answers a request for a canvas it already
+  serves with a core that can run code with an error rather than that core.
+  A worker that asks its coordinator to open another canvas (a `file` node
+  pointing at one) sends the same field.
+  The macOS daemon and `meshfox serve` honour the field; the VS Code
+  extension only starts workers that can run code, so it refuses such an
+  `open` (logged in its output channel) instead of opening the canvas.
+- Whatever answers, the client checks. Before using a worker it did not
+  start — one an external coordinator returned, or one found through the
+  canvas's lock file — a `--no-exec` process reads `GET /api/info`, and a
+  worker whose `noExec` is not true is refused with a message that says to
+  stop it or to open the canvas with `--read-only` (a private core). A
+  worker that cannot be asked counts as able to run code. This is what
+  keeps a coordinator that ignores `no_exec` (an older macOS daemon or
+  editor extension) from handing out an unrestricted core.
+
 **What `--read-only` does not isolate.** The core keeps no state of its own,
 but the blocks it runs are ordinary programs: whatever a script writes into the
 project, or any other shared resource it uses, is shared with every other core.
