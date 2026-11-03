@@ -1276,3 +1276,67 @@ test("closing the tab with unsaved edits asks first (beforeunload)", async ({ pa
   await closing;
   expect(page.isClosed(), "staying keeps the tab open").toBe(false);
 });
+
+// --- packed canvases (.canvas.tar.xz, made by `meshfox pack`) ---
+
+const PACK = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/pack-demo.canvas.tar.xz");
+
+test("a packed canvas opens from a picked file with its include and image", async ({ page }) => {
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(PACK);
+  await expect(page.getByText("The root of a packed canvas.")).toBeVisible();
+  // The include came out of the pack, and so did the picture.
+  await expect(page.getByText("This text was included from notes.md.")).toBeVisible();
+  await expect(page.locator('img[alt="dot"]')).toBeVisible();
+  expect(await page.locator('img[alt="dot"]').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBeGreaterThan(0);
+  await expect(page.getByText("noexec", { exact: true })).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("in your browser");
+  // A pack is saved as a pack, not as the canvas text.
+  await expect(page.locator("#wasm-download")).toHaveText("download pack");
+  await expect(page.locator("#wasm-save")).toHaveCount(0);
+});
+
+test("edits to a packed canvas download as a new pack that opens again, and the original is left alone", async ({ page }) => {
+  const original = fs.readFileSync(PACK);
+  const copy = path.join(tmpDir(), "my-pack.canvas.tar.xz");
+  fs.writeFileSync(copy, original);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(copy);
+  await expect(page.getByText("The root of a packed canvas.")).toBeVisible();
+
+  await editSource(page, ADDED);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect(page.locator("#wasm-pill")).toContainText("unsaved changes");
+
+  const downloading = page.waitForEvent("download");
+  await page.locator("#wasm-download").click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe("my-pack.canvas.tar.xz");
+  const saved = path.join(tmpDir(), "saved.canvas.tar.xz");
+  await download.saveAs(saved);
+  await expect(page.locator("#wasm-pill")).not.toContainText("unsaved changes");
+
+  // A real xz file (the signature), and not the file that was opened.
+  const bytes = fs.readFileSync(saved);
+  expect([...bytes.subarray(0, 6)]).toEqual([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]);
+  expect(fs.readFileSync(copy).equals(original)).toBe(true);
+
+  // The new pack holds the edit and everything else the old one carried.
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(saved);
+  await expect(page.getByText("added in the browser")).toBeVisible();
+  await expect(page.getByText("This text was included from notes.md.")).toBeVisible();
+  await expect(page.locator('img[alt="dot"]')).toBeVisible();
+});
+
+test("a damaged pack is refused with a reason and nothing is opened", async ({ page }) => {
+  const bytes = Buffer.from(fs.readFileSync(PACK));
+  bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+  const damaged = path.join(tmpDir(), "damaged.canvas.tar.xz");
+  fs.writeFileSync(damaged, bytes);
+  await page.goto("/");
+  await page.locator("input[type=file]:not([webkitdirectory])").setInputFiles(damaged);
+  await expect(page.locator("#status")).toContainText("damaged.canvas.tar.xz");
+  await expect(page.locator("#status")).toHaveClass(/error/);
+  await expect(page.locator("#launcher")).toHaveCount(1);
+});

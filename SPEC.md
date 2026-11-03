@@ -1965,6 +1965,152 @@ Nor are plain runs of one block in two read-only cores excluded from each other
 (that exclusion is the run ledger, which is per core here). Use `--no-exec`
 as well when nothing should be run at all.
 
+## Packed canvases (`.canvas.tar.xz`)
+
+A packed canvas is one file that carries a canvas together with everything it
+reads: includes, images, linked files and the canvases it links to. It is meant
+for handing a canvas to someone else, and it opens without unpacking by hand.
+The file is a plain tar archive compressed as one xz stream, so `tar xf` opens
+it too; its name ends in `.canvas.tar.xz`. A reader recognizes it by the xz
+magic bytes (`FD 37 7A 58 5A 00`), not by the name.
+
+### Layout
+
+The archive root is the directory of the **entry canvas** (the canvas `pack`
+was given); every other path is relative to it. Entries are regular files and
+directories only (`pack` writes files only; a reader accepts directory
+entries); a reader refuses symbolic links, hard links, devices and FIFOs. The first entry is the manifest, `.meshfox-pack.json`:
+
+```json
+{
+  "format": 1,
+  "entry": "README.canvas.md",
+  "created_by": "meshfox 1.0.0",
+  "files": [
+    {"path": "README.canvas.md", "size": 1234, "blake3": "<64 hex digits>"},
+    {"path": "img/sensor.webp", "size": 5678, "blake3": "<64 hex digits>"}
+  ]
+}
+```
+
+- `format` is the format version, `1` here. A reader that does not know a
+  version refuses the file and says which version it found.
+- `entry` is the path of the canvas to open.
+- `files` lists every regular file except the manifest itself, sorted by path
+  bytewise, with its size and BLAKE3 hash. The manifest holds no time, user or
+  machine, so the same files always give the same manifest.
+- Archive entries are sorted the same way. Timestamps, owner and group are
+  zero, names are empty, and a file's mode is `0755` if the source was
+  executable by its owner and `0644` otherwise (`0755` for directories). For
+  the same input and meshfox version the archive is byte-identical.
+
+**Paths.** A path is UTF-8 with `/` separators and is relative: no leading
+`/`, no empty, `.` or `..` component, no backslash, NUL or drive prefix, at
+most 1024 bytes. Two paths that differ only in letter case are a conflict, so
+a pack unpacks the same way on a case-insensitive filesystem. `.meshfox/`
+(the canvas's own state: cache, history, session data, secrets, `@tmp`) and the
+manifest's own name are reserved: they never appear as files of the pack.
+
+### What goes in
+
+`meshfox pack` starts from the entry canvas and follows every local reference
+that meshfox itself would read:
+
+- `include` targets, `file` node targets, and local images and links in node
+  bodies (Markdown assets inside an included file resolve against that file's
+  directory, as when the canvas is opened);
+- every canvas such a reference names (a `.canvas.md`, or an `.md` with the
+  canvas marker) is packed whole and followed the same way, each reference
+  resolved against its own file's directory. A canvas reached twice is packed
+  once. With `--shallow` those canvases are not followed: they and what only
+  they reference stay out, and a `file` node that points at one is left as it is
+  (it will not open from the pack).
+
+Cached output regions that are already part of a canvas's own text travel with
+it; a reference inside one that cannot be packed (an image a block wrote to
+`@tmp`, say) is left out with a warning instead of failing the pack, since the
+output is derived data its author cannot edit. Nothing else of a run goes in:
+no `.meshfox/` state, no files a block wrote. Collecting follows references and
+never walks a directory, so `.meshfoxignore` plays no part in it.
+
+**Every reference stays inside the directory of the file that holds it.** A
+reference is resolved against the file it is written in and must land inside
+that file's directory tree: the canvas's directory for a reference written in a
+canvas (the entry canvas, or a nested one), the included file's directory for
+one written in a Markdown file an `include` pulls in. A reference that lands
+outside fails `pack` with an error naming the canvas, the node and the path,
+and writes nothing. This is the strictest rule any front end applies (the
+browser editor applies it always, `meshfox` when no `[files] allow` widens it),
+so a pack behaves the same wherever it is opened. It covers `../` paths that
+leave that directory, including a nested canvas reaching a sibling directory,
+absolute and `~` paths, and symbolic links that lead out, also when
+`[files] allow` would let meshfox read them on the sender's machine. A pack is
+complete or it does not exist.
+The same goes for a local reference whose target is missing, and for a target
+that names a `dir` variable or `@tmp`: a pack must not depend on the sender's
+environment. External URLs and `#anchors` are not references to files. The
+declarations of `dir` and `file` variables stay in the canvas text; their
+values are not packed.
+
+Files are read through the same access checks as everything else
+(`FileAccess`, see "Configured file access"), never by walking the directory
+separately.
+
+### Reading and limits
+
+A reader checks the whole file before anything is used: the manifest first,
+then every entry against it. It refuses the pack, naming the first problem, if
+the xz stream is truncated or corrupt, an entry has another type than file or
+directory, a path breaks the rules above, a file is missing from the manifest
+or the manifest lists one the archive lacks, a size or hash differs, `entry` is
+not a listed canvas, or a limit is exceeded. Nothing is written to disk on a
+refused pack.
+
+The limits are part of the format version and the same for the command line and
+the browser: at most 20 000 entries, 256 MiB for one file and 512 MiB in all,
+and a manifest of at most 8 MiB. They are enforced while decompressing, on the
+bytes actually produced, never on sizes the archive claims, so a small file
+that expands without end stops at the limit.
+
+### Opening a pack
+
+Whoever opens a pack has not written its canvases, and a canvas can run code,
+so a pack is opened as untrusted:
+
+- `meshfox view PACK` unpacks into a fresh temporary directory and serves the
+  entry canvas with `--read-only --no-exec` (see "Restricting a core"); the
+  directory is removed when the view ends. The restrictions are handed on to
+  every core started from it, so a nested canvas opened by clicking its `file`
+  node is read-only and no-exec too. The pack carries no configuration
+  (`.meshfox/` is never in it), so nothing in the pack widens what its canvases
+  may read.
+- The browser editor opens a pack like a folder: the unpacked files are its
+  virtual directory, so includes, images, links and nested canvases resolve
+  inside the pack. It runs as `noexec` already. Edits are saved by
+  downloading a new pack; the file that was opened never changes.
+
+### Commands
+
+- `meshfox pack CANVAS [-o FILE] [--shallow] [--list] [-f]` writes the pack.
+  `FILE` defaults to the canvas's name without `.canvas.md` (or `.md`) plus
+  `.canvas.tar.xz`, in the current directory. An existing file is not replaced
+  without `-f`. `--list` prints what would go in (path, a tab, size in bytes,
+  one file per line) and writes nothing; it fails in the same cases `pack`
+  does. Anything left out on purpose (a canvas under `--shallow`, a reference
+  in cached output) is reported on stderr as a warning. A failure leaves no
+  partial file. The reading is the canvas's worker's job (`GET /api/pack` and
+  `GET /api/pack/archive`), like every other read of a canvas and what it
+  references; the command stores the result.
+- `meshfox unpack PACK [DIR]` checks the pack as above and extracts it. `DIR`
+  defaults to the pack's name without `.canvas.tar.xz`; it must not exist or
+  must be empty, and no existing file is overwritten. It prints the path of the
+  entry canvas. The result is an ordinary directory: it is not read-only and
+  not `no-exec`, and has no `.meshfox/`. Because `pack` only follows references
+  that stay inside their canvas's directory, the unpacked canvases read exactly
+  what they did in the pack.
+- `meshfox view PACK` as above; `--read-only` and `--no-exec` are always on and
+  cannot be turned off.
+
 ## Variables
 
 Document-scoped configuration values a canvas wants from whoever runs

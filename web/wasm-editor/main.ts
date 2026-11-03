@@ -142,16 +142,74 @@ const skippedNote = (skipped: Picked["skipped"]): string | undefined => {
   return parts.length > 0 ? `not read: ${parts.join(", ")}` : undefined;
 };
 
-/** The edited text as a file: the page has no disk, so this is how it leaves. */
-function download(doc: Document, backend: Backend) {
-  const blob = new Blob([backend.session.raw], { type: "text/markdown;charset=utf-8" });
+/** Hands `blob` to the user as a file called `name`. */
+function offer(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob);
-  const link = el("a", { href: url, download: doc.path.split("/").pop() ?? "canvas.canvas.md" });
+  const link = el("a", { href: url, download: name });
   document.body.append(link);
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** The edited text as a file: the page has no disk, so this is how it leaves. */
+function download(doc: Document, backend: Backend) {
+  offer(
+    new Blob([backend.session.raw], { type: "text/markdown;charset=utf-8" }),
+    doc.path.split("/").pop() ?? "canvas.canvas.md",
+  );
   backend.session.markSaved();
+}
+
+/** The opened pack with the edits in it, as a new pack under the name of the
+ * one that was opened (which itself is never changed). The reason it cannot be
+ * made, or `undefined`. */
+function downloadPack(doc: Document, backend: Backend): string | undefined {
+  const pack = doc.pack;
+  if (!pack) return undefined;
+  try {
+    // Every canvas edited so far has its latest text in the files already.
+    const files = doc.files.paths().map((path) => ({ path, data: doc.files.get(path)! }));
+    const bytes = wasmApi.buildPack(pack.entry, `meshfox editor ${wasmApi.version()}`, files);
+    offer(new Blob([bytes as BlobPart], { type: "application/x-xz" }), pack.name);
+    backend.markAllSaved();
+    return undefined;
+  } catch (e) {
+    return `not packed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+/** A packed canvas (`.canvas.tar.xz`), if `file` is one: told by its first
+ * bytes, not its name. Unpacked and checked completely by the model before
+ * anything is shown; one that fails a check is refused with the reason. */
+async function openAsPack(file: File): Promise<Picked | undefined> {
+  const head = new Uint8Array(await file.slice(0, 6).arrayBuffer());
+  await ready;
+  if (!wasmApi.isPack(head)) return undefined;
+  let opened: { entry: string; files: Array<{ path: string; data: Uint8Array }> };
+  try {
+    opened = wasmApi.openPack(new Uint8Array(await file.arrayBuffer())) as typeof opened;
+  } catch (e) {
+    throw new Error(`${file.name}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const files = new VirtualFiles();
+  for (const f of opened.files) files.set(f.path, f.data);
+  return {
+    files,
+    candidates: [opened.entry],
+    rootName: file.name,
+    skipped: { tooLarge: 0, tooMany: 0 },
+    pack: { name: file.name, entry: opened.entry },
+  };
+}
+
+/** What a pick of these files is: one packed canvas, or loose files. */
+async function pickedFiles(list: FileList): Promise<Picked> {
+  if (list.length === 1) {
+    const pack = await openAsPack(list[0]);
+    if (pack) return pack;
+  }
+  return fromFileList(list, newRules);
 }
 
 type SaveFilePicker = (options: {
@@ -248,8 +306,20 @@ function pill(doc: Document, backend: Backend, pending?: Draft): { element: HTML
           el("a", { id: "wasm-discard", textContent: "discard", onclick: () => decide(false) }),
         ]
       : []),
-    ...(savePicker() ? [el("a", { id: "wasm-save", textContent: "save", onclick: () => void save() })] : []),
-    el("a", { id: "wasm-download", textContent: "download", onclick: () => download(doc, backend) }),
+    ...(savePicker() && !doc.pack ? [el("a", { id: "wasm-save", textContent: "save", onclick: () => void save() })] : []),
+    ...(doc.pack
+      ? [
+          el("a", {
+            id: "wasm-download",
+            textContent: "download pack",
+            onclick: () => {
+              problem = downloadPack(doc, backend);
+              draw();
+            },
+          }),
+          el("a", { id: "wasm-download-canvas", textContent: "download canvas", onclick: () => download(doc, backend) }),
+        ]
+      : [el("a", { id: "wasm-download", textContent: "download", onclick: () => download(doc, backend) })]),
     el("a", { id: "wasm-add-files", textContent: "add files…", onclick: () => filePicker.click() }),
     el("a", { id: "wasm-add-folder", textContent: "add folder…", onclick: () => folderPicker.click() }),
     el("a", { textContent: "open another", onclick: () => history.back() }),
@@ -410,7 +480,7 @@ async function chooseAndStart(picked: Picked) {
     return;
   }
   if (pool.length === 1) {
-    await start({ path: pool[0], files: picked.files, key: documentKey(picked, pool[0]), keyFor: (p) => documentKey(picked, p), note: skippedNote(picked.skipped) });
+    await start({ path: pool[0], files: picked.files, key: documentKey(picked, pool[0]), keyFor: (p) => documentKey(picked, p), note: skippedNote(picked.skipped), pack: picked.pack });
     return;
   }
   document.getElementById("choices")!.replaceChildren(
@@ -419,7 +489,7 @@ async function chooseAndStart(picked: Picked) {
       "div",
       { className: "list" },
       ...pool.slice(0, 40).map((path) =>
-        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, key: documentKey(picked, path), keyFor: (p) => documentKey(picked, p), note: skippedNote(picked.skipped) }) }),
+        el("button", { textContent: path, onclick: () => void start({ path, files: picked.files, key: documentKey(picked, path), keyFor: (p) => documentKey(picked, p), note: skippedNote(picked.skipped), pack: picked.pack }) }),
       ),
     ),
   );
@@ -449,6 +519,7 @@ function help(): HTMLElement {
     ...section(
       "Using it",
       "Open a folder, or drop it here, when the canvas includes other files, images or links to other canvases; for a single self-contained file, opening just that file is enough. “add files…” brings in what is missing later.",
+      "A packed canvas (.canvas.tar.xz, made by meshfox pack) opens like a folder: the whole pack is checked first, then its files, includes, images and linked canvases are all there. “download pack” hands you a new pack with your edits; the file you opened never changes.",
       "Edit changes nodes in place; Source edits the whole file. Undo, redo and the history list work on every edit, for each canvas separately.",
       "Nothing changes your original until you save. “save” writes into a file you choose (Chrome and Edge), “download” hands you the text anywhere else. A canvas that links to another one in the folder opens it with ↗; Back returns.",
     ),
@@ -463,21 +534,21 @@ function help(): HTMLElement {
 function launcher(note?: string) {
   const root = document.getElementById("root")!;
 
-  const filePicker = el("input", { type: "file", multiple: true, hidden: true, accept: ".md,.json,.csv,.txt,.yaml,.yml,.toml,.png,.jpg,.jpeg,.gif,.svg,.webp" });
+  const filePicker = el("input", { type: "file", multiple: true, hidden: true, accept: ".md,.json,.csv,.txt,.yaml,.yml,.toml,.png,.jpg,.jpeg,.gif,.svg,.webp,.xz" });
   const folderPicker = el("input", { type: "file", hidden: true });
   folderPicker.setAttribute("webkitdirectory", "");
   const handle = (task: Promise<Picked>) => {
     status(engine.done ? "Reading…" : "Waiting for the engine…");
     task.then(chooseAndStart).catch((e) => status(String(e), true));
   };
-  filePicker.onchange = () => filePicker.files && handle(fromFileList(filePicker.files, newRules));
+  filePicker.onchange = () => filePicker.files && handle(pickedFiles(filePicker.files));
   folderPicker.onchange = () => folderPicker.files && handle(fromFileList(folderPicker.files, newRules));
 
   const drop = el(
     "div",
     { className: "drop", id: "drop" },
     el("div", { className: "hint", textContent: "Drop a .canvas.md here" }),
-    el("div", { className: "sub", textContent: "or a whole folder, so its include, image and file links resolve" }),
+    el("div", { className: "sub", textContent: "or a whole folder, so its include, image and file links resolve, or a packed canvas (.canvas.tar.xz)" }),
     el(
       "div",
       { className: "row" },
@@ -490,7 +561,13 @@ function launcher(note?: string) {
   drop.ondrop = (e) => {
     e.preventDefault();
     drop.classList.remove("over");
-    if (e.dataTransfer) handle(fromDrop(e.dataTransfer.items, newRules));
+    const dropped = e.dataTransfer;
+    if (!dropped) return;
+    // One dropped file may be a pack. The drop's entries can only be taken
+    // before the first `await`, so a folder (or several things) goes straight
+    // to the entries API, and a lone file is looked at first.
+    const lone = dropped.files.length === 1 && dropped.items.length === 1 && dropped.items[0].webkitGetAsEntry?.()?.isFile;
+    handle(lone ? pickedFiles(dropped.files) : fromDrop(dropped.items, newRules));
   };
 
   const newName = el("input", { id: "new-name", type: "text", value: "untitled", ariaLabel: "name of the new canvas" });

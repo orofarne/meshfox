@@ -4849,6 +4849,80 @@ async fn get_includes(
     Ok(Json(entries))
 }
 
+/// What `GET /api/pack` and `GET /api/pack/archive` take.
+#[derive(Debug, Deserialize)]
+struct PackQuery {
+    /// `1`/`true`: do not follow references to other canvases.
+    #[serde(default)]
+    shallow: Option<String>,
+    /// Which meshfox the client is, for the manifest (informational).
+    #[serde(default)]
+    created_by: Option<String>,
+}
+
+/// Collects the files a pack of this canvas would hold, on a blocking thread
+/// (it reads files). A reference the pack cannot carry is a `422` naming it.
+async fn collect_pack(
+    state: &AppState,
+    query: &PackQuery,
+) -> Result<meshfox_core::pack::Collected, ApiError> {
+    let path = state.canvas_path.clone();
+    let shallow = matches!(query.shallow.as_deref(), Some("1" | "true"));
+    tokio::task::spawn_blocking(move || {
+        meshfox_core::pack::collect(&path, meshfox_core::pack::CollectOptions { shallow })
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+}
+
+/// What a pack of this canvas would hold: the entry, every file with its size,
+/// and what was left out or deserves a look. Writes nothing.
+async fn pack_plan(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PackQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let collected = collect_pack(&state, &query).await?;
+    let files: Vec<serde_json::Value> = collected
+        .files
+        .iter()
+        .map(|f| serde_json::json!({ "path": f.path, "size": f.data.len() }))
+        .collect();
+    Ok(Json(serde_json::json!({
+        "entry": collected.entry,
+        "files": files,
+        "warnings": collected.warnings,
+    })))
+}
+
+/// The pack itself, the bytes of a `.canvas.tar.xz`. The worker is the one
+/// that reads the canvas and what it references (with the grants it applies),
+/// like every other front end; the client only stores the result.
+async fn pack_archive(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PackQuery>,
+) -> Result<Response, ApiError> {
+    let collected = collect_pack(&state, &query).await?;
+    let created_by = query
+        .created_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(200).collect::<String>())
+        .unwrap_or_else(|| format!("meshfox {}", env!("CARGO_PKG_VERSION")));
+    let bytes = tokio::task::spawn_blocking(move || {
+        meshfox_core::pack::pack_bytes(&collected, &created_by)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-xz")],
+        bytes,
+    )
+        .into_response())
+}
+
 #[derive(Debug, Deserialize)]
 struct SourceFileQuery {
     /// An include's own `nodeId` (see `get_includes`) — absent means the
@@ -10460,6 +10534,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/canvas", get(get_canvas).put(put_canvas))
         .route("/api/canvas/raw", get(get_canvas_raw).put(put_canvas_raw))
         .route("/api/includes", get(get_includes))
+        .route("/api/pack", get(pack_plan))
+        .route("/api/pack/archive", get(pack_archive))
         .route("/api/canvas/clear-layout", post(clear_layout))
         .route("/api/canvas/reorder-siblings", post(reorder_siblings))
         .route("/api/undo", post(api_undo))
@@ -14581,6 +14657,88 @@ mod include_edit_tests {
         assert!(after.contains("urgent"), "tags reverted:\n{after}");
 
         let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    fn pack_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mfx-server-pack-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_worker_plans_and_builds_a_pack_of_its_canvas() {
+        let dir = pack_test_dir("ok");
+        std::fs::write(
+            dir.join("doc.canvas.md"),
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n![p](img/p.png)\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("img")).unwrap();
+        std::fs::write(dir.join("img/p.png"), "png").unwrap();
+        std::fs::write(dir.join("unrelated.txt"), "left out").unwrap();
+        let state = build_state(dir.join("doc.canvas.md"), false, None)
+            .await
+            .expect("valid test canvas");
+        let query = || PackQuery {
+            shallow: None,
+            created_by: Some("meshfox test".into()),
+        };
+
+        let Json(plan) = pack_plan(State(state.clone()), Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(plan["entry"], "doc.canvas.md");
+        let listed: Vec<&str> = plan["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, ["doc.canvas.md", "img/p.png"]);
+
+        let response = pack_archive(State(state), Query(query())).await.unwrap();
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/x-xz"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pack = meshfox_core::pack::read_xz(&bytes, &meshfox_core::pack::Limits::default())
+            .expect("the worker's archive is a valid pack");
+        assert_eq!(pack.created_by, "meshfox test");
+        assert_eq!(pack.file("img/p.png").unwrap().data, b"png");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_worker_refuses_a_pack_that_would_leave_the_directory() {
+        let dir = pack_test_dir("out");
+        std::fs::write(dir.join("secret.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("main")).unwrap();
+        std::fs::write(
+            dir.join("main/doc.canvas.md"),
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n[s](../secret.txt)\n",
+        )
+        .unwrap();
+        let state = build_state(dir.join("main/doc.canvas.md"), false, None)
+            .await
+            .expect("valid test canvas");
+        let ApiError(status, message) = pack_plan(
+            State(state),
+            Query(PackQuery {
+                shallow: None,
+                created_by: None,
+            }),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(message.contains("../secret.txt"), "{message}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

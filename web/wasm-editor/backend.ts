@@ -28,6 +28,10 @@ export interface Document {
   keyFor?: (path: string) => string;
   /** Shown beside the "in your browser" pill, e.g. what was not read. */
   note?: string;
+  /** Set when the files came out of a packed canvas (`.canvas.tar.xz`): the
+   * name of the file that was opened and the canvas it opens at. "download"
+   * then hands back a new pack instead of the canvas text. */
+  pack?: { name: string; entry: string };
 }
 
 const SESSION = "wasm-editor";
@@ -147,6 +151,8 @@ export interface Backend {
   /** The files changed: render again and tell the page, which reloads the
    * canvas as it does when a file changes under a real server. */
   refresh(): Rendered;
+  /** Marks every canvas opened so far as saved (a pack holds them all). */
+  markAllSaved(): void;
 }
 
 export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): Backend {
@@ -667,6 +673,9 @@ export function installBackend(wasm: WasmApi, doc: Document, render: Renderer): 
       return undefined;
     },
     current: () => render(),
+    markAllSaved() {
+      for (const each of sessions.values()) each.markSaved();
+    },
     replace: (raw, opKind) => commit(raw, opKind),
     refresh() {
       render.reset();

@@ -173,8 +173,12 @@ plutil -create xml1 "$SETUP_PLIST"
 
 COMPONENTS_PLIST="dist/pkg-components.plist"
 pkgbuild --analyze --root "$PKG_ROOT" "$COMPONENTS_PLIST"
-"$PB" -c "Set :0:BundleIsRelocatable false" "$COMPONENTS_PLIST"
-"$PB" -c "Set :0:BundleIsVersionChecked false" "$COMPONENTS_PLIST"
+# Newer pkgbuild versions leave out keys they would write as their defaults,
+# and `Set` fails on a missing key: set it, or add it.
+for KEY in BundleIsRelocatable BundleIsVersionChecked; do
+  "$PB" -c "Set :0:$KEY false" "$COMPONENTS_PLIST" 2>/dev/null \
+    || "$PB" -c "Add :0:$KEY bool false" "$COMPONENTS_PLIST"
+done
 
 rm -f "$PKG"
 pkgbuild --root "$PKG_ROOT" --install-location / \

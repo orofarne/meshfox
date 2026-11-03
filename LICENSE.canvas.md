@@ -30,6 +30,8 @@ Computed Starlark views add a direct use of `allocative` (Apache-2.0) in `meshfo
 
 Inline color spans unify `meshfox-core` and the CLI on `pulldown-cmark` 0.13.4 (MIT, already used by the CLI). This removes the separate 0.12.2 package. Refreshed via `cargo metadata --filter-platform aarch64-apple-darwin`: 628 normal-edge third-party crates, 790 total non-workspace packages across all targets and dependency kinds. The only package removed is MIT-licensed; no new licenses or copyleft obligations are introduced.
 
+Packed canvases (`.canvas.tar.xz`, SPEC.md's "Packed canvases") add two direct dependencies of `crates/model`, which also builds for the browser: `lzma-rust2` (Apache-2.0, pure Rust) reads and writes the xz stream — it compiles to WebAssembly, so the command line and the browser editor use the same code to read and to write a pack — and `tar` (MIT OR Apache-2.0). `tar` was already in Cargo.lock (through `self_update`); `lzma-rust2` is new, with `sha2` for xz's SHA-256 check, which was already in the tree. `liblzma` (MIT OR Apache-2.0, bindings to the C library) is a dev-dependency of `crates/model` only, used by its tests to check the reader and the writer against the reference implementation, and never ships, so it is omitted from the table. No copyleft is added.
+
 ## MIT License
 <!-- meshfox:node id="license-file" type="file" display="code" -->
 
@@ -60,6 +62,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | image | MIT OR Apache-2.0 |
 | libc | MIT OR Apache-2.0 |
 | lopdf | MIT |
+| lzma-rust2 | Apache-2.0 |
 | lsp-server | MIT OR Apache-2.0 |
 | lsp-types | MIT |
 | mime_guess | MIT |
@@ -89,6 +92,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | syntect | MIT |
 | syntect-tmlanguage | MIT OR Apache-2.0 |
 | sysinfo | MIT |
+| tar | MIT OR Apache-2.0 |
 | tera | MIT |
 | thiserror | MIT OR Apache-2.0 |
 | time | MIT OR Apache-2.0 |

@@ -18,7 +18,9 @@
 #![allow(linker_messages)]
 
 use clap::{Args, Parser, Subcommand};
-use meshfox_core::{mdcanvas, Canvas, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType};
+use meshfox_core::{
+    mdcanvas, pack, Canvas, FileDisplay, Node, NodeType, VarCache, VarDecl, VarType,
+};
 #[cfg(test)]
 use meshfox_core::{ExtraEdge, FenceAttrsPatch, NodeMeta};
 use std::collections::{HashMap, HashSet};
@@ -138,6 +140,48 @@ enum SessionOp {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Pack a canvas and everything it reads into one file for handing to
+    /// someone else: a `.canvas.tar.xz` holding the canvas, its includes,
+    /// images and linked files, and the canvases it links to (with
+    /// `--shallow`, not those). Only what the canvas references goes in, and
+    /// only files below each canvas's own directory: a reference that leads
+    /// outside it, to a directory, to a missing file or to a variable or
+    /// `@tmp` fails the command and writes nothing. The worker does the
+    /// reading, with the same file access every other front end has. Open the
+    /// result with `meshfox view` (read-only, nothing runs) or in the browser
+    /// editor, or extract it with `meshfox unpack`.
+    Pack {
+        #[command(flatten)]
+        canvas: CanvasOpt,
+        /// Output file. Default: the canvas's name without `.canvas.md`
+        /// plus `.canvas.tar.xz`, in the current directory.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Do not follow references to other canvases: they stay out of the
+        /// pack, and so does everything only they reference.
+        #[arg(long)]
+        shallow: bool,
+        /// Print what would go in (path and size, tab-separated, one file
+        /// per line) and write nothing. Fails in the same cases `pack` does.
+        #[arg(long)]
+        list: bool,
+        /// Replace an existing output file.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Extract a packed canvas (`.canvas.tar.xz`) into a new directory. The
+    /// whole pack is checked first (manifest, sizes, hashes, paths, limits); a
+    /// pack that fails a check writes nothing. The directory must not exist
+    /// or must be empty, and nothing is overwritten. Prints the path of the
+    /// entry canvas. The result is an ordinary directory: unlike
+    /// `meshfox view PACK`, it is neither read-only nor no-exec.
+    Unpack {
+        /// The pack to extract.
+        pack: PathBuf,
+        /// Directory to fill. Default: the pack's name without
+        /// `.canvas.tar.xz`, in the current directory.
+        dir: Option<PathBuf>,
+    },
     /// Summarize retained invocation journals (not all-time execution history).
     Stats {
         /// Block address as in run; omit for an overview of this canvas.
@@ -1756,6 +1800,9 @@ fn main() {
                 // either this or a later `Open` request) tries to read
                 // it.
                 None => {
+                    if looks_like_pack(&canvas_path) {
+                        return view_pack(canvas_path, port, no_open, no_auto_exit);
+                    }
                     if create_if_missing && !canvas_path.exists() {
                         write_canvas_template(&canvas_path);
                         println!("meshfox view: created {}", canvas_path.display());
@@ -1845,6 +1892,17 @@ fn main() {
                 sitemap_git_dates,
             )
         }
+        Command::Pack {
+            canvas,
+            out,
+            shallow,
+            list,
+            force,
+        } => {
+            let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
+            pack_cmd(&canvas_path, out, shallow, list, force)
+        }
+        Command::Unpack { pack, dir } => unpack_cmd(&pack, dir),
         Command::Pdf {
             canvas,
             out,
@@ -2708,11 +2766,11 @@ fn view_worker(canvas_path: PathBuf, port: u16, auto_exit: bool, watcher_socket:
 fn view_watcher(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: bool) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
-        std::process::exit(1);
+        exit_cleaning_up(1);
     });
     let exe = std::env::current_exe().unwrap_or_else(|e| {
         eprintln!("meshfox view: couldn't resolve this binary's own path: {e}");
-        std::process::exit(1);
+        exit_cleaning_up(1);
     });
     if let Err(e) = runtime.block_on(watcher::run(
         exe,
@@ -2722,7 +2780,7 @@ fn view_watcher(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: 
         auto_exit,
     )) {
         eprintln!("meshfox view: {e}");
-        std::process::exit(1);
+        exit_cleaning_up(1);
     }
 }
 
@@ -2734,7 +2792,7 @@ fn view_watcher(canvas_path: PathBuf, port: u16, open_browser: bool, auto_exit: 
 fn view_or_hand_off(canvas_path: PathBuf, port: u16, no_open: bool, no_auto_exit: bool) {
     let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         eprintln!("failed to start async runtime: {e}");
-        std::process::exit(1);
+        exit_cleaning_up(1);
     });
     let fragment = None; // `view`'s own path argument has no `#node-id` deep-link syntax.
     match runtime.block_on(coordinator::hand_off_to_configured_coordinator(
@@ -2753,6 +2811,128 @@ fn view_or_hand_off(canvas_path: PathBuf, port: u16, no_open: bool, no_auto_exit
         }
         Err(e) => {
             eprintln!("meshfox view: {e}");
+            exit_cleaning_up(1);
+        }
+    }
+}
+
+/// A packed canvas opened by `meshfox view PACK` unpacks into a temporary
+/// directory that has to go away however the view ends. Kept here so that the
+/// error paths of the view functions, which exit the process, can remove it
+/// first.
+static PACK_TEMP: std::sync::Mutex<Option<pack::TempUnpacked>> = std::sync::Mutex::new(None);
+
+/// `std::process::exit`, after removing the temporary directory of a packed
+/// canvas, if one is being viewed.
+fn exit_cleaning_up(code: i32) -> ! {
+    if let Ok(mut guard) = PACK_TEMP.lock() {
+        drop(guard.take());
+    }
+    std::process::exit(code)
+}
+
+/// Whether `path` is a packed canvas: a file that opens like an xz stream.
+fn looks_like_pack(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 6];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && pack::is_xz(&head)
+}
+
+/// `meshfox view PACK`: unpack into a private temporary directory and serve
+/// the entry canvas read-only and without running anything. A pack is someone
+/// else's canvas, and a canvas can run code, so neither restriction can be
+/// turned off here; both are handed on to every core started from it.
+fn view_pack(pack_path: PathBuf, port: u16, no_open: bool, no_auto_exit: bool) {
+    let bytes = std::fs::read(&pack_path).unwrap_or_else(|e| {
+        eprintln!("meshfox view: {}: {e}", pack_path.display());
+        std::process::exit(1);
+    });
+    meshfox_core::capabilities::set_requested(meshfox_core::capabilities::Capabilities {
+        read_only: true,
+        no_exec: true,
+    });
+    let temp = pack::unpack_to_temp(&bytes).unwrap_or_else(|e| {
+        eprintln!("meshfox view: {}: {e}", pack_path.display());
+        std::process::exit(1);
+    });
+    let entry = temp.unpacked.entry.clone();
+    eprintln!(
+        "meshfox view: {} is a packed canvas: opened read-only, and nothing in it runs",
+        pack_path.display()
+    );
+    if let Ok(mut guard) = PACK_TEMP.lock() {
+        *guard = Some(temp);
+    }
+    view_or_hand_off(entry, port, no_open, no_auto_exit);
+    if let Ok(mut guard) = PACK_TEMP.lock() {
+        drop(guard.take());
+    }
+}
+
+/// `meshfox pack`.
+fn pack_cmd(canvas_path: &Path, out: Option<PathBuf>, shallow: bool, list: bool, force: bool) {
+    let out = out.unwrap_or_else(|| PathBuf::from(pack::default_pack_name(canvas_path)));
+    if !list && out.exists() && !force {
+        eprintln!(
+            "meshfox pack: {} already exists (use -f to replace it)",
+            out.display()
+        );
+        std::process::exit(1);
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let plan = runtime
+        .block_on(worker_client::pack_plan(port, shallow))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox pack: {e}");
+            std::process::exit(1);
+        });
+    for warning in &plan.warnings {
+        eprintln!("meshfox pack: warning: {warning}");
+    }
+    if list {
+        for file in &plan.files {
+            println!("{}\t{}", file.path, file.size);
+        }
+        return;
+    }
+    let label = format!("meshfox {}", env!("MESHFOX_VERSION_LABEL"));
+    let bytes = runtime
+        .block_on(worker_client::pack_archive(port, shallow, &label))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox pack: {e}");
+            std::process::exit(1);
+        });
+    if let Err(e) = pack::write_file(&out, &bytes, force) {
+        eprintln!("meshfox pack: {e}");
+        std::process::exit(1);
+    }
+    println!(
+        "meshfox pack: wrote {} (entry {}, {} files, {} bytes)",
+        out.display(),
+        plan.entry,
+        plan.files.len(),
+        bytes.len()
+    );
+}
+
+/// `meshfox unpack`.
+fn unpack_cmd(pack_path: &Path, dir: Option<PathBuf>) {
+    let bytes = std::fs::read(pack_path).unwrap_or_else(|e| {
+        eprintln!("meshfox unpack: {}: {e}", pack_path.display());
+        std::process::exit(1);
+    });
+    let dir = dir.unwrap_or_else(|| pack::default_unpack_dir(pack_path));
+    match pack::unpack(&bytes, &dir) {
+        Ok(unpacked) => println!("{}", unpacked.entry.display()),
+        Err(e) => {
+            eprintln!("meshfox unpack: {}: {e}", pack_path.display());
             std::process::exit(1);
         }
     }

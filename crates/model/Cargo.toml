@@ -21,8 +21,13 @@ blake3 = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 similar = "2"
 unicode-normalization = "0.1"
+tar = "0.4"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "xz", "optimization"] }
 
 # `starlark` pulls in `getrandom` 0.4 (via quickcheck/rand), which has no
 # default backend on wasm32-unknown-unknown.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+liblzma = "0.4"

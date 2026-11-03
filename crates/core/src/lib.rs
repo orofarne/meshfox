@@ -48,6 +48,7 @@ pub use meshfox_model::merge;
 pub mod open_rules;
 pub use meshfox_model::options;
 pub use meshfox_model::output;
+pub mod pack;
 pub use meshfox_model::render;
 pub mod process_env;
 pub mod prune;

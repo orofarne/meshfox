@@ -338,6 +338,82 @@ impl JsUndoLog {
     }
 }
 
+/// Whether `bytes` open like a packed canvas (`.canvas.tar.xz`): an xz stream.
+#[wasm_bindgen(js_name = isPack)]
+pub fn is_pack(bytes: &[u8]) -> bool {
+    meshfox_model::pack::is_xz(bytes)
+}
+
+/// Reads a packed canvas the way `meshfox unpack` and `meshfox view` do (the
+/// very same code, `meshfox_model::pack`): the whole pack is checked first —
+/// manifest, sizes, hashes, paths, limits — and a pack that fails any check is
+/// refused, with the reason, as an error. Returns
+/// `{ entry, createdBy, files: [{ path, data, executable }] }`, the files sorted
+/// by path, `data` a `Uint8Array`.
+#[wasm_bindgen(js_name = openPack)]
+pub fn open_pack(bytes: &[u8]) -> Result<JsValue, JsError> {
+    let pack = meshfox_model::pack::read_xz(bytes, &meshfox_model::pack::Limits::default())
+        .map_err(js_err)?;
+    let set = |object: &js_sys::Object, key: &str, value: JsValue| {
+        js_sys::Reflect::set(object, &JsValue::from_str(key), &value)
+            .map(|_| ())
+            .map_err(|_| JsError::new("could not build the result"))
+    };
+    let files = js_sys::Array::new();
+    for file in &pack.files {
+        let item = js_sys::Object::new();
+        set(&item, "path", JsValue::from_str(&file.path))?;
+        set(
+            &item,
+            "data",
+            js_sys::Uint8Array::from(&file.data[..]).into(),
+        )?;
+        set(&item, "executable", JsValue::from_bool(file.executable))?;
+        files.push(&item);
+    }
+    let result = js_sys::Object::new();
+    set(&result, "entry", JsValue::from_str(&pack.entry))?;
+    set(&result, "createdBy", JsValue::from_str(&pack.created_by))?;
+    set(&result, "files", files.into())?;
+    Ok(result.into())
+}
+
+/// Writes a packed canvas: `files` is an array of `{ path, data }` (`data` a
+/// `Uint8Array`, optionally `executable: true`), `entry` the path of the canvas
+/// to open. Refuses what `openPack` would refuse (a bad or clashing path, a
+/// limit, an entry that is not a canvas among the files). The bytes are a
+/// `.canvas.tar.xz`, the same ones `meshfox pack` writes for the same files.
+#[wasm_bindgen(js_name = buildPack)]
+pub fn build_pack(
+    entry: &str,
+    created_by: &str,
+    files: &js_sys::Array,
+) -> Result<Vec<u8>, JsError> {
+    let get = |item: &JsValue, key: &str| {
+        js_sys::Reflect::get(item, &JsValue::from_str(key))
+            .map_err(|_| JsError::new("a file entry is not an object"))
+    };
+    let mut list = Vec::with_capacity(files.length() as usize);
+    for item in files.iter() {
+        let path = get(&item, "path")?
+            .as_string()
+            .ok_or_else(|| JsError::new("a file entry has no `path` string"))?;
+        let data = get(&item, "data")?
+            .dyn_into::<js_sys::Uint8Array>()
+            .map_err(|_| JsError::new("a file entry has no `data` Uint8Array"))?
+            .to_vec();
+        let executable = get(&item, "executable")?.is_truthy();
+        list.push(meshfox_model::pack::PackFile {
+            path,
+            data,
+            executable,
+        });
+    }
+    let limits = meshfox_model::pack::Limits::default();
+    let tar = meshfox_model::pack::build_tar(entry, created_by, &list, &limits).map_err(js_err)?;
+    meshfox_model::pack::compress_xz(&tar).map_err(js_err)
+}
+
 /// The text of a new, empty canvas whose root heading is `title`: the same
 /// template `meshfox create` writes.
 #[wasm_bindgen(js_name = newCanvasContent)]

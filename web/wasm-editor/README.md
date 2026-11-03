@@ -21,6 +21,16 @@ resolve), or drop either onto the page. The build is a static site with
 relative URLs, emitted as `index.html`, so it can be served from any path
 (published at `https://meshfox-editor.orofarne.net/`).
 
+A packed canvas (`.canvas.tar.xz`, made by `meshfox pack`) can be picked or
+dropped as well: the model (`openPack`, the same code `meshfox unpack` and
+`meshfox view` run) checks all of it — manifest, sizes, BLAKE3 hashes, paths,
+limits — and refuses a damaged or hostile pack with the reason before anything
+is shown. Its files then become the in-memory tree, exactly like a folder, so
+includes, images and linked canvases resolve inside the pack. "download pack"
+(`buildPack`) hands back a new pack with the edits, under the name of the one
+that was opened; "download canvas" gives the text of the canvas now shown, and
+the file that was opened is never changed.
+
 A document with an `include` (or image, or file link) whose file was not
 picked still opens: the node shows a notice and the strip at the bottom lists
 what is missing. "add files…" / "add folder…" there put more files in place and
@@ -67,6 +77,9 @@ Forward onto a document that is gone, lands on the launcher with a note.
   `display="table"` (needs DuckDB), no link preview cards.
 - Files a canvas includes are shown but not edited here; only the canvas text
   is.
+- A pack is saved whole: "download pack" holds every file the page has (the
+  pack's own, plus anything added with "add files…"), not only what the canvases
+  still reference.
 - Safari's folder picker leaves out every dot-file, so a *picked* folder cannot
   honour `.meshfoxignore` there (a dropped one can). The suite also runs on
   WebKit (Safari's engine, which every iOS browser uses).

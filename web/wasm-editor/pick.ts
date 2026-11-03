@@ -24,6 +24,8 @@ export interface Picked {
   rootName: string;
   /** What the guardrails left out (not what the ignore rules did). */
   skipped: { tooLarge: number; tooMany: number };
+  /** Set when the files were read out of a packed canvas. */
+  pack?: { name: string; entry: string };
 }
 
 function finish(files: VirtualFiles, skipped: Picked["skipped"], rootName: string): Picked {
@@ -65,7 +67,7 @@ class Reader {
  * folder itself) or a handful of loose files (rooted at nothing). The browser
  * lists every file up front, so the ignore files are read first and the rest
  * only if they pass; nothing is read from an excluded directory. */
-export async function fromFileList(list: FileList, newRules: NewIgnoreRules): Promise<Picked> {
+export async function fromFileList(list: ArrayLike<File>, newRules: NewIgnoreRules): Promise<Picked> {
   const entries = Array.from(list).map((file) => {
     const rel = file.webkitRelativePath;
     return { file, path: rel ? rel.split("/").slice(1).join("/") : file.name };

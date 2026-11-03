@@ -34,6 +34,8 @@ const CONTROL: Duration = Duration::from_secs(20);
 const SERVICE_CONTROL: Duration = Duration::from_secs(3620);
 const DEBUG_SEND_MARGIN: Duration = Duration::from_secs(15);
 const PING: Duration = Duration::from_secs(3);
+// Reading every file a canvas references and compressing them is real work.
+const PACK: Duration = Duration::from_secs(300);
 
 /// The limit for a `debug_send`: the command's own timeout, plus a margin so
 /// the worker's answer to *that* timeout arrives before this client gives up.
@@ -3242,4 +3244,72 @@ pub async fn stats(
             .unwrap_or_else(|_| "could not read statistics".into()));
     }
     response.json().await.map_err(|e| e.to_string())
+}
+
+/// What `GET /api/pack` reports: the files a pack of the canvas would hold.
+#[derive(Debug, serde::Deserialize)]
+pub struct PackPlan {
+    pub entry: String,
+    pub files: Vec<PackPlanFile>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PackPlanFile {
+    pub path: String,
+    pub size: u64,
+}
+
+fn pack_url(port: u16, path: &str, shallow: bool) -> Result<reqwest::Url, String> {
+    let mut url =
+        reqwest::Url::parse(&format!("{}{path}", base_url(port))).map_err(|e| e.to_string())?;
+    if shallow {
+        url.query_pairs_mut().append_pair("shallow", "1");
+    }
+    Ok(url)
+}
+
+async fn error_text(res: reqwest::Response) -> String {
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if text.is_empty() {
+        status.to_string()
+    } else {
+        text
+    }
+}
+
+/// What a pack of the worker's canvas would hold, without making one. The
+/// worker is the one that reads the canvas and what it references.
+pub async fn pack_plan(port: u16, shallow: bool) -> Result<PackPlan, String> {
+    let res = client()
+        .get(pack_url(port, "/api/pack", shallow)?)
+        .timeout(time_limit(PACK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        return Err(error_text(res).await);
+    }
+    res.json().await.map_err(|e| e.to_string())
+}
+
+/// The bytes of a `.canvas.tar.xz` of the worker's canvas. `created_by` is the
+/// label of this meshfox, stored in the pack's manifest.
+pub async fn pack_archive(port: u16, shallow: bool, created_by: &str) -> Result<Vec<u8>, String> {
+    let mut url = pack_url(port, "/api/pack/archive", shallow)?;
+    url.query_pairs_mut().append_pair("created_by", created_by);
+    let res = client()
+        .get(url)
+        .timeout(time_limit(PACK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        return Err(error_text(res).await);
+    }
+    res.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| describe(&e))
 }
