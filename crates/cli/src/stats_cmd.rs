@@ -187,7 +187,7 @@ pub fn render_report(report: &Report) -> String {
 fn write_report(out: &mut String, report: &Report) {
     let selected = report.address.as_ref().map_or_else(
         || "canvas".into(),
-        |a| format!("{}::{} · {}", a.node_id, a.block, report.scope),
+        |a| format!("{}/{} · {}", a.node_id, a.block, report.scope),
     );
     outln!(out, "{}", style(format!("Statistics · {selected}"), "1;36"));
     let c = &report.coverage;
@@ -289,7 +289,7 @@ fn write_report(out: &mut String, report: &Report) {
         for b in slow.iter().take(5) {
             outln!(
                 out,
-                "  {}::{} · total {} · median {} · p95 {} · {} samples",
+                "  {}/{} · total {} · median {} · p95 {} · {} samples",
                 b.node_id,
                 b.block,
                 meshfox_core::format_duration_ms(b.duration.total_ms),
@@ -320,7 +320,7 @@ fn write_report(out: &mut String, report: &Report) {
         for b in failures.iter().take(5) {
             outln!(
                 out,
-                "  {}::{} · {}/{} failed",
+                "  {}/{} · {}/{} failed",
                 b.node_id,
                 b.block,
                 b.outcomes.failed,

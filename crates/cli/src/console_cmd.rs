@@ -63,7 +63,7 @@ fn output(addr: &Address, text: &str, stderr: bool, timestamps: bool, time_ms: O
     } && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
         && std::env::var_os("TERM").is_none_or(|v| v != "dumb");
     let prefix = format!(
-        "[{}::{}{}]",
+        "[{}/{}{}]",
         addr.0,
         addr.1,
         if stderr { " stderr" } else { "" }
@@ -147,7 +147,7 @@ async fn monitor(
                         output(&addr, &text, matches!(stream, meshfox_server::stream_exec::OutputStream::Stderr), timestamps, time_ms);
                     }
                     api::SubscribeEvent::Done { exit_code } => {
-                        eprintln!("[{}::{}] finished (exit {})", addr.0, addr.1,
+                        eprintln!("[{}/{}] finished (exit {})", addr.0, addr.1,
                             exit_code.map_or("unknown".into(), |c| c.to_string()));
                         if exit_code != Some(0) { result = State::Failure(addr.1); }
                         else if !matches!(result, State::Failure(_)) { result = State::Completed(addr.1); }
@@ -204,7 +204,7 @@ async fn monitor(
                     if idle_before && new { result = State::Clear; }
                     if let Some((_, old)) = subscriptions.remove(&addr) { old.abort(); }
                     if let Some(id) = run.history_id { seen.insert(addr.clone(), id); }
-                    eprintln!("[{}::{}] {}", addr.0, addr.1, run.status);
+                    eprintln!("[{}/{}] {}", addr.0, addr.1, run.status);
                     let cursor = cursors.entry(addr.clone()).or_insert_with(||
                         (run.history_id, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0))));
                     if cursor.0 != run.history_id {
@@ -230,7 +230,7 @@ async fn monitor(
                     let entry = services.entry(addr).or_insert((service.pid, String::new(), 0));
                     if entry.0 != service.pid { *entry = (service.pid, String::new(), 0); }
                     if entry.1 != service.status {
-                        eprintln!("[{}::{}] service {} (pid {})", service.node_id, service.block, service.status, service.pid);
+                        eprintln!("[{}/{}] service {} (pid {})", service.node_id, service.block, service.status, service.pid);
                         entry.1 = service.status.clone();
                     }
                     if service.status == "running" { ready += 1; }

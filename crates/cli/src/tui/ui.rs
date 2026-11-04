@@ -1598,12 +1598,15 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
-    let title = if !app.external_running.is_empty() {
+    let title = if app.run.as_ref().is_some_and(|run| run.is_running()) {
+        format!(
+            " Output (running: {} — K to kill) ",
+            app.foreground_run_label()
+        )
+    } else if !app.external_running.is_empty() {
         " Output (running) ".to_string()
     } else if let Some(run) = &app.run {
-        if run.is_running() {
-            " Output (running — K to kill) ".to_string()
-        } else if run.killed {
+        if run.killed {
             " Output (killed) ".to_string()
         } else if run.had_failure {
             " Output (failed) ".to_string()
@@ -4451,6 +4454,100 @@ mod tests {
             .content
             .iter()
             .any(|c| c.bg == Color::Rgb(0, 215, 255) || c.bg == Color::Yellow));
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn console_and_status_share_the_step_and_chain_phase() {
+        use super::super::app::RunState;
+        use crate::terminal_status::State;
+        use crate::worker_client::RunEvent;
+        use meshfox_core::deps::BlockAddr;
+        let mut app = test_app().await;
+        let mut status = super::super::terminal_status::CanvasStatus::default();
+        status.update(&mut app);
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.run_target = Some(BlockAddr::new("root", "ready"));
+        app.run = Some(RunState {
+            chain: Vec::new(),
+            idx: 0,
+            http_rx: Some(rx),
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        app.console_collapsed = false;
+        app.on_run_event(Some(RunEvent::StepStart {
+            node_id: "root".into(),
+            block: "install".into(),
+        }))
+        .await;
+        app.on_run_event(Some(RunEvent::StepEnd {
+            node_id: "root".into(),
+            block: "install".into(),
+            exit_code: 0,
+            duration_ms: 85_000,
+        }))
+        .await;
+        for block in ["plan", "segment", "translate", "check", "export"] {
+            app.on_run_event(Some(RunEvent::StepSkipped {
+                node_id: "root".into(),
+                block: block.into(),
+                output: String::new(),
+                duration_ms: 0,
+            }))
+            .await;
+        }
+        app.on_run_event(Some(RunEvent::StepStart {
+            node_id: "root".into(),
+            block: "render".into(),
+        }))
+        .await;
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Running("render".into()));
+        let area = Rect::new(0, 0, 100, 14);
+        let screen = render_to_screen(area, |f| {
+            render_output(f, Rect::new(0, 0, 100, 12), &mut app);
+            render_footer(f, Rect::new(0, 13, 100, 1), &app);
+        });
+        assert!(screen.contains("running: render"), "{screen}");
+        assert!(screen.contains("Running: render"), "{screen}");
+        assert!(screen.contains("install (exit 0"), "{screen}");
+        assert!(screen.contains("==> render"), "{screen}");
+        app.on_run_event(Some(RunEvent::StepEnd {
+            node_id: "root".into(),
+            block: "render".into(),
+            exit_code: 0,
+            duration_ms: 85_000,
+        }))
+        .await;
+        // The chain may still be doing artifact validation or cleanup.
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Running("between steps".into()));
+        assert!(app.activity.elapsed.is_none());
+        let screen = render_to_screen(area, |f| {
+            render_output(f, Rect::new(0, 0, 100, 12), &mut app);
+            render_footer(f, Rect::new(0, 13, 100, 1), &app);
+        });
+        assert!(screen.contains("running: between steps"), "{screen}");
+        assert!(screen.contains("Running: between steps"), "{screen}");
+        assert!(screen.contains("render (exit 0"), "{screen}");
+        app.on_run_event(Some(RunEvent::Done { exit_code: 0 }))
+            .await;
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Completed("ready".into()));
+        let screen = render_to_screen(area, |f| {
+            render_output(f, Rect::new(0, 0, 100, 12), &mut app);
+            render_footer(f, Rect::new(0, 13, 100, 1), &app);
+        });
+        assert!(screen.contains("Output (done)"), "{screen}");
+        assert!(screen.contains("Completed: ready"), "{screen}");
         std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
     }
 

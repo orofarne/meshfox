@@ -154,3 +154,37 @@ fn color_spans_paint_terminal_cells_and_restore_nested_colors() {
     );
     assert!(session.screen_text().contains("[LiteralCode]{color=#fff}"));
 }
+
+#[test]
+#[ignore = "pty-based e2e — run via cargo test --test tui_e2e -- --ignored"]
+fn quiet_chain_console_and_status_follow_the_same_step() {
+    let (path, dir) = fixtures::write_fixture(concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=root -->\n",
+        "```sh name=prep\nprintf 'previous-step-done\\n'\n```\n",
+        "```sh name=render deps=prep\nsleep 4\n```\n",
+    ));
+    let mut session = TuiSession::spawn(&path, dir, 40, 110);
+    session.wait_for("Root", Duration::from_secs(5)).unwrap();
+    session.send_keys("r");
+    session
+        .wait_for("which block?", Duration::from_secs(5))
+        .unwrap();
+    session.send_keys("\x1b[B\r");
+    session
+        .wait_for("Output (running: render", Duration::from_secs(10))
+        .unwrap();
+    session
+        .wait_for("Running: render", Duration::from_secs(2))
+        .unwrap();
+    let screen = session.screen_text();
+    let output = &screen[screen.find("Output (running: render").unwrap()..];
+    assert!(output.contains("prep (exit 0"), "{screen}");
+    assert!(output.contains("==> render"), "{screen}");
+    session
+        .wait_for("Completed: render", Duration::from_secs(10))
+        .unwrap();
+    let screen = session.screen_text();
+    let output = &screen[screen.find("Output (done)").expect(&screen)..];
+    assert!(output.contains("render (exit 0"), "{screen}");
+    assert!(!output.contains("Running: render"), "{screen}");
+}

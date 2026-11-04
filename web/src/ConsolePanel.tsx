@@ -51,7 +51,7 @@ export function ConsolePanel({
           lines.map((line, i) => (
             <div key={i} className={line.stream === "stderr" ? "console-line console-line-stderr" : "console-line"}>
               <span className="console-line-addr">
-                {line.nodeId}::{line.block}
+                {line.nodeId}/{line.block}
               </span>{" "}
               <AnsiText text={line.text} />
             </div>

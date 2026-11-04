@@ -62,7 +62,7 @@ pub enum DepsError {
     Artifacts(String),
     #[error("no runnable block named {1:?} in node {0:?}")]
     BlockNotFound(String, String),
-    #[error("dependency cycle: {}", .0.iter().map(|a| a.key()).collect::<Vec<_>>().join(" -> "))]
+    #[error("dependency cycle: {}", .0.iter().map(|a| format!("{}/{}", a.node_id, a.block_name)).collect::<Vec<_>>().join(" -> "))]
     Cycle(Vec<BlockAddr>),
     #[error("node {0:?} has more than one default block ({1:?}) — only one block per node may be `default` (or named after the node's own id)")]
     MultipleDefaults(String, Vec<String>),

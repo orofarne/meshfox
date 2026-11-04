@@ -966,14 +966,14 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             TtyPreludeOutcome::EnterPty
         }
         RunEvent::Started { .. } | RunEvent::ServiceStarted { .. } => TtyPreludeOutcome::Continue,
-        RunEvent::StepStart { block, .. } => {
+        RunEvent::StepStart { node_id, block } => {
             crate::terminal_status::running(&block);
-            crate::run_output::banner(&block, "\r\n");
+            crate::run_output::banner(&format!("{node_id}/{block}"), "\r\n");
             TtyPreludeOutcome::Continue
         }
-        RunEvent::StepSkipped { block, .. } => {
+        RunEvent::StepSkipped { node_id, block, .. } => {
             crate::run_output::banner(
-                &format!("{block} (skipped, already fresh this session)"),
+                &format!("{node_id}/{block} (skipped, already fresh this session)"),
                 "\r\n",
             );
             TtyPreludeOutcome::Continue

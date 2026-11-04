@@ -75,7 +75,7 @@ async fn read(path: PathBuf, options: Options) -> Result<(), String> {
                         style(format!("#{}", run.id), "1;36"),
                         style(&run.started_at, "2"),
                         status(&run.status),
-                        style(format!("{}::{}", run.node_id, run.block), "1"),
+                        style(format!("{}/{}", run.node_id, run.block), "1"),
                         style(&run.source, "2")
                     );
                 }
@@ -160,7 +160,7 @@ fn print_summary(run: &Summary, json_output: bool) {
     println!(
         "{} · {} · {}\n{} · {}",
         style(format!("Run #{}", run.id), "1;36"),
-        style(format!("{}::{}", run.node_id, run.block), "1"),
+        style(format!("{}/{}", run.node_id, run.block), "1"),
         style(&run.source, "2"),
         style(&run.started_at, "2"),
         status(&run.status),
@@ -198,7 +198,7 @@ fn string<'a>(value: &'a Value, key: &str) -> &'a str {
 }
 fn print_event(item: &Event, effective: bool) {
     let event = &item.event;
-    let addr = format!("{}::{}", string(event, "nodeId"), string(event, "block"));
+    let addr = format!("{}/{}", string(event, "nodeId"), string(event, "block"));
     match string(event, "type") {
         "step-start" => banner(&addr),
         "step-not-started" => {

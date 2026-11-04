@@ -348,7 +348,7 @@ pub fn fold(run: &Summary, events: &[Event], now: Option<OffsetDateTime>) -> Rep
     Report {
         run: RunInfo {
             id: run.id,
-            target: format!("{}::{}", run.node_id, run.block),
+            target: format!("{}/{}", run.node_id, run.block),
             status: run.status.clone(),
             started_at: run.started_at.clone(),
             ended_at: run.ended_at.clone(),
@@ -820,7 +820,7 @@ mod tests {
     fn json_snapshot_has_a_stable_shape() {
         let value = snapshot_json(&fold(&summary("running"), &[], None));
         assert_eq!(value["type"], "snapshot");
-        assert_eq!(value["run"]["target"], "full::full");
+        assert_eq!(value["run"]["target"], "full/full");
         assert_eq!(value["steps"][0]["state"], "pending");
         assert_eq!(value["steps"][0]["node"], "unit");
         assert!(value["failures"].as_array().unwrap().is_empty());

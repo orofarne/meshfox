@@ -119,17 +119,20 @@ impl Snapshot {
                 .map(|a| a.block_name.as_str())
                 .unwrap_or("preparing");
             if run.is_running() {
-                if let Some(addr) = run.current_addr() {
-                    let label = app
-                        .child_steps
-                        .get(addr)
-                        .map(|child| format!("{name} → {child}"))
-                        .unwrap_or_else(|| name.into());
+                // The chain stream also spans preparation and finalization.
+                // Clear stale ledger entries before publishing its actual phase.
+                for addr in run.chain.iter().chain(app.run_target.iter()) {
+                    snapshot
+                        .active
+                        .remove(&key(&addr.node_id, &addr.block_name));
+                }
+                let label = app.foreground_run_label();
+                if let Some(addr) = app.foreground_step() {
                     snapshot
                         .active
                         .insert(key(&addr.node_id, &addr.block_name), label);
                 } else {
-                    snapshot.active.insert("foreground".into(), name.into());
+                    snapshot.active.insert("foreground".into(), label);
                 }
             } else if run.finished {
                 // Foreground completion is authoritative; worker snapshots
@@ -205,17 +208,8 @@ impl CanvasStatus {
             self.elapsed = None;
         }
         crate::terminal_status::set(state.clone());
-        let panel_state = if let Some(run) = app.run.as_ref().filter(|run| run.is_running()) {
-            let label = run
-                .current_addr()
-                .map(|addr| {
-                    app.child_steps
-                        .get(addr)
-                        .map(|child| format!("{} → {child}", addr.block_name))
-                        .unwrap_or_else(|| addr.block_name.clone())
-                })
-                .unwrap_or_else(|| "preparing".into());
-            State::Running(label)
+        let panel_state = if app.run.as_ref().is_some_and(|run| run.is_running()) {
+            State::Running(app.foreground_run_label())
         } else if matches!(state, State::Ready(_)) {
             self.result.clone().unwrap_or(state)
         } else {
@@ -223,12 +217,13 @@ impl CanvasStatus {
         };
         let now = Instant::now();
         let elapsed = self.panel_elapsed(&panel_state, now);
-        let elapsed = if matches!(panel_state, State::Running(_)) {
-            app.run
-                .as_ref()
-                .filter(|run| run.is_running())
+        let elapsed = if matches!(panel_state, State::Running(_))
+            && app.run.as_ref().is_some_and(|run| run.is_running())
+        {
+            // A completed process's timer is not the timer of chain cleanup.
+            app.foreground_step()
+                .and_then(|_| app.run.as_ref())
                 .map(|run| run.step_started.elapsed())
-                .or(elapsed)
         } else {
             elapsed
         };

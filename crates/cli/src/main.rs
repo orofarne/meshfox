@@ -4050,10 +4050,10 @@ async fn drain_worker_run_events(
                         }
                         worker_client::RunEvent::StepStart { node_id, block } => {
                             terminal_status::running(&block);
-                            run_output::banner(&block, "\n");
+                            run_output::banner(&format!("{node_id}/{block}"), "\n");
                             current_step = Some((node_id, block));
                         }
-                        worker_client::RunEvent::StepSkipped { block, .. } => {
+                        worker_client::RunEvent::StepSkipped { node_id, block, .. } => {
                             // No equivalent in the in-process loop above,
                             // which always re-executes every step
                             // regardless of a previous cached run — this is
@@ -4062,7 +4062,7 @@ async fn drain_worker_run_events(
                             // `compute_forced_reruns`), a deliberate benefit
                             // of joining a shared session rather than a gap
                             // to hide.
-                            run_output::banner(&format!("{block} (already run this session, skipped)"), "\n");
+                            run_output::banner(&format!("{node_id}/{block} (already run this session, skipped)"), "\n");
                         }
                         worker_client::RunEvent::Output { stream, text, child, .. } => {
                             if let Some(label) = child.as_ref().and_then(worker_client::child_step_label) {
@@ -4074,7 +4074,7 @@ async fn drain_worker_run_events(
                             }
                         },
                         worker_client::RunEvent::ServiceStarted { node_id, block, pid } => {
-                            run_output::banner(&format!("{block} (service started, pid {pid})"), "\n");
+                            run_output::banner(&format!("{node_id}/{block} (service started, pid {pid})"), "\n");
                             started_services.push((node_id, block));
                         }
                         worker_client::RunEvent::StepEnd { exit_code, duration_ms, .. } => {

@@ -6125,6 +6125,7 @@ impl App {
                 }
                 self.displayed_invocations
                     .insert(definition_addr(&addr), addr.clone());
+                run.lines.push(format!("==> {}", addr.block_name));
                 run.chain.push(addr.clone());
                 run.idx += 1;
                 run.stdout_only.clear();
@@ -6242,7 +6243,7 @@ impl App {
                 duration_ms,
             } => {
                 run.lines.push(format!(
-                    "(exit {exit_code} · {})",
+                    "{block} (exit {exit_code} · {})",
                     meshfox_core::format_duration_ms(duration_ms)
                 ));
                 let addr = BlockAddr::new(node_id, block);
@@ -6735,6 +6736,33 @@ impl App {
             if self.auto_expanded_pane == Some(self.focus) {
                 self.auto_expanded_pane = None;
             }
+        }
+    }
+
+    /// One source for the console title and activity panel. An open chain
+    /// stream does not imply its last process is still running: StepEnd can
+    /// precede dependency preparation, cleanup and the chain's final Done.
+    pub(super) fn foreground_step(&self) -> Option<&BlockAddr> {
+        self.run.as_ref()?.current_addr().filter(|addr| {
+            self.step_output
+                .get(*addr)
+                .is_some_and(|output| output.running)
+        })
+    }
+
+    pub(super) fn foreground_run_label(&self) -> String {
+        let Some(run) = self.run.as_ref().filter(|run| run.is_running()) else {
+            return "idle".into();
+        };
+        if let Some(addr) = self.foreground_step() {
+            self.child_steps
+                .get(addr)
+                .map(|child| format!("{} → {child}", addr.block_name))
+                .unwrap_or_else(|| addr.block_name.clone())
+        } else if run.chain.is_empty() {
+            "preparing".into()
+        } else {
+            "between steps".into()
         }
     }
 
@@ -9556,7 +9584,7 @@ mod tests {
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         app.run_target = Some(BlockAddr::new("root", "target"));
         app.run = Some(RunState {
-            chain: vec![BlockAddr::new("root", "dep")],
+            chain: Vec::new(),
             idx: 0,
             http_rx: Some(rx),
             lines: Vec::new(),
@@ -9583,6 +9611,11 @@ mod tests {
                 })
                 .collect(),
         );
+        app.on_run_event(Some(crate::worker_client::RunEvent::StepStart {
+            node_id: "root".into(),
+            block: "dep".into(),
+        }))
+        .await;
         status.update(&mut app);
         assert_eq!(
             app.activity.state,
