@@ -123,12 +123,15 @@ fn find_list_pid(screen: &str, status_word: &str) -> Option<u32> {
 
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
-fn s_opens_the_services_view_and_s_r_stop_and_restart() {
+fn s_opens_the_services_view_and_k_stops_r_restarts() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::SERVICE_RUNNABLE);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
     session
         .wait_for("Root", Duration::from_secs(5))
         .expect("initial render");
+    session
+        .wait_for("[service]", Duration::from_secs(5))
+        .expect("service fence badge");
 
     // A single-block run never auto-expands the Output console
     // (`App::begin_http_run`'s own >= 2-step gate) — click the collapsed
@@ -158,10 +161,15 @@ fn s_opens_the_services_view_and_s_r_stop_and_restart() {
         "list should show the same pid the run just reported"
     );
 
+    session.wait_for("K stop", Duration::from_secs(5)).unwrap();
+    // Opening the list key no longer doubles as a destructive stop action.
     session.send_keys("s");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(is_alive(pid), "s must not stop a service");
+    session.send_keys("K");
     session
         .wait_for("stopped", Duration::from_secs(5))
-        .expect("the list should flip to stopped after s");
+        .expect("the list should flip to stopped after K");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut still_alive = is_alive(pid);
@@ -171,7 +179,7 @@ fn s_opens_the_services_view_and_s_r_stop_and_restart() {
     }
     assert!(
         !still_alive,
-        "pid {pid} should be dead after stopping via s"
+        "pid {pid} should be dead after stopping via K"
     );
 
     session.send_keys("r");

@@ -2064,6 +2064,9 @@ impl<'a> Renderer<'a> {
                 if tangle {
                     label.push_str(" · tangle");
                 }
+                if block.is_some_and(|block| block.service) {
+                    label.push_str(" [service]");
+                }
                 label.push(' ');
                 // `┌` matches the box-drawing set ratatui's own pane
                 // borders already use (see `Borders::ALL` in ui.rs), so the
@@ -3564,6 +3567,27 @@ mod tests {
         // Exactly as written in the attribute — no case-folding — mirrors
         // the web UI's own `mesh-code-interpreter` suffix.
         assert!(text.contains("python · seed #!python3 -u"), "{text}");
+    }
+
+    #[test]
+    fn service_fences_are_marked_in_the_header() {
+        let hl = Highlighter::new();
+        for (attr, service) in [("service", true), ("", false)] {
+            let md = format!("```bash name=server {attr}\nnpm run start\n```\n");
+            let (segments, _) = render(
+                &md,
+                Path::new("/nonexistent-base-dir"),
+                &hl,
+                "n",
+                &[],
+                &std::collections::HashMap::new(),
+                None,
+                &std::collections::HashMap::new(),
+            );
+            let text = segment_text(&segments);
+            assert_eq!(text.contains("bash · server [service]"), service, "{text}");
+            assert!(text.contains("[run]"), "{text}");
+        }
     }
 
     #[test]

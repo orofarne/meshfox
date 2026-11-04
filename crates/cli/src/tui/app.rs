@@ -7062,9 +7062,9 @@ impl App {
         keys
     }
 
-    /// `j`/`k`/arrows navigate, `s` stops the selected service (no-op if
+    /// `j`/`k`/arrows navigate, `K` stops the selected service (no-op if
     /// it isn't running), `r` restarts it (no-op if it's already
-    /// running — use `s` first), `q`/Esc closes the view. **Experimental**,
+    /// running — use `K` first), `q`/Esc closes the view. **Experimental**,
     /// see SPEC.md's "Service blocks (experimental)".
     async fn on_services_view_key(&mut self, key: KeyEvent) {
         let keys = self.sorted_service_keys();
@@ -7099,7 +7099,7 @@ impl App {
                 let key = keys[new_selected].clone();
                 self.refresh_service_log(&key.0, &key.1).await;
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('K') => {
                 let (node_id, block) = keys[selected].clone();
                 match crate::worker_client::stop_service(port, &node_id, &block).await {
                     Ok(()) => self.status = format!("stopped {block}"),

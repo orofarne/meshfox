@@ -2826,7 +2826,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "j/k select · s stop · r restart · q/esc close",
+            "j/k select · K stop · r restart · q/esc close",
             Style::default().fg(super::theme::muted()),
         ))),
         hint_area,
@@ -3270,7 +3270,7 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     if app.service_stats.is_some() {
-        items.push("s               open the services list (stop/restart any of them) —");
+        items.push("s               open the services list (K stop · r restart) —");
         items.push("                experimental, see SPEC.md's \"Service blocks (experimental)\"");
     }
     if app.worker_port.is_some() {
