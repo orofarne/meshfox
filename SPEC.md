@@ -573,6 +573,18 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   the edge. A `from=`-computed variable first runs its source block and then
   decides the edge, like any other value computed during a run; before a value
   is known, static views (and cycle checks) treat the edge as present.
+  A conditional entry governs the **whole dependency**, not just the explicit
+  edge: while it is off, the target is also not pulled in as the producer of
+  one of this block's `inputs=` (an `inputs=` declaration that only consumes
+  that target's `outputs=` is ignored entirely — not required to exist, not part
+  of the fingerprint) nor as the `from=` source of a variable exposed through
+  `env=` (the variable is left out of the environment and never required). When
+  the entry is on, it is an ordinary explicit `deps=` edge, so it brings the
+  usual execution cascade. If the same dependency is also named by an
+  unconditional entry, nothing is switched off. A variable computed by a
+  conditionally-depended-on block can only be used through `env=`: `interpreter=`,
+  artifact paths, application arguments and conditions need the value always,
+  and `meshfox validate` rejects them.
   Conditions exist only in `deps=`: `lease=`, `defer=` and `from=` reject
   them. `meshfox validate` reports an empty condition (`fix?`), an unknown
   variable, a bare condition on a non-`bool` variable and a comparison value

@@ -78,7 +78,68 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
+/// The declared paths of `attr`, minus `inputs=` declarations that exist only
+/// to consume the output of a producer this block depends on through a
+/// conditional `deps=` entry that is off: such an input is ignored entirely —
+/// not required to exist, not part of the fingerprint.
 fn paths(
+    canvas: &Canvas,
+    addr: &BlockAddr,
+    block: &CodeBlock,
+    attr: &str,
+    values: &HashMap<String, String>,
+    strict: bool,
+) -> Result<Vec<PathBuf>, crate::DepsError> {
+    let all = paths_unfiltered(canvas, addr, block, attr, values, strict)?;
+    if attr != "inputs" {
+        return Ok(all);
+    }
+    let gated = gated_producers(canvas, addr, block, values)?;
+    if gated.is_empty() {
+        return Ok(all);
+    }
+    let mut graph = graph_values(canvas);
+    graph.extend(values.clone());
+    let known = producers(canvas, &graph)?;
+    let templates = producer_templates(canvas, &graph)?;
+    let mut kept = Vec::new();
+    for (input, raw) in all.into_iter().zip(declarations(block, "inputs")) {
+        let found = declaration_producers(
+            canvas,
+            &known,
+            &templates,
+            &graph,
+            block,
+            input.clone(),
+            raw,
+        )?;
+        if found.is_empty() || !found.iter().all(|producer| gated.contains(producer)) {
+            kept.push(input);
+        }
+    }
+    Ok(kept)
+}
+
+/// Dependencies of `block` switched off by a conditional `deps=` entry — see
+/// `crate::deps::gated_targets`. Empty (and free) for blocks without one.
+fn gated_producers(
+    canvas: &Canvas,
+    addr: &BlockAddr,
+    block: &CodeBlock,
+    values: &HashMap<String, String>,
+) -> Result<std::collections::HashSet<BlockAddr>, crate::DepsError> {
+    if block
+        .dependencies()
+        .iter()
+        .all(|dep| dep.condition.is_none())
+    {
+        return Ok(Default::default());
+    }
+    let decls = crate::declared_vars(canvas)?;
+    crate::deps::gated_targets(canvas, &addr.node_id, block, values, &decls)
+}
+
+fn paths_unfiltered(
     canvas: &Canvas,
     addr: &BlockAddr,
     block: &CodeBlock,
@@ -466,50 +527,72 @@ pub fn producer_deps(
             }
         }
     }
-    let inputs = paths(canvas, addr, block, "inputs", &values, false)?;
+    let gated = gated_producers(canvas, addr, block, &canvas.artifact_values)?;
+    let inputs = paths_unfiltered(canvas, addr, block, "inputs", &values, false)?;
     for (input, raw) in inputs.into_iter().zip(declarations(block, "inputs")) {
-        let mut declaration = block.clone();
-        declaration.attrs.remove("outputs");
-        declaration.attrs.insert("inputs".into(), raw);
-        if var_refs(&declaration)
-            .iter()
-            .any(|name| !values.contains_key(name))
+        for producer in
+            declaration_producers(canvas, &producers, &templates, &values, block, input, raw)?
         {
-            // Planning sentinels are not argument values. Preserve finite default
-            // producers (the old graph behavior), and infer only after observation.
-            let pattern = matcher(&input)?;
-            for (output, producer) in &producers {
-                if pattern.is_match(output) && !deps.contains(producer) {
-                    deps.push(producer.clone());
-                }
-            }
-            continue;
-        }
-        let mut requested = if has_glob(&input) {
-            let pattern = matcher(&input)?;
-            let mut paths: Vec<_> = producers
-                .keys()
-                .filter(|output| pattern.is_match(output))
-                .cloned()
-                .collect();
-            paths.extend(files(&input)?);
-            paths.sort();
-            paths.dedup();
-            paths
-        } else {
-            vec![input]
-        };
-        requested.sort();
-        requested.dedup();
-        for output in requested {
-            if let Some(producer) = infer_producer(canvas, &templates, &output, &values)? {
-                if !deps.contains(&producer) {
-                    deps.push(producer);
-                }
+            if !gated.contains(&producer) && !deps.contains(&producer) {
+                deps.push(producer);
             }
         }
     }
     Ok(deps)
+}
+
+/// The producers whose outputs one `inputs=` declaration consumes.
+fn declaration_producers(
+    canvas: &Canvas,
+    producers: &BTreeMap<PathBuf, BlockAddr>,
+    templates: &[Producer],
+    values: &HashMap<String, String>,
+    block: &CodeBlock,
+    input: PathBuf,
+    raw: String,
+) -> Result<Vec<BlockAddr>, crate::DepsError> {
+    let mut found: Vec<BlockAddr> = Vec::new();
+    let mut declaration = block.clone();
+    declaration.attrs.remove("outputs");
+    declaration.attrs.insert("inputs".into(), raw);
+    if var_refs(&declaration)
+        .iter()
+        .any(|name| !values.contains_key(name))
+    {
+        // Planning sentinels are not argument values. Preserve finite default
+        // producers (the old graph behavior), and infer only after observation.
+        let pattern = matcher(&input)?;
+        for (output, producer) in producers {
+            if pattern.is_match(output) && !found.contains(producer) {
+                found.push(producer.clone());
+            }
+        }
+        return Ok(found);
+    }
+    let mut requested = if has_glob(&input) {
+        let pattern = matcher(&input)?;
+        let mut paths: Vec<_> = producers
+            .keys()
+            .filter(|output| pattern.is_match(output))
+            .cloned()
+            .collect();
+        paths.extend(files(&input)?);
+        paths.sort();
+        paths.dedup();
+        paths
+    } else {
+        vec![input]
+    };
+    requested.sort();
+    requested.dedup();
+    for output in requested {
+        if let Some(producer) = infer_producer(canvas, templates, &output, values)? {
+            if !found.contains(&producer) {
+                found.push(producer);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn files(pattern: &Path) -> Result<Vec<PathBuf>, crate::DepsError> {
@@ -644,6 +727,56 @@ mod tests {
             "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n{body}"
         ))
         .unwrap()
+    }
+
+    fn gated_doc(deps: &str) -> String {
+        format!(
+            "<!-- meshfox:var name=\"USE_AGENT\" type=\"bool\" default=\"false\" -->\n```bash name=\"fix\" outputs=\"gated-fixed-output.md\"\ntrue\n```\n```bash name=\"convert\" inputs=\"gated-fixed-output.md\"{deps}\ntrue\n```\n"
+        )
+    }
+
+    fn gated_chain(md: &str, flag: Option<&str>) -> Vec<String> {
+        let mut c = canvas(md);
+        if let Some(flag) = flag {
+            c.artifact_values.insert("USE_AGENT".into(), flag.into());
+        }
+        crate::deps::resolve_chain(&c, BlockAddr::new("root", "convert"))
+            .unwrap()
+            .into_iter()
+            .map(|a| a.block_name)
+            .collect()
+    }
+
+    #[test]
+    fn a_conditional_deps_entry_governs_the_file_producer_of_the_same_dependency() {
+        // Without the explicit edge the producer is always pulled in.
+        let plain = gated_doc("");
+        assert_eq!(gated_chain(&plain, Some("false")), ["fix", "convert"]);
+
+        let md = gated_doc(" deps=\"fix?USE_AGENT\"");
+        assert_eq!(gated_chain(&md, Some("false")), ["convert"]);
+        assert_eq!(gated_chain(&md, Some("true")), ["fix", "convert"]);
+        // Nothing resolved yet: the superset, like any conditional edge.
+        assert_eq!(gated_chain(&md, None), ["fix", "convert"]);
+
+        let also_unconditional = gated_doc(" deps=\"fix?USE_AGENT,fix\"");
+        assert_eq!(
+            gated_chain(&also_unconditional, Some("false")),
+            ["fix", "convert"]
+        );
+    }
+
+    #[test]
+    fn an_input_of_a_gated_producer_is_ignored_entirely() {
+        let c = canvas(&gated_doc(" deps=\"fix?USE_AGENT\""));
+        let addr = BlockAddr::new("root", "convert");
+        let block = crate::deps::find_block(&c, &addr).unwrap();
+        let values = |flag: &str| HashMap::from([("USE_AGENT".to_string(), flag.to_string())]);
+        // Off: the missing file is neither required nor part of the fingerprint.
+        let off = fingerprint(&c, &addr, &block, &values("false"), "inputs", true).unwrap();
+        assert_eq!(off, blake3::Hasher::new().finalize().to_hex().to_string());
+        // On: it is an ordinary input again, and strictly required.
+        assert!(fingerprint(&c, &addr, &block, &values("true"), "inputs", true).is_err());
     }
 
     #[test]

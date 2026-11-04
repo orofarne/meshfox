@@ -235,8 +235,6 @@ pub fn application_ref(
     values: &HashMap<String, String>,
     decls: &[VarDecl],
 ) -> Result<Option<BlockAddr>, DepsError> {
-    let addr = resolve_ref(node_id, dep);
-    let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
     let mut scope = canvas.artifact_values.clone();
     scope.extend(values.clone());
     scope.extend(owner.arguments.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -248,17 +246,42 @@ pub fn application_ref(
         // the runner replans once that source has produced a value. A value
         // that is simply unknown (nothing resolved it yet) keeps the edge, so
         // static views and cycle checks see the superset.
-        let active = match scope.get(&condition.var) {
-            Some(value) => condition.holds(value),
-            None => !decls
-                .iter()
-                .any(|decl| decl.name == condition.var && decl.from.is_some()),
-        };
-        if !active {
+        if !condition_allows(condition, &scope, decls) {
             validate_dep_condition(canvas, node_id, owner, dep, decls)?;
             return Ok(None);
         }
     }
+    bind_ref(canvas, node_id, owner, dep, &scope, decls)
+}
+
+/// Whether `condition` lets its edge exist for the values in `scope`. A value
+/// nobody has resolved yet keeps the edge (static views show the superset); a
+/// computed variable that has not been observed yet does not (pending).
+fn condition_allows(
+    condition: &crate::fence::DepCondition,
+    scope: &HashMap<String, String>,
+    decls: &[VarDecl],
+) -> bool {
+    match scope.get(&condition.var) {
+        Some(value) => condition.holds(value),
+        None => !decls
+            .iter()
+            .any(|decl| decl.name == condition.var && decl.from.is_some()),
+    }
+}
+
+/// The dependency a `deps=` entry names for the given scope, ignoring its
+/// condition. `None` while an argument binding still waits for a computed value.
+fn bind_ref(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    dep: &BlockRef,
+    scope: &HashMap<String, String>,
+    decls: &[VarDecl],
+) -> Result<Option<BlockAddr>, DepsError> {
+    let addr = resolve_ref(node_id, dep);
+    let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
     if app.bindings.values().any(|binding| match binding {
         crate::args::Binding::Reference(name) => {
             !scope.contains_key(name)
@@ -272,8 +295,139 @@ pub fn application_ref(
         validate_application_ref(canvas, node_id, owner, dep, decls)?;
         return Ok(None);
     }
-    let bound = find_block_with_values(canvas, &addr, &scope)?;
+    let bound = find_block_with_values(canvas, &addr, scope)?;
     Ok(Some(BlockAddr::new(addr.node_id, bound.name.unwrap())))
+}
+
+/// Blocks `owner` depends on only through conditional `deps=` entries that are
+/// off (or pending) right now. A conditional entry governs the whole pair, so
+/// the implicit reasons for the same dependency — a file producer matched
+/// through `inputs=`/`outputs=`, a `from=` source behind an `env=` variable —
+/// are switched off with it. A dependency that also has an active or
+/// unconditional entry is never gated.
+pub(crate) fn gated_targets(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    values: &HashMap<String, String>,
+    decls: &[VarDecl],
+) -> Result<HashSet<BlockAddr>, DepsError> {
+    let deps = owner.dependencies();
+    if deps.iter().all(|dep| dep.condition.is_none()) {
+        return Ok(HashSet::new());
+    }
+    let mut scope = canvas.artifact_values.clone();
+    scope.extend(values.clone());
+    scope.extend(owner.arguments.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let mut off = HashSet::new();
+    let mut on = HashSet::new();
+    for dep in &deps {
+        let allowed = match &dep.condition {
+            Some(condition) => condition_allows(condition, &scope, decls),
+            None => true,
+        };
+        let Some(target) = bind_ref(canvas, node_id, owner, dep, &scope, decls)? else {
+            continue;
+        };
+        if allowed {
+            on.insert(target);
+        } else {
+            off.insert(target);
+        }
+    }
+    Ok(off.difference(&on).cloned().collect())
+}
+
+/// Names of the declared variables that `owner`'s conditional `deps=` entries
+/// switch off: those computed (`from=`) by a gated source. They are left out of
+/// the block's environment and never required, because their source does not
+/// run (see [`gated_targets`]).
+pub fn gated_variables(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    values: &HashMap<String, String>,
+) -> Result<HashSet<String>, DepsError> {
+    if owner
+        .dependencies()
+        .iter()
+        .all(|dep| dep.condition.is_none())
+    {
+        return Ok(HashSet::new());
+    }
+    let decls = crate::vars::declared_vars(canvas)?;
+    let gated = gated_targets(canvas, node_id, owner, values, &decls)?;
+    Ok(decls
+        .iter()
+        .filter(|decl| {
+            decl.from
+                .as_ref()
+                .is_some_and(|from| gated.contains(&resolve_ref(node_id, from)))
+        })
+        .map(|decl| decl.name.clone())
+        .collect())
+}
+
+/// A conditional `deps=` entry governs every reason this block depends on its
+/// target, so a variable computed by such a target can only reach the block
+/// through `env=` (where it is simply left out while the edge is off). Any
+/// other use — `interpreter=`, an artifact path, an application argument or a
+/// condition — needs the value unconditionally.
+fn validate_conditional_sources(
+    node_id: &str,
+    block: &crate::fence::CodeBlock,
+    decls: &[VarDecl],
+) -> Result<(), DepsError> {
+    let deps = block.dependencies();
+    if deps.iter().all(|dep| dep.condition.is_none()) {
+        return Ok(());
+    }
+    let key = |r: &BlockRef| {
+        let addr = resolve_ref(node_id, r);
+        let definition = crate::args::Application::parse(&addr.block_name)
+            .map(|app| app.definition)
+            .unwrap_or_else(|_| addr.block_name.clone());
+        (addr.node_id, definition)
+    };
+    let conditional: HashSet<_> = deps
+        .iter()
+        .filter(|dep| dep.condition.is_some())
+        .map(key)
+        .collect();
+    let unconditional: HashSet<_> = deps
+        .iter()
+        .filter(|dep| dep.condition.is_none())
+        .map(key)
+        .collect();
+    let gated: HashSet<_> = conditional.difference(&unconditional).cloned().collect();
+    let mut names: Vec<String> = block
+        .interpreter
+        .as_deref()
+        .map(crate::exec::interpreter_var_refs)
+        .unwrap_or_default();
+    names.extend(crate::artifacts::var_refs(block));
+    names.extend(crate::args::dependency_refs(block));
+    names.retain(|name| !block.arguments.contains_key(name));
+    for name in crate::vars::close_over_var_refs(decls, names.iter().map(String::as_str)) {
+        let Some(from) = decls
+            .iter()
+            .find(|decl| decl.name == name)
+            .and_then(|decl| decl.from.as_ref())
+        else {
+            continue;
+        };
+        if gated.contains(&key(from)) {
+            return Err(DepsError::Condition(
+                node_id.to_string(),
+                block.name.clone().unwrap_or_default(),
+                format!(
+                    "variable {name:?} is computed by {:?}, which this block depends on only conditionally; a conditional dependency can only provide variables through `env=`",
+                    from.block_name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Checks the `?COND` of one `deps=` entry against what it can refer to: a
@@ -434,6 +588,7 @@ fn implicit_from_deps(
     node_id: &str,
     block: &crate::fence::CodeBlock,
     decls: &[VarDecl],
+    gated: &HashSet<BlockAddr>,
 ) -> Vec<BlockAddr> {
     let interpreter_names = block
         .interpreter
@@ -464,6 +619,7 @@ fn implicit_from_deps(
             .and_then(|d| d.from.as_ref())
             .map(|from| resolve_ref(node_id, from))
     })
+    .filter(|source| !gated.contains(source))
     .collect()
 }
 
@@ -500,7 +656,14 @@ fn visit(
 
     // Observe computed values before action dependencies, especially `!`
     // preparations whose necessity depends on those values.
-    let mut dep_addrs = implicit_from_deps(&addr.node_id, &block, decls);
+    let gated = gated_targets(
+        canvas,
+        &addr.node_id,
+        &block,
+        &canvas.artifact_values,
+        decls,
+    )?;
+    let mut dep_addrs = implicit_from_deps(&addr.node_id, &block, decls, &gated);
     for cleanup in block.defers() {
         if let Some(cleanup) = application_ref(
             canvas,
@@ -511,7 +674,12 @@ fn visit(
             decls,
         )? {
             let cleanup_block = find_block(canvas, &cleanup)?;
-            dep_addrs.extend(implicit_from_deps(&cleanup.node_id, &cleanup_block, decls));
+            dep_addrs.extend(implicit_from_deps(
+                &cleanup.node_id,
+                &cleanup_block,
+                decls,
+                &HashSet::new(),
+            ));
         }
     }
     dep_addrs.extend(crate::artifacts::producer_deps(canvas, &addr, &block)?);
@@ -1026,6 +1194,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             }
             for dep in &block.dependencies() {
                 validate_dep_condition(canvas, &node.id, block, dep, &decls)?;
+                validate_conditional_sources(&node.id, block, &decls)?;
                 let dep_addr = resolve_ref(&node.id, dep);
                 let dep_block = validate_application_ref(canvas, &node.id, block, dep, &decls)?;
                 if crate::exec::is_form(&dep_block.lang) {
@@ -1264,6 +1433,56 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must be a `bool`"));
+    }
+
+    fn computed_doc(consumer_attrs: &str) -> String {
+        format!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n<!-- meshfox:var name=\"USE_AGENT\" type=\"bool\" default=\"false\" -->\n<!-- meshfox:var name=\"RESULT\" from=\"fix\" -->\n```sh name=\"fix\"\ntrue\n```\n```sh name=\"convert\" {consumer_attrs}\ntrue\n```\n"
+        )
+    }
+
+    #[test]
+    fn a_conditional_deps_entry_governs_the_from_source_of_the_same_dependency() {
+        let plain = computed_doc("env=\"RESULT\"");
+        assert_eq!(
+            chain_with(&plain, &[("USE_AGENT", "false")]),
+            ["fix", "convert"]
+        );
+
+        let md = computed_doc("env=\"RESULT\" deps=\"fix?USE_AGENT\"");
+        assert_eq!(chain_with(&md, &[("USE_AGENT", "false")]), ["convert"]);
+        assert_eq!(
+            chain_with(&md, &[("USE_AGENT", "true")]),
+            ["fix", "convert"]
+        );
+        validate(&canvas(&md)).unwrap();
+    }
+
+    #[test]
+    fn gated_variables_name_the_computed_values_of_a_switched_off_source() {
+        let md = computed_doc("env=\"RESULT\" deps=\"fix?USE_AGENT\"");
+        let names = |flag: &str| {
+            let c = canvas(&md);
+            let addr = BlockAddr::new("root", "convert");
+            let block = find_block(&c, &addr).unwrap();
+            let values = HashMap::from([("USE_AGENT".to_string(), flag.to_string())]);
+            gated_variables(&c, "root", &block, &values).unwrap()
+        };
+        assert_eq!(names("false"), HashSet::from(["RESULT".to_string()]));
+        assert!(names("true").is_empty());
+    }
+
+    #[test]
+    fn a_gated_computed_variable_may_only_be_used_through_env() {
+        let md = computed_doc("interpreter=\"$RESULT\" deps=\"fix?USE_AGENT\"");
+        let error = validate(&canvas(&md)).unwrap_err().to_string();
+        assert!(
+            error.contains("only provide variables through `env=`"),
+            "{error}"
+        );
+        // An unconditional edge to the same block lifts the restriction.
+        let md = computed_doc("interpreter=\"$RESULT\" deps=\"fix?USE_AGENT,fix\"");
+        validate(&canvas(&md)).unwrap();
     }
 
     #[test]

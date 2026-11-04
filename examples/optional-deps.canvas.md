@@ -46,6 +46,18 @@ meshfox examples/optional-deps.canvas.md run --set USE_AGENT=true convert  # "fi
 meshfox examples/optional-deps.canvas.md run repair fix                    # "fix" regardless of USE_AGENT
 ```
 
+### Files and variables follow the same edge
+
+A condition on a `deps=` entry covers everything that makes this block depend
+on the target, not only the explicit edge. If `fix` declared
+`outputs="fixed.md"` and `convert` declared `inputs="fixed.md"`, the producer
+would normally be pulled in automatically; with `deps="fix?USE_AGENT"` it is
+pulled in only while `USE_AGENT` is `true`, and while it is `false` the
+`inputs="fixed.md"` declaration is ignored altogether (the file need not exist).
+The same goes for a variable computed by `fix` (`meshfox:var from="fix"`) that
+`convert` takes through `env=`: it is simply absent while the edge is off, so
+branch on the flag, not on whether the file or variable happens to exist.
+
 ## Repair
 <!-- meshfox:node id="repair" -->
 

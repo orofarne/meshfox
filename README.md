@@ -1291,7 +1291,10 @@ dependency from the chain and from the block's freshness, so flipping the value
 makes the block stale. This is the way to keep an optional agent step
 (`interpreter="@agent"`, with its provider choice, `$VAR` interpolation and
 `tty` mode) in the chain instead of wrapping it in a shell script. Conditions
-are valid in `deps=` only; see SPEC.md's `deps` entry.
+are valid in `deps=` only; see SPEC.md's `deps` entry. The condition covers
+the whole dependency: the producer of an `inputs=` file or the `from=` source
+of an `env=` variable is not pulled in while it is off, and the matching input
+is ignored.
 
 #### Example
 <!-- meshfox:node id="example-optional-deps" type="file" -->

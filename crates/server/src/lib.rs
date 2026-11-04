@@ -2657,11 +2657,15 @@ fn artifact_lock_candidates(
 fn step_values(
     state: &AppState,
     canvas: &Canvas,
+    node_id: &str,
     block: &meshfox_core::CodeBlock,
     values: &mut HashMap<String, String>,
 ) -> Result<(), meshfox_core::DepsError> {
     let decls = meshfox_core::declared_vars(canvas)
         .map_err(|e| meshfox_core::DepsError::Artifacts(e.to_string()))?;
+    // Variables computed by a source this block only depends on conditionally,
+    // while that condition is off: not required and not exported.
+    let gated = meshfox_core::deps::gated_variables(canvas, node_id, block, values)?;
     let mut names = meshfox_core::artifacts::var_refs(block);
     names.extend(block.env.iter().map(|r| r.var_name.clone()));
     if let Some(spec) = &block.interpreter {
@@ -2673,7 +2677,7 @@ fn step_values(
     let needed = meshfox_core::close_over_var_refs(&decls, names.iter().map(String::as_str));
     let relevant: Vec<_> = decls
         .into_iter()
-        .filter(|d| needed.contains(&d.name))
+        .filter(|d| needed.contains(&d.name) && !gated.contains(&d.name))
         .collect();
     let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
     let cache = state.vars_cache.lock().unwrap();
@@ -7196,7 +7200,7 @@ async fn run_block_impl_sized(
             // table, say). `forced_reruns`, re-planned with observed
             // values, adds a third way in: a `!` `deps=` edge whose
             // declaring block is itself running for real this pass.
-            if let Err(e) = step_values(&state, &canvas, &block, &mut resolved_vars) {
+            if let Err(e) = step_values(&state, &canvas, &addr.node_id, &block, &mut resolved_vars) {
                 final_exit_code = 1;
                 yield Ok(ndjson_line(&RunEvent::Error { message: e.to_string() }));
                 break;
