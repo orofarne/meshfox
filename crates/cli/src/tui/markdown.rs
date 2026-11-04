@@ -3753,7 +3753,10 @@ mod tests {
             links(md),
             vec![
                 ("the docs".to_string(), "https://a.example/x".to_string()),
-                ("https://b.example".to_string(), "https://b.example".to_string()),
+                (
+                    "https://b.example".to_string(),
+                    "https://b.example".to_string()
+                ),
                 ("local".to_string(), "other.canvas.md#n".to_string()),
             ]
         );

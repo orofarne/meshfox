@@ -4707,10 +4707,9 @@ impl App {
             // 1-9 pick that row directly.
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < count => {
                 picker.selected = c as usize - '1' as usize;
-                Box::pin(self.on_link_picker_key(KeyEvent::new(
-                    KeyCode::Enter,
-                    KeyModifiers::NONE,
-                )))
+                Box::pin(
+                    self.on_link_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                )
                 .await;
             }
             KeyCode::Enter => {
@@ -9529,7 +9528,11 @@ mod tests {
         app.on_key(key(KeyCode::Char('o'))).await;
         app.on_key(key(KeyCode::Char('3'))).await;
         assert!(app.link_picker.is_none());
-        assert!(app.status.starts_with("not opening non-web link"), "{}", app.status);
+        assert!(
+            app.status.starts_with("not opening non-web link"),
+            "{}",
+            app.status
+        );
         std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
     }
 

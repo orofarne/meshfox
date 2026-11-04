@@ -396,9 +396,13 @@ mod tests {
     fn embedded_raster_image_is_rendered() {
         use base64::Engine as _;
         let mut png = Vec::new();
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 255, 0, 255])))
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            4,
+            image::Rgba([0, 255, 0, 255]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100"><image width="100" height="100" xlink:href="data:image/png;base64,{b64}"/></svg>"#
