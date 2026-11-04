@@ -143,14 +143,9 @@ impl Snapshot {
             }
         }
         let handoff = app
-            .pending_http_tty
+            .pending_http_tty_attach
             .as_ref()
-            .map(|tty| &tty.block_name)
-            .or_else(|| {
-                app.pending_http_tty_attach
-                    .as_ref()
-                    .map(|tty| &tty.block_name)
-            });
+            .map(|tty| &tty.block_name);
         if let Some(name) = handoff {
             if !snapshot.active.values().any(|active| active == name) {
                 snapshot.active.insert("tty-handoff".into(), name.clone());

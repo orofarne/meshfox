@@ -482,20 +482,6 @@ async fn main_loop(
             app.request_worker_refresh();
         }
 
-        if let Some(pending) = app.pending_http_tty.take() {
-            let exit_code = run_http_tty_handoff(
-                terminal,
-                input_paused,
-                input_rx,
-                pending.socket,
-                &pending.block_name,
-                pending.autoclose,
-            )
-            .await?;
-            app.resume_after_http_tty(exit_code).await;
-            continue;
-        }
-
         if let Some(pending) = app.pending_http_tty_attach.take() {
             run_http_tty_attach_handoff(
                 terminal,
@@ -503,6 +489,7 @@ async fn main_loop(
                 input_rx,
                 pending.socket,
                 &pending.block_name,
+                pending.autoclose,
             )
             .await?;
             continue;
@@ -762,68 +749,15 @@ async fn hand_terminal_over<T>(
     Ok(outcome)
 }
 
-/// Leaves the alternate screen and relays an already-connected
-/// `/api/run/tty` socket (see `crate::worker_client::tty_connect`,
-/// `app::PendingHttpTty`). Raw mode is never disabled here — *this*
-/// process is the one relaying bytes itself, so local echo/line-buffering/
-/// signal-generation have to stay off the whole time, same posture the
-/// rest of this TUI already runs under. `input_paused` still matters: it
-/// keeps the ordinary crossterm background reader (`run`, above) from
-/// racing `spawn_raw_stdin_reader`'s own direct reads of the same fd.
-async fn run_http_tty_handoff(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    input_paused: &Arc<AtomicBool>,
-    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    mut socket: crate::worker_client::TtySocket,
-    block_name: &str,
-    autoclose: bool,
-) -> io::Result<i32> {
-    use std::io::Write;
-
-    input_paused.store(true, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    crate::run_output::banner(block_name, "\r\n");
-    io::stdout().flush()?;
-
-    let exit_code = bridge_http_tty(&mut socket).await;
-    let _ = futures_util::SinkExt::close(&mut socket).await;
-
-    if !autoclose || !matches!(exit_code, TtyEnd::Exited(_)) {
-        print!(
-            "\r\n({} — press any key to return to the canvas)\r\n",
-            exit_code.label()
-        );
-        io::stdout().flush()?;
-        input_paused.store(false, Ordering::Release);
-        let _ = input_rx.recv().await;
-        input_paused.store(true, Ordering::Release);
-    }
-
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
-    terminal.clear()?;
-
-    input_paused.store(false, Ordering::Release);
-    Ok(exit_code.exit_code())
-}
-
 /// Joins an existing tty session, then displays its actual final outcome.
-/// Attach viewers always wait for a key before returning to the canvas.
+/// The step’s own autoclose flag controls the pause before returning.
 async fn run_http_tty_attach_handoff(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     mut socket: crate::worker_client::TtySocket,
     block_name: &str,
+    autoclose: bool,
 ) -> io::Result<()> {
     use std::io::Write;
 
@@ -841,14 +775,16 @@ async fn run_http_tty_attach_handoff(
     let outcome = bridge_http_tty_attach(&mut socket).await;
     let _ = futures_util::SinkExt::close(&mut socket).await;
 
-    print!(
-        "\r\n({} — press any key to return to the canvas)\r\n",
-        outcome.label()
-    );
-    io::stdout().flush()?;
-    input_paused.store(false, Ordering::Release);
-    let _ = input_rx.recv().await;
-    input_paused.store(true, Ordering::Release);
+    if !autoclose || !matches!(outcome, TtyEnd::Exited(_)) {
+        print!(
+            "\r\n({} — press any key to return to the canvas)\r\n",
+            outcome.label()
+        );
+        io::stdout().flush()?;
+        input_paused.store(false, Ordering::Release);
+        let _ = input_rx.recv().await;
+        input_paused.store(true, Ordering::Release);
+    }
 
     execute!(
         terminal.backend_mut(),
@@ -866,7 +802,7 @@ async fn run_http_tty_attach_handoff(
 /// mechanism a shell or `ssh` already uses before handing a fd to a new
 /// interactive program, for the same reason: without it, keystrokes typed
 /// while nothing was reading stdin land on whatever starts reading it next
-/// as an unexpected burst, not as if freshly typed. See `bridge_http_tty`'s
+/// as an unexpected burst, not as if freshly typed. See `bridge_http_tty_with_chain_id`'s
 /// own call site for exactly which window this closes.
 #[cfg(unix)]
 fn flush_pending_stdin() {
@@ -921,7 +857,7 @@ fn write_all_retrying(stdout: &mut std::io::Stdout, mut bytes: &[u8]) -> io::Res
 /// screen redraw (a real interactive program's own, e.g. a table-viewer
 /// repainting many rows at once) could hit a momentarily-full pty output
 /// buffer and get back `EWOULDBLOCK` on an ordinary write, which
-/// `bridge_http_tty` had no reason to treat as anything but fatal. `poll`
+/// `bridge_http_tty_with_chain_id` had no reason to treat as anything but fatal. `poll`
 /// only checks readiness; it never mutates any flag any other fd could be
 /// sharing.
 #[cfg(unix)]
@@ -940,7 +876,7 @@ fn stdin_has_input_within(timeout: Duration) -> bool {
 /// Reads raw bytes straight off real stdin onto its own OS thread, forwarded
 /// on the returned channel, until `stop` is set — the worker-routed tty
 /// bridge's counterpart to `Stdio::inherit()`'s zero-copy fd handoff (see
-/// `bridge_http_tty`). Deliberately *not* the ordinary crossterm event
+/// `bridge_http_tty_with_chain_id`). Deliberately *not* the ordinary crossterm event
 /// reader (`run`'s own background thread): a real interactive session (a
 /// shell, `vim`, ...) needs the exact bytes typed — arrow-key escape
 /// sequences, a literal Ctrl-C byte, everything — relayed to the remote
@@ -949,7 +885,7 @@ fn stdin_has_input_within(timeout: Duration) -> bool {
 /// call (which stdin's own normal blocking mode, left untouched, then
 /// guarantees won't actually block) purely so this thread can notice
 /// `stop` roughly every 20ms and exit instead of being leaked. Returns the
-/// `JoinHandle` alongside the channel — `bridge_http_tty` joins it before
+/// `JoinHandle` alongside the channel — `bridge_http_tty_with_chain_id` joins it before
 /// returning (see its own call site's doc comment for why that matters,
 /// not just tidiness).
 fn spawn_raw_stdin_reader(
@@ -988,16 +924,7 @@ fn spawn_raw_stdin_reader(
     (rx, handle)
 }
 
-/// One `RunEvent` text frame arriving over the tty socket, printed as a
-/// plain scrolling transcript line (mirrors `run_stream`'s own
-/// `RunEvent`-to-`RunState` folding, just printed directly instead of fed
-/// into a `RunState` — see `app::PendingHttpTty`'s own doc comment for why
-/// a worker-routed `tty` chain's pre-interactive steps aren't shown in the
-/// ordinary Output pane the way local mode's are). `bridge_http_tty`'s
-/// pre-tty loop keeps going on `Continue`, hands off to the actual byte
-/// relay on `EnterPty` (the interactive step itself is about to start),
-/// and returns the run's own exit code on `Done` (a terminal event arrived
-/// before any `tty` step ever did — a failed dep, say).
+/// Terminal outcome shared by the CLI transcript and TUI step viewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TtyEnd {
     Exited(i32),
@@ -1101,13 +1028,9 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
 /// this verbatim for `meshfox run`'s worker-routed `tty` handling. Nothing
 /// in here or in what it calls touches this TUI's own `Terminal`/alt-screen
 /// state at all (that's all in this module's *caller*,
-/// `run_http_tty_handoff`, which a plain `run` invocation has no
+/// the TUI handoff, which a plain `run` invocation has no
 /// equivalent of — it's never in an alt screen to begin with, just needs
 /// its own raw-mode enable/disable around this call).
-pub(crate) async fn bridge_http_tty(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
-    bridge_http_tty_with_chain_id(socket, &mut None).await
-}
-
 /// CLI runs retain the journal identity for their final elapsed-time summary.
 pub(crate) async fn bridge_http_tty_with_chain_id(
     socket: &mut crate::worker_client::TtySocket,
@@ -1116,8 +1039,7 @@ pub(crate) async fn bridge_http_tty_with_chain_id(
     use tokio_tungstenite::tungstenite::Message;
 
     // Pre-tty phase: a `tty`-touching chain can (and typically does) run
-    // ordinary deps first (see `App::target_chain_tty_autoclose`'s own doc
-    // comment on a chain's `tty` step never having to be the last one) —
+    // ordinary deps first; the tty step need not be the last one —
     // this reads and prints only that transcript, deliberately *not yet*
     // touching real stdin at all. Starting the raw stdin reader here too
     // (as an earlier version of this function did) meant every keystroke
@@ -1164,7 +1086,7 @@ pub(crate) async fn bridge_http_tty_with_chain_id(
     bridge_tty_pty_phase(socket).await
 }
 
-/// The actual interactive byte relay, shared by `bridge_http_tty` (once its
+/// The actual interactive byte relay, shared by `bridge_http_tty_with_chain_id` (once its
 /// own pre-tty transcript phase reaches `TtyStart`) and
 /// `bridge_http_tty_attach` (which has no pre-tty phase to begin with — an
 /// attach connection is already mid-session the instant it opens, see that
@@ -1185,9 +1107,9 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
     // Pty phase: only from here does real stdin get read/forwarded at all.
     // The kernel's own tty input buffer, though, has been silently piling
     // up this whole time regardless — `input_paused` (set before this
-    // function is ever reached, see `run_http_tty_handoff`) stopped the
+    // function is ever reached, see `run_http_tty_attach_handoff`) stopped the
     // ordinary crossterm reader thread from draining it, and (for
-    // `bridge_http_tty`'s own caller) the pre-tty phase just above
+    // `bridge_http_tty_with_chain_id`'s own caller) the pre-tty phase just above
     // deliberately never reads real stdin either (see its own doc comment
     // on why not). Left alone, whatever a user typed while still-running
     // deps ate anywhere from milliseconds to many seconds would all land
@@ -1203,11 +1125,15 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
     let stop = Arc::new(AtomicBool::new(false));
     let (mut stdin_rx, stdin_thread) = spawn_raw_stdin_reader(Arc::clone(&stop));
     let mut stdout = std::io::stdout();
-    let mut last_size = crossterm::terminal::size().ok();
+    // Send the current size on entry too: the terminal may have changed
+    // while dependencies ran, after the connection's initial size was sent.
+    let mut last_size = None;
+    let mut resize_tick = tokio::time::interval(Duration::from_millis(300));
+    resize_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // The select below is restarted every 300 ms by its resize arm, so a
-    // per-read timeout would never fire; track the last frame heard instead
-    // (the worker pings even when the shell is quiet).
+    // Use a persistent timer: recreating a sleep after every output frame
+    // would starve resize checks while an interactive program keeps drawing.
+    // Track liveness separately because this timer wakes even without data.
     let mut last_heard = std::time::Instant::now();
     let mut worker_silent = false;
     let exit_code = loop {
@@ -1239,7 +1165,7 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
                     Some(Ok(_)) => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(300)) => {
+            _ = resize_tick.tick() => {
                 if last_heard.elapsed() > crate::worker_client::ws_silence_limit() {
                     worker_silent = true;
                     break TtyEnd::Disconnected;
@@ -1264,7 +1190,7 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
     // Waits for the thread to actually notice `stop` and revert stdin's
     // fd mode (`set_stdin_nonblocking(false)`) before this function
     // returns — skipping this (as an earlier version did) left a real
-    // race: the caller (`run_http_tty_handoff`) goes on to resume the
+    // race: the caller (`run_http_tty_attach_handoff`) goes on to resume the
     // ordinary crossterm reader thread almost immediately after this
     // returns, and if *this* thread hadn't actually finished exiting yet,
     // both threads could read real stdin for a brief window. Worse, on a
@@ -1283,10 +1209,10 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
     exit_code
 }
 
-/// The attach-mode counterpart to `bridge_http_tty` — no pre-tty transcript
+/// The attach-mode counterpart to `bridge_http_tty_with_chain_id` — no pre-tty transcript
 /// phase at all: a `worker_client::tty_attach` socket is already mid-
 /// session the instant it opens (see that function's own doc comment), so
-/// this goes straight to the same interactive byte relay `bridge_http_tty`
+/// this goes straight to the same interactive byte relay `bridge_http_tty_with_chain_id`
 /// itself hands off to once its own prelude reaches `TtyStart`.
 async fn bridge_http_tty_attach(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
     bridge_tty_pty_phase(socket).await

@@ -216,7 +216,7 @@ pub struct VarFormState {
 
 /// Set by `App::start_run_via_worker` when `GET /api/vars` finds something
 /// still unresolved — consumed by `submit_var_form` to resume into
-/// `begin_http_run`/`begin_http_tty_run` with the form's answers, instead
+/// `begin_http_run` with the form's answers, instead
 /// of `advance_run` (the local-mode resume path `configuring: false`
 /// already takes).
 pub struct PendingHttpRun {
@@ -226,9 +226,6 @@ pub struct PendingHttpRun {
     pub with_deps: bool,
     pub port: u16,
     pub force: Option<(String, String)>,
-    /// See `App::target_chain_has_tty` — which of `begin_http_run`/
-    /// `begin_http_tty_run` to resume into.
-    pub is_tty: bool,
 }
 
 /// Human-readable label for a dependency's own block — bare `block_name`
@@ -266,30 +263,11 @@ pub struct BlockPickerState {
     pub stats: bool,
 }
 
-/// An *already-connected* `/api/run/tty` socket (see
-/// `crate::worker_client::tty_connect`) waiting for `mod.rs`'s event loop to
-/// hand it the terminal. Connecting happens in `App::begin_http_tty_run` (an
-/// ordinary async call, no terminal access needed for that part — only the
-/// actual byte relay needs `mod.rs`'s raw-mode/alternate-screen control),
-/// so this just carries the live socket itself plus what the handoff needs
-/// to print/decide with: `block_name` for the "==> {block}" banner the
-/// handoff prints, `autoclose` mirroring the *last* tty block found in the
-/// chain scan (see `App::target_chain_tty_autoclose`).
-pub struct PendingHttpTty {
-    pub socket: crate::worker_client::TtySocket,
-    pub block_name: String,
-    pub autoclose: bool,
-}
-
-/// An `/api/run/tty/attach` socket (see `crate::worker_client::tty_attach`)
-/// waiting for `mod.rs`'s event loop to hand it the terminal — the "join a
-/// session I didn't start" counterpart to `PendingHttpTty`, from the `t`
-/// live-terminals view (`App::attach_selected_tty_session`). No
-/// `autoclose` field: an attach-only viewer has no chain of its own to
-/// skip back to (see `mod.rs`'s `run_http_tty_attach_handoff`).
+/// A viewer of one tty step, handed to the terminal by the event loop.
 pub struct PendingHttpTtyAttach {
     pub socket: crate::worker_client::TtySocket,
     pub block_name: String,
+    pub autoclose: bool,
 }
 
 /// The `t` live-terminals view — see `App::live_tty_sessions`,
@@ -496,10 +474,9 @@ pub struct ServiceConflictState {
     pub owner_pid: u32,
     pub owner_desc: String,
     /// Always `Some` in practice — every conflict comes from a
-    /// worker-routed run's `409` (`App::begin_http_run`/`begin_http_tty_run`)
-    /// now; `on_service_conflict_key`'s `y` branch retries via `POST
-    /// /api/run/force` (or, for a `tty` conflict, a direct kill-and-retry —
-    /// see its own doc comment).
+    /// worker-routed run's `409` (`App::begin_http_run`)
+    /// now; `on_service_conflict_key`'s `y` branch retries via the force
+    /// run endpoint.
     pub http_retry: Option<HttpRunRetry>,
 }
 
@@ -521,9 +498,6 @@ pub struct HttpRunRetry {
     pub port: u16,
     pub force_node_id: String,
     pub force_block: String,
-    /// See `App::target_chain_has_tty` — which of `begin_http_run`/
-    /// `begin_http_tty_run` to retry into.
-    pub is_tty: bool,
 }
 
 /// The `s` services list view — see `App::services_view`,
@@ -543,7 +517,6 @@ pub struct RunConfirmation {
     vars: HashMap<String, String>,
     save_secrets: std::collections::HashSet<String>,
     force: Option<(String, String)>,
-    tty: bool,
 }
 
 pub struct App {
@@ -759,7 +732,6 @@ pub struct App {
     /// very next frame, however far apart in real time two draws happen to
     /// land — see `mod.rs`'s own spinner-tick `select!` arm.
     pub spinner_tick: u32,
-    pub pending_http_tty: Option<PendingHttpTty>,
     /// See `PendingHttpTtyAttach`'s own doc comment.
     pub pending_http_tty_attach: Option<PendingHttpTtyAttach>,
     /// The `t` live-terminals view's own state — `None` when closed. Its
@@ -1387,7 +1359,6 @@ impl App {
             console_collapsed: true,
             console_last_activity: None,
             spinner_tick: 0,
-            pending_http_tty: None,
             pending_http_tty_attach: None,
             tty_sessions_view: None,
             history_view: None,
@@ -1710,29 +1681,16 @@ impl App {
                         return;
                     }
                     self.run_confirmation_approved = true;
-                    if pending.tty {
-                        Box::pin(self.begin_http_tty_run(
-                            pending.node_id,
-                            pending.block_name,
-                            pending.with_deps,
-                            pending.port,
-                            pending.vars,
-                            pending.save_secrets,
-                            pending.force,
-                        ))
-                        .await;
-                    } else {
-                        Box::pin(self.begin_http_run(
-                            pending.node_id,
-                            pending.block_name,
-                            pending.with_deps,
-                            pending.port,
-                            pending.vars,
-                            pending.save_secrets,
-                            pending.force,
-                        ))
-                        .await;
-                    }
+                    Box::pin(self.begin_http_run(
+                        pending.node_id,
+                        pending.block_name,
+                        pending.with_deps,
+                        pending.port,
+                        pending.vars,
+                        pending.save_secrets,
+                        pending.force,
+                    ))
+                    .await;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
                     self.status = "run cancelled".into();
@@ -5824,53 +5782,8 @@ impl App {
         chain
     }
 
-    /// Whether resolving `node_id`/`block_name`'s own chain (`deps=` if
-    /// `with_deps`, `from=` only otherwise — same choice `start_run_local`
-    /// makes) touches a `tty` block anywhere in it, not just at the target
-    /// itself — a `tty` block may be an explicit or implicit dependency of
-    /// any other block (`meshfox_core::deps`'s own module doc comment), so
-    /// this can't just check the target block alone. Mirrors
-    /// `crates/server/src/lib.rs`'s own `find_tty_block` exactly (same
-    /// "resolved canvas, scan each address's own node text" approach), just
-    /// against `display_canvas` locally instead of a request's own
-    /// resolved snapshot — decides whether `start_run_via_worker` routes
-    /// through `begin_http_run` (`POST /api/run`) or `begin_http_tty_run`
-    /// (`GET /api/run/tty`, the only one of the two the server actually
-    /// accepts a tty-touching chain on at all). Returns the *last* tty
-    /// block's own `autoclose` flag found while walking the chain (`None`
-    /// if none are `tty` at all) — a chain can touch more than one `tty`
-    /// step, and the last one is the one whose own flag actually governs
-    /// whether the handoff pauses at the end (see `PendingHttpTty::autoclose`).
-    fn target_chain_tty_autoclose(
-        &self,
-        node_id: &str,
-        block_name: &str,
-        with_deps: bool,
-    ) -> Option<bool> {
-        let target = BlockAddr::new(node_id.to_string(), block_name.to_string());
-        let chain_result = if with_deps {
-            meshfox_core::deps::resolve_chain(&self.display_canvas, target)
-        } else {
-            meshfox_core::deps::resolve_from_chain(&self.display_canvas, target)
-        };
-        let Ok(chain) = chain_result else { return None };
-        let mut autoclose = None;
-        for addr in &chain {
-            let Ok(block) = meshfox_core::deps::find_block(&self.display_canvas, addr) else {
-                continue;
-            };
-            if !block.tty {
-                continue;
-            }
-            autoclose = Some(block.autoclose);
-        }
-        autoclose
-    }
-
     /// Length of `node_id`/`block_name`'s own resolved chain (`deps=` if
-    /// `with_deps`, `from=` only otherwise) — same resolution
-    /// `target_chain_tty_autoclose` does, just counting steps instead of
-    /// scanning for `tty`. Used to decide whether starting this run should
+    /// `with_deps`, `from=` only otherwise). Used to decide whether a run should
     /// auto-open the console: a single-block run doesn't need it, only a
     /// multi-block chain does (see `begin_http_run`'s call site). Worker
     /// mode doesn't know its own chain length up front the way local mode's
@@ -5895,14 +5808,11 @@ impl App {
     /// chain, the same gate the web UI's own `handleRun` already runs
     /// before `executeRun`), opening the same `VarFormState` modal on
     /// anything still unresolved, then starts the run for real — through
-    /// `begin_http_tty_run` when `target_chain_tty_autoclose` finds a
-    /// `tty` block anywhere in the chain (the server's plain `/api/run`
-    /// rejects one outright, see its own `find_tty_block` check), through
-    /// `begin_http_run` otherwise. `force`, when given, names the address a
-    /// prior `LockConflict`/`TtyConnectError::Conflict` reported — see
+    /// the ordinary event stream for both plain and mixed chains.
+    /// `force` names the address a prior `LockConflict` reported — see
     /// `on_service_conflict_key`'s worker-routed branch — and skips the
     /// vars check entirely (already done on the first attempt); passed
-    /// straight through to whichever of the two this chain needs.
+    /// straight through to the run endpoint.
     async fn start_run_via_worker(
         &mut self,
         node_id: String,
@@ -5945,7 +5855,6 @@ impl App {
                             with_deps,
                             port,
                             force,
-                            is_tty: false,
                         });
                         self.var_form = Some(argument_form_from_statuses(prepared.fields));
                         return;
@@ -5960,9 +5869,6 @@ impl App {
                 }
             }
         }
-        let is_tty = self
-            .target_chain_tty_autoclose(&node_id, &block_name, with_deps)
-            .is_some();
         if force.is_none() {
             match crate::worker_client::get_vars(port, &path, &block_name, !with_deps).await {
                 Ok(statuses) => {
@@ -5975,7 +5881,6 @@ impl App {
                             with_deps,
                             port,
                             force,
-                            is_tty,
                         });
                         self.var_form = Some(var_form_from_statuses(missing));
                         return;
@@ -5987,135 +5892,16 @@ impl App {
                 }
             }
         }
-        if is_tty {
-            self.begin_http_tty_run(
-                node_id,
-                block_name,
-                with_deps,
-                port,
-                extra_vars,
-                std::collections::HashSet::new(),
-                force,
-            )
-            .await;
-        } else {
-            self.begin_http_run(
-                node_id,
-                block_name,
-                with_deps,
-                port,
-                extra_vars,
-                std::collections::HashSet::new(),
-                force,
-            )
-            .await;
-        }
-    }
-
-    /// Actually starts a worker-routed interactive run (`GET
-    /// /api/run/tty`) — connects the socket (an ordinary async call, no
-    /// terminal access needed yet) and parks it as `pending_http_tty` for
-    /// `mod.rs`'s event loop to actually hand the terminal to on its next
-    /// iteration (see `PendingHttpTty`'s own doc comment) — the
-    /// worker-routed counterpart to `advance_run`'s local `pending_tty`
-    /// branch. A `409` reuses the same `ServiceConflictState` modal
-    /// `begin_http_run`'s own conflict branch does, just with
-    /// `HttpRunRetry::is_tty` set so `on_service_conflict_key` retries the
-    /// right way (see `TtyConnectError::Conflict`'s own doc comment).
-    /// `force`, when given, names the address a prior conflict on this same
-    /// chain reported — mirrors `begin_http_run`'s own `force` parameter.
-    #[allow(clippy::too_many_arguments)]
-    async fn begin_http_tty_run(
-        &mut self,
-        node_id: String,
-        block_name: String,
-        with_deps: bool,
-        port: u16,
-        vars: HashMap<String, String>,
-        save_secrets: std::collections::HashSet<String>,
-        force: Option<(String, String)>,
-    ) {
-        let approved = std::mem::take(&mut self.run_confirmation_approved);
-        if !approved {
-            let path = self.path_to(&node_id);
-            match crate::worker_client::confirmation_blocks(port, &path, &block_name, !with_deps)
-                .await
-            {
-                Ok(blocks) if !blocks.is_empty() => {
-                    self.run_confirmation = Some(RunConfirmation {
-                        blocks,
-                        restart: false,
-                        node_id,
-                        block_name,
-                        with_deps,
-                        port,
-                        vars,
-                        save_secrets,
-                        force,
-                        tty: true,
-                    });
-                    return;
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    self.status = format!("confirmation check failed: {error}");
-                    return;
-                }
-            }
-        }
-        let path = self.path_to(&node_id);
-        let autoclose = self
-            .target_chain_tty_autoclose(&node_id, &block_name, with_deps)
-            .unwrap_or(false);
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        match crate::worker_client::tty_connect(
+        self.begin_http_run(
+            node_id,
+            block_name,
+            with_deps,
             port,
-            &path,
-            &block_name,
-            !with_deps,
-            false,
-            false,
-            vars,
-            save_secrets,
-            cols,
-            rows,
+            extra_vars,
+            std::collections::HashSet::new(),
             force,
-            approved,
         )
-        .await
-        {
-            Ok(socket) => {
-                self.status.clear();
-                self.pending_http_tty = Some(PendingHttpTty {
-                    socket,
-                    block_name,
-                    autoclose,
-                });
-            }
-            Err(crate::worker_client::TtyConnectError::Conflict(conflict)) => {
-                self.status = format!(
-                    "meshfox: {:?}/{:?} is locked by pid {} ({}) — y to kill and retry, n to cancel",
-                    conflict.node_id, conflict.block, conflict.owner_pid, conflict.owner_desc
-                );
-                self.service_conflict = Some(ServiceConflictState {
-                    block_name: conflict.block.clone(),
-                    owner_pid: conflict.owner_pid,
-                    owner_desc: conflict.owner_desc.clone(),
-                    http_retry: Some(HttpRunRetry {
-                        node_id,
-                        block_name,
-                        with_deps,
-                        port,
-                        force_node_id: conflict.node_id.clone(),
-                        force_block: conflict.block.clone(),
-                        is_tty: true,
-                    }),
-                });
-            }
-            Err(e) => {
-                self.status = format!("meshfox: failed to start interactive session: {e}");
-            }
-        }
+        .await;
     }
 
     /// Actually starts a worker-routed run (`POST /api/run`/`force`) and
@@ -6151,7 +5937,6 @@ impl App {
                         vars,
                         save_secrets,
                         force,
-                        tty: false,
                     });
                     return;
                 }
@@ -6221,7 +6006,6 @@ impl App {
                                 port,
                                 force_node_id: conflict_node,
                                 force_block: conflict_block,
-                                is_tty: false,
                             }),
                         });
                     }
@@ -6400,7 +6184,11 @@ impl App {
                 dest.push('\n');
                 touched = Some(addr);
             }
-            RunEvent::TtyStart { .. } => {}
+            RunEvent::TtyStart { node_id, block } => {
+                if let Some(port) = self.worker_port {
+                    self.attach_tty_session(port, node_id, block).await;
+                }
+            }
             RunEvent::ServiceStarted {
                 node_id: _,
                 block,
@@ -6784,26 +6572,6 @@ impl App {
             .await;
     }
 
-    /// Called by `mod.rs` once `bridge_http_tty`'s relay loop returns —
-    /// there's no `RunState`/chain `idx` to advance here at all: the
-    /// *entire* chain (deps and interactive step alike) already ran
-    /// server-side over the one `/api/run/tty` connection
-    /// `begin_http_tty_run` opened — see `PendingHttpTty`'s own doc
-    /// comment for why this never populates `self.run` in the first
-    /// place. Only draining `pending_autoruns` (same "one foreground run
-    /// slot" reasoning a chain-exhausted run has) carries over.
-    pub async fn resume_after_http_tty(&mut self, exit_code: i32) {
-        self.refresh_block_runs().await;
-        self.status = if exit_code == 0 {
-            "run finished".into()
-        } else {
-            "run finished with a failure".into()
-        };
-        if let Some(addr) = self.pending_autoruns.pop_front() {
-            Box::pin(self.start_run(addr.node_id, addr.block_name, true)).await;
-        }
-    }
-
     /// Whether the console (Output pane) still needs `mod.rs`'s periodic
     /// tick calling `console_tick` — i.e. it's expanded, and either
     /// something's running (so re-collapsing wouldn't be correct yet, but
@@ -7185,29 +6953,16 @@ impl App {
                     "killed pid {} — restarting {:?}",
                     conflict.owner_pid, conflict.block_name
                 );
-                if retry.is_tty {
-                    Box::pin(self.begin_http_tty_run(
-                        retry.node_id,
-                        retry.block_name,
-                        retry.with_deps,
-                        retry.port,
-                        HashMap::new(),
-                        std::collections::HashSet::new(),
-                        Some((retry.force_node_id, retry.force_block)),
-                    ))
-                    .await;
-                } else {
-                    Box::pin(self.begin_http_run(
-                        retry.node_id,
-                        retry.block_name,
-                        retry.with_deps,
-                        retry.port,
-                        HashMap::new(),
-                        std::collections::HashSet::new(),
-                        Some((retry.force_node_id, retry.force_block)),
-                    ))
-                    .await;
-                }
+                Box::pin(self.begin_http_run(
+                    retry.node_id,
+                    retry.block_name,
+                    retry.with_deps,
+                    retry.port,
+                    HashMap::new(),
+                    std::collections::HashSet::new(),
+                    Some((retry.force_node_id, retry.force_block)),
+                ))
+                .await;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.status = format!(
@@ -7331,7 +7086,6 @@ impl App {
                             vars: HashMap::new(),
                             save_secrets: Default::default(),
                             force: None,
-                            tty: false,
                         });
                         return;
                     }
@@ -7806,7 +7560,6 @@ impl App {
     /// `GET /api/runs`. The worker's `409` on a form's Send is the backstop.
     fn foreground_run_in_progress(&self) -> bool {
         self.spinner_active()
-            || self.pending_http_tty.is_some()
             || self.pending_http_tty_attach.is_some()
             || self
                 .block_runs
@@ -7815,7 +7568,7 @@ impl App {
     }
 
     /// `WatchEvent::TtyStarted`: a terminal session started in the worker
-    /// that this TUI didn't ask for (an `autorun` `tty` block after a
+    /// outside the foreground chain (an `autorun` `tty` block after a
     /// form's Send, or a manual run in another frontend) — hand the terminal
     /// to it, like picking it in the `t` live-terminals view, unless one is
     /// already being handed over. Skipped for a session that is no longer
@@ -7825,7 +7578,15 @@ impl App {
     /// would flash a dead screen.
     pub async fn on_tty_started(&mut self, node_id: String, block: String) {
         let Some(port) = self.worker_port else { return };
-        if self.pending_http_tty.is_some() || self.pending_http_tty_attach.is_some() {
+        // A foreground chain handles its own TtyStart events, including
+        // sessions that already finished by the time the event arrives.
+        // Ignore its duplicate watch announcements.
+        if self
+            .run
+            .as_ref()
+            .is_some_and(|run| !run.finished && run.http_rx.is_some())
+            || self.pending_http_tty_attach.is_some()
+        {
             return;
         }
         let running = crate::worker_client::list_active_runs(port)
@@ -7846,8 +7607,7 @@ impl App {
 
     /// Connects `worker_client::tty_attach` and parks the result as
     /// `pending_http_tty_attach` for `mod.rs`'s event loop to hand the
-    /// terminal to on its next iteration — the attach counterpart to
-    /// `begin_http_tty_run`. A session can finish (or simply stop existing
+    /// terminal to on its next iteration. A session can finish (or simply stop existing
     /// — killed by someone else, say) between this view listing it and the
     /// keypress that picks it, so a `404` here is a normal, unsurprising
     /// outcome, not a bug to alarm about.
@@ -7858,6 +7618,11 @@ impl App {
                 self.status.clear();
                 self.pending_http_tty_attach = Some(PendingHttpTtyAttach {
                     socket,
+                    autoclose: meshfox_core::deps::find_block(
+                        &self.display_canvas,
+                        &BlockAddr::new(node_id, block.clone()),
+                    )
+                    .is_ok_and(|block| block.autoclose),
                     block_name: block,
                 });
             }
@@ -8056,29 +7821,16 @@ impl App {
                 .filter(|(d, save)| d.secret && **save)
                 .map(|(d, _)| d.name.clone())
                 .collect();
-            if pending.is_tty {
-                self.begin_http_tty_run(
-                    pending.node_id,
-                    pending.block_name,
-                    pending.with_deps,
-                    pending.port,
-                    vars,
-                    save_secrets,
-                    pending.force,
-                )
-                .await;
-            } else {
-                self.begin_http_run(
-                    pending.node_id,
-                    pending.block_name,
-                    pending.with_deps,
-                    pending.port,
-                    vars,
-                    save_secrets,
-                    pending.force,
-                )
-                .await;
-            }
+            self.begin_http_run(
+                pending.node_id,
+                pending.block_name,
+                pending.with_deps,
+                pending.port,
+                vars,
+                save_secrets,
+                pending.force,
+            )
+            .await;
             return;
         }
         // Worker mode's own `c` flow — this only reaches here via
@@ -10446,7 +10198,7 @@ mod tests {
             }
         };
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(meshfox_server::serve_as_worker(
+        let mut worker = tokio::spawn(meshfox_server::serve_as_worker(
             canonical,
             0,
             false,
@@ -10455,9 +10207,120 @@ mod tests {
             guard,
             Some(ready_tx),
         ));
-        let port = ready_rx.await.unwrap();
+        let port = tokio::select! {
+            port = ready_rx => match port {
+                Ok(port) => port,
+                Err(_) => panic!("worker exited before readiness: {:?}", worker.await),
+            },
+            result = &mut worker => panic!("worker exited before readiness: {result:?}"),
+        };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(path, tx, None, Some(port)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn mixed_chain_hands_off_only_each_tty_step() {
+        use crate::worker_client::RunEvent;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let initial = app_with_blocks(
+            "mixed-tty",
+            concat!(
+                "```sh name=before\necho before\n```\n",
+                "<!-- meshfox:arg name=lang default=en -->\n",
+                "```sh name=first tty autoclose deps=before\necho ready; read answer\n```\n",
+                "```sh name=middle deps=\"first[lang=hy]\"\necho middle\n```\n",
+                "```sh name=second tty deps=middle\necho ready; read answer\n```\n",
+                "```sh name=after deps=second\necho after\n```\n",
+            ),
+        )
+        .await;
+        let path = initial.canvas_path.clone();
+        drop(initial);
+        let mut app = app_with_real_worker(path.clone()).await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            app.begin_http_run(
+                "root".into(),
+                "after".into(),
+                true,
+                app.worker_port.unwrap(),
+                HashMap::new(),
+                Default::default(),
+                None,
+            )
+            .await;
+            assert!(app.pending_http_tty_attach.is_none());
+            assert!(app.run.as_ref().expect(&app.status).http_rx.is_some());
+            let mut terminals = Vec::new();
+            while !app.run.as_ref().unwrap().finished {
+                let event = app
+                    .run
+                    .as_mut()
+                    .unwrap()
+                    .http_rx
+                    .as_mut()
+                    .unwrap()
+                    .recv()
+                    .await;
+                let tty = match &event {
+                    Some(RunEvent::TtyStart { node_id, block }) => {
+                        Some((node_id.clone(), block.clone()))
+                    }
+                    _ => None,
+                };
+                app.on_run_event(event).await;
+                if let Some((node_id, block)) = tty {
+                    let mut pending = app.pending_http_tty_attach.take().expect("tty step viewer");
+                    terminals.push((pending.block_name.clone(), pending.autoclose));
+                    // The watch announcement must not open a second viewer.
+                    app.on_tty_started(node_id, block).await;
+                    assert!(app.pending_http_tty_attach.is_none());
+                    let mut output = String::new();
+                    while !output.contains("ready") {
+                        if let Some(Ok(Message::Binary(bytes))) = pending.socket.next().await {
+                            output.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                    pending
+                        .socket
+                        .send(Message::Binary(b"ok\n".to_vec().into()))
+                        .await
+                        .unwrap();
+                    loop {
+                        if let Some(Ok(Message::Text(text))) = pending.socket.next().await {
+                            if matches!(
+                                serde_json::from_str::<RunEvent>(&text),
+                                Ok(RunEvent::Done { exit_code: 0 })
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                    pending.socket.close(None).await.unwrap();
+                } else {
+                    assert!(app.pending_http_tty_attach.is_none());
+                }
+            }
+            assert_eq!(
+                terminals,
+                [("first[lang=hy]".into(), true), ("second".into(), false)]
+            );
+            assert!(!app.run.as_ref().unwrap().had_failure);
+            for name in ["before", "middle", "after"] {
+                assert!(
+                    app.step_output
+                        .iter()
+                        .any(|(addr, output)| addr.block_name.starts_with(name)
+                            && output.text.contains(name)
+                            && !output.running),
+                    "missing ordinary output for {name}"
+                );
+            }
+        })
+        .await
+        .expect("mixed chain completed");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[tokio::test]
@@ -10931,27 +10794,6 @@ mod tests {
         assert!(form.arguments);
         assert_eq!(form.inputs, ["false", "en"]);
         assert!(form.save.iter().all(|save| !save));
-    }
-
-    #[tokio::test]
-    async fn parameterized_tty_targets_and_forwarded_dependencies_select_the_terminal() {
-        let app = app_with_blocks(
-            "arg-tty",
-            concat!(
-                "<!-- meshfox:arg name=\"lang\" type=\"select\" choices=\"en,hy\" -->\n",
-                "```bash name=\"extract\" tty autoclose\necho ok\n```\n",
-                "```button name=\"launch\" deps=\"extract[lang=hy]\"\nRun\n```\n",
-            ),
-        )
-        .await;
-        assert_eq!(
-            app.target_chain_tty_autoclose("root", "extract[lang=hy]", true),
-            Some(true)
-        );
-        assert_eq!(
-            app.target_chain_tty_autoclose("root", "launch", true),
-            Some(true)
-        );
     }
 
     fn document_text(app: &App) -> String {

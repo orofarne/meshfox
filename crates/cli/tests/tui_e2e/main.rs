@@ -50,3 +50,5 @@ mod starlark_render;
 mod table_view;
 
 mod terminal_status;
+
+mod tty;

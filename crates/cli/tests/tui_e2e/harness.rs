@@ -325,6 +325,22 @@ impl TuiSession {
         self.send_keys(&format!("\x1b[<{button};{};{}M", col + 1, row + 1));
     }
 
+    pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
+        self.parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
+        self._master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize terminal");
+    }
+
     /// The rendered screen as plain text (rows joined by `\n`, trailing
     /// blank cells on each row trimmed) — for `.contains()`-style
     /// assertions. Uses `vt100::Screen::contents`, which already does this
