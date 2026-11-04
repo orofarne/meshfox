@@ -79,7 +79,7 @@ const MIN_OUTPUT_HEIGHT: u16 = ui::MIN_OUTPUT_HEIGHT;
 
 /// A modal form for one or more declared variables at once — all of them
 /// visible and editable together (arrow keys move the focused field,
-/// Enter submits the whole form), same shape as the web UI's `VarsForm`,
+/// the bottom button submits the whole form), same shape as the web UI's `VarsForm`,
 /// rather than asking one at a time. Built either by `advance_run` (just
 /// whatever a run still needs) or by `trigger_configure` (every declared
 /// non-secret variable in the document).
@@ -123,11 +123,23 @@ pub struct LinkPickerState {
 }
 
 /// Edit even malformed pasted numbers so validation never traps the user.
+#[cfg(test)]
 fn edit_number(
     input: &mut String,
     cursor: &mut Option<(usize, usize)>,
     field: usize,
     key: KeyEvent,
+) -> bool {
+    edit_field(input, cursor, field, key, true)
+}
+
+/// Shared UTF-8 cursor editing for numeric and free-text form fields.
+fn edit_field(
+    input: &mut String,
+    cursor: &mut Option<(usize, usize)>,
+    field: usize,
+    key: KeyEvent,
+    numeric: bool,
 ) -> bool {
     let mut pos = cursor
         .filter(|(i, _)| *i == field)
@@ -160,7 +172,8 @@ fn edit_number(
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            if c.is_ascii_digit()
+            if !numeric
+                || c.is_ascii_digit()
                 || (matches!(c, '+' | '-') && pos == 0 && !input.starts_with(['+', '-']))
             {
                 input.insert(pos, c);
@@ -180,7 +193,7 @@ pub struct VarFormState {
     /// with `current_value` (so submitting untouched just confirms the
     /// suggestion).
     pub inputs: Vec<String>,
-    /// Numeric edit position: field index and UTF-8 byte offset; None means end.
+    /// Edit position: field index and UTF-8 byte offset; None means end.
     pub number_cursor: Option<(usize, usize)>,
     /// Parallel to `decls`/`inputs` — `Some` when the field's `inputs`
     /// entry was pre-filled from shared/global config (see
@@ -683,6 +696,7 @@ pub struct App {
     pub link_picker: Option<LinkPickerState>,
     run_confirmation_approved: bool,
     pub run: Option<RunState>,
+    pub(super) run_target: Option<BlockAddr>,
     /// Live per-step output from the most recent run, kept around after
     /// `RunState` moves past a step — see `StepOutput`'s own
     /// doc comment. Consulted by `render_current_document`/`markdown::render`
@@ -786,6 +800,7 @@ pub struct App {
     /// set by palette commands that create a node.
     select_after_reload: Option<String>,
     pub status: String,
+    pub(super) activity: super::terminal_status::PanelStatus,
     pub show_help: bool,
     /// How far the `?` help modal's own content is scrolled down — counts
     /// wrapped display rows (post word-wrap), same convention
@@ -959,7 +974,7 @@ pub struct InlineFormState {
     /// session) or else the same cache/shared/default fallback
     /// `initial_field_input` already gives `var_form`.
     pub inputs: Vec<String>,
-    /// Numeric edit position: field index and UTF-8 byte offset; None means end.
+    /// Edit position: field index and UTF-8 byte offset; None means end.
     pub number_cursor: Option<(usize, usize)>,
     /// Which field is focused — `fields.len()` (one past the last field)
     /// means the virtual "Send" row is focused instead of any real field.
@@ -1350,6 +1365,7 @@ impl App {
             link_picker: None,
             run_confirmation_approved: false,
             run: None,
+            run_target: None,
             step_output: HashMap::new(),
             child_steps: HashMap::new(),
             displayed_invocations: HashMap::new(),
@@ -1380,6 +1396,7 @@ impl App {
             select_picker: None,
             palette: None,
             select_after_reload: None,
+            activity: super::terminal_status::PanelStatus::default(),
             status: if let Some(warning) = theme_warning {
                 format!("theme: {warning}")
             } else if read_only {
@@ -1968,11 +1985,10 @@ impl App {
         }
     }
 
-    /// All of `var_form`'s fields at once — arrow keys/Tab move which one's
-    /// focused, and Enter submits the *whole* form regardless of which
-    /// field is focused (same as pressing Enter in an HTML text input
-    /// submits its enclosing `<form>`, which is what the web UI's own
-    /// `VarsForm` is). Editing a field is type-aware, same control each
+    /// Arrow keys/Tab move focus between the fields and bottom submit
+    /// button. Enter opens a select's choices or moves to the next control;
+    /// only activation of the submit button sends the whole form.
+    /// Editing a field is type-aware, same control each
     /// type gets in `VarsForm`/the CLI's own line prompt: `String` takes
     /// any text; `Int` only accepts digits (and a leading `-`) as they're
     /// typed, so the field can't even hold something
@@ -2080,8 +2096,14 @@ impl App {
         if let Some(form) = &mut self.var_form {
             let i = form.selected;
             if i < form.decls.len()
-                && form.decls[i].var_type == VarType::Int
-                && edit_number(&mut form.inputs[i], &mut form.number_cursor, i, key)
+                && !matches!(form.decls[i].var_type, VarType::Bool | VarType::Select)
+                && edit_field(
+                    &mut form.inputs[i],
+                    &mut form.number_cursor,
+                    i,
+                    key,
+                    form.decls[i].var_type == VarType::Int,
+                )
             {
                 self.render_current_document();
                 return;
@@ -2091,6 +2113,21 @@ impl App {
                 KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab
             ) {
                 form.number_cursor = None;
+            }
+        }
+        // The submit button is a separate focus stop after the last field.
+        if let Some(form) = &mut self.var_form {
+            if form.selected == form.decls.len() {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char(' ') => self.submit_var_form().await,
+                    KeyCode::Esc => self.cancel_var_form(),
+                    KeyCode::Up | KeyCode::BackTab => {
+                        form.selected = form.decls.len().saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Tab => form.selected = 0,
+                    _ => {}
+                }
+                return;
             }
         }
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
@@ -2104,16 +2141,21 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Enter => self.submit_var_form().await,
+            KeyCode::Enter => {
+                if let Some(vf) = &mut self.var_form {
+                    vf.selected += 1;
+                    vf.number_cursor = None;
+                }
+            }
             KeyCode::Esc => self.cancel_var_form(),
             KeyCode::Up | KeyCode::BackTab => {
                 if let Some(vf) = &mut self.var_form {
-                    vf.selected = vf.selected.checked_sub(1).unwrap_or(vf.decls.len() - 1);
+                    vf.selected = vf.selected.checked_sub(1).unwrap_or(vf.decls.len());
                 }
             }
             KeyCode::Down | KeyCode::Tab => {
                 if let Some(vf) = &mut self.var_form {
-                    vf.selected = (vf.selected + 1) % vf.decls.len();
+                    vf.selected = (vf.selected + 1) % (vf.decls.len() + 1);
                 }
             }
             KeyCode::Left => self.cycle_var_form_field(-1),
@@ -2352,8 +2394,14 @@ impl App {
         if let Some(form) = &mut self.active_inline_form {
             let i = form.selected;
             if i < form.decls.len()
-                && form.decls[i].var_type == VarType::Int
-                && edit_number(&mut form.inputs[i], &mut form.number_cursor, i, key)
+                && !matches!(form.decls[i].var_type, VarType::Bool | VarType::Select)
+                && edit_field(
+                    &mut form.inputs[i],
+                    &mut form.number_cursor,
+                    i,
+                    key,
+                    form.decls[i].var_type == VarType::Int,
+                )
             {
                 self.render_current_document();
                 return;
@@ -2369,6 +2417,7 @@ impl App {
             return;
         };
         let send_idx = form.fields.len();
+        let selected = form.selected;
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -2380,7 +2429,15 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Enter => self.submit_inline_form().await,
+            KeyCode::Enter if selected == send_idx => self.submit_inline_form().await,
+            KeyCode::Char(' ') if selected == send_idx => self.submit_inline_form().await,
+            KeyCode::Enter => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected += 1;
+                    form.number_cursor = None;
+                }
+                self.render_current_document();
+            }
             KeyCode::Esc => {
                 if let Some(form) = &mut self.active_inline_form {
                     form.editing = false;
@@ -3079,26 +3136,6 @@ impl App {
                     && meshfox_core::is_button(&b.lang)
             })
         })
-    }
-
-    pub(super) fn render_block_label(&self, addr: &BlockAddr) -> Option<String> {
-        let index = addr
-            .block_name
-            .strip_prefix("@render:")?
-            .parse::<usize>()
-            .ok()?;
-        let result = self
-            .display_canvas
-            .node(&addr.node_id)?
-            .render_results
-            .get(index)?;
-        Some(
-            result
-                .label
-                .strip_prefix(&format!("{}/", addr.node_id))
-                .unwrap_or(&result.label)
-                .to_owned(),
-        )
     }
 
     fn select_adjacent_block(&mut self, direction: i32) {
@@ -3942,6 +3979,7 @@ impl App {
                             if let Some(slot) = vf.inputs.get_mut(i) {
                                 *slot = path;
                             }
+                            vf.number_cursor = None;
                         }
                     }
                     PickerTarget::InlineForm(i) => {
@@ -3949,6 +3987,7 @@ impl App {
                             if let Some(slot) = form.inputs.get_mut(i) {
                                 *slot = path;
                             }
+                            form.number_cursor = None;
                         }
                         self.render_current_document();
                     }
@@ -4002,41 +4041,38 @@ impl App {
     /// would — everything else (including a click that lands outside the
     /// modal's own rect, on whatever pane is still visible behind it) is a
     /// no-op, since there's no pane underneath a modal to click through to.
-    /// `list_rect` mirrors exactly what `render_var_form`/
-    /// `render_block_picker` themselves compute (`ui::var_form_list_rect`/
-    /// `ui::block_picker_list_rect`), so a row's hit-test can never drift
-    /// from where it actually renders.
+    /// Form field rectangles and block picker rows share the renderer's
+    /// layout, including wrapped prompts and scroll offsets.
     async fn on_modal_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
         if let Some(vf) = &mut self.var_form {
-            let list_rect = ui::var_form_list_rect(area, vf.decls.len());
+            let layout = ui::var_form_layout(area, vf);
+            if point_in(layout.submit, mouse.column, mouse.row) {
+                vf.selected = vf.decls.len();
+                self.submit_var_form().await;
+                return;
+            }
             let mut browse = None;
             let mut select = None;
-            if mouse.column >= list_rect.x
-                && mouse.column < list_rect.right()
-                && mouse.row >= list_rect.y
-                && mouse.row < list_rect.y + list_rect.height
-            {
-                let idx = ui::var_form_offset(list_rect, vf.selected)
-                    + (mouse.row - list_rect.y) as usize / 2;
-                if idx < vf.decls.len() {
-                    vf.selected = idx;
-                    if vf.decls[idx].var_type == VarType::Select {
-                        select = Some(idx);
-                    }
-                    // The right-aligned "[Browse… ^o]" strip of a
-                    // `dir`/`file` row (see `render_var_form`).
-                    let marker = super::date_picker::marker_for(vf.decls[idx].var_type)
-                        .map_or(0, |m| m.chars().count() as u16);
-                    let on_marker = marker > 0
-                        && (mouse.row - list_rect.y) % 2 == 1
-                        && mouse.column + marker >= list_rect.x + list_rect.width
-                        && mouse.column < list_rect.x + list_rect.width;
-                    if on_marker {
-                        browse = Some(idx);
-                    }
+            if let Some((idx, _, value)) = layout.fields.iter().find(|(_, prompt, value)| {
+                point_in(*prompt, mouse.column, mouse.row)
+                    || point_in(*value, mouse.column, mouse.row)
+            }) {
+                let idx = *idx;
+                vf.selected = idx;
+                vf.number_cursor = None;
+                if vf.decls[idx].var_type == VarType::Select {
+                    select = Some(idx);
+                }
+                let marker = super::date_picker::marker_for(vf.decls[idx].var_type)
+                    .map_or(0, |m| m.chars().count() as u16);
+                if marker > 0
+                    && point_in(*value, mouse.column, mouse.row)
+                    && mouse.column + marker >= value.right()
+                {
+                    browse = Some(idx);
                 }
             }
             if let Some(idx) = select {
@@ -6010,6 +6046,7 @@ impl App {
                         });
                     }
                     first => {
+                        self.run_target = Some(BlockAddr::new(node_id, block_name));
                         self.run = Some(RunState {
                             chain: Vec::new(),
                             idx: 0,
@@ -6057,6 +6094,7 @@ impl App {
             // unexpectedly would already need.
             run.http_rx = None;
             run.finished = true;
+            run.had_failure = true;
             self.status = "meshfox: lost the worker's run stream".into();
             return;
         };
@@ -6706,7 +6744,12 @@ impl App {
     /// `console_pending_collapse`/`has_services` already follow for their
     /// own ticks.
     pub fn spinner_active(&self) -> bool {
-        self.run.as_ref().is_some_and(RunState::is_running) || !self.external_running.is_empty()
+        self.run.as_ref().is_some_and(RunState::is_running)
+            || !self.external_running.is_empty()
+            || matches!(
+                self.activity.state,
+                crate::terminal_status::State::Running(_)
+            )
     }
 
     /// Advances `spinner_tick` by one frame — see that field's own doc
@@ -9119,6 +9162,168 @@ mod tests {
         assert_eq!(app.var_form.as_ref().unwrap().inputs[0], "1059047");
     }
 
+    #[tokio::test]
+    async fn file_and_directory_fields_edit_at_the_cursor_in_both_forms() {
+        for kind in ["file", "dir"] {
+            let mut app = app_with_blocks("path-cursor", &format!(
+                "<!-- meshfox:var name=PATH_VALUE type={kind} session -->\n```form name=pick\nfield var=PATH_VALUE\n```\n"
+            )).await;
+            let mut form = app.try_build_inline_form("root", "pick").unwrap();
+            form.editing = true;
+            form.inputs[0] = "/tmp/видео.mp4".into();
+            let decl = form.decls[0].clone();
+            app.active_inline_form = Some(form);
+            let mut vf = var_form_from_statuses(Vec::new());
+            vf.decls = vec![decl];
+            vf.inputs = vec!["/tmp/видео.mp4".into()];
+            app.var_form = Some(vf);
+            let mut keys = vec![KeyCode::Home];
+            keys.extend(std::iter::repeat_n(KeyCode::Right, 5));
+            keys.extend([
+                KeyCode::Delete,
+                KeyCode::Char('В'),
+                KeyCode::End,
+                KeyCode::Left,
+                KeyCode::Backspace,
+                KeyCode::Char('k'),
+            ]);
+            for code in keys {
+                app.on_var_form_key(key(code)).await;
+                app.on_inline_form_key(key(code)).await;
+            }
+            assert_eq!(app.var_form.as_ref().unwrap().inputs[0], "/tmp/Видео.mk4");
+            assert_eq!(
+                app.active_inline_form.as_ref().unwrap().inputs[0],
+                "/tmp/Видео.mk4"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_mouse_selects_fields_after_wrapped_labels_and_scrolling() {
+        let mut app = app_with_blocks("configure-mouse-wrap", "").await;
+        let statuses = serde_json::from_value(serde_json::json!([
+            {"name":"A", "type":"string", "prompt":"A long label that wraps over several rows in a narrow form", "resolved":false},
+            {"name":"B", "type":"string", "prompt":"Another long label that wraps over several rows in a narrow form", "resolved":false},
+            {"name":"C", "type":"string", "prompt":"Last field", "resolved":false}
+        ])).unwrap();
+        app.var_form = Some(var_form_from_statuses(statuses));
+        let area = Rect::new(0, 0, 60, 18);
+        let layout = ui::var_form_layout(area, app.var_form.as_ref().unwrap());
+        let (_, _, value) = layout.fields.iter().find(|(i, _, _)| *i == 1).unwrap();
+        app.on_modal_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: value.x + 2,
+                row: value.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        assert_eq!(app.var_form.as_ref().unwrap().selected, 1);
+        app.on_var_form_key(key(KeyCode::Char('b'))).await;
+        assert_eq!(app.var_form.as_ref().unwrap().inputs[1], "b");
+        app.var_form.as_mut().unwrap().selected = 2;
+        let area = Rect::new(0, 0, 60, 10);
+        let layout = ui::var_form_layout(area, app.var_form.as_ref().unwrap());
+        let (idx, prompt, _) = layout.fields[0];
+        app.on_modal_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: prompt.x,
+                row: prompt.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        assert_eq!(app.var_form.as_ref().unwrap().selected, idx);
+    }
+
+    #[tokio::test]
+    async fn configure_submits_only_from_the_explicit_button() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for mouse in [false, true] {
+            let mut app = app_with_blocks("configure-button", "").await;
+            let statuses = serde_json::from_value(serde_json::json!([
+                {"name":"A", "type":"string", "prompt":"First", "value":"hello", "resolved":false},
+                {"name":"B", "type":"string", "prompt":"Second", "value":"world", "resolved":false}
+            ]))
+            .unwrap();
+            let mut vf = var_form_from_statuses(statuses);
+            vf.configuring = true;
+            app.var_form = Some(vf);
+            let (port, mut request) = stub_worker().await;
+            app.worker_port = Some(port);
+            app.on_var_form_key(key(KeyCode::Enter)).await;
+            assert_eq!(app.var_form.as_ref().unwrap().selected, 1);
+            app.on_var_form_key(key(KeyCode::Enter)).await;
+            assert_eq!(app.var_form.as_ref().unwrap().selected, 2);
+            assert!(
+                request.try_recv().is_err(),
+                "Enter in a field sent the form"
+            );
+            for code in [
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Delete,
+                KeyCode::Char('x'),
+            ] {
+                app.on_var_form_key(key(code)).await;
+            }
+            assert_eq!(app.var_form.as_ref().unwrap().inputs, ["hello", "world"]);
+            app.on_var_form_key(key(KeyCode::Up)).await;
+            assert_eq!(app.var_form.as_ref().unwrap().selected, 1);
+            app.on_var_form_key(key(KeyCode::Tab)).await;
+            assert_eq!(app.var_form.as_ref().unwrap().selected, 2);
+            if mouse {
+                app.var_form.as_mut().unwrap().selected = 0;
+                let area = Rect::new(0, 0, 80, 24);
+                let button = ui::var_form_layout(area, app.var_form.as_ref().unwrap()).submit;
+                app.on_modal_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: button.x + 2,
+                        row: button.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                )
+                .await;
+            } else {
+                app.on_var_form_key(key(KeyCode::Enter)).await;
+            }
+            assert!(app.var_form.is_none());
+            assert_eq!(request.await.unwrap(), "POST /api/vars/configure HTTP/1.1");
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_form_enter_moves_to_send_without_submitting_a_field() {
+        let mut app = app_with_blocks(
+            "inline-enter-button",
+            concat!(
+                "<!-- meshfox:var name=VALUE type=string session -->\n",
+                "```form name=pick\nfield var=VALUE\n```\n",
+            ),
+        )
+        .await;
+        let mut form = app.try_build_inline_form("root", "pick").unwrap();
+        form.editing = true;
+        form.inputs[0] = "answer".into();
+        app.active_inline_form = Some(form);
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().selected, 1);
+        assert!(app.active_inline_form.as_ref().unwrap().editing);
+        assert!(app.session_vars.is_empty());
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.session_vars.get("VALUE").map(String::as_str),
+            Some("answer")
+        );
+    }
+
     #[test]
     fn number_cursor_handles_unicode_and_field_changes() {
         let mut input = "1 234".to_string();
@@ -9341,6 +9546,119 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn activity_panel_uses_current_step_and_finishes_before_worker_snapshot_refresh() {
+        let mut app = app_with_blocks("activity-panel", "```sh name=dep\necho dep\n```\n").await;
+        let mut status = super::super::terminal_status::CanvasStatus::default();
+        status.update(&mut app);
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.run_target = Some(BlockAddr::new("root", "target"));
+        app.run = Some(RunState {
+            chain: vec![BlockAddr::new("root", "dep")],
+            idx: 0,
+            http_rx: Some(rx),
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        app.block_runs = Some(
+            ["dep", "target"]
+                .into_iter()
+                .map(|block| crate::worker_client::ActiveRunDto {
+                    history_id: None,
+                    node_id: "root".into(),
+                    block: block.into(),
+                    kind: "plain".into(),
+                    status: "running".into(),
+                    exit_code: None,
+                    uptime_ms: 0,
+                })
+                .collect(),
+        );
+        status.update(&mut app);
+        assert_eq!(
+            app.activity.state,
+            crate::terminal_status::State::Running("dep".into())
+        );
+        // A lost stream must be a failure, even while the last ledger snapshot
+        // still reports both the dependency and reserved target as running.
+        app.on_run_event(None).await;
+        status.update(&mut app);
+        assert_eq!(
+            app.activity.state,
+            crate::terminal_status::State::Failure("dep".into())
+        );
+        let elapsed = app.activity.elapsed;
+        status.update(&mut app);
+        assert_eq!(app.activity.elapsed, elapsed);
+    }
+
+    #[tokio::test]
+    async fn completed_ready_keeps_the_chain_result_when_step_history_catches_up() {
+        use crate::terminal_status::State;
+        let mut app = app_with_blocks("ready-status", "```sh name=edit\necho edit\n```\n").await;
+        let mut status = super::super::terminal_status::CanvasStatus::default();
+        status.update(&mut app);
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.run_target = Some(BlockAddr::new("root", "ready"));
+        app.run = Some(RunState {
+            chain: vec![BlockAddr::new("root", "edit")],
+            idx: 1,
+            http_rx: Some(rx),
+            lines: Vec::new(),
+            full_output: String::new(),
+            stdout_only: String::new(),
+            stderr_only: String::new(),
+            output_markdown: false,
+            step_started: std::time::Instant::now(),
+            had_failure: false,
+            killed: false,
+            finished: false,
+        });
+        let ledger = |block: &str, ms| crate::worker_client::ActiveRunDto {
+            history_id: Some(1),
+            node_id: "root".into(),
+            block: block.into(),
+            kind: "plain".into(),
+            status: "exited".into(),
+            exit_code: Some(0),
+            uptime_ms: ms,
+        };
+        status.update(&mut app);
+        // The target may be a button or a fresh/skipped block; its last
+        // executed dependency must not become the chain's result label.
+        app.on_run_event(Some(crate::worker_client::RunEvent::StepSkipped {
+            node_id: "root".into(),
+            block: "ready".into(),
+            output: String::new(),
+            duration_ms: 228,
+        }))
+        .await;
+        app.on_run_event(Some(crate::worker_client::RunEvent::Done { exit_code: 0 }))
+            .await;
+        // These addresses sort after the synthetic foreground result.
+        app.block_runs = Some(vec![ledger("edit", 53_600), ledger("ready", 228)]);
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Completed("ready".into()));
+        let elapsed = app.activity.elapsed;
+        assert!(elapsed.is_some());
+        // Passive replay/worker refresh supplies corrected per-step durations.
+        app.block_runs.as_mut().unwrap()[0].uptime_ms += 5;
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Completed("ready".into()));
+        assert_eq!(app.activity.elapsed, elapsed);
+        app.block_runs = None;
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Completed("ready".into()));
+        assert_eq!(app.activity.elapsed, elapsed);
     }
 
     #[tokio::test]

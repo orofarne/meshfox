@@ -3,7 +3,7 @@
 use super::app::App;
 use crate::terminal_status::State;
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Revision {
@@ -132,10 +132,27 @@ impl Snapshot {
                     snapshot.active.insert("foreground".into(), name.into());
                 }
             } else if run.finished {
+                // Foreground completion is authoritative; worker snapshots
+                // and passive subscriptions can lag behind the Done event.
+                for addr in run.chain.iter().chain(app.run_target.iter()) {
+                    let key = key(&addr.node_id, &addr.block_name);
+                    snapshot.active.remove(&key);
+                    // These are steps of the completed foreground chain,
+                    // not separate new results when the ledger catches up.
+                    snapshot.completed.remove(&key);
+                }
+                let result_name = if run.had_failure || run.killed {
+                    name
+                } else {
+                    app.run_target
+                        .as_ref()
+                        .map(|addr| addr.block_name.as_str())
+                        .unwrap_or(name)
+                };
                 snapshot.completed.insert(
                     "foreground".into(),
                     Completion {
-                        label: name.into(),
+                        label: result_name.into(),
                         failed: run.had_failure || run.killed,
                         revision: Revision::Local(run.step_started),
                     },
@@ -155,16 +172,82 @@ impl Snapshot {
     }
 }
 
+/// The visible status bar shares activity semantics with terminal integration.
+#[derive(Clone, Debug)]
+pub(super) struct PanelStatus {
+    pub state: State,
+    pub elapsed: Option<Duration>,
+}
+impl Default for PanelStatus {
+    fn default() -> Self {
+        Self {
+            state: State::Clear,
+            elapsed: None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct CanvasStatus {
     previous: Option<Snapshot>,
     result: Option<State>,
     batch_failure: Option<String>,
+    batch_started: Option<Instant>,
+    elapsed: Option<Duration>,
 }
 impl CanvasStatus {
-    pub fn update(&mut self, app: &App) {
+    pub fn update(&mut self, app: &mut App) {
+        let previous_result = self.result.clone();
         let state = self.observe(Snapshot::from_app(app));
-        crate::terminal_status::set(state);
+        if self.batch_started.is_none() && self.result != previous_result {
+            // An external run may finish entirely between two observations.
+            // Do not attribute the preceding run's elapsed time to it.
+            self.elapsed = None;
+        }
+        crate::terminal_status::set(state.clone());
+        let panel_state = if let Some(run) = app.run.as_ref().filter(|run| run.is_running()) {
+            let label = run
+                .current_addr()
+                .map(|addr| {
+                    app.child_steps
+                        .get(addr)
+                        .map(|child| format!("{} → {child}", addr.block_name))
+                        .unwrap_or_else(|| addr.block_name.clone())
+                })
+                .unwrap_or_else(|| "preparing".into());
+            State::Running(label)
+        } else if matches!(state, State::Ready(_)) {
+            self.result.clone().unwrap_or(state)
+        } else {
+            state
+        };
+        let now = Instant::now();
+        let elapsed = self.panel_elapsed(&panel_state, now);
+        let elapsed = if matches!(panel_state, State::Running(_)) {
+            app.run
+                .as_ref()
+                .filter(|run| run.is_running())
+                .map(|run| run.step_started.elapsed())
+                .or(elapsed)
+        } else {
+            elapsed
+        };
+        app.activity = PanelStatus {
+            state: panel_state,
+            elapsed,
+        };
+    }
+
+    fn panel_elapsed(&mut self, state: &State, now: Instant) -> Option<Duration> {
+        if matches!(state, State::Running(_)) {
+            let started = *self.batch_started.get_or_insert(now);
+            self.elapsed = Some(now.saturating_duration_since(started));
+        } else if !matches!(state, State::Waiting(_)) {
+            if let Some(started) = self.batch_started.take() {
+                self.elapsed = Some(now.saturating_duration_since(started));
+            }
+        }
+        self.elapsed
     }
 
     fn observe(&mut self, snapshot: Snapshot) -> State {
@@ -189,6 +272,13 @@ impl CanvasStatus {
                         .get_or_insert_with(|| completion.label.clone());
                 }
                 self.result = Some(State::Completed(completion.label.clone()));
+            }
+            // A newly completed foreground chain is the result of this
+            // invocation, regardless of the lexical order of step addresses.
+            if let Some(completion) = snapshot.completed.get("foreground") {
+                if previous.completed.get("foreground") != Some(completion) {
+                    self.result = Some(State::Completed(completion.label.clone()));
+                }
             }
         }
         let state = if let Some(waiting) = &snapshot.waiting {
@@ -236,6 +326,31 @@ mod tests {
             },
         );
     }
+    #[test]
+    fn panel_timer_freezes_on_completion_and_restarts_on_the_next_run() {
+        let mut status = CanvasStatus::default();
+        let start = Instant::now();
+        let running = State::Running("build".into());
+        assert_eq!(status.panel_elapsed(&running, start), Some(Duration::ZERO));
+        assert_eq!(
+            status.panel_elapsed(&running, start + Duration::from_secs(12)),
+            Some(Duration::from_secs(12))
+        );
+        let done = State::Completed("build".into());
+        assert_eq!(
+            status.panel_elapsed(&done, start + Duration::from_secs(15)),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            status.panel_elapsed(&done, start + Duration::from_secs(40)),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            status.panel_elapsed(&running, start + Duration::from_secs(50)),
+            Some(Duration::ZERO)
+        );
+    }
+
     #[test]
     fn parallel_failure_survives_later_success_and_navigation_until_next_run() {
         let mut status = CanvasStatus::default();

@@ -1738,70 +1738,68 @@ fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
+    use crate::terminal_status::State;
+    let (label, color) = match &app.activity.state {
+        State::Running(name) => (
+            format!("{} Running: {name}", spinner_frame(app.spinner_tick)),
+            super::theme::accent(),
+        ),
+        State::Waiting(name) => (format!("◉ Waiting: {name}"), super::theme::warn()),
+        State::Completed(name) => (format!("✓ Completed: {name}"), super::theme::ok()),
+        State::Failure(name) => (format!("✗ Failed: {name}"), super::theme::fail()),
+        State::Ready(count) => (
+            format!("Ready · {count} service(s) running"),
+            super::theme::ok(),
+        ),
+        State::Done => ("✓ Completed".into(), super::theme::ok()),
+        State::Failed => ("✗ Failed".into(), super::theme::fail()),
+        State::Clear => ("Ready".into(), super::theme::muted()),
+    };
+    let mut spans = vec![Span::styled(
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(elapsed) = app.activity.elapsed {
+        if matches!(
+            app.activity.state,
+            State::Running(_)
+                | State::Completed(_)
+                | State::Failure(_)
+                | State::Done
+                | State::Failed
+        ) {
+            spans.push(Span::styled(
+                format!(
+                    " · {}",
+                    meshfox_core::format_duration_ms(elapsed.as_millis() as u64)
+                ),
+                Style::default().fg(color),
+            ));
+        }
+    }
     if let Some(selection) = &app.text_selection {
         let mode = if selection.selecting {
             "SELECT"
         } else {
             "CURSOR"
         };
-        let hint = selection
-            .notice
-            .as_ref()
-            .map(|s| format!("{mode} · {s} · Space new selection · Esc exit"))
-            .unwrap_or_else(|| {
-                if selection.selecting {
-                    "SELECT · arrows extend · Space clear · y copy · Ctrl-p method · Esc exit"
-                        .into()
-                } else {
-                    "CURSOR · arrows/hjkl move · Space select · Shift+arrows select · Esc exit"
-                        .into()
-                }
-            });
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(super::theme::accent())),
-            area,
-        );
-        return;
+        spans.push(Span::styled(
+            format!("  ·  {mode}"),
+            Style::default().fg(super::theme::accent()),
+        ));
+        if let Some(notice) = &selection.notice {
+            spans.push(Span::raw(format!(" · {notice}")));
+        }
     }
-    let mut hint = String::from(
-        "tab tree/document · Ctrl-w console · f fullscreen focused pane · z collapse focused pane · j/k move/scroll · enter expand/follow link · h/l collapse/expand · r run · R run (no deps) · K kill · e edit · v select",
-    );
-    if app.focus == Focus::Document {
-        hint = if let Some(addr) = &app.selected_block {
-            if let Some(label) = app.render_block_label(addr) {
-                format!("render: {label} · [/] select · Enter/c source · Esc clear · j/k scroll · v select text · tab tree/document · Ctrl-w console")
-            } else if app.is_button_block(addr) {
-                format!("button: {} · Enter/r run chain · R run without deps · [/] select · Esc clear · tab tree/document · Ctrl-w console", addr.block_name)
-            } else {
-                format!("block: {} · [/] select · Enter fold · c code · r chain · R run · L history · Esc clear · j/k scroll · v select text · tab tree/document · Ctrl-w console", addr.block_name)
-            }
-        } else {
-            "[/] select block · r run · R run (no deps) · L history · j/k scroll · v select text · tab tree/document · Ctrl-w console".into()
-        };
-    }
-    if spatial::active_spatial_parent(app).is_some() {
-        hint.push_str(" · a all/selected arrows");
-    }
-    if app.selected_is_open_target() {
-        hint.push_str(" · o open");
-    }
-    if app.selected_is_table() && app.worker_port.is_some() {
-        hint.push_str(" · enter open table");
-    }
-    if app.has_configurable_vars()
-        && !(app.focus == Focus::Document && app.selected_block.is_some())
+    if !app.status.is_empty()
+        && !matches!(app.activity.state, State::Running(_) | State::Waiting(_))
+        && !matches!(
+            app.status.as_str(),
+            "run finished" | "run finished with a failure" | "run killed"
+        )
     {
-        hint.push_str(" · c configure");
+        spans.push(Span::raw(format!("  ·  {}", app.status)));
     }
-    if app.service_stats.is_some() {
-        hint.push_str(" · s services");
-    }
-    if app.worker_port.is_some() {
-        hint.push_str(" · t live terminals · H history · L run history");
-    }
-    hint.push_str(" · / search · ? help · q quit");
-
-    let mut spans = Vec::new();
     if let Some((total, failed)) = app.constraint_stats {
         let (text, color) = if failed > 0 {
             (
@@ -1809,44 +1807,26 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 super::theme::fail(),
             )
         } else {
-            (
-                format!(
-                    "all {total} constraint{} pass",
-                    if total == 1 { "" } else { "s" }
-                ),
-                super::theme::ok(),
-            )
+            (format!("{total} constraints pass"), super::theme::ok())
         };
-        spans.push(Span::styled(text, Style::default().fg(color)));
         spans.push(Span::styled(
-            "  ·  ",
-            Style::default().fg(super::theme::muted()),
+            format!("  ·  {text}"),
+            Style::default().fg(color),
         ));
     }
-    // **Experimental**, see SPEC.md's "Service blocks (experimental)" —
-    // recomputed by `App::tick_services`, not derived here (unlike
-    // `constraint_stats`, service status changes on its own schedule, not
-    // just on a document reload).
     if let Some((running, crashed)) = app.service_stats {
-        let (text, color) = if crashed > 0 {
-            (
-                format!("{crashed} service(s) crashed"),
-                super::theme::fail(),
-            )
-        } else {
-            (format!("{running} service(s) running"), super::theme::ok())
-        };
-        spans.push(Span::styled(text, Style::default().fg(color)));
-        spans.push(Span::styled(
-            "  ·  ",
-            Style::default().fg(super::theme::muted()),
-        ));
+        if crashed > 0 {
+            spans.push(Span::styled(
+                format!("  ·  {crashed} service(s) crashed"),
+                Style::default().fg(super::theme::fail()),
+            ));
+        } else if running > 0 && !matches!(app.activity.state, State::Ready(_)) {
+            spans.push(Span::styled(
+                format!("  ·  {running} service(s) running"),
+                Style::default().fg(super::theme::muted()),
+            ));
+        }
     }
-    spans.push(Span::styled(
-        hint,
-        Style::default().fg(super::theme::muted()),
-    ));
-
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1863,10 +1843,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-/// Every field in `vf` at once, one per row — arrow keys/Tab move which
-/// row is focused (highlighted), typing edits only that row's value, and
-/// Enter submits every row's current value together, same "whole form at
-/// once" shape as the web UI's `VarsForm` rather than one field at a time.
 /// Keeps a growing text field's own cursor on screen — `List`/`Line`
 /// (unlike edtui's own source editor, see `source_editor.rs`'s
 /// `prime_viewport`) never wrap or scroll on their own, so a value once it
@@ -1892,36 +1868,115 @@ fn tail_fit(s: &str, max: usize) -> String {
     format!("…{}", chars[start..].iter().collect::<String>())
 }
 
-/// The var form modal's own outer rect for `decl_count` fields in `area` —
-/// factored out of `render_var_form` so `var_form_list_rect` (below) can
-/// derive the same inner list rows rect from it without duplicating this
-/// sizing math.
-fn var_form_rect(area: Rect, decl_count: usize) -> Rect {
-    let height = (decl_count.saturating_mul(2).saturating_add(4)).min(area.height as usize) as u16;
-    centered_rect(64, height, area)
+/// Keep the editing cursor visible when moving through a long value.
+fn cursor_fit(value: &str, budget: usize, cursor: Option<usize>) -> String {
+    let Some(cursor) = cursor else {
+        return tail_fit(value, budget);
+    };
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= budget {
+        return value.to_string();
+    }
+    if budget <= 2 {
+        let start = cursor.min(chars.len().saturating_sub(budget));
+        return chars[start..(start + budget).min(chars.len())]
+            .iter()
+            .collect();
+    }
+    let content = budget - 2;
+    let start = cursor
+        .saturating_sub(content / 2)
+        .min(chars.len().saturating_sub(content));
+    let end = (start + content).min(chars.len());
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        chars[start..end].iter().collect::<String>(),
+        if end < chars.len() { "…" } else { "" }
+    )
 }
 
-/// The var form's own list rows rect for `decl_count` fields in `area` —
-/// shared by `render_var_form` and `App::on_mouse`'s modal hit-testing, so
-/// the two can never drift apart (same idea as `PaneLayout`/
-/// `compute_layout`).
-pub(super) fn var_form_list_rect(area: Rect, decl_count: usize) -> Rect {
-    let rect = var_form_rect(area, decl_count);
-    let inner = Block::default().borders(Borders::ALL).inner(rect);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    rows[0]
+pub(super) struct VarFormLayout {
+    pub outer: Rect,
+    pub footer: Rect,
+    pub submit: Rect,
+    pub fields: Vec<(usize, Rect, Rect)>,
 }
 
-/// Keep the selected two-line field visible and share the scroll offset with mouse input.
-pub(super) fn var_form_offset(rows: Rect, selected: usize) -> usize {
-    selected.saturating_sub((rows.height as usize / 2).max(1) - 1)
+/// Share wrapped field geometry with mouse input and keep the selected
+/// value visible, even when its description fills the available height.
+pub(super) fn var_form_layout(area: Rect, vf: &super::app::VarFormState) -> VarFormLayout {
+    let width = (area.width.saturating_sub(4)).min(100);
+    let prompt_width = width.saturating_sub(4).max(1);
+    let max_prompt = area.height.saturating_sub(11).max(1) as usize;
+    let heights: Vec<usize> = vf
+        .decls
+        .iter()
+        .map(|decl| {
+            Paragraph::new(decl.prompt.as_str())
+                .wrap(Wrap { trim: true })
+                .line_count(prompt_width)
+                .max(1)
+                .min(max_prompt)
+                + 2
+        })
+        .collect();
+    let height = (heights.iter().sum::<usize>() + 8).min(area.height as usize) as u16;
+    let outer = centered_rect(width, height, area);
+    let inner = Block::default().borders(Borders::ALL).inner(outer);
+    let footer = Rect::new(
+        inner.x + 1,
+        inner.bottom().saturating_sub(2),
+        inner.width.saturating_sub(2),
+        2.min(inner.height),
+    );
+    let list = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height.saturating_sub(6),
+    );
+    let button_label = if vf.configuring {
+        "[ Save configuration ]"
+    } else {
+        "[ Submit ]"
+    };
+    let submit = Rect::new(
+        list.x,
+        footer.y.saturating_sub(2),
+        (button_label.len() as u16).min(list.width),
+        1.min(inner.height),
+    );
+    let selected = vf.selected.min(heights.len().saturating_sub(1));
+    let mut offset = selected;
+    let mut used = heights.get(selected).copied().unwrap_or(0);
+    while offset > 0 && used + heights[offset - 1] <= list.height as usize {
+        offset -= 1;
+        used += heights[offset];
+    }
+    let mut y = list.y;
+    let mut fields = Vec::new();
+    for (i, &height) in heights.iter().enumerate().skip(offset) {
+        if y + 1 >= list.bottom() {
+            break;
+        }
+        let prompt_height = (height as u16 - 2).min(list.bottom() - y - 1);
+        let prompt = Rect::new(list.x, y, list.width, prompt_height);
+        let value = Rect::new(list.x, y + prompt_height, list.width, 1);
+        fields.push((i, prompt, value));
+        y = value.bottom().saturating_add(1);
+    }
+    VarFormLayout {
+        outer,
+        footer,
+        submit,
+        fields,
+    }
 }
 
 fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
-    let rect = var_form_rect(area, vf.decls.len());
+    let layout = var_form_layout(area, vf);
+    let rect = layout.outer;
     f.render_widget(Clear, rect);
     let title = if vf.arguments {
         " arguments for this application "
@@ -1934,183 +1989,212 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(super::theme::accent()))
         .title(title);
-    let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-
-    let items: Vec<ListItem> = vf
-        .decls
-        .iter()
-        .zip(vf.inputs.iter())
-        .zip(vf.origins.iter())
-        .enumerate()
-        .map(|(i, ((decl, input), origin))| {
-            let masked;
-            let shown: &str = if decl.secret {
-                masked = "*".repeat(input.chars().count());
-                &masked
-            } else {
-                input.as_str()
-            };
-            // `Bool`/`Select` are a left/right toggle/cycle, not free text
-            // (see `App::cycle_var_form_field`) — the `‹ ›` framing marks
-            // that visually, on every such row, not just the focused one,
-            // same way `VarsForm` renders them as a checkbox/dropdown
-            // rather than a text input. `String`/`Int` keep the plain
-            // text-cursor look, shown only on the focused row.
-            let value = match decl.var_type {
-                VarType::Bool => format!("‹ {shown} ›"),
-                VarType::Select => format!("[ {shown} ▾ ]"),
-                VarType::String
-                | VarType::Int
-                | VarType::Dir
-                | VarType::File
-                | VarType::Date
-                | VarType::DateTime => {
-                    if i == vf.selected {
-                        let mut value = shown.to_string();
-                        let mut pos = vf
-                            .number_cursor
-                            .filter(|(field, _)| *field == i)
-                            .map(|(_, p)| p)
-                            .unwrap_or(input.len())
-                            .min(input.len());
-                        while !input.is_char_boundary(pos) {
-                            pos -= 1;
-                        }
-                        if decl.secret {
-                            pos = input[..pos].chars().count();
-                        }
-                        value.insert(pos, '_');
-                        value
-                    } else {
-                        shown.to_string()
+    for &(i, prompt_rect, value_rect) in &layout.fields {
+        let decl = &vf.decls[i];
+        let input = &vf.inputs[i];
+        let origin = &vf.origins[i];
+        let masked;
+        let shown: &str = if decl.secret {
+            masked = "*".repeat(input.chars().count());
+            &masked
+        } else {
+            input.as_str()
+        };
+        // `Bool`/`Select` are a left/right toggle/cycle, not free text
+        // (see `App::cycle_var_form_field`) — the `‹ ›` framing marks
+        // that visually, on every such row, not just the focused one,
+        // same way `VarsForm` renders them as a checkbox/dropdown
+        // rather than a text input. `String`/`Int` keep the plain
+        // text-cursor look, shown only on the focused row.
+        let mut cursor_index = None;
+        let value = match decl.var_type {
+            VarType::Bool => format!("‹ {shown} ›"),
+            VarType::Select => format!("[ {shown} ▾ ]"),
+            VarType::String
+            | VarType::Int
+            | VarType::Dir
+            | VarType::File
+            | VarType::Date
+            | VarType::DateTime => {
+                if i == vf.selected {
+                    let mut value = shown.to_string();
+                    let mut pos = vf
+                        .number_cursor
+                        .filter(|(field, _)| *field == i)
+                        .map(|(_, p)| p)
+                        .unwrap_or(input.len())
+                        .min(input.len());
+                    while !input.is_char_boundary(pos) {
+                        pos -= 1;
                     }
+                    if decl.secret {
+                        pos = input[..pos].chars().count();
+                    }
+                    cursor_index = Some(value[..pos].chars().count());
+                    value.insert(pos, '_');
+                    value
+                } else {
+                    shown.to_string()
                 }
-            };
-            // `[shared]`/`[global]` when this field's value was inherited
-            // from a project-/global-config `[[env]]` section (see
-            // `meshfox_core::shared_env`) — the terminal counterpart to
-            // the web `VarsForm`'s "inherited" badge. Typing over the
-            // field just overrides it, same as any other answer.
-            let origin_tag = match origin {
-                Some(meshfox_core::SharedOrigin::Project) => " [shared]",
-                Some(meshfox_core::SharedOrigin::Global { .. }) => " [global]",
-                None => "",
-            };
-            // A `secret` field's "save" toggle (Ctrl-S), labelled by where
-            // it would go (`secret_store`), and — if the store couldn't be
-            // read — why the field is being asked for again.
-            let save_tag = if decl.secret && vf.configuring {
-                // Configure: typing a value saves it (empty leaves it
-                // alone), so there's no save toggle — just what's there.
-                let state = if vf.clear[i] {
-                    "[x] clear stored value"
-                } else if vf.stored[i] == Some(true) {
-                    "stored in keychain · ^d clear"
-                } else if origin.is_some() {
-                    "type to override"
-                } else {
-                    "not set"
-                };
-                format!(" ({state})")
-            } else if decl.secret {
-                let label = if vf.secret_store == "keychain" {
-                    "keychain"
-                } else {
-                    "plaintext"
-                };
-                format!(" [{}] save→{label}", if vf.save[i] { "x" } else { " " })
+            }
+        };
+        // `[shared]`/`[global]` when this field's value was inherited
+        // from a project-/global-config `[[env]]` section (see
+        // `meshfox_core::shared_env`) — the terminal counterpart to
+        // the web `VarsForm`'s "inherited" badge. Typing over the
+        // field just overrides it, same as any other answer.
+        let origin_tag = match origin {
+            Some(meshfox_core::SharedOrigin::Project) => " [shared]",
+            Some(meshfox_core::SharedOrigin::Global { .. }) => " [global]",
+            None => "",
+        };
+        // A `secret` field's "save" toggle (Ctrl-S), labelled by where
+        // it would go (`secret_store`), and — if the store couldn't be
+        // read — why the field is being asked for again.
+        let save_tag = if decl.secret && vf.configuring {
+            // Configure: typing a value saves it (empty leaves it
+            // alone), so there's no save toggle — just what's there.
+            let state = if vf.clear[i] {
+                "[x] clear stored value"
+            } else if vf.stored[i] == Some(true) {
+                "stored in keychain · ^d clear"
+            } else if origin.is_some() {
+                "type to override"
             } else {
-                String::new()
+                "not set"
             };
-            let error_tag = vf.errors[i]
-                .as_ref()
-                .map(|e| format!(" ⚠ {e}"))
-                .unwrap_or_default();
-            let prefix = "  ";
-            // A `dir`/`file` field ends in a right-aligned, clickable
-            // "[Browse… ^o]" (`App::on_modal_mouse` hit-tests the same
-            // `BROWSE_MARKER`-wide strip at the row's right edge).
-            let marker = super::date_picker::marker_for(decl.var_type);
-            let marker_chars = marker.map_or(0, |m| m.chars().count());
-            let browse_width = if marker.is_some() {
-                marker_chars + 2
+            format!(" ({state})")
+        } else if decl.secret {
+            let label = if vf.secret_store == "keychain" {
+                "keychain"
             } else {
-                0
+                "plaintext"
             };
-            let value_budget = (inner.width as usize).saturating_sub(
-                prefix.chars().count()
-                    + save_tag.chars().count()
-                    + error_tag.chars().count()
-                    + browse_width,
-            );
-            let value = tail_fit(&value, value_budget.max(8));
-            let mut spans = vec![
-                Span::raw(prefix),
-                Span::styled(value.clone(), Style::default().fg(super::theme::value())),
-                Span::styled(save_tag.clone(), Style::default().fg(super::theme::muted())),
-                Span::styled(
-                    error_tag.clone(),
-                    Style::default().fg(super::theme::error()),
-                ),
-            ];
-            if browse_width > 0 {
-                let used = prefix.chars().count()
-                    + value.chars().count()
-                    + save_tag.chars().count()
-                    + error_tag.chars().count();
-                let pad = (inner.width as usize).saturating_sub(used + marker_chars);
-                spans.push(Span::raw(" ".repeat(pad.max(2))));
-                spans.push(Span::styled(
-                    marker.unwrap_or_default(),
+            format!(" [{}] save→{label}", if vf.save[i] { "x" } else { " " })
+        } else {
+            String::new()
+        };
+        let error_tag = vf.errors[i]
+            .as_ref()
+            .map(|e| format!(" ⚠ {e}"))
+            .unwrap_or_default();
+        let prefix = "  ";
+        // A `dir`/`file` field ends in a right-aligned, clickable
+        // "[Browse… ^o]" (`App::on_modal_mouse` hit-tests the same
+        // `BROWSE_MARKER`-wide strip at the row's right edge).
+        let marker = super::date_picker::marker_for(decl.var_type);
+        let marker_chars = marker.map_or(0, |m| m.chars().count());
+        let browse_width = if marker.is_some() {
+            marker_chars + 2
+        } else {
+            0
+        };
+        let value_budget = (value_rect.width as usize).saturating_sub(
+            prefix.chars().count()
+                + save_tag.chars().count()
+                + error_tag.chars().count()
+                + browse_width,
+        );
+        let value = cursor_fit(&value, value_budget.max(1), cursor_index);
+        let mut spans = vec![
+            Span::raw(prefix),
+            Span::styled(value.clone(), Style::default().fg(super::theme::value())),
+            Span::styled(save_tag.clone(), Style::default().fg(super::theme::muted())),
+            Span::styled(
+                error_tag.clone(),
+                Style::default().fg(super::theme::error()),
+            ),
+        ];
+        if browse_width > 0 {
+            let used = prefix.chars().count()
+                + value.chars().count()
+                + save_tag.chars().count()
+                + error_tag.chars().count();
+            let pad = (value_rect.width as usize).saturating_sub(used + marker_chars);
+            spans.push(Span::raw(" ".repeat(pad.max(2))));
+            spans.push(Span::styled(
+                marker.unwrap_or_default(),
+                Style::default()
+                    .fg(super::theme::accent())
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ));
+        }
+        let selected = i == vf.selected;
+        let label = Paragraph::new(Line::from(vec![
+            Span::styled(
+                decl.prompt.clone(),
+                if selected {
                     Style::default()
                         .fg(super::theme::accent())
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ));
-            }
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::raw(decl.prompt.clone()),
-                    Span::styled(origin_tag, Style::default().fg(super::theme::muted())),
-                ]),
-                Line::from(spans),
-            ])
-        })
-        .collect();
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(origin_tag, Style::default().fg(super::theme::muted())),
+        ]))
+        .wrap(Wrap { trim: true });
+        f.render_widget(label, prompt_rect);
+        let value_style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(value_style),
+            value_rect,
+        );
+    }
 
-    let mut state = ListState::default();
-    state.select(Some(vf.selected));
-    *state.offset_mut() = var_form_offset(rows[0], vf.selected);
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    f.render_stateful_widget(list, rows[0], &mut state);
-
-    let esc_hint = if vf.configuring {
-        "↑/↓/tab field · ←/→ toggle/cycle · ^d clear secret · enter save all · esc cancel configure"
+    let button_focused = vf.selected == vf.decls.len();
+    let button_label = if vf.configuring {
+        "[ Save configuration ]"
     } else {
-        "↑/↓/tab field · ←/→ toggle/cycle · ^s save secret · enter confirm all · esc cancel run"
+        "[ Submit ]"
     };
-    let esc_hint = match vf.decls.get(vf.selected).map(|d| d.var_type) {
-        Some(VarType::Select) => {
-            format!("enter/space choices · ctrl-enter submit all · {esc_hint}")
-        }
-        Some(VarType::Dir | VarType::File) => format!("^o browse · {esc_hint}"),
-        Some(VarType::Date) => format!("YYYY-MM-DD · ^o calendar · {esc_hint}"),
-        Some(VarType::DateTime) => {
-            format!("YYYY-MM-DD HH:MM[:SS][±HH:MM] · ^o calendar · {esc_hint}")
-        }
-        _ => esc_hint.to_string(),
-    };
+    let mut button_style = Style::default()
+        .fg(super::theme::accent())
+        .add_modifier(Modifier::BOLD);
+    if button_focused {
+        button_style = button_style.add_modifier(Modifier::REVERSED);
+    }
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            esc_hint,
-            Style::default().fg(super::theme::muted()),
-        ))),
-        rows[1],
+        Paragraph::new(button_label).style(button_style),
+        layout.submit,
+    );
+    let hint = match vf.decls.get(vf.selected).map(|d| d.var_type) {
+        Some(VarType::Select) => "Enter/Space choices",
+        Some(VarType::Bool) => "←/→ toggle",
+        Some(VarType::File | VarType::Dir) => "←/→ cursor · Home/End · Ctrl-O browse",
+        Some(VarType::Date | VarType::DateTime) => "←/→ cursor · Ctrl-O calendar",
+        None => "Enter/Space activate button",
+        _ => "←/→ cursor · Home/End · Delete",
+    };
+    let secret_hint = vf
+        .decls
+        .get(vf.selected)
+        .filter(|d| d.secret)
+        .map(|_| {
+            if vf.configuring {
+                " · Ctrl-D clear secret"
+            } else {
+                " · Ctrl-S save secret"
+            }
+        })
+        .unwrap_or("");
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "↑/↓/Tab navigate · Esc cancel · {}/{}",
+                (vf.selected + 1).min(vf.decls.len()),
+                vf.decls.len()
+            )),
+            Line::from(format!("{hint}{secret_hint}")),
+        ])
+        .style(Style::default().fg(super::theme::muted())),
+        layout.footer,
     );
 }
 
@@ -2508,7 +2592,7 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
 }
 
 /// The block picker modal's own outer rect for `block_count` blocks in
-/// `area` — see `var_form_rect`'s own doc comment for why this is factored
+/// `area` — shared by rendering and mouse input, so this is factored
 /// out the same way.
 fn block_picker_rect(area: Rect, block_count: usize) -> Rect {
     let height = (block_count as u16 + 4).min(area.height);
@@ -2516,7 +2600,7 @@ fn block_picker_rect(area: Rect, block_count: usize) -> Rect {
 }
 
 /// The block picker's own list rect for `block_count` blocks in `area` —
-/// see `var_form_list_rect`'s own doc comment; same sharing reasoning.
+/// shared by rendering and mouse input.
 pub(super) fn block_picker_list_rect(area: Rect, block_count: usize) -> Rect {
     let rect = block_picker_rect(area, block_count);
     Block::default().borders(Borders::ALL).inner(rect)
@@ -3166,8 +3250,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "                (unavailable on a read-only canvas, like H below)",
         "i               (Document focus) open/focus this node's own form —",
         "                tab/down next field, shift-tab/up previous, left/right",
-        "                toggle bool/cycle select · enter/space opens select · ctrl-enter sends",
-        "                form · enter on Send submits · esc stops editing",
+        "                toggle bool/cycle select · enter/space opens select",
+        "                form · tab to Send, enter submits · esc stops editing",
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
@@ -4371,6 +4455,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_panel_replaces_shortcuts_and_survives_console_and_fullscreen_changes() {
+        use crate::terminal_status::State;
+        use std::time::Duration;
+        let mut app = test_app().await;
+        app.activity.state = State::Running("translate".into());
+        app.activity.elapsed = Some(Duration::from_secs(12));
+        for fullscreen in [None, Some(Focus::Document), Some(Focus::Output)] {
+            app.fullscreen = fullscreen;
+            for collapsed in [false, true] {
+                app.console_collapsed = collapsed;
+                let area = Rect::new(0, 0, 90, 25);
+                let screen = render_to_screen(area, |f| render_screen(f, &mut app));
+                let footer = screen.lines().last().unwrap();
+                assert!(footer.contains("Running: translate"), "{screen}");
+                assert!(footer.contains("12.0s"), "{screen}");
+                assert!(!footer.contains("Ctrl-w"));
+                assert!(!footer.contains("r run"));
+            }
+        }
+        app.activity.state = State::Completed("render".into());
+        app.activity.elapsed = Some(Duration::from_secs(38));
+        let area = Rect::new(0, 0, 90, 1);
+        let screen = render_to_screen(area, |f| render_footer(f, area, &app));
+        assert!(screen.contains("✓ Completed: render"), "{screen}");
+        app.activity.state = State::Failure("translate".into());
+        let screen = render_to_screen(area, |f| render_footer(f, area, &app));
+        assert!(screen.contains("✗ Failed: translate"), "{screen}");
+        app.activity.state = State::Clear;
+        app.status = "meshfox: permission denied".into();
+        let screen = render_to_screen(area, |f| render_footer(f, area, &app));
+        assert!(screen.contains("permission denied"), "{screen}");
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn canvas_search_counts_zero_and_all_occurrences_in_footer() {
         let mut app = test_app().await;
         app.search.open = true;
@@ -4913,6 +5032,47 @@ mod tests {
             rv.list_rect.get().width > 0,
             "list position recorded for mouse hit-testing"
         );
+    }
+
+    #[tokio::test]
+    async fn configure_wraps_labels_and_keeps_value_and_mouse_geometry_visible() {
+        let statuses = serde_json::from_value(serde_json::json!([
+            {"name":"VIDEO", "type":"file", "prompt":"Choose the input video with the original spoken language and subtitle track", "resolved":false, "value":"/tmp/input.mp4"},
+            {"name":"OUTPUT", "type":"file", "prompt":"Where to write the finished video with burned-in subtitles", "resolved":false, "value":"/tmp/output.mp4"},
+            {"name":"FONT", "type":"string", "prompt":"Subtitle font", "resolved":false, "value":"Helvetica"}
+        ])).unwrap();
+        let mut vf = super::super::app::var_form_from_statuses_for_test(statuses);
+        vf.configuring = true;
+        for width in [60, 90, 130] {
+            let area = Rect::new(0, 0, width, 24);
+            let layout = var_form_layout(area, &vf);
+            assert_eq!(layout.fields[0].0, 0);
+            if width == 60 {
+                assert!(layout.fields[0].1.height > 1);
+            }
+            let screen = render_to_screen(area, |f| render_var_form(f, area, &vf));
+            assert!(screen.contains("subtitle track"), "{screen}");
+            assert!(screen.contains("/tmp/input.mp4_"), "{screen}");
+            assert!(screen.contains("Browse"), "{screen}");
+            assert!(screen.contains("Helvetica"), "{screen}");
+            assert!(screen.contains("[ Save configuration ]"), "{screen}");
+        }
+        vf.selected = 2;
+        let area = Rect::new(0, 0, 60, 12);
+        let layout = var_form_layout(area, &vf);
+        let (_, _, value) = layout.fields.iter().find(|(i, _, _)| *i == 2).unwrap();
+        assert!(value.bottom() < layout.footer.y);
+        let screen = render_to_screen(area, |f| render_var_form(f, area, &vf));
+        assert!(screen.contains("Helvetica_"), "{screen}");
+    }
+
+    #[test]
+    fn long_path_view_follows_cursor_instead_of_only_showing_the_tail() {
+        let value = format!("/tmp/_{}", "long-path".repeat(10));
+        let shown = cursor_fit(&value, 20, Some(5));
+        assert!(shown.contains("/tmp/_"), "{shown}");
+        assert!(shown.ends_with('…'));
+        assert!(shown.chars().count() <= 20);
     }
 
     #[tokio::test]
