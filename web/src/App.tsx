@@ -74,6 +74,7 @@ import { computeAutoLayout, FOLDED_HEIGHT, type LayoutBox } from "./autolayout";
 import { buildBlockGraph, resolveChain, type BlockAddr } from "./deps";
 import { parseVarDecls } from "./vars";
 import { parseBody, type CodeSegment } from "./fence";
+import { CanvasDocumentView } from "./CanvasDocumentView";
 import { FileRefreshContext, ForegroundRunContext, MeshNode, NodeDocumentView, resolveNodeColor, type MeshNodeData, type LiveBlockState } from "./MeshNode";
 import { VarsForm } from "./VarsForm";
 import { RunConfirmDialog } from "./RunConfirmDialog";
@@ -353,19 +354,22 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-/** Which of the canvas area's three views is showing: the source editor, a single node as a page, or the graph. */
+/** Which of the canvas area's four views is showing: the source editor, the whole canvas as a flat page, a single node as a page, or the graph. */
 function CanvasView({
   sourceMode,
+  documentList,
   documentNode,
   source,
   flow,
 }: Readonly<{
   sourceMode: boolean;
+  documentList: ReactNode;
   documentNode: { id: string; data: MeshNodeData } | undefined;
   source: ReactNode;
   flow: ReactNode;
 }>) {
   if (sourceMode) return source;
+  if (documentList) return documentList;
   if (documentNode) return <NodeDocumentView nodeId={documentNode.id} data={documentNode.data} />;
   return flow;
 }
@@ -486,6 +490,12 @@ export default function App() {
   // Count document nodes, never the folded/filtered render list.
   const documentNodeId = !editMode && canvas?.nodes.length === 1 && !canvas.nodes[0].parent
     ? canvas.nodes[0].id : null;
+  // The toolbar's "Document" toggle: the whole canvas as one flat, read-only
+  // page with edges as text links (see CanvasDocumentView). Never combined
+  // with Edit — clicking Edit shows the graph — and a single-node canvas is
+  // already shown as a page.
+  const [documentMode, setDocumentMode] = useState(false);
+  const canvasDocumentMode = documentMode && !editMode && !documentNodeId;
   // The worker serves this canvas read-only for good (it or its directory
   // isn't writable) — as opposed to `!editMode`, which is only "not yet
   // clicked Edit". Hides the Edit button; the worker refuses edits anyway.
@@ -3365,6 +3375,7 @@ export default function App() {
       // focuses an input (e.g. a plain confirm dialog).
       if (
         sourceMode ||
+        canvasDocumentMode ||
         settingsNodeId ||
         ttySession ||
         varsModal ||
@@ -3497,6 +3508,7 @@ export default function App() {
     handleRedo,
     editMode,
     documentNodeId,
+    canvasDocumentMode,
   ]);
   // Trimmed once here, not read fresh off `searchQuery` state inside the
   // map below — `useMemo`'s own dependency array needs a primitive it can
@@ -3980,6 +3992,19 @@ export default function App() {
           </span>
         )}
         {!editMode && !workerReadOnly && <button onClick={() => setEditMode(true)}>Edit</button>}
+        {!editMode && !documentNodeId && (
+          <button
+            className={documentMode ? "deps-toggle deps-toggle-active" : "deps-toggle"}
+            onClick={() => {
+              if (!documentMode) closeSearch();
+              setDocumentMode((d) => !d);
+            }}
+            aria-pressed={documentMode}
+            title="Read the whole canvas as one flat document, with connections as links instead of arrows"
+          >
+            {documentMode ? "Canvas" : "Document"}
+          </button>
+        )}
         {hasConfigurableVars && !workerNoExec && !workerReadOnly && (
           <button
             className="deps-toggle"
@@ -4001,11 +4026,13 @@ export default function App() {
         <button
           className={searchOpen ? "deps-toggle deps-toggle-active" : "deps-toggle"}
           onClick={() => (searchOpen ? closeSearch() : openSearch())}
-          disabled={sourceMode}
+          disabled={sourceMode || canvasDocumentMode}
           title={
             sourceMode
               ? "Source mode has its own search (the editor's own Ctrl/Cmd-F)"
-              : "Search every node's title/body (or press /)"
+              : canvasDocumentMode
+                ? "Document mode is a plain page — use the browser's own find (Ctrl/Cmd-F)"
+                : "Search every node's title/body (or press /)"
           }
         >
           🔍 search
@@ -4024,6 +4051,9 @@ export default function App() {
     [
       editMode,
       sourceMode,
+      documentMode,
+      documentNodeId,
+      canvasDocumentMode,
       sourceDirty,
       dirty,
       error,
@@ -4083,6 +4113,11 @@ export default function App() {
         <CanvasView
           sourceMode={sourceMode}
           documentNode={documentNode}
+          documentList={
+            canvasDocumentMode && canvas ? (
+              <CanvasDocumentView canvasNodes={canvas.nodes} dataById={new Map(nodes.map((n) => [n.id, n.data]))} />
+            ) : null
+          }
           source={
             <CanvasSourceEditor
               initialInclude={sourceInitialInclude}

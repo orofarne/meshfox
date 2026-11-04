@@ -384,6 +384,52 @@ a {
   height: min(65vh, 640px);
 }
 
+/* The whole-canvas document view (CanvasDocumentView). */
+.mesh-doc-toc ul,
+.mesh-doc-links ul {
+  margin: 0.25rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.mesh-doc-toc {
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border, currentColor);
+}
+
+.mesh-doc-toc ul {
+  list-style: none;
+  padding-left: 0;
+}
+
+.mesh-doc-section {
+  margin-bottom: 2.5rem;
+}
+
+.mesh-doc-section > :is(h1, h2, h3, h4, h5, h6) {
+  margin: 0 0 0.75rem;
+  line-height: 1.2;
+}
+
+.mesh-doc-section > .mesh-node-body {
+  padding: 0;
+  overflow: visible;
+  line-height: 1.65;
+}
+
+.mesh-doc-section > .mesh-table {
+  height: min(65vh, 640px);
+}
+
+.mesh-doc-links {
+  margin-top: 0.75rem;
+}
+
+.mesh-doc-section :focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
 /* Shared search overlay for the canvas and single-node document. */
 .search-bar {
   position: absolute;
