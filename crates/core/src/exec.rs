@@ -193,14 +193,49 @@ pub fn script_file(
 /// place a block's code becomes a file for an `interpreter=`, shared by the
 /// captured (`stream_exec`) and `tty` spawn paths. The caller removes it once
 /// the child has exited.
+///
+/// The name is guessable (pid and a counter) and the temp dir may be shared
+/// with other users, so the file is created exclusively: a path somebody
+/// already put there — a file, or a symlink to one of ours — is skipped, never
+/// written through or run.
 pub fn write_script_file(code: &str, lang: Option<&str>) -> io::Result<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "meshfox-{}.{}",
-        uuid_like_suffix(),
-        script_extension(lang)
-    ));
-    std::fs::write(&path, code)?;
+    use std::io::Write;
+    let ext = script_extension(lang);
+    let (path, mut file) = create_exclusive(|| {
+        std::env::temp_dir().join(format!("meshfox-{}.{ext}", uuid_like_suffix()))
+    })?;
+    if let Err(e) = file.write_all(code.as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     Ok(path)
+}
+
+/// Creates a file that did not exist (`O_CREAT | O_EXCL`: a symlink in the
+/// way counts as existing and is not followed) at the first name `next`
+/// offers that is free, and returns it open for writing. Callers whose names
+/// are guessable and live in a directory others can write to use this instead
+/// of `std::fs::write`, which would write through a planted symlink or into a
+/// file another user owns.
+pub(crate) fn create_exclusive(
+    mut next: impl FnMut() -> std::path::PathBuf,
+) -> io::Result<(std::path::PathBuf, std::fs::File)> {
+    for _ in 0..32 {
+        let path = next();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary file name",
+    ))
 }
 
 /// A short, unique-enough suffix for a temp filename without pulling in a
@@ -424,19 +459,77 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn create_exclusive_skips_taken_names_and_never_writes_through_a_symlink() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("meshfox-excl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let link = dir.join("a");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let dangling = dir.join("b");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &dangling).unwrap();
+        let taken = dir.join("c");
+        std::fs::write(&taken, "theirs").unwrap();
+        let free = dir.join("d");
+
+        let mut names = vec![link, dangling, taken.clone(), free.clone()].into_iter();
+        let (path, mut file) = create_exclusive(|| names.next().unwrap()).unwrap();
+        file.write_all(b"mine").unwrap();
+        drop(file);
+
+        assert_eq!(path, free);
+        assert_eq!(std::fs::read_to_string(&free).unwrap(), "mine");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "theirs");
+        assert!(
+            !dir.join("nowhere").exists(),
+            "a dangling link is not followed"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn create_exclusive_gives_up_when_every_name_is_taken() {
+        let dir = std::env::temp_dir().join(format!("meshfox-excl-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let taken = dir.join("only");
+        std::fs::write(&taken, "x").unwrap();
+        let err = create_exclusive(|| taken.clone()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_script_file_writes_the_code_to_a_new_file_each_time() {
+        let a = write_script_file("one", Some("python")).unwrap();
+        let b = write_script_file("two", Some("python")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.extension().and_then(|e| e.to_str()), Some("py"));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "two");
+        std::fs::remove_file(a).unwrap();
+        std::fs::remove_file(b).unwrap();
+    }
+
+    #[test]
     fn resolve_command_rejects_a_malformed_interpreter() {
         assert!(resolve_command("code", Some(r#"unterminated ""#), None, None, None, &[]).is_err());
     }
 
     #[test]
-    fn resolve_command_resolves_an_at_builtin_interpreter_to_its_materialized_script() {
+    fn resolve_command_resolves_an_at_builtin_interpreter_to_bash_running_its_script() {
         let resolved = resolve_command("a prompt", Some("@agent"), None, None, None, &[]).unwrap();
-        assert!(
-            resolved.program.ends_with(".sh"),
-            "program: {}",
-            resolved.program
-        );
-        assert!(std::path::Path::new(&resolved.program).exists());
+        assert_eq!(resolved.program, "bash");
+        // `bash -c <script> agent <the fence body's file>`: nothing written
+        // for the script itself, and the body's file is the last argument.
+        assert_eq!(resolved.args[0], "-c");
+        assert!(resolved.args[1].contains("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER"));
+        assert_eq!(resolved.args[2], "agent");
+        assert_eq!(resolved.args.len(), 4);
         // No canvas_path given -> no MESHFOX_VENV_DIR, but @agent never
         // sets that anyway (only @python_venv does) — this just confirms
         // resolve_command's own config-env plumbing ran at all, same as

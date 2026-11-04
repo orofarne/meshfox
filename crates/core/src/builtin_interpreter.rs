@@ -1,11 +1,12 @@
 //! `@name` interpreters — a small, fixed set of macro scripts meshfox
 //! embeds in its own binary. `interpreter="@agent"` (or `"@python_venv"`)
-//! resolves, via `resolve_builtin_spec`, to a real on-disk script path
-//! *before* `crate::exec::split_interpreter` ever sees it — from that
-//! point on a builtin is completely indistinguishable from a real
-//! `interpreter="/some/script"`: same shebang-style temp-file-for-code
+//! resolves, via `resolve_builtin_spec`, to a `bash -c '<script>' <name>`
+//! command *before* `crate::exec::split_interpreter` ever sees it — from
+//! that point on a builtin is indistinguishable from a real
+//! `interpreter="bash -c ..."`: same shebang-style temp-file-for-code
 //! convention (`crate::exec`'s own doc comment), same spawn path, no
-//! special-cased execution model of its own.
+//! special-cased execution model of its own. The script is never written to
+//! disk, so there is no file in a shared directory to plant or replace.
 //!
 //! Deliberately "dumb": every builtin's *entire* behavior lives in its
 //! embedded shell script text (`src/builtins/*.sh`), not in bespoke Rust
@@ -96,15 +97,15 @@ fn environment_options(spec: &str) -> io::Result<(String, Option<String>, Option
 }
 
 /// If `spec` names a builtin (environment builtins also accept `name=`
-/// and `var=` options), materializes its script to a stable on-disk
-/// path (a no-op if already there from an earlier call with the same
-/// binary) and returns that path — ready to be handed to
-/// `crate::exec::split_interpreter` as an ordinary `interpreter=` value,
-/// same as any real installed interpreter's own path would be. `Ok(None)`
-/// for a spec that isn't `@`-prefixed at all — nothing for a caller to do
-/// differently than today. An `@`-prefixed spec naming no known builtin is
-/// an error, not a silent pass-through (there's no real program named
-/// `@whatever` it could otherwise fall back to trying).
+/// and `var=` options), returns the interpreter command that runs its
+/// embedded script — `bash -c '<script>' <name>`, shell-quoted — ready to be
+/// handed to `crate::exec::split_interpreter` as an ordinary `interpreter=`
+/// value, same as any real installed interpreter's own command would be.
+/// Nothing is written to disk. `Ok(None)` for a spec that isn't
+/// `@`-prefixed at all — nothing for a caller to do differently than today.
+/// An `@`-prefixed spec naming no known builtin is an error, not a silent
+/// pass-through (there's no real program named `@whatever` it could
+/// otherwise fall back to trying).
 pub fn resolve_builtin_spec(spec: &str) -> io::Result<Option<String>> {
     if !shlex::split(spec)
         .and_then(|words| words.into_iter().next())
@@ -132,7 +133,14 @@ pub fn resolve_builtin_spec(spec: &str) -> io::Result<Option<String>> {
             ),
         )
     })?;
-    Ok(Some(materialize(builtin)?.display().to_string()))
+    // The script travels as bash's own `-c` argument: no file is written
+    // anywhere, so there is nothing in a shared directory for another user to
+    // plant or swap. `crate::exec::split_interpreter` takes this apart again
+    // as program `bash` with the arguments `-c <script> <name>`, and appends
+    // the fence body's file, which the script sees as `$1` (`$0` is the name).
+    shlex::try_join(["bash", "-c", builtin.script, builtin.name])
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
 }
 
 /// The resolved interpreter path, plus every `(name, value)` env var pair
@@ -255,20 +263,50 @@ pub(crate) fn canvas_state_dir(canvas_path: &Path, suffix: &str) -> PathBuf {
 /// than meshfox leaving state behind for canvases that are long gone. Keyed
 /// by the full path, since unlike the colocated directory nothing here
 /// separates two canvases that happen to share a file name.)
-/// `<system temp>/meshfox-readonly-<hash of the canvas path>`, created
-/// owner-only (best effort) — the one place state for a canvas that can't be
-/// written may live on disk (its venv, `display="table"` caches). `absolute`
+/// `<system temp>/meshfox-readonly-<uid>-<hash of the canvas path>`, created
+/// owner-only and checked to be this user's own — the one place state for a
+/// canvas that can't be written may live on disk (its venv, `display="table"` caches). `absolute`
 /// is the canvas's absolute path.
 pub fn read_only_temp_root(absolute: &Path) -> PathBuf {
-    use std::os::unix::fs::DirBuilderExt;
     let key = fnv1a(absolute.to_string_lossy().as_bytes());
-    let root = std::env::temp_dir().join(format!("meshfox-readonly-{key:08x}"));
-    // Best-effort: if this fails, the caller's own create reports it.
-    let _ = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&root);
-    root
+    read_only_root_in(&std::env::temp_dir(), key)
+}
+
+/// `read_only_temp_root` under `temp`. The system temp dir can be shared with
+/// other users and the name is guessable, so a directory already there is
+/// used only if it is a real directory (not a symlink) of this user that
+/// nobody else can enter; anything else — somebody else's, or open to
+/// others — is left alone and a fresh private directory is used instead
+/// (this canvas then does not share its environment with an earlier run).
+fn read_only_root_in(temp: &Path, key: u32) -> PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // SAFETY: `geteuid` takes no arguments and can't fail.
+    let uid = unsafe { libc::geteuid() };
+    let private = |path: &Path| match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => std::fs::symlink_metadata(path)
+            .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0),
+        Err(_) => false,
+    };
+    let stable = temp.join(format!("meshfox-readonly-{uid}-{key:08x}"));
+    if private(&stable) {
+        return stable;
+    }
+    let mut fresh = stable;
+    for attempt in 0..8u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        fresh = temp.join(format!(
+            "meshfox-readonly-{uid}-{key:08x}-{}-{nanos}-{attempt}",
+            std::process::id()
+        ));
+        if private(&fresh) {
+            break;
+        }
+    }
+    fresh
 }
 
 /// True if `name` (without the `@`, e.g. `"agent"`) is a known builtin —
@@ -282,69 +320,6 @@ pub fn is_builtin(spec: &str) -> bool {
         || spec
             .strip_prefix('@')
             .is_some_and(|name| lookup(name).is_some())
-}
-
-/// Writes `builtin.script` to a stable, content-addressed path under the
-/// system temp dir (so a binary upgrade that changes the embedded script
-/// gets a fresh path instead of silently reusing stale content) and marks
-/// it executable. Reused across every call in the same meshfox version —
-/// this is static, binary-embedded content, not a fresh temp file per run
-/// the way the fence's own code gets (`crate::exec::resolve_command`'s own
-/// per-run temp file, cleaned up after) — there's nothing to clean up
-/// here, same as a real installed `python3` binary is never deleted after
-/// use.
-fn materialize(builtin: &Builtin) -> io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("meshfox-builtins");
-    materialize_in(builtin.name, builtin.script, &dir)
-}
-
-fn materialize_in(name: &str, script: &str, dir: &Path) -> io::Result<PathBuf> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!(
-        "{}-{}.sh",
-        name,
-        blake3::hash(script.as_bytes()).to_hex()
-    ));
-    if path.exists() {
-        return Ok(path);
-    }
-    let temporary = dir.join(format!(
-        ".{}-{}-{}-{}.tmp",
-        name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let result = (|| {
-        file.write_all(script.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
-        }
-        // Close the writable descriptor before publication: on Linux another
-        // process executing it while still open for writing gets ETXTBSY.
-        drop(file);
-        // A hard link atomically publishes a complete, executable file without
-        // replacing another process's already-published instance.
-        match std::fs::hard_link(&temporary, &path) {
-            Ok(()) => Ok(path.clone()),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(path.clone()),
-            Err(e) => Err(e),
-        }
-    })();
-    let _ = std::fs::remove_file(&temporary);
-    result
 }
 
 /// Execution identity of a builtin, excluding unrelated machine settings.
@@ -469,23 +444,142 @@ mod tests {
     }
 
     #[test]
-    fn resolve_builtin_spec_materializes_a_readable_executable_script() {
-        let path = resolve_builtin_spec("@agent").unwrap().unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o111, 0o111);
-        }
-    }
-
-    #[test]
     fn resolve_builtin_spec_is_stable_across_calls() {
         let a = resolve_builtin_spec("@python_venv").unwrap().unwrap();
         let b = resolve_builtin_spec("@python_venv").unwrap().unwrap();
         assert_eq!(a, b);
+    }
+
+    /// The command a builtin resolves to, run by `shell` over `input` the way
+    /// `crate::exec::resolve_command` does: split into program and arguments,
+    /// then the fence body's file last.
+    fn builtin_command(spec: &str, shell: &str, input: &Path) -> std::process::Command {
+        let resolved = resolve_builtin_spec(spec).unwrap().unwrap();
+        let (_, args) = crate::exec::split_interpreter(&resolved).unwrap();
+        let mut command = std::process::Command::new(shell);
+        command.args(args).arg(input);
+        command
+    }
+
+    #[test]
+    fn a_builtin_resolves_to_bash_dash_c_with_its_embedded_script() {
+        for builtin in BUILTINS {
+            let spec = format!("@{}", builtin.name);
+            let resolved = resolve_builtin_spec(&spec).unwrap().unwrap();
+            let (program, args) = crate::exec::split_interpreter(&resolved).unwrap();
+            assert_eq!(program, "bash", "{spec}");
+            assert_eq!(args, ["-c", builtin.script, builtin.name], "{spec}");
+        }
+    }
+
+    /// The script is one argv entry (a Linux limit of 128 KiB each, and the
+    /// environment shares the total): keep the embedded ones well below it.
+    #[test]
+    fn every_builtin_script_fits_comfortably_in_one_argument() {
+        for builtin in BUILTINS {
+            assert!(
+                builtin.script.len() < 64 * 1024,
+                "{} is {} bytes",
+                builtin.name,
+                builtin.script.len()
+            );
+            assert!(!builtin.script.contains('\0'), "{}", builtin.name);
+        }
+    }
+
+    /// The scripts run as `bash -c`, where `$0` is the builtin's name and
+    /// not a path: none may rely on its own location.
+    #[test]
+    fn no_builtin_script_depends_on_its_own_path() {
+        for builtin in BUILTINS {
+            assert!(!builtin.script.contains("BASH_SOURCE"), "{}", builtin.name);
+            assert!(!builtin.script.contains("$0"), "{}", builtin.name);
+            assert!(!builtin.script.contains("${0"), "{}", builtin.name);
+        }
+    }
+
+    #[test]
+    fn resolving_a_builtin_leaves_nothing_in_the_shared_temp_dir() {
+        let shared = std::env::temp_dir().join("meshfox-builtins");
+        let before = std::fs::metadata(&shared).ok().map(|m| m.modified().ok());
+        for builtin in BUILTINS {
+            resolve_builtin_spec(&format!("@{}", builtin.name)).unwrap();
+        }
+        let after = std::fs::metadata(&shared).ok().map(|m| m.modified().ok());
+        assert_eq!(
+            before,
+            after,
+            "resolving must not touch {}",
+            shared.display()
+        );
+    }
+
+    /// The directory `read_only_root_in` starts from, for one test: its own
+    /// temp dir, and the name an attacker would plant (the key is public).
+    #[cfg(unix)]
+    fn read_only_fixture(tag: &str) -> (PathBuf, PathBuf) {
+        // SAFETY: `geteuid` takes no arguments and can't fail.
+        let uid = unsafe { libc::geteuid() };
+        let temp =
+            std::env::temp_dir().join(format!("meshfox-ro-root-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let stable = temp.join(format!("meshfox-readonly-{uid}-{:08x}", 0xabcd_u32));
+        (temp, stable)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_read_only_root_is_a_private_directory_reused_across_calls() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, stable) = read_only_fixture("own");
+        let first = read_only_root_in(&temp, 0xabcd);
+        assert_eq!(first, stable);
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(read_only_root_in(&temp, 0xabcd), first);
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_only_root_open_to_others_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, stable) = read_only_fixture("open");
+        std::fs::create_dir(&stable).unwrap();
+        std::fs::set_permissions(&stable, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let root = read_only_root_in(&temp, 0xabcd);
+        assert_ne!(root, stable);
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            std::fs::read_dir(&stable).unwrap().next().is_none(),
+            "untouched"
+        );
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_only_root_that_is_a_symlink_is_not_followed() {
+        let (temp, stable) = read_only_fixture("link");
+        let elsewhere = temp.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &stable).unwrap();
+
+        let root = read_only_root_in(&temp, 0xabcd);
+        assert_ne!(root, stable);
+        assert!(root.is_dir() && !root.starts_with(&elsewhere));
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "untouched"
+        );
+        std::fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]
@@ -570,14 +664,11 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn agent_sh_interpolate_survives_bash_3_2_with_no_env_names() {
-        let script = resolve_builtin_spec("@agent").unwrap().unwrap();
         let prompt =
             std::env::temp_dir().join(format!("meshfox-agent-sh-test-{}.txt", std::process::id()));
         std::fs::write(&prompt, "hello world").unwrap();
 
-        let output = std::process::Command::new("/bin/bash")
-            .arg(&script)
-            .arg(&prompt)
+        let output = builtin_command("@agent", "/bin/bash", &prompt)
             .env_remove("MESHFOX_ENV_NAMES")
             .env(
                 "MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER",
@@ -684,9 +775,7 @@ mod tests {
         for shell in ["/bin/bash", "bash"] {
             for provider in ["claude", "codex"] {
                 for names in ["A,B", "B,A"] {
-                    let output = std::process::Command::new(shell)
-                        .arg(resolve_builtin_spec("@agent").unwrap().unwrap())
-                        .arg(&prompt)
+                    let output = builtin_command("@agent", shell, &prompt)
                         .env(
                             "PATH",
                             format!(
@@ -731,62 +820,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    // Invoked by concurrent_materialization_publishes_complete_executables
-    // in separate processes, without changing this process's environment.
-    #[test]
-    #[cfg(unix)]
-    fn materialization_child() {
-        use std::os::unix::fs::PermissionsExt;
-        let Some(dir) = std::env::var_os("MESHFOX_TEST_BUILTIN_DIR") else {
-            return;
-        };
-        for round in 0..16 {
-            let script = format!("#!/bin/sh\n# {}\nexit 0\n", "x".repeat(65536 + round));
-            let path = materialize_in("concurrent", &script, Path::new(&dir)).unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
-            assert_ne!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o111,
-                0
-            );
-            assert!(std::process::Command::new(&path)
-                .status()
-                .unwrap()
-                .success());
-        }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn concurrent_materialization_publishes_complete_executables() {
-        let dir = std::env::temp_dir().join(format!(
-            "meshfox-materialize-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut children: Vec<_> = (0..8)
-            .map(|_| {
-                std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "builtin_interpreter::tests::materialization_child",
-                    ])
-                    .env("MESHFOX_TEST_BUILTIN_DIR", &dir)
-                    .stdout(std::process::Stdio::null())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        for child in &mut children {
-            assert!(child.wait().unwrap().success());
-        }
-        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
-        assert_eq!(files.len(), 16, "no unpublished temporary files remain");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
     #[test]
     #[cfg(unix)]
     fn python_venv_dispatches_text_and_toml_to_pip() {
@@ -815,11 +848,8 @@ mod tests {
             "[project]\nname = \"example\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        let script = resolve_builtin_spec("@python_venv").unwrap().unwrap();
         for (lang, input) in [("text", &requirements), ("toml", &project)] {
-            let output = std::process::Command::new("bash")
-                .arg(&script)
-                .arg(input)
+            let output = builtin_command("@python_venv", "bash", input)
                 .env("MESHFOX_BLOCK_LANG", lang)
                 .env("MESHFOX_VENV_DIR", dir.join("venv"))
                 .env("MESHFOX_VARS_OUT", &vars)
@@ -849,9 +879,7 @@ mod tests {
             std::fs::metadata(&launcher).unwrap().permissions().mode() & 0o111 != 0,
             "launcher is executable"
         );
-        let renamed = std::process::Command::new("bash")
-            .arg(&script)
-            .arg(&requirements)
+        let renamed = builtin_command("@python_venv", "bash", &requirements)
             .env("MESHFOX_BLOCK_LANG", "text")
             .env("MESHFOX_VENV_DIR", dir.join("venv"))
             .env("MESHFOX_ENVIRONMENT_VAR", "XLS_PYTHON")
@@ -886,9 +914,7 @@ mod tests {
                 probe.canonicalize().unwrap().display()
             )
         );
-        let unsupported = std::process::Command::new("bash")
-            .arg(&script)
-            .arg(&project)
+        let unsupported = builtin_command("@python_venv", "bash", &project)
             .env("MESHFOX_BLOCK_LANG", "yaml")
             .env("MESHFOX_VENV_DIR", dir.join("venv"))
             .env("MESHFOX_VARS_OUT", &vars)
@@ -933,14 +959,11 @@ mod tests {
         let env_dir = dir.join("env");
         let calls = dir.join("npm-calls");
         let vars = dir.join("vars");
-        let script = resolve_builtin_spec("@node_env").unwrap().unwrap();
         let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
         let run = |lang: &str, body: &str| {
             let input = dir.join("input");
             std::fs::write(&input, body).unwrap();
-            let output = std::process::Command::new("bash")
-                .arg(&script)
-                .arg(&input)
+            let output = builtin_command("@node_env", "bash", &input)
                 .env("PATH", &path)
                 .env("MESHFOX_BLOCK_LANG", lang)
                 .env("MESHFOX_NODE_DIR", &env_dir)
@@ -993,9 +1016,7 @@ mod tests {
             assert!(env_dir.join(file).exists(), "{file}");
         }
 
-        let unsupported = std::process::Command::new("bash")
-            .arg(&script)
-            .arg(dir.join("input"))
+        let unsupported = builtin_command("@node_env", "bash", &dir.join("input"))
             .env("MESHFOX_BLOCK_LANG", "yaml")
             .env("MESHFOX_VARS_OUT", &vars)
             .output()

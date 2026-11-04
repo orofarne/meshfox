@@ -289,7 +289,7 @@ where
 ///
 /// `interpreter` is resolved through `meshfox_core::resolve_with_env`
 /// first — an `@name` builtin (see `meshfox_core::builtin_interpreter`)
-/// becomes its materialized script's real path before anything below ever
+/// becomes `bash -c '<its script>' <name>` before anything below ever
 /// sees it, with its `MESHFOX_*` env vars (config, and — for
 /// `@python_venv` specifically — `MESHFOX_BLOCK_LANG` and, when
 /// `origin` is given, `MESHFOX_VENV_DIR`) merged into `envs`; a plain, non-`@` `interpreter=`
@@ -670,7 +670,7 @@ mod tests {
         }
     }
 
-    /// End-to-end through the real `@agent` builtin (materialized script,
+    /// End-to-end through the real `@agent` builtin (its embedded script,
     /// `spawn_interpreter`'s own `@`-detection, config-env merge) without
     /// ever actually invoking a real `claude`/`codex` binary: an unknown
     /// `MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER` value hits `agent.sh`'s

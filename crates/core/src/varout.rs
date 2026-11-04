@@ -31,11 +31,23 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// concurrently (e.g. the web UI serving two runs at once) never collide —
 /// process id plus a monotonic in-process counter, since two allocations
 /// inside the same process are otherwise indistinguishable by time alone.
-/// Nothing is created on disk yet; the source block may or may not ever
-/// write to this path at all (see `read_and_cleanup`).
+///
+/// The name is guessable and the temp dir may be shared, so an empty file is
+/// created at it right away (exclusively, see `crate::exec::create_exclusive`):
+/// otherwise another user could put their own file there and have it read
+/// back as this block's output when the block writes nothing. The source
+/// block may or may not ever write to it (see `read_and_cleanup`; an empty
+/// file reads as no values, same as a missing one).
 pub fn allocate_path() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("meshfox-vars-{}-{n}.env", std::process::id()))
+    let next = || {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("meshfox-vars-{}-{n}.env", std::process::id()))
+    };
+    match crate::exec::create_exclusive(next) {
+        Ok((path, _)) => path,
+        // The temp dir can't be written: nothing could use the path anyway.
+        Err(_) => next(),
+    }
 }
 
 /// Reads back whatever a `from=` source block wrote to `path` (its own
@@ -77,6 +89,22 @@ pub fn from_targets<'a>(decls: &'a [VarDecl], addr: &BlockAddr) -> Vec<&'a VarDe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocate_path_reserves_the_name_with_an_empty_file() {
+        let path = allocate_path();
+        assert!(path.exists(), "{}", path.display());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // Nobody else can take the name over: creating it again fails.
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .is_err());
+        // Unwritten reads as no values and is cleaned up.
+        assert!(read_and_cleanup(&path).unwrap().is_empty());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn allocate_path_returns_distinct_paths() {
