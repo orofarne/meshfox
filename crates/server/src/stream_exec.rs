@@ -1011,7 +1011,7 @@ mod tests {
         proc.kill().unwrap();
         proc.child.wait().await.unwrap();
         // Give the OS a moment to actually deliver/process the signal.
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // `kill(pid, 0)` sends no signal — it just checks whether anything
         // in that group still exists.

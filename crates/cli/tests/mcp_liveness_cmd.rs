@@ -129,6 +129,12 @@ fn process_exists(pid: u32) -> bool {
         .success()
 }
 
+/// Waits for a worker to exit without parking one of the test runtime's
+/// threads on it.
+async fn reap(mut worker: std::process::Child) {
+    let _ = tokio::task::spawn_blocking(move || worker.wait()).await;
+}
+
 /// A standalone worker for `file`, which calls from the root's canvas will find
 /// through the lock file. `--watcher-socket` makes this process the worker
 /// itself; without it `view` is only the watcher and starts the worker as its
@@ -164,7 +170,7 @@ async fn finish(client: Client, dir: &Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_canvas_whose_worker_died_is_served_by_a_new_one_on_the_next_call() {
     let dir = unique_dir();
-    let mut worker = standalone_worker(&dir, "doc.canvas.md");
+    let worker = standalone_worker(&dir, "doc.canvas.md");
     let client = start(&dir, None).await;
 
     let opened = call(
@@ -182,7 +188,7 @@ async fn a_canvas_whose_worker_died_is_served_by_a_new_one_on_the_next_call() {
 
     let first = worker.id();
     signal(first, "KILL");
-    let _ = worker.wait();
+    reap(worker).await;
     assert!(!process_exists(first));
 
     assert_eq!(listed(&client).await, vec!["doc.canvas.md".to_string()]);
@@ -301,7 +307,7 @@ async fn closing_a_canvas_ends_its_debug_shells() {
 
     finish(client, &dir).await;
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -319,7 +325,7 @@ async fn an_idle_canvas_s_debug_shells_end_with_it() {
 
     finish(client, &dir).await;
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -335,7 +341,7 @@ async fn the_host_going_away_ends_every_debug_shell() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
 }
 
 // ---- A worker that is alive but not answering ----
@@ -373,7 +379,7 @@ async fn a_call_to_a_hung_worker_ends_with_an_error_and_leaves_the_worker_alone(
         .expect("the canvas works again once its worker does");
 
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
     finish(client, &dir).await;
 }
 
@@ -434,7 +440,7 @@ async fn a_stuck_call_on_one_canvas_blocks_neither_the_list_nor_the_other_canvas
 
     signal(worker.id(), "CONT");
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
     // The spawned call has finished and let go of its share of the client.
     let client = std::sync::Arc::try_unwrap(client)
         .ok()
@@ -475,7 +481,7 @@ async fn calls_on_one_canvas_run_one_at_a_time() {
 
     signal(worker.id(), "CONT");
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
     let client = std::sync::Arc::try_unwrap(client)
         .ok()
         .expect("no other owner left");
@@ -511,6 +517,6 @@ async fn a_hung_worker_is_reported_by_canvas_list_and_the_report_clears() {
     assert_eq!(health(&list), "ok", "{list}");
 
     let _ = worker.kill();
-    let _ = worker.wait();
+    reap(worker).await;
     finish(client, &dir).await;
 }

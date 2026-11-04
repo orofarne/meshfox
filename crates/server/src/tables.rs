@@ -871,19 +871,28 @@ impl TableManager {
         sessions: &mut HashMap<String, Arc<Session>>,
     ) {
         let max = self.max_bytes();
-        let Ok(entries) = std::fs::read_dir(cache) else {
+        // Walking every cached table's directory can take a while on a big
+        // cache: keep it off the async worker threads.
+        let cache = cache.to_path_buf();
+        let scanned = tokio::task::spawn_blocking(move || {
+            let entries = std::fs::read_dir(cache).ok()?;
+            Some(
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| {
+                        let p = e.path();
+                        let size = dir_size(&p);
+                        let used = last_used(&p);
+                        (p, size, used)
+                    })
+                    .collect::<Vec<(PathBuf, u64, SystemTime)>>(),
+            )
+        })
+        .await;
+        let Ok(Some(mut dirs)) = scanned else {
             return;
         };
-        let mut dirs: Vec<(PathBuf, u64, SystemTime)> = entries
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .map(|e| {
-                let p = e.path();
-                let size = dir_size(&p);
-                let used = last_used(&p);
-                (p, size, used)
-            })
-            .collect();
         let mut total: u64 = dirs.iter().map(|d| d.1).sum();
         dirs.sort_by_key(|d| d.2);
         for (path, size, _) in dirs {
@@ -905,7 +914,7 @@ impl TableManager {
                 sessions.remove(&id);
                 s.close().await;
             }
-            let _ = std::fs::remove_dir_all(&path);
+            let _ = tokio::fs::remove_dir_all(&path).await;
             total = total.saturating_sub(size);
         }
     }
@@ -924,7 +933,8 @@ impl TableManager {
         source: &Path,
         csv_strict: bool,
     ) -> Result<Arc<Session>, TableError> {
-        let meta = std::fs::metadata(source)
+        let meta = tokio::fs::metadata(source)
+            .await
             .map_err(|e| TableError::Target(format!("{}: {e}", source.display())))?;
         if !meta.is_file() {
             return Err(TableError::Target(format!(
@@ -960,7 +970,7 @@ impl TableManager {
         // Changed (or first) — drop any stale session of this node.
         if let Some(old) = sessions.remove(node_id) {
             old.close().await;
-            let _ = std::fs::remove_dir_all(&old.dir);
+            let _ = tokio::fs::remove_dir_all(&old.dir).await;
         }
 
         let duckdb = locate_duckdb(&self.canvas_dir).map_err(TableError::Unavailable)?;
@@ -1019,7 +1029,8 @@ impl TableManager {
         {
             Ok(s) => Ok(s.meta().await),
             Err(TableError::Unavailable(failure)) => {
-                let (file_size, mtime_ms) = std::fs::metadata(source)
+                let (file_size, mtime_ms) = tokio::fs::metadata(source)
+                    .await
                     .map(|m| {
                         let ms = m
                             .modified()
@@ -1143,8 +1154,8 @@ impl Session {
         let mut proc = match self.open_proc().await {
             Ok(p) => p,
             Err(first) => {
-                let _ = std::fs::remove_file(self.db_path());
-                let _ = std::fs::remove_file(self.dir.join("t.duckdb.wal"));
+                let _ = tokio::fs::remove_file(self.db_path()).await;
+                let _ = tokio::fs::remove_file(self.dir.join("t.duckdb.wal")).await;
                 self.open_proc().await.map_err(|_| fail(first))?
             }
         };
@@ -1209,10 +1220,13 @@ impl Session {
             .await
             .map_err(fail)?;
 
-        let used = dir_size(&self.dir);
+        let dir = self.dir.clone();
+        let used = tokio::task::spawn_blocking(move || dir_size(&dir))
+            .await
+            .map_err(|e| fail(e.to_string()))?;
         if used > self.max_bytes {
             proc.kill();
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = tokio::fs::remove_dir_all(&self.dir).await;
             return Err(TableFailure::new(
                 "limit",
                 format!(
