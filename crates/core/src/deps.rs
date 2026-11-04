@@ -1244,6 +1244,29 @@ mod tests {
     }
 
     #[test]
+    fn a_condition_may_name_an_argument_of_its_own_block() {
+        let md = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n```sh name=\"fix\"\ntrue\n```\n<!-- meshfox:arg name=\"polish\" type=\"bool\" default=\"false\" -->\n```sh name=\"build\" deps=\"fix?polish\"\ntrue\n```\n";
+        let chain = |target: &str| {
+            resolve_chain(&canvas(md), BlockAddr::new("root", target))
+                .unwrap()
+                .into_iter()
+                .map(|a| a.block_name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chain("build[polish=true]"), ["fix", "build[polish=true]"]);
+        assert_eq!(chain("build[polish=false]"), ["build[polish=false]"]);
+        validate(&canvas(md)).unwrap();
+        let wrong = md.replace(
+            "type=\"bool\" default=\"false\"",
+            "type=\"int\" default=\"1\"",
+        );
+        assert!(validate(&canvas(&wrong))
+            .unwrap_err()
+            .to_string()
+            .contains("must be a `bool`"));
+    }
+
+    #[test]
     fn the_closure_fingerprint_follows_which_conditional_edges_are_active() {
         let c = canvas(&conditional_doc("fix?USE_AGENT"));
         let addr = BlockAddr::new("root", "convert");

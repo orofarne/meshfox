@@ -576,7 +576,9 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   Conditions exist only in `deps=`: `lease=`, `defer=` and `from=` reject
   them. `meshfox validate` reports an empty condition (`fix?`), an unknown
   variable, a bare condition on a non-`bool` variable and a comparison value
-  the variable cannot hold.
+  the variable cannot hold. `--no-deps` does not follow `deps=` edges, but a
+  variable named in a condition is still resolved (and still required when it
+  has no value), exactly like one bound in an application argument.
 - `inputs` / `outputs` — optional, comma-separated file paths. Inputs accept
   glob patterns (`src/**/*.rs`); outputs must name exact files. Paths are
   relative to the block's effective working directory and normalized before
@@ -608,8 +610,9 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   same name) or `local=name` (expose it under a different name in this
   block's own environment) — a leading `$` on the variable-name side is
   accepted and stripped, but purely cosmetic: `env="$X,LOCAL=$Y"` and
-  `env="X,LOCAL=Y"` mean exactly the same thing. A block with no `env=`, path-variable references or interpreter-variable
-  references never resolves or prompts for declared variables — this is what scopes "does running this
+  `env="X,LOCAL=Y"` mean exactly the same thing. A block with no `env=`, path-variable references, interpreter-variable
+  references, application arguments bound to variables (`child[lang=$L]`) or
+  `deps=` `?` conditions never resolves or prompts for declared variables — this is what scopes "does running this
   block need to ask about anything" to the block itself, not the whole
   canvas. An `env=` entry naming a variable nothing declares is a
   `meshfox validate` error.
@@ -2329,6 +2332,66 @@ no options. The resolver passes the selected directory through
 `MESHFOX_ENVIRONMENT_VAR`; normal computed-variable dependency planning
 and interpreter substitution apply.
 
+### The `@agent` builtin
+
+`interpreter="@agent"` hands the fence body to an AI agent CLI as a prompt. It
+is one of the `@name` interpreters embedded in the binary (its whole behavior is
+the shell script `crates/core/src/builtins/agent.sh`; copy it out and point
+`interpreter=` at the copy to change it) and works on any fence language that
+accepts `interpreter=`; `text` is the usual choice. It takes no options, and the
+agent CLI itself (`claude` or `codex`) is not shipped: it must be on `PATH`.
+
+Whether the run is interactive is decided by the fence, not by an extra
+attribute: the script checks whether its standard output is a terminal.
+
+| Fence | Invocation | Result |
+| --- | --- | --- |
+| `tty` | `claude "<prompt>"` / `codex "<prompt>"` | A real interactive session on the inherited terminal, with the prompt as its first message. Nothing is captured; the session's exit code is the block's. |
+| any other | `claude -p -- "<prompt>"` / `codex exec -- "<prompt>"` | A one-shot run. Standard output is captured as the block's output, so `cache` and `output=` work as for any block. |
+
+**Provider.** `interpreters.agent.provider` in `.meshfox/config.toml` (next to
+the canvas, resolved from the block's execution directory) or in
+`~/.meshfox/config.toml` selects `claude` (the default when unset) or `codex`;
+the local file wins key by key. Meshfox exports the setting to the script as
+`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`, like every flattened config key.
+Any other value fails the block with `@agent: unknown
+interpreters.agent.provider '<value>' (expected claude or codex)` and exit code
+1. The provider is a property of the machine, not of the document, so it is
+deliberately not a `meshfox:var`.
+
+**Interpolation.** Before the prompt is passed on, `$NAME` and `${NAME}` are
+replaced by the value of a name the block itself declares: a local name from its
+`env=` (`env="TOPIC=$GLOBAL_TOPIC"` makes `$TOPIC`) or a bound argument (see
+"Block arguments"). The script is told these names through
+`MESHFOX_ENV_NAMES`. Three rules apply:
+
+1. A reference to any other name (`$PATH`, `$HOME`, a typo, an undeclared
+   variable) is left exactly as written.
+2. The bare form matches a whole name only: `$TOPIC` matches, `$TOPICS` is a
+   different name and `$TOPIC_X` is not `$TOPIC` followed by text.
+   `${TOPIC}` is unambiguous.
+3. `$$NAME` is always a literal `$NAME`, whether or not `NAME` is declared.
+
+The prompt is read once and substituted in a single pass; inserted values are
+never scanned for further references, so a value containing `$OTHER` stays
+literal. Nothing in the prompt is evaluated or run through a shell.
+
+**Access.** Meshfox adds no restrictions of its own: the agent runs as the
+current user, and its tool, sandbox, approval and directory-trust settings
+apply. `tty` changes only interactivity; capturing output does not disable the
+agent's tools. Meshfox's own restriction flags (`--no-exec`, see "Restricting
+a core") still refuse to run the block at all, like any other.
+
+**Freshness.** As described under "Runnable code fences" (session freshness),
+the script's content and the effective provider are part of the block's runtime
+identity: changing the provider invalidates restored results and dependent runs,
+while unrelated config keys do not.
+
+As a step in a chain it behaves like any other block, including as a `deps=`
+target and, with `tty`, as a step that takes over the terminal. An optional
+agent step is expressed on the consumer's edge, for example
+`deps="fix?USE_AGENT"` (see `deps` above).
+
 ### Consumption (`env=`)
 
 A `meshfox:var` declaration on its own does nothing to any block — it's
@@ -3419,7 +3482,7 @@ then the block name).
   when one hangs. A `tty` block instead opens a real interactive terminal
   panel — see "Interactive (`tty`) blocks" above.
 - `meshfox validate` — parse-only validation (single root, no duplicate ids,
-  no dangling edges, type body rules, no dangling/cyclic `deps=`); no
+  no dangling edges, type body rules, no dangling/cyclic `deps=`, no invalid `deps=` `?` conditions); no
   execution, no writes. Exit non-zero on error — usable in CI/pre-commit.
 - `meshfox check` — run every embedded constraint fence's Starlark contract
   (see "Constraint fences" above) and report pass/fail per fence. Exit
