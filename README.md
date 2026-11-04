@@ -1274,6 +1274,30 @@ a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
 
 [examples/agent-prompt.canvas.md](./examples/agent-prompt.canvas.md)
 
+### Making a dependency optional
+<!-- meshfox:node id="making-a-dependency-optional" -->
+
+[examples/optional-deps.canvas.md](./examples/optional-deps.canvas.md) — a
+`?` after a `deps=` entry makes that *edge* conditional on a variable:
+`deps="fix?USE_AGENT"` runs `fix` first only while the `bool` variable
+`USE_AGENT` is `true`; `fix?!USE_AGENT` negates it, and
+`fix?PROVIDER=claude` compares any variable with a value (`?!` negates the
+comparison too). The condition belongs to the dependency, not to the block it
+points at, so another block can still depend on `fix` unconditionally. A
+variable named in a condition is resolved like one named in `env=` — it shows
+up in `configure` and in the run form only for chains that reach the edge —
+and a `from=`-computed one runs its source first. A false condition drops the
+dependency from the chain and from the block's freshness, so flipping the value
+makes the block stale. This is the way to keep an optional agent step
+(`interpreter="@agent"`, with its provider choice, `$VAR` interpolation and
+`tty` mode) in the chain instead of wrapping it in a shell script. Conditions
+are valid in `deps=` only; see SPEC.md's `deps` entry.
+
+#### Example
+<!-- meshfox:node id="example-optional-deps" type="file" -->
+
+[examples/optional-deps.canvas.md](./examples/optional-deps.canvas.md)
+
 ### Showing a diagram, formula or chart (SVG)
 <!-- meshfox:node id="showing-a-diagram-formula-or-chart-svg" -->
 

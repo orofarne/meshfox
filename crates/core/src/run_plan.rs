@@ -379,6 +379,35 @@ mod tests {
     }
 
     #[test]
+    fn a_false_condition_with_only_a_default_value_drops_its_edge_from_the_prepared_chain() {
+        let doc = "<!-- meshfox:var name=\"USE_AGENT\" type=\"bool\" default=\"false\" -->\n```sh name=\"fix\"\ntrue\n```\n```sh name=\"convert\" deps=\"fix?USE_AGENT\"\ntrue\n```\n";
+        let chain_for = |overrides: HashMap<String, String>| {
+            let mut c = canvas(doc);
+            let (cache, _) = cache(&[], true);
+            prepare_run(
+                &mut c,
+                &[],
+                "convert",
+                true,
+                &overrides,
+                &cache,
+                &HashMap::new(),
+                &SharedEnv::new(),
+            )
+            .unwrap()
+            .chain
+            .into_iter()
+            .map(|a| a.block_name)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(chain_for(HashMap::new()), ["convert"]);
+        assert_eq!(
+            chain_for(HashMap::from([("USE_AGENT".into(), "true".into())])),
+            ["fix", "convert"]
+        );
+    }
+
+    #[test]
     fn follows_indirect_variable_references_and_honors_overrides() {
         let mut c = canvas("<!-- meshfox:var name=\"LAZY_TOKEN\" secret required -->\n<!-- meshfox:var name=\"LAZY_ALIAS\" default_var=\"LAZY_TOKEN\" -->\n```sh name=\"use\" env=\"LAZY_ALIAS\"\ntrue\n```\n");
         let (cache, store) = cache(&[], true);

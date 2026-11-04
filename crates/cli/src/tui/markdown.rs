@@ -1554,10 +1554,14 @@ impl<'a> Renderer<'a> {
                 .iter()
                 .map(|r| {
                     let addr = meshfox_core::deps::resolve_ref(self.node_id, r);
-                    (
-                        super::app::dep_label(self.node_id, &addr.node_id, &addr.block_name),
-                        addr.node_id,
-                    )
+                    let mut label =
+                        super::app::dep_label(self.node_id, &addr.node_id, &addr.block_name);
+                    // A conditional edge shows its condition right after the block.
+                    if let Some(condition) = &r.condition {
+                        label.push_str(" ?");
+                        label.push_str(&condition.render());
+                    }
+                    (label, addr.node_id)
                 })
                 .collect()
         };

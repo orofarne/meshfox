@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseBody, parseEnvList, selectedEnvNames } from '../src/fence.ts';
+import { fingerprint, parseBody, parseEnvList, selectedEnvNames } from '../src/fence.ts';
+import { parseBlockRef } from '../src/deps.ts';
 
 test('visible block contract retains declaration order, UI-only defaults and file templates', () => {
   const source = `<!-- meshfox:arg name="lang" type="select" choices="en,hy" default="en" -->
@@ -138,4 +139,19 @@ test('Starlark views respect fence boundaries and leave nested examples inert', 
   const source = '~~~~markdown\n```starlark render\nprint("inert")\n```\n~~~~\n~~~~starlark render name="real"\nprint(1)\n~~~~~\n````starlark render\nprint(2)\n````';
   const segments = parseBody(source, 'root');
   assert.deepEqual(segments.filter(s => s.type === 'render').map(s => s.code), ['print(1)', 'print(2)']);
+});
+
+
+test('conditional deps entries resolve to their block and fingerprint like the Rust renderer', () => {
+  assert.deepEqual(parseBlockRef('fix?USE_AGENT', 'root'), {nodeId:'root', blockName:'fix'});
+  assert.deepEqual(parseBlockRef('n/fix?!PROVIDER=codex!', 'root'), {nodeId:'n', blockName:'fix'});
+  assert.deepEqual(parseBlockRef('e[q="x?y"]?FLAG', 'root'), {nodeId:'root', blockName:'e[q="x?y"]'});
+  assert.deepEqual(parseBlockRef('build!', 'root'), {nodeId:'root', blockName:'build'});
+  // `$`/whitespace spelling differences in the condition do not change the hash,
+  // exactly like `BlockRef::render`; a different condition does.
+  const hash = deps => fingerprint('bash', 'x', undefined, undefined, deps);
+  assert.equal(hash('fix?$USE_AGENT'), hash('fix?USE_AGENT'));
+  assert.equal(hash('fix? !USE_AGENT'), hash('fix?!USE_AGENT'));
+  assert.notEqual(hash('fix?USE_AGENT'), hash('fix?!USE_AGENT'));
+  assert.notEqual(hash('fix?USE_AGENT'), hash('fix'));
 });

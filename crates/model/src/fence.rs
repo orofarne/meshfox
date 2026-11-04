@@ -237,6 +237,122 @@ pub struct BlockRef {
     /// schema exactly when (and only when) the load step that repopulates
     /// it is about to run for real, not on every pulled-in reference.
     pub sync: bool,
+    /// `?COND` after the block (and its `[...]` arguments) on a `deps=`
+    /// entry: the edge exists only while the condition holds. A property of
+    /// this *edge*, not of the target block — another block may depend on
+    /// the same target unconditionally. See [`DepCondition`].
+    pub condition: Option<DepCondition>,
+}
+
+/// The `?COND` part of a `deps=` entry: `?NAME` (a `bool` variable or local
+/// argument is `true`), `?!NAME` (it is `false`), `?NAME=value` (its value
+/// equals `value`) and `?!NAME=value` (it does not). A leading `$` before
+/// the name is cosmetic, as in `env=`. Parsing never fails: an empty name
+/// (`fix?`) is kept as-is and reported by `meshfox validate`, the same
+/// lenient-parse/strict-validate split every other `deps=` problem uses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DepCondition {
+    pub negate: bool,
+    pub var: String,
+    /// `Some` for the `NAME=value` comparison form; `None` means the
+    /// variable must itself be a `bool`.
+    pub equals: Option<String>,
+}
+
+impl DepCondition {
+    /// Evaluates against a resolved variable value. `bool` conditions
+    /// compare with the canonical `"true"`; anything else is `false` here —
+    /// `meshfox validate` rejects non-`bool` variables without `=value`.
+    pub fn holds(&self, value: &str) -> bool {
+        let truth = match &self.equals {
+            Some(expected) => value == expected,
+            None => value == "true",
+        };
+        truth != self.negate
+    }
+
+    /// Source text of the part after `?`, the exact inverse of parsing.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        if self.negate {
+            out.push('!');
+        }
+        out.push_str(&self.var);
+        if let Some(value) = &self.equals {
+            out.push('=');
+            out.push_str(value);
+        }
+        out
+    }
+}
+
+impl BlockRef {
+    /// The `deps=` entry text for this reference — the inverse of
+    /// [`parse_block_ref`]: `[node/]block[args][?COND][!]`.
+    pub fn render(&self) -> String {
+        let mut part = match &self.node_id {
+            Some(n) => format!("{n}/{}", self.block_name),
+            None => self.block_name.clone(),
+        };
+        if let Some(condition) = &self.condition {
+            part.push('?');
+            part.push_str(&condition.render());
+        }
+        if self.sync {
+            part.push('!');
+        }
+        part
+    }
+}
+
+/// Index of the `?` that starts an entry's condition: the first one outside
+/// quotes and outside the `[...]` application arguments, so a `?` inside an
+/// argument value (`child[q="a?b"]`) never counts.
+fn condition_start(s: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escape = false;
+    for (index, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if quoted && c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '?' if depth == 0 => return Some(index),
+            _ => (),
+        }
+    }
+    None
+}
+
+fn parse_condition(s: &str) -> DepCondition {
+    let s = s.trim();
+    let (negate, s) = match s.strip_prefix('!') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, s),
+    };
+    let (var, equals) = match s.split_once('=') {
+        Some((var, value)) => (var.trim(), Some(value.trim().to_string())),
+        None => (s, None),
+    };
+    DepCondition {
+        negate,
+        var: strip_dollar(var).to_string(),
+        equals,
+    }
 }
 
 pub fn parse_block_ref(s: &str) -> BlockRef {
@@ -244,17 +360,23 @@ pub fn parse_block_ref(s: &str) -> BlockRef {
         Some(rest) => (rest, true),
         None => (s, false),
     };
+    let (s, condition) = match condition_start(s) {
+        Some(at) => (&s[..at], Some(parse_condition(&s[at + 1..]))),
+        None => (s, None),
+    };
     let prefix_end = s.find('[').unwrap_or(s.len());
     match s[..prefix_end].split_once('/') {
         Some((node_id, block_name)) => BlockRef {
             node_id: Some(node_id.to_string()),
             block_name: format!("{}{}", block_name, &s[prefix_end..]),
             sync,
+            condition,
         },
         None => BlockRef {
             node_id: None,
             block_name: s.to_string(),
             sync,
+            condition,
         },
     }
 }
@@ -1033,14 +1155,7 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         parts.push(format!("{}\u{0}{}", env.local_name, env.var_name));
     }
     for dep in &block.deps {
-        let mut part = match &dep.node_id {
-            Some(node_id) => format!("{node_id}/{}", dep.block_name),
-            None => dep.block_name.clone(),
-        };
-        if dep.sync {
-            part.push('!');
-        }
-        parts.push(part);
+        parts.push(dep.render());
     }
     for name in ["lease", "defer", "argv"] {
         if let Some(value) = block.attrs.get(name) {
@@ -1336,14 +1451,76 @@ mod tests {
                     node_id: None,
                     block_name: "build".to_string(),
                     sync: false,
+                    condition: None,
                 },
                 BlockRef {
                     node_id: Some("other-node".to_string()),
                     block_name: "test".to_string(),
                     sync: false,
+                    condition: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn deps_parses_conditions_in_every_form_and_renders_them_back() {
+        let md = "```bash name=\"c\" deps=\"a?FLAG,b?!FLAG,n/c?$PROVIDER=claude,d?!PROVIDER=none!,e[lang=$L]?FLAG\"\necho hi\n```\n";
+        let deps = &scan_code_blocks(md)[0].deps;
+        let cond = |negate: bool, var: &str, equals: Option<&str>| {
+            Some(DepCondition {
+                negate,
+                var: var.to_string(),
+                equals: equals.map(str::to_string),
+            })
+        };
+        assert_eq!(deps[0].block_name, "a");
+        assert_eq!(deps[0].condition, cond(false, "FLAG", None));
+        assert_eq!(deps[1].condition, cond(true, "FLAG", None));
+        assert_eq!(deps[2].node_id.as_deref(), Some("n"));
+        assert_eq!(deps[2].block_name, "c");
+        assert_eq!(deps[2].condition, cond(false, "PROVIDER", Some("claude")));
+        assert_eq!(deps[3].condition, cond(true, "PROVIDER", Some("none")));
+        assert!(deps[3].sync);
+        assert_eq!(deps[4].block_name, "e[lang=$L]");
+        assert_eq!(deps[4].condition, cond(false, "FLAG", None));
+        assert_eq!(
+            deps.iter().map(BlockRef::render).collect::<Vec<_>>(),
+            vec![
+                "a?FLAG",
+                "b?!FLAG",
+                "n/c?PROVIDER=claude",
+                "d?!PROVIDER=none!",
+                "e[lang=$L]?FLAG"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_mark_inside_application_arguments_is_not_a_condition() {
+        let plain = parse_block_ref("e[q=\"x?y\"]");
+        assert_eq!(plain.block_name, "e[q=\"x?y\"]");
+        assert!(plain.condition.is_none());
+        let conditional = parse_block_ref("e[q=\"x?y\"]?FLAG");
+        assert_eq!(conditional.block_name, "e[q=\"x?y\"]");
+        assert_eq!(conditional.condition.unwrap().var, "FLAG");
+    }
+
+    #[test]
+    fn a_bare_question_mark_parses_to_an_empty_condition_for_validate_to_reject() {
+        let dep = parse_block_ref("fix?");
+        assert_eq!(dep.block_name, "fix");
+        assert_eq!(dep.condition.as_ref().map(|c| c.var.as_str()), Some(""));
+        assert!(parse_block_ref("fix").condition.is_none());
+    }
+
+    #[test]
+    fn dep_condition_holds_for_bool_and_comparisons() {
+        let c = |s: &str| parse_block_ref(&format!("x?{s}")).condition.unwrap();
+        assert!(c("F").holds("true") && !c("F").holds("false"));
+        assert!(!c("!F").holds("true") && c("!F").holds("false"));
+        assert!(c("P=a").holds("a") && !c("P=a").holds("b"));
+        assert!(!c("!P=a").holds("a") && c("!P=a").holds("b"));
     }
 
     #[test]
@@ -1357,11 +1534,13 @@ mod tests {
                     node_id: None,
                     block_name: "build".to_string(),
                     sync: true,
+                    condition: None,
                 },
                 BlockRef {
                     node_id: Some("other-node".to_string()),
                     block_name: "test".to_string(),
                     sync: true,
+                    condition: None,
                 },
             ]
         );

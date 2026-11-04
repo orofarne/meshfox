@@ -56,6 +56,8 @@ pub enum DepsError {
     CanvasCall(String),
     #[error("block arguments: {0}")]
     Arguments(String),
+    #[error("node {0:?} block {1:?}: `deps=` condition: {2}")]
+    Condition(String, String, String),
     #[error("artifact dependency: {0}")]
     Artifacts(String),
     #[error("no runnable block named {1:?} in node {0:?}")]
@@ -238,6 +240,25 @@ pub fn application_ref(
     let mut scope = canvas.artifact_values.clone();
     scope.extend(values.clone());
     scope.extend(owner.arguments.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if let Some(condition) = &dep.condition {
+        // An inactive edge contributes nothing: no block, no fingerprint
+        // part, no cascade. A computed variable not yet observed leaves the
+        // edge pending, exactly like an unresolved binding below: its `from=`
+        // source is already an implicit dependency (`dependency_refs`), and
+        // the runner replans once that source has produced a value. A value
+        // that is simply unknown (nothing resolved it yet) keeps the edge, so
+        // static views and cycle checks see the superset.
+        let active = match scope.get(&condition.var) {
+            Some(value) => condition.holds(value),
+            None => !decls
+                .iter()
+                .any(|decl| decl.name == condition.var && decl.from.is_some()),
+        };
+        if !active {
+            validate_dep_condition(canvas, node_id, owner, dep, decls)?;
+            return Ok(None);
+        }
+    }
     if app.bindings.values().any(|binding| match binding {
         crate::args::Binding::Reference(name) => {
             !scope.contains_key(name)
@@ -253,6 +274,83 @@ pub fn application_ref(
     }
     let bound = find_block_with_values(canvas, &addr, &scope)?;
     Ok(Some(BlockAddr::new(addr.node_id, bound.name.unwrap())))
+}
+
+/// Checks the `?COND` of one `deps=` entry against what it can refer to: a
+/// declared variable or one of the owner's own arguments. Without `=value`
+/// the name must be a `bool`; with it, the value must be acceptable for the
+/// name's type (a `select` only takes one of its choices).
+fn validate_dep_condition(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    dep: &BlockRef,
+    decls: &[VarDecl],
+) -> Result<(), DepsError> {
+    use crate::vars::VarType;
+    let Some(condition) = &dep.condition else {
+        return Ok(());
+    };
+    let block_name = owner.name.clone().unwrap_or_default();
+    let fail = |message: String| {
+        Err(DepsError::Condition(
+            node_id.to_string(),
+            block_name.clone(),
+            message,
+        ))
+    };
+    if condition.var.is_empty() {
+        return fail(format!("{:?} has `?` with no variable name", dep.render()));
+    }
+    let local = canvas
+        .node(node_id)
+        .and_then(|node| crate::args::scan_node_signatures(node).ok())
+        .and_then(|signatures| {
+            signatures
+                .into_iter()
+                .filter(|sig| sig.block.span == owner.span)
+                .flat_map(|sig| sig.args)
+                .find(|arg| arg.name == condition.var)
+        });
+    let (var_type, choices) = match (local, decls.iter().find(|d| d.name == condition.var)) {
+        (Some(arg), _) => (arg.var_type, arg.choices),
+        (None, Some(decl)) => (decl.var_type, decl.choices.clone()),
+        (None, None) => {
+            return fail(format!(
+            "{:?} names {:?}, which is neither a declared variable nor an argument of this block",
+            dep.render(),
+            condition.var
+        ))
+        }
+    };
+    match &condition.equals {
+        None if var_type != VarType::Bool => fail(format!(
+            "{:?} uses {:?} as a bare condition, which must be a `bool` (it is {}); compare it with `?{}=value` instead",
+            dep.render(),
+            condition.var,
+            var_type.as_str(),
+            condition.var
+        )),
+        None => Ok(()),
+        Some(value) => {
+            let acceptable = match var_type {
+                VarType::Bool => value == "true" || value == "false",
+                VarType::Int => value.parse::<i64>().is_ok(),
+                VarType::Select => choices.is_empty() || choices.contains(value),
+                _ => true,
+            };
+            if acceptable {
+                Ok(())
+            } else {
+                fail(format!(
+                    "{:?} compares {:?} ({}) with {value:?}, which is not a valid value for it",
+                    dep.render(),
+                    condition.var,
+                    var_type.as_str()
+                ))
+            }
+        }
+    }
 }
 
 /// Validate a function's edge without inventing values for its mandatory args.
@@ -927,6 +1025,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                 ));
             }
             for dep in &block.dependencies() {
+                validate_dep_condition(canvas, &node.id, block, dep, &decls)?;
                 let dep_addr = resolve_ref(&node.id, dep);
                 let dep_block = validate_application_ref(canvas, &node.id, block, dep, &decls)?;
                 if crate::exec::is_form(&dep_block.lang) {
@@ -934,6 +1033,18 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                         node.id.clone(),
                         name.clone(),
                         dep_addr,
+                    ));
+                }
+            }
+            for edge in block.leases().iter().chain(block.defers().iter()) {
+                if edge.condition.is_some() {
+                    return Err(DepsError::Condition(
+                        node.id.clone(),
+                        name.clone(),
+                        format!(
+                            "{:?}: `?` conditions are only supported in `deps=`, not `lease=` or `defer=`",
+                            edge.render()
+                        ),
                     ));
                 }
             }
@@ -1054,6 +1165,119 @@ mod tests {
 
     fn canvas(md: &str) -> Canvas {
         Canvas::from_markdown(md).unwrap()
+    }
+
+    fn conditional_doc(deps: &str) -> String {
+        format!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n<!-- meshfox:var name=\"USE_AGENT\" type=\"bool\" default=\"false\" -->\n<!-- meshfox:var name=\"PROVIDER\" type=\"select\" choices=\"claude,codex\" default=\"claude\" -->\n```sh name=\"fix\"\ntrue\n```\n```sh name=\"convert\" deps=\"{deps}\"\ntrue\n```\n"
+        )
+    }
+
+    fn chain_with(md: &str, values: &[(&str, &str)]) -> Vec<String> {
+        let mut c = canvas(md);
+        for (k, v) in values {
+            c.artifact_values.insert((*k).into(), (*v).into());
+        }
+        resolve_chain(&c, BlockAddr::new("root", "convert"))
+            .unwrap()
+            .into_iter()
+            .map(|a| a.block_name)
+            .collect()
+    }
+
+    #[test]
+    fn a_conditional_edge_is_present_only_while_its_condition_holds() {
+        let md = conditional_doc("fix?USE_AGENT");
+        assert_eq!(
+            chain_with(&md, &[("USE_AGENT", "true")]),
+            ["fix", "convert"]
+        );
+        assert_eq!(chain_with(&md, &[("USE_AGENT", "false")]), ["convert"]);
+        // Nothing resolved the value yet: static views see the superset.
+        assert_eq!(chain_with(&md, &[]), ["fix", "convert"]);
+
+        let negated = conditional_doc("fix?!USE_AGENT");
+        assert_eq!(chain_with(&negated, &[("USE_AGENT", "true")]), ["convert"]);
+        assert_eq!(
+            chain_with(&negated, &[("USE_AGENT", "false")]),
+            ["fix", "convert"]
+        );
+
+        let compared = conditional_doc("fix?PROVIDER=codex");
+        assert_eq!(
+            chain_with(&compared, &[("PROVIDER", "claude")]),
+            ["convert"]
+        );
+        assert_eq!(
+            chain_with(&compared, &[("PROVIDER", "codex")]),
+            ["fix", "convert"]
+        );
+        let not_compared = conditional_doc("fix?!PROVIDER=codex");
+        assert_eq!(
+            chain_with(&not_compared, &[("PROVIDER", "claude")]),
+            ["fix", "convert"]
+        );
+    }
+
+    #[test]
+    fn an_unconditional_edge_keeps_a_block_a_false_condition_would_drop() {
+        let md = conditional_doc("fix?USE_AGENT,fix");
+        assert_eq!(
+            chain_with(&md, &[("USE_AGENT", "false")]),
+            ["fix", "convert"]
+        );
+    }
+
+    #[test]
+    fn a_condition_on_a_computed_variable_waits_for_its_source_then_decides() {
+        let md = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n<!-- meshfox:var name=\"USE_AGENT\" type=\"bool\" from=\"probe\" -->\n```sh name=\"probe\"\ntrue\n```\n```sh name=\"fix\"\ntrue\n```\n```sh name=\"convert\" deps=\"fix?USE_AGENT\"\ntrue\n```\n";
+        // The source runs first; the edge itself stays pending until it has.
+        assert_eq!(chain_with(md, &[]), ["probe", "convert"]);
+        assert_eq!(
+            chain_with(md, &[("USE_AGENT", "true")]),
+            ["probe", "fix", "convert"]
+        );
+        assert_eq!(
+            chain_with(md, &[("USE_AGENT", "false")]),
+            ["probe", "convert"]
+        );
+    }
+
+    #[test]
+    fn the_closure_fingerprint_follows_which_conditional_edges_are_active() {
+        let c = canvas(&conditional_doc("fix?USE_AGENT"));
+        let addr = BlockAddr::new("root", "convert");
+        let fp = |flag: &str| {
+            let values = HashMap::from([("USE_AGENT".to_string(), flag.to_string())]);
+            closure_fingerprint(&c, &addr, &values).unwrap()
+        };
+        assert_ne!(fp("true"), fp("false"));
+        assert_eq!(fp("false"), fp("false"));
+    }
+
+    #[test]
+    fn validate_rejects_bad_conditions() {
+        let err = |deps: &str| {
+            validate(&canvas(&conditional_doc(deps)))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(validate(&canvas(&conditional_doc("fix?USE_AGENT"))).is_ok());
+        assert!(validate(&canvas(&conditional_doc("fix?!PROVIDER=claude"))).is_ok());
+        assert!(err("fix?").contains("no variable name"));
+        assert!(err("fix?MISSING").contains("neither a declared variable"));
+        assert!(err("fix?PROVIDER").contains("must be a `bool`"));
+        assert!(err("fix?PROVIDER=gemini").contains("not a valid value"));
+        assert!(err("fix?USE_AGENT=maybe").contains("not a valid value"));
+    }
+
+    #[test]
+    fn validate_rejects_conditions_on_lease_and_defer() {
+        let md = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n<!-- meshfox:var name=\"F\" type=\"bool\" default=\"true\" -->\n```sh name=\"svc\" service\nsleep 1\n```\n```sh name=\"user\" lease=\"svc?F\"\ntrue\n```\n";
+        assert!(validate(&canvas(md))
+            .unwrap_err()
+            .to_string()
+            .contains("only supported in `deps=`"));
     }
 
     #[test]

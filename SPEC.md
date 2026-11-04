@@ -554,6 +554,29 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   dependency is left to its own normal freshness decision instead — see
   `always` below for the plain (unconditional) alternative, and why a `!`
   edge exists as a separate mechanism from it.
+  A `?` suffix makes the **edge** conditional — the condition belongs to
+  this dependency, not to the target block, so another block may depend on the
+  same target unconditionally. `deps="fix?USE_AGENT"` keeps the edge only
+  while the `bool` variable (or argument of this block) `USE_AGENT` is `true`;
+  `fix?!USE_AGENT` only while it is `false`; `fix?PROVIDER=claude` only while
+  `PROVIDER` equals `claude` (any variable type, a `select` only accepts one of
+  its choices), and `fix?!PROVIDER=claude` while it does not. The condition
+  follows the application arguments (`child[lang=$L]?FLAG`) and precedes a
+  sync `!` (`fix?USE_AGENT!`); a `$` before the name is cosmetic, as in `env=`.
+  A false condition removes the edge entirely: the dependency is not run for
+  this block and contributes nothing to its fingerprint, so flipping the value
+  makes the block stale; the dependency still runs when another unconditional
+  edge reaches it, and running it directly ignores the conditions on edges
+  that point at it (its own `deps=` conditions still apply). The
+  variable is resolved like any other variable the block references (a prompt or
+  `configure` entry, `--set`, its default), and only for chains that reach
+  the edge. A `from=`-computed variable first runs its source block and then
+  decides the edge, like any other value computed during a run; before a value
+  is known, static views (and cycle checks) treat the edge as present.
+  Conditions exist only in `deps=`: `lease=`, `defer=` and `from=` reject
+  them. `meshfox validate` reports an empty condition (`fix?`), an unknown
+  variable, a bare condition on a non-`bool` variable and a comparison value
+  the variable cannot hold.
 - `inputs` / `outputs` — optional, comma-separated file paths. Inputs accept
   glob patterns (`src/**/*.rs`); outputs must name exact files. Paths are
   relative to the block's effective working directory and normalized before

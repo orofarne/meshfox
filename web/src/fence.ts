@@ -142,13 +142,56 @@ function stripDollar(s: string): string {
   return s.startsWith("$") ? s.slice(1) : s;
 }
 
+/** Index of the `?` that starts a `deps=` entry's condition (`fix?USE_AGENT`):
+ * the first one outside quotes and outside the `[...]` application arguments.
+ * Mirrors `core::fence::condition_start`. */
+export function depConditionStart(s: string): number {
+  let depth = 0;
+  let quoted = false;
+  let escape = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (escape) { escape = false; continue; }
+    if (quoted && c === "\\") { escape = true; continue; }
+    if (c === '"') { quoted = !quoted; continue; }
+    if (quoted) continue;
+    if (c === "[") depth += 1;
+    else if (c === "]") depth = Math.max(0, depth - 1);
+    else if (c === "?" && depth === 0) return i;
+  }
+  return -1;
+}
+
+/** One raw `deps=` token the way `core::fence::BlockRef::render` writes it
+ * back: the `?COND` part is normalized (whitespace trimmed, a cosmetic `$`
+ * before the variable name dropped); a token without a condition is returned
+ * untouched, so every existing fingerprint stays what it was. */
+function normalizeDepToken(raw: string): string {
+  const sync = raw.endsWith("!");
+  const body = sync ? raw.slice(0, -1) : raw;
+  const at = depConditionStart(body);
+  if (at === -1) return raw;
+  let condition = body.slice(at + 1).trim();
+  let negate = false;
+  if (condition.startsWith("!")) {
+    negate = true;
+    condition = condition.slice(1).trimStart();
+  }
+  const eq = condition.indexOf("=");
+  let name = (eq >= 0 ? condition.slice(0, eq) : condition).trim();
+  if (name.startsWith("$") && !name.startsWith("${")) name = name.slice(1);
+  const value = eq >= 0 ? `=${condition.slice(eq + 1).trim()}` : "";
+  return `${body.slice(0, at)}?${negate ? "!" : ""}${name}${value}${sync ? "!" : ""}`;
+}
+
 /** Mirrors `core::fence::fingerprint(block)` field-for-field: `lang`, `code`,
  * `interpreter` (empty string when unset, same as Rust's
  * `unwrap_or_default()`), then each `env=` entry as its own `local\0var`
  * pair (same `local_name`/`var_name` split+dollar-strip
- * `core::fence::parse_env_ref` does), then each raw `deps=` token as-is
- * (already in the exact `node-id/block-name`-or-bare-name shape Rust
- * reconstructs its own parsed `BlockRef`s back into). Joined with NUL,
+ * `core::fence::parse_env_ref` does), then each raw `deps=` token (already in the
+ * exact `node-id/block-name`-or-bare-name shape Rust reconstructs its own
+ * parsed `BlockRef`s back into; a `?COND` suffix is normalized the way
+ * `BlockRef::render` writes it). Joined with NUL,
  * hashed as UTF-8 bytes — see `fnv1aHex`. */
 export function fingerprint(
   lang: string,
@@ -171,7 +214,7 @@ export function fingerprint(
     }
   }
   for (const raw of (depsAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
-    parts.push(raw);
+    parts.push(normalizeDepToken(raw));
   }
   // `output-attrs=` is baked into the cached image (`output="image"`), so
   // it's part of what makes a cached output stale — only when present,

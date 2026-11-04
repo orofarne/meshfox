@@ -1270,16 +1270,7 @@ pub struct FenceAttrsPatch {
 
 fn render_deps(deps: &[BlockRef]) -> String {
     deps.iter()
-        .map(|d| {
-            let mut part = match &d.node_id {
-                Some(n) => format!("{n}/{}", d.block_name),
-                None => d.block_name.clone(),
-            };
-            if d.sync {
-                part.push('!');
-            }
-            part
-        })
+        .map(BlockRef::render)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -3965,6 +3956,7 @@ Reused from Tests as well.
                 node_id: Some("build step".to_string()),
                 block_name: "build".to_string(),
                 sync: false,
+                condition: None,
             }]
         );
     }
@@ -5776,11 +5768,13 @@ Reused from Tests as well.
                     node_id: Some("build".to_string()),
                     block_name: "build".to_string(),
                     sync: false,
+                    condition: None,
                 },
                 crate::fence::BlockRef {
                     node_id: None,
                     block_name: "other".to_string(),
                     sync: false,
+                    condition: None,
                 },
             ]
         );

@@ -336,7 +336,17 @@ pub fn canonical_value(arg: &ArgDecl, value: &str) -> Result<String, String> {
 }
 
 /// Names used by dependency bindings, before the caller's local scope is applied.
+///
+/// Also the variables named by `deps=` `?COND` conditions: they need a value
+/// (and, when computed, their `from=` source run first) before the edge can be
+/// decided.
 pub fn dependency_refs(block: &CodeBlock) -> Vec<String> {
+    let conditions = block
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| dep.condition)
+        .map(|condition| condition.var)
+        .filter(|name| !name.is_empty());
     block
         .dependencies()
         .into_iter()
@@ -347,6 +357,7 @@ pub fn dependency_refs(block: &CodeBlock) -> Vec<String> {
             Binding::Reference(name) => Some(name),
             Binding::Literal(_) => None,
         })
+        .chain(conditions)
         .collect()
 }
 

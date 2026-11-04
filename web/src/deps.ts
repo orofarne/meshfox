@@ -8,7 +8,7 @@
 // preview/UI purposes.
 
 import type { CanvasDoc } from "./types";
-import { parseBody } from "./fence.ts";
+import { depConditionStart, parseBody } from "./fence.ts";
 
 export interface BlockAddr {
   nodeId: string;
@@ -20,7 +20,8 @@ export function addrKey(a: BlockAddr): string {
 }
 
 /** Resolves one raw `deps=` entry (a bare block name, or `node-id/block-name`,
- * either optionally suffixed with `!` — see `core::fence::BlockRef::sync`)
+ * either optionally suffixed with `?COND` and/or `!` — see
+ * `core::fence::BlockRef::{condition,sync}`)
  * against the node that declared it. The trailing `!` only matters to the
  * server's own session-freshness bookkeeping (`meshfox_core::deps::
  * compute_forced_reruns`) — nothing here reads it back, it's just stripped
@@ -28,7 +29,11 @@ export function addrKey(a: BlockAddr): string {
  * MeshNode's clickable "after: …" links, which need the same resolution
  * just to jump to a block rather than to build the whole graph. */
 export function parseBlockRef(raw: string, ownerNodeId: string): BlockAddr {
-  const ref = raw.endsWith("!") ? raw.slice(0, -1) : raw;
+  const unsynced = raw.endsWith("!") ? raw.slice(0, -1) : raw;
+  // A `?COND` suffix (`fix?USE_AGENT`) makes the *edge* conditional; the
+  // preview graph keeps it (the superset), so only the block part is resolved.
+  const at = depConditionStart(unsynced);
+  const ref = at === -1 ? unsynced : unsynced.slice(0, at);
   const slash = ref.indexOf("/");
   if (slash === -1) return { nodeId: ownerNodeId, blockName: ref };
   return { nodeId: ref.slice(0, slash), blockName: ref.slice(slash + 1) };

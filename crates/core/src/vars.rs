@@ -190,6 +190,8 @@ pub enum VarsError {
     TargetVarOutOfScope(String, String, String),
     #[error("meshfox:var {0:?} has an empty from= target")]
     EmptyFrom(String),
+    #[error("meshfox:var {0:?} has a `?` condition in from=, which only deps= supports")]
+    FromCondition(String),
     #[error(
         "meshfox:var {0:?} combines from= with {1}=, which isn't allowed for a computed variable"
     )]
@@ -303,7 +305,13 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
     let from = match attrs.get("from") {
         None => None,
         Some(s) if s.trim().is_empty() => return Err(VarsError::EmptyFrom(name)),
-        Some(s) => Some(crate::fence::parse_block_ref(s.trim())),
+        Some(s) => {
+            let from = crate::fence::parse_block_ref(s.trim());
+            if from.condition.is_some() {
+                return Err(VarsError::FromCondition(name));
+            }
+            Some(from)
+        }
     };
     if from.is_some() {
         if default.is_some() {
@@ -2164,6 +2172,7 @@ mod tests {
             node_id: Some(node_id.to_string()),
             block_name: block_name.to_string(),
             sync: false,
+            condition: None,
         }
     }
 
@@ -2664,6 +2673,7 @@ mod tests {
                 node_id: Some("provision".to_string()),
                 block_name: "create".to_string(),
                 sync: false,
+                condition: None,
             })
         );
     }
@@ -2681,6 +2691,7 @@ mod tests {
                 node_id: None,
                 block_name: "create".to_string(),
                 sync: false,
+                condition: None,
             })
         );
     }
@@ -2691,6 +2702,15 @@ mod tests {
         assert_eq!(
             scan_var_decls(md).unwrap_err(),
             VarsError::EmptyFrom("X".to_string())
+        );
+    }
+
+    #[test]
+    fn from_rejects_a_deps_condition() {
+        let md = "<!-- meshfox:var name=\"X\" from=\"probe?FLAG\" -->\n";
+        assert_eq!(
+            scan_var_decls(md).unwrap_err(),
+            VarsError::FromCondition("X".to_string())
         );
     }
 
@@ -2732,6 +2752,7 @@ mod tests {
                 node_id: Some("my-root".to_string()),
                 block_name: "create".to_string(),
                 sync: false,
+                condition: None,
             })
         );
     }
