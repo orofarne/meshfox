@@ -1011,7 +1011,8 @@ test("on a phone-sized screen the strip is a bar across the bottom and covers no
   expect(pill.height).toBeLessThan(140);
   // ... with the text on one readable block, and nothing of React Flow under it.
   for (const selector of [".react-flow__controls", ".react-flow__minimap"]) {
-    if ((await page.locator(selector).count()) === 0) continue;
+    // Absent or hidden (the minimap is display:none on a narrow screen) covers nothing.
+    if (!(await page.locator(selector).first().isVisible())) continue;
     const other = await box(selector);
     expect(other.y + other.height, `${selector} must end above the strip`).toBeLessThanOrEqual(pill.y + 1);
   }

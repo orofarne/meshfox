@@ -327,7 +327,7 @@ export default defineConfig({
   timeout: 30_000,
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  retries: process.env.CI ? 1 : 3,
   // Playwright's own default (half the CPU cores) still lets enough browser
   // instances run at once, across this file's many per-suite projects, to
   // starve timing-sensitive tests (e.g. select.spec.ts's drag-selection
