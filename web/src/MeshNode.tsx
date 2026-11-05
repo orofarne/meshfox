@@ -392,6 +392,11 @@ export interface MeshNodeData {
    * childless title-only node and for a childless node with a one-/two-line
    * body — those get no fold toggle and ignore title clicks. */
   foldable: boolean;
+  /** Held header-only because its authored box is too small to unfold in
+   * place (App.tsx's `isTooSmallForInPlace`): the title click still opens
+   * the full-screen panel, but the ▸ button would promise an in-place
+   * unfold that never happens, so it is not rendered. */
+  inPlaceDisabled?: boolean;
   onToggleFold: () => void;
   /** True for the one node keyboard nav (j/k/h/l/Enter, see App.tsx)
    * currently has focus on — distinct from React Flow's own mouse-driven
@@ -3419,7 +3424,9 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
         </div>
       ) : (
         <div className="mesh-node-title" data-level={data.level}>
-          {data.foldable && <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />}
+          {data.foldable && !data.inPlaceDisabled && (
+            <FoldToggle folded={data.folded} onToggle={data.onToggleFold} />
+          )}
           {editingTitle ? (
             <input {...titleEditInputProps} />
           ) : (

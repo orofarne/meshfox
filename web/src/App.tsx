@@ -240,6 +240,26 @@ function isShortBodyNode(n: CanvasNode): boolean {
   );
 }
 
+/** Below this authored width or height (flow px), a node's in-place
+ * expansion shows only a clipped slice of its content, so it isn't offered:
+ * the node stays a header-only row and its ▸/Enter opens the full-screen
+ * panel instead (same as the expand button). An explicit `fold="false"`
+ * opts a node out. */
+const IN_PLACE_MIN_SIZE = 480;
+
+/** A leaf node whose authored box is smaller than `IN_PLACE_MIN_SIZE` in
+ * either dimension. Only leaves: a node with children folds to hide its
+ * subtree, which a size rule must not force. A node without any authored
+ * size is auto-sized by the layout, so it's never "too small". */
+function isTooSmallForInPlace(n: CanvasNode, withChildren: ReadonlySet<string>): boolean {
+  if (n.type === "group" || n.fold === false || withChildren.has(n.id)) return false;
+  if (n.width === undefined && n.height === undefined) return false;
+  return (
+    (n.width !== undefined && n.width < IN_PLACE_MIN_SIZE) ||
+    (n.height !== undefined && n.height < IN_PLACE_MIN_SIZE)
+  );
+}
+
 /** The default folded set for `canvas` on its very first open (nothing
  * saved in localStorage for it yet — see the restore effect below) — the
  * document's own declared preference, not a hardcoded rule: a node's own
@@ -440,11 +460,24 @@ export default function App() {
     if (!canvas) return rawFoldedNodeIds;
     const withChildren = nodesWithChildren(canvas);
     const byId = new Map(canvas.nodes.map((n) => [n.id, n]));
-    return new Set([...rawFoldedNodeIds].filter((id) => {
+    const folded = new Set([...rawFoldedNodeIds].filter((id) => {
       const n = byId.get(id);
       return !n || canFold(n, withChildren);
     }));
+    for (const n of canvas.nodes) {
+      if (canFold(n, withChildren) && isTooSmallForInPlace(n, withChildren)) folded.add(n.id);
+    }
+    return folded;
   }, [canvas, rawFoldedNodeIds]);
+  // Nodes held header-only by size (see `isTooSmallForInPlace`): their
+  // fold toggle opens the full-screen panel instead of unfolding in place.
+  const smallNodeIds = useMemo(() => {
+    if (!canvas) return new Set<string>();
+    const withChildren = nodesWithChildren(canvas);
+    return new Set(
+      canvas.nodes.filter((n) => canFold(n, withChildren) && isTooSmallForInPlace(n, withChildren)).map((n) => n.id),
+    );
+  }, [canvas]);
   const foldedStorageKeyRef = useRef<string | null>(null);
   // Restores folded state for whichever canvas just loaded, keyed by its
   // root node's id (stable across reloads/renames per SPEC.md — the only
@@ -624,6 +657,10 @@ export default function App() {
   const measuredHeightsRef = useRef<Map<string, number>>(new Map());
   const toggleFold = useCallback(
     (id: string) => {
+      if (smallNodeIds.has(id)) {
+        setExpandedNodeId(id);
+        return;
+      }
       const isUnfolding = foldedNodeIds.has(id);
       setFoldedNodeIds((prev) => {
         const next = new Set(prev);
@@ -679,7 +716,7 @@ export default function App() {
         { duration: 400 },
       );
     },
-    [foldedNodeIds, canvas, flowInstance],
+    [foldedNodeIds, smallNodeIds, canvas, flowInstance],
   );
   // Set only while the pre-run "configure variables" modal is open (see
   // VarsForm) — remembers which run to actually start once it's answered.
@@ -2622,6 +2659,7 @@ export default function App() {
             folded: isFolded,
             hasChildren: parentIdSet.has(n.id),
             foldable: canFold(n, parentIdSet),
+            inPlaceDisabled: smallNodeIds.has(n.id),
             onToggleFold: () => toggleFold(n.id),
             target: n.target,
             caption: n.caption,
