@@ -390,6 +390,7 @@ pub fn render_with_blocks(
         focused,
         runnable_controls,
         &[],
+        &Default::default(),
     )
 }
 
@@ -424,6 +425,9 @@ pub fn render_with_computed(
     focused: bool,
     runnable_controls: bool,
     render_results: &[meshfox_core::starlark_render::RenderResult],
+    // Interpreters blocks inherit through `extends=`, by block name (from
+    // `Node::extended`): a fence that names none of its own shows this one.
+    inherited_interpreters: &std::collections::HashMap<String, String>,
 ) -> (Vec<Segment>, Vec<ClickRegion>) {
     // Pre-scanned once so `Tag::CodeBlock`'s own handling (`start`) can
     // resolve a fence's *real* run name — including the implicit "sole
@@ -449,6 +453,7 @@ pub fn render_with_computed(
     renderer.selected_block = selected_block.map(str::to_owned);
     renderer.focused = focused;
     renderer.runnable_controls = runnable_controls;
+    renderer.inherited_interpreters = inherited_interpreters.clone();
     let signatures = meshfox_core::args::scan_signatures(node_id, md).unwrap_or_default();
     for block in &runnable {
         let mut details = Vec::new();
@@ -643,6 +648,8 @@ struct Renderer<'a> {
     code_lease: Option<String>,
     /// This fence's raw `extends=` attribute, shown as `├─ extends:` rows.
     code_extends: Option<String>,
+    /// See `render_with_computed`'s `inherited_interpreters`.
+    inherited_interpreters: std::collections::HashMap<String, String>,
     code_env: Option<String>,
     block_details: std::collections::HashMap<usize, Vec<String>>,
     code_details: Vec<String>,
@@ -779,6 +786,7 @@ impl<'a> Renderer<'a> {
             code_deps: None,
             code_lease: None,
             code_extends: None,
+            inherited_interpreters: Default::default(),
             code_env: None,
             block_details: Default::default(),
             code_details: Vec::new(),
@@ -2071,7 +2079,12 @@ impl<'a> Renderer<'a> {
                 // `#!interpreter`, exactly as written in the attribute (no
                 // case-folding) — mirrors the web UI's own
                 // `mesh-code-interpreter` suffix right after the lang/name.
-                if let Some(interpreter) = &interpreter {
+                let shown = interpreter.clone().or_else(|| {
+                    name.as_ref()
+                        .and_then(|n| self.inherited_interpreters.get(n))
+                        .cloned()
+                });
+                if let Some(interpreter) = &shown {
                     label.push_str(&format!(" #!{interpreter}"));
                 }
                 if tangle {
@@ -2354,6 +2367,7 @@ mod tests {
                 false,
                 true,
                 &results,
+                &Default::default(),
             )
         };
         let (segments, clicks) = render(&Default::default());
@@ -3733,6 +3747,43 @@ mod tests {
             .expect("▶ marker span");
         assert_eq!(marker_span.style.fg, Some(crate::tui::theme::accent()));
     }
+    #[test]
+    fn an_inherited_interpreter_shows_as_a_shebang_suffix_on_the_header() {
+        let hl = Highlighter::new();
+        let md = "```python name=\"t\" extends=\"defs\"\nf()\n```\n";
+        let header = |inherited: &std::collections::HashMap<String, String>| {
+            let (segments, _) = render_with_computed(
+                md,
+                Path::new("/nonexistent-base-dir"),
+                &hl,
+                "n",
+                &[],
+                &Default::default(),
+                None,
+                &Default::default(),
+                &Default::default(),
+                None,
+                false,
+                true,
+                &[],
+                inherited,
+            );
+            text_segments(segments)
+                .iter()
+                .filter_map(|s| match s {
+                    Segment::Text(lines) => Some(lines),
+                    _ => None,
+                })
+                .flatten()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let inherited = std::collections::HashMap::from([("t".to_string(), "python3 -u".to_string())]);
+        assert!(header(&inherited).contains("#!python3 -u"));
+        assert!(!header(&Default::default()).contains("#!"));
+    }
+
     #[test]
     fn an_extends_row_names_the_extended_block_and_jumps_to_it() {
         let hl = Highlighter::new();

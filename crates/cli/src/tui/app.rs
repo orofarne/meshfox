@@ -5374,6 +5374,11 @@ impl App {
             self.focus == Focus::Document,
             true,
             &node.render_results,
+            &node
+                .extended
+                .iter()
+                .filter_map(|(name, ext)| Some((name.clone(), ext.interpreter.clone()?)))
+                .collect(),
         );
         let offset = self.doc_segments.len();
         self.doc_segments.extend(segs);
