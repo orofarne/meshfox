@@ -72,6 +72,7 @@ echo "ok"
 ```
 
 ## Running it
+<!-- meshfox:node id="running-it" -->
 
 ```text
 meshfox examples/extends.canvas.md run py slug-test    # test the definitions
