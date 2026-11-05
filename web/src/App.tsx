@@ -2612,6 +2612,7 @@ export default function App() {
             level: n.level,
             nodeType: n.type ?? "text",
             suggested,
+            groupAnchored: isGroup && n.x !== undefined && n.y !== undefined,
             maxHeight,
             fixedSize,
             fixedHeight,

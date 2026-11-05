@@ -1211,7 +1211,8 @@ a {
  * MeshNode.tsx) so a colored node's corner matches its own color instead
  * of always being the theme's `--accent`, which it falls back to when no
  * custom color is set. */
-.mesh-node[data-suggested="false"]:not([data-type="group"]) .mesh-node-clip::before {
+.mesh-node[data-suggested="false"]:not([data-type="group"]) .mesh-node-clip::before,
+.mesh-node[data-type="group"][data-anchored="true"] .mesh-node-clip::before {
   content: "";
   position: absolute;
   top: 0;

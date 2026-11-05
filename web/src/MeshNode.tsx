@@ -299,6 +299,10 @@ export interface MeshNodeData {
    * (see `./autolayout.ts`) rather than the file — not authored, nothing
    * to feel bad about dragging away. */
   suggested: boolean;
+  /** A `group` whose own x/y anchor is authored in the file. A group is
+   * never `suggested` (its size is always derived), so the "authored" corner
+   * marker needs its own flag for groups: only the anchor counts. */
+  groupAnchored?: boolean;
   /** A depth-≥2 auto-placed node's content-driven height is capped here
    * (see `autolayout.ts`) — applied directly to this component's own root
    * element (not the surrounding React Flow node wrapper `App.tsx` sizes):
@@ -3270,6 +3274,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
       className="mesh-node"
       data-type={data.nodeType}
       data-suggested={data.suggested}
+      data-anchored={data.groupAnchored ?? false}
       data-folded={data.folded}
       data-focused={data.focused ?? false}
       style={{
