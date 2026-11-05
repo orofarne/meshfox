@@ -445,7 +445,9 @@ export const FORM_LANG = "form";
  * `is_supported_lang(lang) || attrs.contains_key("interpreter")` gate. */
 function isRunnableCandidate(lang: string, attrs: Record<string, string>): boolean {
   if (lang === "starlark" && ["render", "constraint"].some(key => attrs[key] !== undefined && attrs[key] !== "false")) return false;
-  return isSupportedLang(lang) || attrs.interpreter !== undefined;
+  // `extends=` takes its interpreter from the block it extends, so it also counts
+  // (mirrors `candidate_fences`).
+  return isSupportedLang(lang) || attrs.interpreter !== undefined || attrs.extends !== undefined;
 }
 
 /**
@@ -569,7 +571,11 @@ function parseOutputMarkerAttrs(line: string, name: string): Record<string, stri
  * omission ambiguous) — mirrors `core::fence::scan_runnable_blocks`; see
  * SPEC.md's "Runnable code fences".
  */
-export function parseBody(markdown: string, nodeId: string): BodySegment[] {
+export function parseBody(
+  markdown: string,
+  nodeId: string,
+  extended?: Record<string, { interpreter?: string }>,
+): BodySegment[] {
   const soloUnnamed = countUnnamedCandidateFences(markdown) === 1;
   const lines = markdown.split("\n");
   const segments: BodySegment[] = [];
@@ -658,7 +664,8 @@ export function parseBody(markdown: string, nodeId: string): BodySegment[] {
     const outputImage = attrs.output === "image";
     const outputMarkdown = attrs.output === "markdown" || outputImage;
     const outputAttrs = attrs["output-attrs"];
-    const interpreter = attrs.interpreter;
+    // `Node.extended` (resolved server side) supplies what `extends=` inherits.
+    const interpreter = attrs.interpreter ?? (name !== undefined ? extended?.[name]?.interpreter : undefined);
     const envRefs = attrs.env !== undefined ? parseEnvList(attrs.env) : [];
     const refs = (raw: string | undefined) => (raw ?? "").split(",").map(s => s.trim()).filter(Boolean);
     const declaredDeps = refs(attrs.deps);

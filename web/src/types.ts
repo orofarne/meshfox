@@ -104,6 +104,9 @@ export interface CanvasNode {
    * file's content, which the client cannot recompute) — compared with the
    * cached output's `hash=` to flag it stale. */
   blockFingerprint?: string;
+  /** `extends=` resolved server side, by block name (`Node.extended`): the
+   * interpreter a block inherits from what it extends. */
+  extended?: Record<string, { interpreter?: string }>;
   /** link-node only: whether to fetch and show an OpenGraph social preview
    * (title/description/image) below the link. Absent means off (the
    * default) — meshfox omits the default from the wire format, same as

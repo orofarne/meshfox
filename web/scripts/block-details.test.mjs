@@ -155,3 +155,12 @@ test('conditional deps entries resolve to their block and fingerprint like the R
   assert.notEqual(hash('fix?USE_AGENT'), hash('fix?!USE_AGENT'));
   assert.notEqual(hash('fix?USE_AGENT'), hash('fix'));
 });
+
+test('a fence with only extends= is runnable and shows the inherited interpreter', () => {
+  const source = '```python name="t" extends="defs"\nf()\n```';
+  const plain = parseBody(source, 'root').find(s => s.type === 'code');
+  assert.equal(plain?.name, 't');
+  assert.equal(plain.interpreter, undefined);
+  const inherited = parseBody(source, 'root', { t: { interpreter: 'python3 -u' } }).find(s => s.type === 'code');
+  assert.equal(inherited.interpreter, 'python3 -u');
+});

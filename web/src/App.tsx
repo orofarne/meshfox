@@ -2675,6 +2675,7 @@ export default function App() {
             interpreter: n.interpreter,
             blockAttrs: n.blockAttrs,
             blockFingerprint: n.blockFingerprint,
+            extended: n.extended,
             preview: n.preview,
             text: n.text,
             bodyRev: n.bodyRev,

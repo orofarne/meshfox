@@ -462,6 +462,8 @@ export interface MeshNodeData {
   /** file-node only: see `CanvasNode.blockAttrs` / `blockFingerprint`. */
   blockAttrs?: Record<string, string>;
   blockFingerprint?: string;
+  /** See `CanvasNode.extended`. */
+  extended?: Record<string, { interpreter?: string }>;
   /** link-node only: shows an OpenGraph social preview card (title/
    * description/image) below the link — see `LinkPreviewCard`. */
   preview?: boolean;
@@ -2685,7 +2687,7 @@ function RenderFenceBlock({ seg, result, assetBase }: Readonly<{
 }
 
 function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) {
-  const segments = parseBody(data.text, nodeId);
+  const segments = parseBody(data.text, nodeId, data.extended);
   const wheelRef = useStopWheelIfScrollable<HTMLDivElement>();
   const components = useMemo(() => makeMarkdownComponents(data.assetBase), [data.assetBase]);
 
