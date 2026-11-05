@@ -182,6 +182,19 @@ function isBlockCached(canvas: CanvasDoc, addr: BlockAddr): boolean {
   return seg?.cache ?? false;
 }
 
+/** Whether the `tty` block `addr` opted into `autoclose`. A terminal that
+ * arrives as a `"tty-started"` watch event (a `tty` step a chain passed
+ * through, or an `autorun`) has no run request of its own to carry the
+ * flag, so the block's own fence is the only place to read it from. */
+function isBlockAutoclose(canvas: CanvasDoc | null, addr: BlockAddr): boolean {
+  const node = canvas?.nodes.find((n) => n.id === addr.nodeId);
+  if (!node) return false;
+  const seg = parseBody(node.text, node.id).find(
+    (s): s is CodeSegment => s.type === "code" && s.name === addr.blockName,
+  );
+  return seg?.autoclose ?? false;
+}
+
 /** Whether `n` renders as an already-title-only, empty-bodied row (see
  * MeshNode.tsx's own `isTitleOnly`, computed independently there since it
  * additionally accounts for `editMode` — a purely display-time concern
@@ -240,24 +253,21 @@ function isShortBodyNode(n: CanvasNode): boolean {
   );
 }
 
-/** Below this authored width or height (flow px), a node's in-place
- * expansion shows only a clipped slice of its content, so it isn't offered:
- * the node stays a header-only row and its ▸/Enter opens the full-screen
- * panel instead (same as the expand button). An explicit `fold="false"`
- * opts a node out. */
-const IN_PLACE_MIN_SIZE = 480;
+/** An authored height at or below this (flow px) is barely more than a
+ * folded header (`FOLDED_HEIGHT`): unfolding in place would only show a
+ * sliver, so the node stays a header-only row and its ▸/Enter opens the
+ * full-screen panel instead (same as the expand button). Any taller
+ * authored size is a deliberate "show this much of it" and is respected.
+ * An explicit `fold="false"` opts a node out. */
+const IN_PLACE_MIN_HEIGHT = FOLDED_HEIGHT + 20;
 
-/** A leaf node whose authored box is smaller than `IN_PLACE_MIN_SIZE` in
- * either dimension. Only leaves: a node with children folds to hide its
- * subtree, which a size rule must not force. A node without any authored
- * size is auto-sized by the layout, so it's never "too small". */
+/** A leaf node whose authored height is below `IN_PLACE_MIN_HEIGHT`. Only
+ * leaves: a node with children folds to hide its subtree, which a size rule
+ * must not force. A node without an authored height is auto-sized by the
+ * layout, so it's never "too small". */
 function isTooSmallForInPlace(n: CanvasNode, withChildren: ReadonlySet<string>): boolean {
   if (n.type === "group" || n.fold === false || withChildren.has(n.id)) return false;
-  if (n.width === undefined && n.height === undefined) return false;
-  return (
-    (n.width !== undefined && n.width < IN_PLACE_MIN_SIZE) ||
-    (n.height !== undefined && n.height < IN_PLACE_MIN_SIZE)
-  );
+  return n.height !== undefined && n.height < IN_PLACE_MIN_HEIGHT;
 }
 
 /** The default folded set for `canvas` on its very first open (nothing
@@ -1410,6 +1420,10 @@ export default function App() {
     [load],
   );
 
+  // The watch subscription below outlives any one render, so it reads the
+  // current canvas through a ref rather than closing over a stale one.
+  const canvasRef = useRef<CanvasDoc | null>(null);
+  canvasRef.current = canvas;
   useEffect(() => {
     const stop = watchChanges(
       () => {
@@ -1448,7 +1462,7 @@ export default function App() {
           path: [],
           blockName: block,
           withDeps: false,
-          autoclose: false,
+          autoclose: isBlockAutoclose(canvasRef.current, { nodeId, blockName: block }),
           attachTo: { nodeId, block },
         });
       },
