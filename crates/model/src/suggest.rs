@@ -29,6 +29,7 @@ pub const FENCE_VALUE_ATTRS: &[&str] = &[
     "render",
     "send",
     "argv",
+    "extends",
 ];
 
 /// The block attributes of a runnable `file` node (`mdcanvas::FILE_BLOCK_ATTRS`)
@@ -38,7 +39,7 @@ const FILE_BLOCK_FLAGS: &[&str] = &["cache", "always", "default", "autorun", "co
 
 /// Block attributes the parser accepts on a file node but `meshfox validate`
 /// rejects — never suggested.
-const FILE_BLOCK_UNSUPPORTED: &[&str] = &["tty", "service", "autoclose", "tangle"];
+const FILE_BLOCK_UNSUPPORTED: &[&str] = &["tty", "service", "autoclose", "tangle", "extends"];
 
 pub const FENCE_FLAG_ATTRS: &[&str] = &[
     "cache",

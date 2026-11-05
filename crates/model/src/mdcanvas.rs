@@ -148,7 +148,12 @@ fn id_has_forbidden_char(id: &str) -> bool {
 
 impl Canvas {
     pub fn from_markdown(markdown: &str) -> Result<Canvas, ParseError> {
-        parse(markdown)
+        let mut canvas = parse(markdown)?;
+        // Settled again after `include`s are spliced in (`include::resolve`);
+        // doing it here too means a document read on its own (an editor
+        // buffer, a test) already knows what its blocks extend.
+        canvas.resolve_extends();
+        Ok(canvas)
     }
 
     /// Full regeneration from the in-memory model. Prefer `set_node_body`
@@ -625,6 +630,7 @@ pub fn parse(markdown: &str) -> Result<Canvas, ParseError> {
             },
             target_digest: None,
             block_fingerprint: None,
+            extended: Default::default(),
         });
     }
 

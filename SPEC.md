@@ -725,6 +725,56 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   its nodes runs in; files of other canvases, and of a canvas that was
   renamed, are left alone. Add `.meshfox-tangle-*` to `.gitignore`.
   Not part of the block's fingerprint.
+- `extends` — optional, comma-separated list of other blocks (a bare name in
+  the same node, or `node-id/block-name`, as in `deps=`) whose **code is placed
+  in front of this block's own**; the joined text is what runs. It exists so
+  that definitions, the action and the tests can share one body in any
+  language, with no module system: a block holds only functions, and each block
+  that extends it adds one thing — run the step, or test the functions.
+
+  ```python name="slug-defs" interpreter="python3 -u"
+  def slug(text): ...
+  ```
+
+  ```python name="slug-test" extends="slug-defs"
+  assert slug("Hello World") == "hello-world"
+  ```
+
+  - **Borrowed text only.** An extended block is not run, is not a dependency
+    and contributes no edge: the extending block declares its own `deps=`,
+    `inputs=` and `outputs=`. Because of that an extended block holds
+    *definitions only*: `deps`, `inputs`, `outputs`, `lease`, `defer`, `tty`,
+    `service` and `cache` on it are a `meshfox validate` error (they would
+    silently never apply). It is still an ordinary block and may be run on its
+    own.
+  - **Order.** The code of each entry comes first, depth-first (an extended
+    block's own `extends=` precede it), in the order written, each block exactly
+    once — a block reached by several paths is included at its first place. The
+    pieces are joined with a newline, then the block's own code. A cycle is an
+    error.
+  - **Inherited attributes.** `interpreter=` is taken from the extended
+    blocks when this block has none (so `extends=` alone makes a `python`
+    fence runnable); if both set one they must be equal. `env=` is the union of
+    the extended blocks' entries (first) and this block's; one local name bound
+    to two different variables is an error. The language (`bash`, `python`, ...)
+    must be the same everywhere. Everything else — `deps`, `inputs`, `outputs`,
+    `tty`, `default`, `always`, ... — is **not** inherited.
+  - **Fingerprint.** The extended code is part of the block's fingerprint, so
+    editing a definition makes every block that extends it stale; the extended
+    block itself is not part of any chain. `cache` cannot be combined with
+    `extends=` (the cached output could not notice a change in the extended
+    code).
+  - **Where it applies.** A block with inline code: not a `file` node, a
+    `service`, a `form`, a `button` or a `meshfox` fence. Only the executed
+    text changes: the source editor, `meshfox node block` and the file still
+    hold the block's own code. Entries take a block name only (no `!`, `?`
+    condition or `[arguments]`). `tangle` writes the joined text.
+  - **Errors.** An unknown or cyclic parent, a language or interpreter
+    mismatch, an unsupported parent and an unresolvable chain are reported by
+    `meshfox validate`; running such a block refuses with the same message.
+    Line numbers an interpreter reports are lines of the **joined** text: the
+    extended code comes first, so a line of the extending block is shifted by the
+    length of what it extends (the extended blocks' own lines are exact).
 - `tty` — optional flag (`tty` or `tty=true`); this block wants a real
   interactive terminal instead of the usual captured/streamed output —
   e.g. `bash` on its own (a login-style shell), or anything else that reads
@@ -3373,12 +3423,12 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
                      | 'autoclose' | 'service' | 'autostop' | 'always' | 'interpreter'
                      | 'autorun' | 'render' | 'output' | 'send' | 'fold'
-                     | 'inputs' | 'outputs' | 'lease' | 'defer'
+                     | 'inputs' | 'outputs' | 'lease' | 'defer' | 'tangle' | 'extends'
     constraint-attr ::= 'constraint' | 'name'
     starlark-render-attr ::= 'render' | 'name' | 'output'
 
 A runnable fence additionally requires `lang` to be `bash` or `sh`, *or* its
-own `interpreter=` attribute set (see "Runnable code fences") — `button`
+own `interpreter=` attribute set (or an `extends=` to take one from) (see "Runnable code fences") — `button`
 and `form` (see their own sections above) are runnable-addressable the
 same way without either, having no real code of their own to require a
 language for in the first place. A constraint

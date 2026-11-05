@@ -80,6 +80,8 @@ pub enum DepsError {
     FormAttrConflict(String, String, &'static str),
     #[error("node {0:?} block {1:?}: `tangle` needs an `interpreter=` — without one the code runs under `bash -c` and never becomes a file to place")]
     TangleWithoutInterpreter(String, String),
+    #[error("node {0:?} block {1:?}: {2}")]
+    Extends(String, String, String),
     #[error("node {0:?}: `{1}` isn't supported on a file node's block (it runs its target file directly)")]
     FileNodeUnsupportedAttr(String, &'static str),
     #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
@@ -207,6 +209,13 @@ fn find_block_with_values(
     }
     let block = crate::args::bind_node_block(node, &addr.block_name, values)
         .map_err(DepsError::Arguments)?;
+    if let Some(error) = node.extends_error(&app.definition) {
+        return Err(DepsError::Extends(
+            addr.node_id.clone(),
+            app.definition.clone(),
+            error.into(),
+        ));
+    }
     crate::vars::validate_selected_env(canvas, &addr.node_id, &block)?;
     Ok(block)
 }
@@ -1186,6 +1195,38 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     }
                 }
             }
+            if !block.extends.is_empty() {
+                if matches!(block.lang.as_str(), "meshfox" | "form" | "button")
+                    || block.service
+                    || node.is_runnable_file()
+                {
+                    return Err(DepsError::Extends(
+                        node.id.clone(),
+                        name.clone(),
+                        "`extends=` needs a block with inline code (not a file node, service, form, button or meshfox block)".into(),
+                    ));
+                }
+                if block.interpreter.is_none() && !matches!(block.lang.as_str(), "bash" | "sh") {
+                    return Err(DepsError::Extends(
+                        node.id.clone(),
+                        name.clone(),
+                        format!(
+                            "a {:?} block needs an `interpreter=`, its own or one inherited from an extended block",
+                            block.lang
+                        ),
+                    ));
+                }
+                if block.cache {
+                    return Err(DepsError::Extends(
+                        node.id.clone(),
+                        name.clone(),
+                        "`extends=` can't be combined with `cache`: the cached output would not notice a change in the extended code".into(),
+                    ));
+                }
+                if let Some(error) = node.extends_error(name) {
+                    return Err(DepsError::Extends(node.id.clone(), name.clone(), error.into()));
+                }
+            }
             if block.tangle() && block.interpreter.is_none() {
                 return Err(DepsError::TangleWithoutInterpreter(
                     node.id.clone(),
@@ -1690,6 +1731,113 @@ mod tests {
             "```button name=\"full-import\" default deps=\"build\"\nRun everything\n```\n",
         ));
         assert!(validate(&c).is_ok());
+    }
+
+    fn extended(body: &str) -> Canvas {
+        let mut c = canvas(&format!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n{body}"
+        ));
+        c.resolve_extends();
+        c
+    }
+
+    fn source_of(c: &Canvas, name: &str) -> String {
+        c.node("root")
+            .unwrap()
+            .runnable_blocks()
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(name))
+            .unwrap()
+            .source()
+            .into_owned()
+    }
+
+    #[test]
+    fn extends_puts_the_parents_code_in_front_in_order_once() {
+        let c = extended(concat!(
+            "```sh name=\"base\"\nbase() { :; }\n```\n",
+            "```sh name=\"mid\" extends=\"base\"\nmid() { :; }\n```\n",
+            "```sh name=\"other\"\nother() { :; }\n```\n",
+            "```sh name=\"top\" extends=\"mid,other,base\"\ntop\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+        assert_eq!(
+            source_of(&c, "top"),
+            "base() { :; }\nmid() { :; }\nother() { :; }\ntop"
+        );
+        // the parents themselves are unchanged, the fence still holds only its own code
+        assert_eq!(source_of(&c, "mid"), "base() { :; }\nmid() { :; }");
+        assert_eq!(
+            c.node("root").unwrap().runnable_blocks()[3].code,
+            "top"
+        );
+    }
+
+    #[test]
+    fn extends_inherits_the_interpreter_and_merges_env() {
+        let c = extended(concat!(
+            "<!-- meshfox:var name=\"A\" default=\"1\" -->\n<!-- meshfox:var name=\"B\" default=\"2\" -->\n",
+            "```python name=\"defs\" interpreter=\"python3 -u\" env=\"A\"\ndef f(): pass\n```\n",
+            "```python name=\"test\" env=\"B\" extends=\"defs\"\nf()\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+        let block = c.node("root").unwrap().runnable_blocks().remove(1);
+        assert_eq!(block.interpreter.as_deref(), Some("python3 -u"));
+        let env: Vec<_> = block.env.iter().map(|e| e.var_name.as_str()).collect();
+        assert_eq!(env, ["B", "A"]);
+    }
+
+    #[test]
+    fn extends_changes_the_fingerprint_with_the_parent_code() {
+        let a = extended("```sh name=\"b\"\none\n```\n```sh name=\"t\" extends=\"b\"\nx\n```\n");
+        let b = extended("```sh name=\"b\"\ntwo\n```\n```sh name=\"t\" extends=\"b\"\nx\n```\n");
+        let fp = |c: &Canvas| {
+            crate::fence::fingerprint(&c.node("root").unwrap().runnable_blocks()[1])
+        };
+        assert_ne!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn extends_errors_are_reported_by_validate_and_by_find_block() {
+        let cases = [
+            ("```sh name=\"t\" extends=\"nope\"\nx\n```\n", "no runnable block"),
+            (
+                "```sh name=\"a\" extends=\"b\"\nx\n```\n```sh name=\"b\" extends=\"a\"\ny\n```\n",
+                "cycle",
+            ),
+            (
+                "```python name=\"p\" interpreter=\"python3\"\nx\n```\n```sh name=\"t\" extends=\"p\"\ny\n```\n",
+                "is \"python\"",
+            ),
+            (
+                "```sh name=\"p\" interpreter=\"bash\"\nx\n```\n```sh name=\"t\" interpreter=\"zsh\" extends=\"p\"\ny\n```\n",
+                "runs under",
+            ),
+            (
+                "```python name=\"t\" extends=\"p\"\ny\n```\n```sh name=\"p\"\nx\n```\n",
+                "needs an `interpreter=`",
+            ),
+            (
+                "```sh name=\"p\" outputs=\"f\"\nx\n```\n```sh name=\"t\" extends=\"p\"\ny\n```\n",
+                "definitions only",
+            ),
+            (
+                "```sh name=\"p\"\nx\n```\n```sh name=\"t\" extends=\"p!\"\ny\n```\n",
+                "only a block name",
+            ),
+            (
+                "```sh name=\"p\"\nx\n```\n```sh name=\"t\" cache extends=\"p\"\ny\n```\n",
+                "cache",
+            ),
+        ];
+        for (body, needle) in cases {
+            let c = extended(body);
+            let message = validate(&c).unwrap_err().to_string();
+            assert!(message.contains(needle), "{needle:?} not in {message:?}");
+        }
+        let c = extended("```sh name=\"t\" extends=\"nope\"\nx\n```\n");
+        let addr = BlockAddr::new("root".to_string(), "t".to_string());
+        assert!(find_block(&c, &addr).is_err());
     }
 
     #[test]

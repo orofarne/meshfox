@@ -167,6 +167,7 @@ mod tests {
             block_attrs: Default::default(),
             target_digest: None,
             block_fingerprint: None,
+            extended: Default::default(),
         }
     }
 

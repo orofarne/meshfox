@@ -493,14 +493,14 @@ where
     match &block.interpreter {
         Some(interpreter) => spawn_interpreter_on(
             interpreter,
-            ScriptSource::Code(&block.code),
+            ScriptSource::Code(&block.source()),
             &block.argv,
             Some(&block.lang),
             envs,
             cwd,
             block_origin(block, canvas_path),
         ),
-        None => spawn_bash(&block.code, envs, cwd),
+        None => spawn_bash(&block.source(), envs, cwd),
     }
 }
 
@@ -1068,6 +1068,8 @@ mod tests {
             interpreter: None,
             attrs: std::collections::HashMap::new(),
             code: "echo hi".to_string(),
+            extends: Vec::new(),
+            inherited: String::new(),
             argv: Vec::new(),
             target: None,
             span: 0..0,

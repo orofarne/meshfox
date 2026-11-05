@@ -145,18 +145,19 @@ fn resolve_inner(
         node.plain_markdown_include = true;
     }
 
-    Ok((
-        Canvas {
-            nodes,
-            options: Vec::new(),
-            artifact_root: base_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .to_path_buf(),
-            artifact_values: canvas.artifact_values.clone(),
-        },
-        warnings,
-    ))
+    let mut resolved = Canvas {
+        nodes,
+        options: Vec::new(),
+        artifact_root: base_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf(),
+        artifact_values: canvas.artifact_values.clone(),
+    };
+    // Every consumer reads the include-resolved document, so this is where
+    // `extends=` (which may name a block in an included node) is settled.
+    resolved.resolve_extends();
+    Ok((resolved, warnings))
 }
 
 /// One `include` node declared directly in `canvas`, resolved to the

@@ -213,6 +213,8 @@ mod tests {
             interpreter: None,
             attrs: std::collections::HashMap::new(),
             code: String::new(),
+            extends: Vec::new(),
+            inherited: String::new(),
             argv: Vec::new(),
             target: None,
             span: 0..0,

@@ -115,6 +115,14 @@ pub struct CodeBlock {
     pub interpreter: Option<String>,
     pub attrs: HashMap<String, String>,
     pub code: String,
+    /// `extends="a,b"` — blocks whose code is placed in front of this
+    /// block's own (see `source`). Parsed leniently like `deps=`; the
+    /// extends-specific rules are checked by `crate::deps::validate`.
+    pub extends: Vec<BlockRef>,
+    /// The already-expanded code of `extends` (parents' code, depth-first,
+    /// each block once, in order), filled by `Canvas::resolve_extends` — a
+    /// block parsed on its own has none. Never written back to the file.
+    pub inherited: String,
     /// Extra command-line arguments for the interpreter, after the script
     /// path: `--name=value` per declared `meshfox:arg`, in declaration
     /// order. Filled by `crate::args` when the block is bound; empty for a
@@ -144,6 +152,18 @@ pub struct BlockTarget {
 }
 
 impl CodeBlock {
+    /// The text that actually runs: the inherited code of `extends=`
+    /// followed by this block's own `code`. This is what an interpreter
+    /// receives and what the fingerprint covers; `code` alone is what the
+    /// fence holds and what an editor shows.
+    pub fn source(&self) -> std::borrow::Cow<'_, str> {
+        if self.inherited.is_empty() {
+            std::borrow::Cow::Borrowed(&self.code)
+        } else {
+            std::borrow::Cow::Owned(format!("{}{}", self.inherited, self.code))
+        }
+    }
+
     /// Service dependencies held until the enclosing run (including cleanup) ends.
     pub fn leases(&self) -> Vec<BlockRef> {
         self.attrs
@@ -648,7 +668,10 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
                 && ["render", "constraint"]
                     .iter()
                     .any(|key| attrs.get(*key).is_some_and(|v| v != "false")))
-                && (crate::block_refs::is_supported_lang(lang) || attrs.contains_key("interpreter"))
+                && (crate::block_refs::is_supported_lang(lang)
+                    || attrs.contains_key("interpreter")
+                    // takes its interpreter from the block it extends
+                    || attrs.contains_key("extends"))
         })
         .collect()
 }
@@ -708,6 +731,7 @@ const FENCE_ATTRS: &[&str] = &[
     "fold",
     "tangle",
     "argv",
+    "extends",
 ];
 
 /// Known `render=` values — see `CodeBlock::render`'s own doc comment and
@@ -772,6 +796,10 @@ fn block_from_attrs(
     let render = attrs.get("render").cloned();
     let fold = attrs.get("fold").map(|v| v != "false").unwrap_or(false);
     let deps = parse_deps(&attrs);
+    let extends = attrs
+        .get("extends")
+        .map(|v| parse_deps_list(v))
+        .unwrap_or_default();
     let env = parse_env(&attrs);
     let interpreter = attrs.get("interpreter").cloned();
     CodeBlock {
@@ -792,6 +820,8 @@ fn block_from_attrs(
         interpreter,
         attrs,
         code,
+        extends,
+        inherited: String::new(),
         argv: Vec::new(),
         target,
         span,
@@ -1133,6 +1163,11 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         block.code.clone(),
         block.interpreter.clone().unwrap_or_default(),
     ];
+    // Inherited code is part of what runs; folded in only when present so a
+    // block without `extends=` keeps the exact hash it always had.
+    if !block.inherited.is_empty() {
+        parts.push(format!("inherited\u{0}{}", block.inherited));
+    }
     if let Some(target) = &block.target {
         // A file node's code is the file: both which file and what is in
         // it decide whether a recorded result is still valid.

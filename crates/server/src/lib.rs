@@ -7438,7 +7438,7 @@ async fn run_block_impl_sized(
             let exit_code = if resolved_block.tty {
                 let key = (addr.node_id.clone(), addr.block_name.clone());
                 let pty = match pty_exec::spawn(
-                    &block.code,
+                    &block.source(),
                     resolved_block.interpreter.as_deref(),
                     Some(&block.lang),
                     &block_env,

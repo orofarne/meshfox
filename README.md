@@ -1301,6 +1301,32 @@ is ignored.
 
 [examples/optional-deps.canvas.md](./examples/optional-deps.canvas.md)
 
+### Sharing code between blocks, and testing it (`extends=`)
+<!-- meshfox:node id="sharing-code-between-blocks" -->
+
+[examples/extends.canvas.md](./examples/extends.canvas.md) — `extends="defs"`
+puts the code of another block in front of this one's and runs the joined text.
+Keep the functions in one block (the *definitions*), and let every block that
+needs them extend it: the step that does the work adds a line that calls them,
+the tests add the assertions. There is no module system to set up, so it works
+the same in `python`, `bash`, `node` or anything else with an `interpreter=`,
+and the tests see everything the definitions define, private names included.
+
+The extended block is only borrowed from — it is not run and is not a
+dependency — so the extending block still declares its own `deps=`, `inputs=`
+and `outputs=`; the definitions hold nothing but definitions. The extending
+block inherits the `interpreter=` (and `env=`) of what it extends, writes its
+own `deps`/`inputs`/`outputs`, and goes stale when a definition changes. Entries
+may be chained and are included once, in order; a cycle, a language mismatch
+or a parent with `deps=`/`outputs=`/`tty` is a `meshfox validate` error. Line
+numbers an interpreter reports count the joined text. See SPEC.md's `extends`
+entry.
+
+#### Example
+<!-- meshfox:node id="example-extends" type="file" -->
+
+[examples/extends.canvas.md](./examples/extends.canvas.md)
+
 ### Showing a diagram, formula or chart (SVG)
 <!-- meshfox:node id="showing-a-diagram-formula-or-chart-svg" -->
 

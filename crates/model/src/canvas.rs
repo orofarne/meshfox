@@ -440,6 +440,26 @@ pub struct Node {
     /// `target_digest` by `Canvas::hydrate_target_digests`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_fingerprint: Option<String>,
+    /// What `extends=` contributes to this node's blocks, by block name —
+    /// derived by `Canvas::resolve_extends`, never stored in the file.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub extended: std::collections::BTreeMap<String, Extended>,
+}
+
+/// The resolved `extends=` of one block (see `Canvas::resolve_extends`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Extended {
+    /// Parents' code, each followed by a newline, in order.
+    pub code: String,
+    /// The interpreter the parents agree on, for a block with none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<String>,
+    /// Parents' `env=` entries as `(local name, variable)`, parents first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+    /// Why the chain cannot be resolved; running the block refuses with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl Node {
@@ -466,8 +486,31 @@ impl Node {
         if self.is_runnable_file() {
             vec![crate::fence::target_block(self)]
         } else {
-            crate::fence::scan_runnable_blocks(&self.id, &self.text)
+            let mut blocks = crate::fence::scan_runnable_blocks(&self.id, &self.text);
+            for block in &mut blocks {
+                let Some(ext) = block.name.as_deref().and_then(|n| self.extended.get(n)) else {
+                    continue;
+                };
+                block.inherited = ext.code.clone();
+                if block.interpreter.is_none() {
+                    block.interpreter = ext.interpreter.clone();
+                }
+                for (local, var) in &ext.env {
+                    if !block.env.iter().any(|e| &e.local_name == local) {
+                        block.env.push(crate::fence::EnvRef {
+                            local_name: local.clone(),
+                            var_name: var.clone(),
+                        });
+                    }
+                }
+            }
+            blocks
         }
+    }
+
+    /// Why `block`'s `extends=` cannot be resolved, if it cannot.
+    pub fn extends_error(&self, block: &str) -> Option<&str> {
+        self.extended.get(block)?.error.as_deref()
     }
 
     /// Records the digest of the target file's content (see
@@ -522,6 +565,156 @@ impl Canvas {
             node.block_fingerprint =
                 Some(crate::fence::fingerprint(&crate::fence::target_block(node)));
         }
+    }
+
+    /// Resolves every block's `extends=` into `Node::extended`: the parents'
+    /// code in order (depth-first, each block once — a diamond includes its
+    /// shared ancestor a single time), the interpreter the parents agree
+    /// on and their `env=`. A broken chain (unknown or cyclic parent,
+    /// mismatching language/interpreter, a parent that is an action rather
+    /// than a set of definitions) is recorded as that block's `error`
+    /// instead of failing the canvas; `meshfox validate` reports it and
+    /// running the block refuses. Call after includes are spliced in.
+    pub fn resolve_extends(&mut self) {
+        let mut out: Vec<(usize, String, Extended)> = Vec::new();
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.is_runnable_file() {
+                continue;
+            }
+            for block in crate::fence::scan_runnable_blocks(&node.id, &node.text) {
+                if block.extends.is_empty() {
+                    continue;
+                }
+                let name = block.name.clone().unwrap_or_default();
+                out.push((idx, name, self.expand_extends(&node.id, &block)));
+            }
+        }
+        for node in &mut self.nodes {
+            node.extended.clear();
+        }
+        for (idx, name, ext) in out {
+            self.nodes[idx].extended.insert(name, ext);
+        }
+    }
+
+    fn expand_extends(&self, node_id: &str, block: &crate::fence::CodeBlock) -> Extended {
+        let mut ext = Extended::default();
+        let mut path = vec![(node_id.to_string(), block.name.clone().unwrap_or_default())];
+        let mut done = std::collections::HashSet::new();
+        if let Err(error) = self.collect_parents(node_id, block, block, &mut path, &mut done, &mut ext) {
+            ext.error = Some(error);
+        }
+        ext
+    }
+
+    fn collect_parents(
+        &self,
+        node_id: &str,
+        owner: &crate::fence::CodeBlock,
+        root: &crate::fence::CodeBlock,
+        path: &mut Vec<(String, String)>,
+        done: &mut std::collections::HashSet<(String, String)>,
+        ext: &mut Extended,
+    ) -> Result<(), String> {
+        let owner_name = owner.name.as_deref().unwrap_or_default();
+        for parent_ref in &owner.extends {
+            if parent_ref.sync || parent_ref.condition.is_some() || parent_ref.block_name.contains('[') {
+                return Err(format!(
+                    "extends= entry {:?} of {owner_name:?} takes only a block name (no `!`, `?` condition or arguments)",
+                    parent_ref.render()
+                ));
+            }
+            let parent_node = parent_ref.node_id.as_deref().unwrap_or(node_id);
+            let key = (parent_node.to_string(), parent_ref.block_name.clone());
+            if path.contains(&key) {
+                return Err(format!(
+                    "extends= cycle: {}",
+                    path.iter()
+                        .chain(std::iter::once(&key))
+                        .map(|(n, b)| format!("{n}/{b}"))
+                        .collect::<Vec<_>>()
+                        .join(" -> ")
+                ));
+            }
+            if done.contains(&key) {
+                continue;
+            }
+            let node = self
+                .node(parent_node)
+                .ok_or_else(|| format!("extends= of {owner_name:?}: no node {parent_node:?}"))?;
+            if node.is_runnable_file() {
+                return Err(format!(
+                    "extends= of {owner_name:?}: {parent_node:?} is a file node, which has no inline code to extend"
+                ));
+            }
+            let parent = crate::fence::scan_runnable_blocks(&node.id, &node.text)
+                .into_iter()
+                .find(|b| b.name.as_deref() == Some(parent_ref.block_name.as_str()))
+                .ok_or_else(|| {
+                    format!(
+                        "extends= of {owner_name:?}: no runnable block {:?} in node {parent_node:?}",
+                        parent_ref.block_name
+                    )
+                })?;
+            let label = format!("{parent_node}/{}", parent_ref.block_name);
+            if parent.lang != root.lang {
+                return Err(format!(
+                    "extends= of {owner_name:?}: {label} is {:?} but the block is {:?}",
+                    parent.lang, root.lang
+                ));
+            }
+            for action in ["deps", "inputs", "outputs", "lease", "defer"] {
+                if parent.attrs.contains_key(action) {
+                    return Err(format!(
+                        "extends= of {owner_name:?}: {label} has `{action}=`; a block that is extended holds definitions only, its dependencies would never run"
+                    ));
+                }
+            }
+            for (flag, set) in [("tty", parent.tty), ("service", parent.service), ("cache", parent.cache)] {
+                if set {
+                    return Err(format!(
+                        "extends= of {owner_name:?}: {label} is `{flag}`; a block that is extended holds definitions only"
+                    ));
+                }
+            }
+            match (&root.interpreter, &parent.interpreter) {
+                (Some(a), Some(b)) if a != b => {
+                    return Err(format!(
+                        "extends= of {owner_name:?}: {label} runs under {b:?} but the block under {a:?}"
+                    ));
+                }
+                (None, Some(b)) => match &ext.interpreter {
+                    Some(a) if a != b => {
+                        return Err(format!(
+                            "extends= of {owner_name:?}: parents disagree on the interpreter ({a:?} / {b:?})"
+                        ));
+                    }
+                    _ => ext.interpreter = Some(b.clone()),
+                },
+                _ => {}
+            }
+            path.push(key.clone());
+            self.collect_parents(&node.id, &parent, root, path, done, ext)?;
+            path.pop();
+            done.insert(key);
+            for e in &parent.env {
+                match ext.env.iter().find(|(local, _)| local == &e.local_name) {
+                    Some((_, var)) if var != &e.var_name => {
+                        return Err(format!(
+                            "extends= of {owner_name:?}: parents bind {:?} to different variables ({var} / {})",
+                            e.local_name, e.var_name
+                        ));
+                    }
+                    Some(_) => {}
+                    None => ext.env.push((e.local_name.clone(), e.var_name.clone())),
+                }
+            }
+            ext.code.push_str(&parent.code);
+            if !parent.code.ends_with('\n') {
+                ext.code.push('\n');
+            }
+        }
+        Ok(())
     }
 
     pub fn node(&self, id: &str) -> Option<&Node> {
