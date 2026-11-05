@@ -459,7 +459,22 @@ Options:
 
 **What does not.** Running blocks, forms, services, `display="table"` tables, link preview cards and editing the files a canvas includes — the page runs as `noexec`, like `meshfox --no-exec view`. Safari's folder picker leaves out dot-files, so a picked (not dropped) folder cannot honour `.meshfoxignore` there; a browser or privacy tool that locks `img.src`, `fetch` or `WebSocket` cannot run it and says so.
 
-**Build and run it yourself.** With the `wasm-prep` block from "Unit tests" done, `cd web && npm run build:wasm && npm run preview:wasm` serves it on `http://localhost:4600/`. `scripts/package-editor.sh` builds the directory to upload (the site plus `_headers` with the Content-Security-Policy; Cloudflare Pages reads it as it is) and should be served from its own origin, because drafts live in that origin's storage. The browser tests are the `wasm-editor` block under "End-to-end tests", the model's own the `wasm` block under "Unit tests". How it works, and its limits, in [web/wasm-editor/README.md](./web/wasm-editor/README.md).
+**Build and run it yourself.** With the `wasm-prep` block from "Unit tests" done, `cd web && npm run build:wasm && npm run preview:wasm` serves it on `http://localhost:4600/`. The `editor-bundle` block below (`meshfox README.md run usage online-editor-in-the-browser editor-bundle`) builds the directory to upload (the site plus `_headers` with the Content-Security-Policy; Cloudflare Pages reads it as it is). The browser tests are the `wasm-editor` block under "End-to-end tests", the model's own the `wasm` block under "Unit tests". How it works, and its limits, in [web/wasm-editor/README.md](./web/wasm-editor/README.md).
+
+**Bundle to upload.** Builds the in-browser editor into `editor-bundle/`, a plain static site (relative URLs) plus `_headers`, which Cloudflare Pages reads itself: the security headers (Content-Security-Policy, …) and the cache rules. Cloudflare compresses (brotli) and serves `.wasm` correctly on its own. Serve it from its own origin (a subdomain): drafts live in that origin's IndexedDB.
+
+```sh name="editor-bundle" deps="unit-tests/wasm-prep"
+set -euo pipefail
+out=editor-bundle
+export PATH="$HOME/.cargo/bin:$PATH"
+
+(cd web && npm run build:wasm)
+
+rm -rf "$out"
+mkdir -p "$out"
+cp -R web/dist-wasm/. "$out/"
+echo "$(find "$out" -type f | wc -l) files, $(du -sh "$out" | cut -f1)"
+```
 
 #### How the browser editor works
 <!-- meshfox:node id="wasm-editor-readme" type="file" -->
