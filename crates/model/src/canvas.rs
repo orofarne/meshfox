@@ -601,7 +601,9 @@ impl Canvas {
         let mut ext = Extended::default();
         let mut path = vec![(node_id.to_string(), block.name.clone().unwrap_or_default())];
         let mut done = std::collections::HashSet::new();
-        if let Err(error) = self.collect_parents(node_id, block, block, &mut path, &mut done, &mut ext) {
+        if let Err(error) =
+            self.collect_parents(node_id, block, block, &mut path, &mut done, &mut ext)
+        {
             ext.error = Some(error);
         }
         ext
@@ -618,101 +620,26 @@ impl Canvas {
     ) -> Result<(), String> {
         let owner_name = owner.name.as_deref().unwrap_or_default();
         for parent_ref in &owner.extends {
-            if parent_ref.sync || parent_ref.condition.is_some() || parent_ref.block_name.contains('[') {
-                return Err(format!(
-                    "extends= entry {:?} of {owner_name:?} takes only a block name (no `!`, `?` condition or arguments)",
-                    parent_ref.render()
-                ));
-            }
+            crate::extends::check_ref(parent_ref, owner_name)?;
             let parent_node = parent_ref.node_id.as_deref().unwrap_or(node_id);
             let key = (parent_node.to_string(), parent_ref.block_name.clone());
-            if path.contains(&key) {
-                return Err(format!(
-                    "extends= cycle: {}",
-                    path.iter()
-                        .chain(std::iter::once(&key))
-                        .map(|(n, b)| format!("{n}/{b}"))
-                        .collect::<Vec<_>>()
-                        .join(" -> ")
-                ));
-            }
+            crate::extends::check_cycle(path, &key)?;
             if done.contains(&key) {
                 continue;
             }
             let node = self
                 .node(parent_node)
                 .ok_or_else(|| format!("extends= of {owner_name:?}: no node {parent_node:?}"))?;
-            if node.is_runnable_file() {
-                return Err(format!(
-                    "extends= of {owner_name:?}: {parent_node:?} is a file node, which has no inline code to extend"
-                ));
-            }
-            let parent = crate::fence::scan_runnable_blocks(&node.id, &node.text)
-                .into_iter()
-                .find(|b| b.name.as_deref() == Some(parent_ref.block_name.as_str()))
-                .ok_or_else(|| {
-                    format!(
-                        "extends= of {owner_name:?}: no runnable block {:?} in node {parent_node:?}",
-                        parent_ref.block_name
-                    )
-                })?;
+            let parent = crate::extends::find_parent(node, &parent_ref.block_name, owner_name)?;
             let label = format!("{parent_node}/{}", parent_ref.block_name);
-            if parent.lang != root.lang {
-                return Err(format!(
-                    "extends= of {owner_name:?}: {label} is {:?} but the block is {:?}",
-                    parent.lang, root.lang
-                ));
-            }
-            for action in ["deps", "inputs", "outputs", "lease", "defer"] {
-                if parent.attrs.contains_key(action) {
-                    return Err(format!(
-                        "extends= of {owner_name:?}: {label} has `{action}=`; a block that is extended holds definitions only, its dependencies would never run"
-                    ));
-                }
-            }
-            for (flag, set) in [("tty", parent.tty), ("service", parent.service), ("cache", parent.cache)] {
-                if set {
-                    return Err(format!(
-                        "extends= of {owner_name:?}: {label} is `{flag}`; a block that is extended holds definitions only"
-                    ));
-                }
-            }
-            match (&root.interpreter, &parent.interpreter) {
-                (Some(a), Some(b)) if a != b => {
-                    return Err(format!(
-                        "extends= of {owner_name:?}: {label} runs under {b:?} but the block under {a:?}"
-                    ));
-                }
-                (None, Some(b)) => match &ext.interpreter {
-                    Some(a) if a != b => {
-                        return Err(format!(
-                            "extends= of {owner_name:?}: parents disagree on the interpreter ({a:?} / {b:?})"
-                        ));
-                    }
-                    _ => ext.interpreter = Some(b.clone()),
-                },
-                _ => {}
-            }
+            crate::extends::check_definitions_only(&parent, root, owner_name, &label)?;
+            crate::extends::merge_interpreter(ext, root, &parent, owner_name, &label)?;
             path.push(key.clone());
             self.collect_parents(&node.id, &parent, root, path, done, ext)?;
             path.pop();
             done.insert(key);
-            for e in &parent.env {
-                match ext.env.iter().find(|(local, _)| local == &e.local_name) {
-                    Some((_, var)) if var != &e.var_name => {
-                        return Err(format!(
-                            "extends= of {owner_name:?}: parents bind {:?} to different variables ({var} / {})",
-                            e.local_name, e.var_name
-                        ));
-                    }
-                    Some(_) => {}
-                    None => ext.env.push((e.local_name.clone(), e.var_name.clone())),
-                }
-            }
-            ext.code.push_str(&parent.code);
-            if !parent.code.ends_with('\n') {
-                ext.code.push('\n');
-            }
+            crate::extends::merge_env(ext, &parent, owner_name)?;
+            crate::extends::append_code(ext, &parent.code);
         }
         Ok(())
     }
