@@ -164,3 +164,10 @@ test('a fence with only extends= is runnable and shows the inherited interpreter
   const inherited = parseBody(source, 'root', { t: { interpreter: 'python3 -u' } }).find(s => s.type === 'code');
   assert.equal(inherited.interpreter, 'python3 -u');
 });
+
+test('extends entries are kept as written for the block details row', () => {
+  const block = parseBody('```bash name="t" extends="defs, other/lib"\nf\n```', 'root').find(s => s.type === 'code');
+  assert.deepEqual(block.extends, ['defs', 'other/lib']);
+  const none = parseBody('```bash name="t"\nf\n```', 'root').find(s => s.type === 'code');
+  assert.deepEqual(none.extends, []);
+});

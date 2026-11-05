@@ -641,6 +641,8 @@ struct Renderer<'a> {
     /// `TagEnd::CodeBlock` into `dep_lines`'s explicit/implicit deps line.
     code_deps: Option<String>,
     code_lease: Option<String>,
+    /// This fence's raw `extends=` attribute, shown as `├─ extends:` rows.
+    code_extends: Option<String>,
     code_env: Option<String>,
     block_details: std::collections::HashMap<usize, Vec<String>>,
     code_details: Vec<String>,
@@ -776,6 +778,7 @@ impl<'a> Renderer<'a> {
             code_tangle: false,
             code_deps: None,
             code_lease: None,
+            code_extends: None,
             code_env: None,
             block_details: Default::default(),
             code_details: Vec::new(),
@@ -1414,6 +1417,7 @@ impl<'a> Renderer<'a> {
                     .position(|(b, _)| b.span.contains(&span_start));
                 self.code_send = None;
                 let mut tangle = false;
+                let mut extends: Option<String> = None;
                 let (lang, name, interpreter, deps, lease, env) = match kind {
                     // The info string carries meshfox's own attributes past
                     // the language token (`name="..."`, `cache`, ...) — see
@@ -1429,6 +1433,7 @@ impl<'a> Renderer<'a> {
                         let interpreter = attrs.remove("interpreter");
                         let deps = attrs.remove("deps");
                         let lease = attrs.remove("lease");
+                        extends = attrs.remove("extends");
                         let env = attrs.remove("env");
                         self.code_send = attrs.remove("send");
                         (lang, name, interpreter, deps, lease, env)
@@ -1458,6 +1463,7 @@ impl<'a> Renderer<'a> {
                 self.code_tangle = tangle;
                 self.code_deps = deps;
                 self.code_lease = lease;
+                self.code_extends = extends;
                 self.code_env = env;
                 self.code_buf.clear();
             }
@@ -1545,6 +1551,7 @@ impl<'a> Renderer<'a> {
         owner: Option<&str>,
         deps_raw: Option<&str>,
         lease_raw: Option<&str>,
+        extends_raw: Option<&str>,
         env_raw: Option<&str>,
         interpreter: Option<&str>,
     ) -> Vec<(Line<'static>, DepClicks)> {
@@ -1567,6 +1574,7 @@ impl<'a> Renderer<'a> {
         };
         let explicit = references(deps_raw);
         let leases = references(lease_raw);
+        let extended = references(extends_raw);
 
         let env_refs = env_raw
             .map(meshfox_core::fence::parse_env_list)
@@ -1627,6 +1635,9 @@ impl<'a> Renderer<'a> {
         for (label, node_id) in explicit {
             rows.push(row("├─ deps: ".into(), label, node_id));
         }
+        for (label, node_id) in extended {
+            rows.push(row("├─ extends: ".into(), label, node_id));
+        }
         for (label, node_id) in leases {
             rows.push(row("├─ lease: ".into(), label, node_id));
         }
@@ -1661,6 +1672,7 @@ impl<'a> Renderer<'a> {
                 let tangle = std::mem::take(&mut self.code_tangle);
                 let deps_raw = self.code_deps.take();
                 let lease_raw = self.code_lease.take();
+                let extends_raw = self.code_extends.take();
                 let env_raw = self.code_env.take();
                 let send_raw = self.code_send.take();
                 let click_name = self
@@ -1998,6 +2010,7 @@ impl<'a> Renderer<'a> {
                         click_name.as_deref(),
                         deps_raw.as_deref(),
                         lease_raw.as_deref(),
+                        extends_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
                     ) {
@@ -2136,6 +2149,7 @@ impl<'a> Renderer<'a> {
                         click_name.as_deref(),
                         deps_raw.as_deref(),
                         lease_raw.as_deref(),
+                        extends_raw.as_deref(),
                         env_raw.as_deref(),
                         interpreter.as_deref(),
                     ) {
@@ -3719,6 +3733,37 @@ mod tests {
             .expect("▶ marker span");
         assert_eq!(marker_span.style.fg, Some(crate::tui::theme::accent()));
     }
+    #[test]
+    fn an_extends_row_names_the_extended_block_and_jumps_to_it() {
+        let hl = Highlighter::new();
+        let (segments, clicks) = render(
+            "```python name=\"t\" extends=\"defs,lib/more\"\nf()\n```\n",
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let text: Vec<String> = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Text(lines) => Some(lines),
+                _ => None,
+            })
+            .flatten()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("extends: defs")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("extends: lib/more")), "{text:?}");
+        let jumps = clicks
+            .iter()
+            .filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. }))
+            .count();
+        assert_eq!(jumps, 2);
+    }
+
     #[test]
     fn dependency_rows_keep_distinct_click_positions_for_code_and_buttons() {
         let hl = Highlighter::new();

@@ -282,6 +282,9 @@ export interface CodeSegment {
    * block's working directory instead of a throwaway temp file; see SPEC.md's
    * "Runnable code fences". Drives `MeshNode.tsx`'s `tangle` badge. */
   tangle: boolean;
+  /** `extends=` entries as written (`defs`, `node/defs`): blocks whose code
+   * runs in front of this one's. Drives the `extends` row in block details. */
+  extends: string[];
   /** Mirrors `core::fence::CodeBlock.service` — **experimental**, see
    * SPEC.md's "Service blocks (experimental)". This block starts a
    * long-lived background process instead of one that runs to completion;
@@ -669,6 +672,7 @@ export function parseBody(
     const envRefs = attrs.env !== undefined ? parseEnvList(attrs.env) : [];
     const refs = (raw: string | undefined) => (raw ?? "").split(",").map(s => s.trim()).filter(Boolean);
     const declaredDeps = refs(attrs.deps);
+    const extendsRefs = refs(attrs.extends);
     const leases = refs(attrs.lease);
     const deps = [...declaredDeps, ...leases];
 
@@ -708,7 +712,7 @@ export function parseBody(
     segments.push({ type: "code", args: precedingArguments(lines, i),
       inputs: (attrs.inputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
       outputs: (attrs.outputs ?? "").split(",").map(s => s.trim()).filter(Boolean),
-      lang, name, cache, tty, autoclose, tangle, service, deps, declaredDeps, leases, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
+      lang, name, cache, tty, autoclose, tangle, extends: extendsRefs, service, deps, declaredDeps, leases, envRefs, default: isDefault, autorun, render, fold, outputMarkdown, outputImage, outputAttrs, interpreter, code: codeLines.join("\n"), output });
     i = cursor;
   }
   flushMarkdown();
