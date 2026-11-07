@@ -560,6 +560,22 @@ export interface NodePatch {
 }
 
 /**
+ * `api/nodes/<id>` for one node. An id comes from the document, or is typed
+ * in Node settings, so it is checked against what the server itself accepts
+ * (`id_has_forbidden_char` in `crates/model/src/mdcanvas.rs`: not empty, no
+ * `"`, no `,`, no control character) before it becomes part of a request
+ * URL, and then appended as exactly one percent-encoded path segment — it
+ * can never address another endpoint or host.
+ */
+function nodeApiPath(id: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (id === "" || /["\u0000-\u001f\u007f-\u009f,]/.test(id)) {
+    throw new Error(`invalid node id: ${JSON.stringify(id)}`);
+  }
+  return `api/nodes/${encodeURIComponent(id)}`;
+}
+
+/**
  * Applies `patch` to node `id` — title/type/color/target/text/edges
  * are all independently optional, so a caller only ever sends what it
  * actually changed. The server validates the fully-patched document parses
@@ -568,7 +584,7 @@ export interface NodePatch {
  * thrown error carrying the server's message, same as `saveLayout`.
  */
 export async function updateNode(id: string, patch: NodePatch): Promise<CanvasDoc> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}`, {
+  const res = await fetch(nodeApiPath(id), {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(patch),
@@ -663,7 +679,7 @@ export type SaveTextOutcome =
  */
 export async function deleteNode(id: string, mode: "subtree" | "reparent" = "subtree"): Promise<CanvasDoc> {
   const params = mode === "reparent" ? "?children=reparent" : "";
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}${params}`, { method: "DELETE" });
+  const res = await fetch(`${nodeApiPath(id)}${params}`, { method: "DELETE" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `DELETE /api/nodes/${id}: ${res.status}`);
@@ -687,7 +703,7 @@ export interface NodeFileContent {
  * one of those cases.
  */
 export async function fetchNodeFileContent(id: string): Promise<NodeFileContent> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/file-content`);
+  const res = await fetch(`${nodeApiPath(id)}/file-content`);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/file-content: ${res.status}`);
@@ -704,7 +720,7 @@ export async function fetchNodeFileContent(id: string): Promise<NodeFileContent>
  * missing file, or a target outside the canvas directory.
  */
 export async function fetchTableMeta(id: string, signal?: AbortSignal): Promise<TableMeta> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/table`, { signal });
+  const res = await fetch(`${nodeApiPath(id)}/table`, { signal });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/table: ${res.status}`);
@@ -724,7 +740,7 @@ export async function fetchTableRows(
 ): Promise<TableRowsPage> {
   const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
   if (!isEmptyView(view)) params.set("view", JSON.stringify(view));
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/table/rows?${params}`, { signal });
+  const res = await fetch(`${nodeApiPath(id)}/table/rows?${params}`, { signal });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `GET /api/nodes/${id}/table/rows: ${res.status}`);
@@ -793,7 +809,7 @@ export async function fetchLinkPreview(url: string): Promise<LinkPreview | null>
  * being the root (see `mdcanvas::reparent_node`).
  */
 export async function reparentNode(id: string, newParentId: string): Promise<CanvasDoc> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/reparent`, {
+  const res = await fetch(`${nodeApiPath(id)}/reparent`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ newParentId }),
@@ -814,7 +830,7 @@ export async function reparentNode(id: string, newParentId: string): Promise<Can
  * for a node that actually has a position to clear.
  */
 export async function clearNodeLayout(id: string): Promise<CanvasDoc> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/clear-layout`, { method: "POST" });
+  const res = await fetch(`${nodeApiPath(id)}/clear-layout`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${id}/clear-layout: ${res.status}`);
@@ -834,7 +850,7 @@ export async function moveSibling(
   id: string,
   target: { before: string } | { after: string },
 ): Promise<CanvasDoc> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/move`, {
+  const res = await fetch(`${nodeApiPath(id)}/move`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(target),
@@ -855,7 +871,7 @@ export async function moveSibling(
  * node — nothing is written in any of those cases.
  */
 export async function renameNodeId(id: string, newId: string): Promise<CanvasDoc> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/rename-id`, {
+  const res = await fetch(`${nodeApiPath(id)}/rename-id`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ newId }),
@@ -880,7 +896,7 @@ export async function renameNodeId(id: string, newId: string): Promise<CanvasDoc
  * to know for sure rather than assume.
  */
 export async function clearNodeId(id: string): Promise<{ id: string; doc: CanvasDoc }> {
-  const res = await fetch(`api/nodes/${encodeURIComponent(id)}/clear-id`, { method: "POST" });
+  const res = await fetch(`${nodeApiPath(id)}/clear-id`, { method: "POST" });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `POST /api/nodes/${id}/clear-id: ${res.status}`);
