@@ -1457,7 +1457,7 @@ export default function App() {
       // session this tab started itself has its panel open already, and
       // any other stays one click away in `TtySessionsPanel`).
       (nodeId, block) => {
-        if (ttySessionRef.current !== null) return;
+        if (ttySessionRef.current !== null || selfInitiatedRuns.current.has(`${nodeId}::${block}`)) return;
         setTtySession({
           path: [],
           blockName: block,
@@ -1492,13 +1492,6 @@ export default function App() {
     },
     [watchAutorunBlock],
   );
-
-  const openConfirmedTerminal = async (session: NonNullable<typeof ttySession>) => {
-    try {
-      const confirm = await confirmRun(session.path, session.blockName, session.withDeps);
-      if (confirm !== null) setTtySession({ ...session, confirm });
-    } catch (error) { setError(String(error)); }
-  };
 
   // Actually starts a run — split out from `handleRun` (below) so the
   // vars-modal's "run" button can call straight back into this once
@@ -1641,6 +1634,11 @@ export default function App() {
             case "started":
               runId = event.runId;
               ownRunIds.current.add(event.runId);
+              break;
+            case "tty-start":
+              setTtySession({ path: [], blockName: event.block, withDeps: false,
+                autoclose: isBlockAutoclose(canvas, { nodeId: event.nodeId, blockName: event.block }),
+                attachTo: { nodeId: event.nodeId, block: event.block } });
               break;
             case "step-start":
               activeStep = { nodeId: event.nodeId, block: event.block };
@@ -1986,20 +1984,13 @@ export default function App() {
         setVarsModal({ nodeId, blockName, withDeps, missing, tty, autoclose });
         return;
       }
-      if (tty) {
-        await openConfirmedTerminal({ path, blockName, withDeps, autoclose });
-      } else {
-        await executeRun(nodeId, blockName, withDeps);
-      }
+      await executeRun(nodeId, blockName, withDeps);
     },
     [canvas, executeRun, workerNoExec],
   );
 
-  // `tty` counterpart to `handleRun`: same "check `GET /api/vars` first,
-  // ask via the same modal if anything's missing" gate, but the actual run
-  // opens `TtyPanel` (a real terminal) instead of calling `executeRun` —
-  // `varsModal.tty` is how `handleVarsSubmit` (below) tells the two apart
-  // once the modal comes back.
+  // TTY runs share the ordinary chain stream. Only a tty-start event
+  // opens a terminal; dependencies keep their normal inline output.
   const handleRunTty = useCallback(
     async (nodeId: string, blockName: string, withDeps: boolean, autoclose: boolean) => {
       if (workerNoExec) {
@@ -2029,9 +2020,9 @@ export default function App() {
         setVarsModal({ nodeId, blockName, withDeps, missing, tty: true, autoclose });
         return;
       }
-      await openConfirmedTerminal({ path, blockName, withDeps, autoclose });
+      await executeRun(nodeId, blockName, withDeps);
     },
-    [canvas, workerNoExec],
+    [canvas, executeRun, workerNoExec],
   );
 
   const handleVarsSubmit = useCallback(
@@ -2050,8 +2041,6 @@ export default function App() {
           setVarsModal(null);
           if (missing.length > 0) {
             setVarsModal({ nodeId, blockName: prepared.block, withDeps, missing, tty: useTty, autoclose: closeTerminal });
-          } else if (useTty) {
-            await openConfirmedTerminal({ path: pathTo(canvas, nodeId), blockName: prepared.block, withDeps, autoclose: closeTerminal });
           } else {
             await executeRun(nodeId, prepared.block, withDeps);
           }
@@ -2059,18 +2048,6 @@ export default function App() {
         return;
       }
       setVarsModal(null);
-      if (tty) {
-        if (!canvas) return;
-        await openConfirmedTerminal({
-          path: pathTo(canvas, nodeId),
-          blockName,
-          withDeps,
-          vars: answers,
-          saveSecrets,
-          autoclose: autoclose ?? false,
-        });
-        return;
-      }
       await executeRun(nodeId, blockName, withDeps, answers, saveSecrets);
     },
     [varsModal, executeRun, canvas],

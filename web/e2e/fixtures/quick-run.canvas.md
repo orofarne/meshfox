@@ -86,3 +86,17 @@ echo confirm-terminal-ran
 [file-block.sh](./file-block.sh)
 
 A runnable file: the same block controls a fence gets.
+
+## Terminal chain
+<!-- meshfox:node id="terminal-chain" -->
+
+```bash name="prepare"
+echo preparing-terminal
+sleep 3
+```
+
+```bash name="terminal" tty deps="prepare"
+stty raw -echo
+printf "input-ready\r\n"
+python3 -c 'import os; print("KEY:" + os.read(0, 7).hex(), flush=True)'
+```

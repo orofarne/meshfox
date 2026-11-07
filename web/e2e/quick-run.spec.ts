@@ -143,3 +143,19 @@ test("a runnable file node gets the controls of a fence: run, chain, history and
   }).toPass();
   await expect(history).toContainText("file-block");
 });
+
+
+test("tty chain keeps ordinary steps on canvas and transmits Shift+Enter", async ({ page }) => {
+  const target = node(page, "terminal-chain");
+  await target.locator("button.mesh-run-chain").filter({ hasText: "terminal" }).click();
+  await expect(target.locator(".mesh-code-output")).toContainText("preparing-terminal");
+  await expect(page.locator(".mesh-tty-panel")).toHaveCount(0);
+  const panel = page.locator(".mesh-tty-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("input-ready");
+  await expect(panel.locator(".mesh-tty-head-status")).toHaveText("interactive");
+  await expect(panel).not.toContainText("preparing-terminal");
+  await panel.locator(".xterm-helper-textarea").press("Shift+Enter");
+  await expect(panel).toContainText("KEY:1b5b31333b3275");
+  await expect(panel.locator(".mesh-tty-head-status")).toHaveText("✓ Completed · exit 0");
+});

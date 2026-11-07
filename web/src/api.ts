@@ -911,6 +911,7 @@ export async function clearNodeId(id: string): Promise<{ id: string; doc: Canvas
 // `lock-conflict` are each terminal for the run (no further messages
 // follow).
 export type RunEvent =
+  | { type: "tty-start"; nodeId: string; block: string }
   | { type: "started"; runId: string }
   | { type: "step-start"; nodeId: string; block: string }
   /** Terminal for this one step (the chain keeps going) — this dependency

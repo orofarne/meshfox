@@ -86,7 +86,7 @@ function statusLabel(status: Status, exitCode: number | undefined, errorMsg: str
     case "connecting":
       return "connecting…";
     case "running":
-      return "starting…";
+      return "running…";
     case "tty":
       return "interactive";
     case "exited":
@@ -318,6 +318,17 @@ export function TtyPanel({
       setCanKill(false);
       setStatus((s) => (s === "exited" || s === "killed" || s === "error" ? s : "closed"));
     };
+
+    // Preserve modified Enter for multiline terminal applications.
+    term.attachCustomKeyEventHandler((event) => {
+      if (event.key === "Enter" && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        if (event.type === "keydown" && ttyActiveRef.current && ws.readyState === WebSocket.OPEN) {
+          ws.send(new TextEncoder().encode("\x1b[13;2u"));
+        }
+        return false;
+      }
+      return true;
+    });
 
     const dataSub = term.onData((data) => {
       if (ttyActiveRef.current && ws.readyState === WebSocket.OPEN) {
