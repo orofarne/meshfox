@@ -1837,7 +1837,16 @@ impl<'a> Renderer<'a> {
                     let mut browse_spans: Vec<(usize, u16, u16)> = Vec::new();
                     for (i, field) in fields.iter().enumerate() {
                         let focused = focused_index == Some(i);
-                        let label = field.label.clone().unwrap_or_else(|| field.var.clone());
+                        // `label=`, else the variable's own `prompt` (which
+                        // defaults to its name) — the same fallback the web UI
+                        // and SPEC.md's "Form fences" use.
+                        let label = field.label.clone().unwrap_or_else(|| {
+                            self.decls
+                                .iter()
+                                .find(|d| d.name == field.var)
+                                .map(|d| d.prompt.clone())
+                                .unwrap_or_else(|| field.var.clone())
+                        });
                         let value = self
                             .form_values
                             .get(&field.var)
@@ -1926,11 +1935,16 @@ impl<'a> Renderer<'a> {
                     let reset_text = "[Reset]";
                     let reset_col_start = send_col_end + 2;
                     let reset_col_end = reset_col_start + reset_text.chars().count() as u16;
+                    let mut reset_span = Span::styled(reset_text, marker_style);
+                    if focused_index == Some(fields.len() + 1) {
+                        reset_span = reset_span
+                            .patch_style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
                     lines.push(Line::from(vec![
                         Span::styled("│ ", border),
                         send_span,
                         Span::raw("  "),
-                        Span::styled(reset_text, marker_style),
+                        reset_span,
                     ]));
                     let foot = if editing_this {
                         "└─ ↑/↓ field · enter apply · ^r reset · esc done"

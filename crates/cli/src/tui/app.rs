@@ -2417,6 +2417,8 @@ impl App {
             return;
         };
         let send_idx = form.fields.len();
+        // `[Reset]` shares the Send line: one more focus stop after it.
+        let reset_idx = send_idx + 1;
         let selected = form.selected;
         if matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
             && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2431,6 +2433,9 @@ impl App {
         match key.code {
             KeyCode::Enter if selected == send_idx => self.submit_inline_form().await,
             KeyCode::Char(' ') if selected == send_idx => self.submit_inline_form().await,
+            KeyCode::Enter | KeyCode::Char(' ') if selected == reset_idx => {
+                self.reset_inline_form().await
+            }
             KeyCode::Enter => {
                 if let Some(form) = &mut self.active_inline_form {
                     form.selected += 1;
@@ -2444,15 +2449,48 @@ impl App {
                 }
                 self.render_current_document();
             }
-            KeyCode::Up | KeyCode::BackTab => {
+            KeyCode::BackTab => {
                 if let Some(form) = &mut self.active_inline_form {
-                    form.selected = form.selected.checked_sub(1).unwrap_or(send_idx);
+                    form.selected = form.selected.checked_sub(1).unwrap_or(reset_idx);
                 }
                 self.render_current_document();
             }
-            KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Tab => {
                 if let Some(form) = &mut self.active_inline_form {
-                    form.selected = (form.selected + 1) % (send_idx + 1);
+                    form.selected = (form.selected + 1) % (reset_idx + 1);
+                }
+                self.render_current_document();
+            }
+            // Up/Down move between rows: `[Reset]` is on the Send row.
+            KeyCode::Up => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected = if form.selected == reset_idx {
+                        send_idx.saturating_sub(1)
+                    } else {
+                        form.selected.checked_sub(1).unwrap_or(send_idx)
+                    };
+                }
+                self.render_current_document();
+            }
+            KeyCode::Down => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected = if form.selected == reset_idx {
+                        0
+                    } else {
+                        (form.selected + 1) % (send_idx + 1)
+                    };
+                }
+                self.render_current_document();
+            }
+            KeyCode::Left if selected == reset_idx => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected = send_idx;
+                }
+                self.render_current_document();
+            }
+            KeyCode::Right if selected == send_idx => {
+                if let Some(form) = &mut self.active_inline_form {
+                    form.selected = reset_idx;
                 }
                 self.render_current_document();
             }
@@ -2734,7 +2772,7 @@ impl App {
             self.active_inline_form = self.try_build_inline_form(node_id, block_name);
             if let Some(f) = &mut self.active_inline_form {
                 f.editing = editing;
-                f.selected = selected.min(f.fields.len());
+                f.selected = selected.min(f.fields.len() + 1);
             }
         }
         self.render_current_document();
@@ -9465,6 +9503,70 @@ mod tests {
         let form = app.active_inline_form.as_ref().unwrap();
         assert_eq!(form.inputs, vec!["da".to_string(), "db".to_string()]);
         assert!(form.editing);
+    }
+
+    #[tokio::test]
+    async fn inline_form_reset_button_is_a_focus_stop_after_send() {
+        let mut app = app_with_blocks(
+            "inline-reset-focus",
+            concat!(
+                "<!-- meshfox:var name=A type=string default=da session -->\n",
+                "```form name=pick\nfield var=A\n```\n",
+            ),
+        )
+        .await;
+        let mut form = app.try_build_inline_form("root", "pick").unwrap();
+        form.editing = true;
+        form.inputs = vec!["typed".into()];
+        form.selected = 1; // Send
+        app.active_inline_form = Some(form);
+        let selected = |app: &App| app.active_inline_form.as_ref().unwrap().selected;
+
+        app.on_inline_form_key(key(KeyCode::Right)).await;
+        assert_eq!(selected(&app), 2, "right from Send focuses Reset");
+        app.on_inline_form_key(key(KeyCode::Left)).await;
+        assert_eq!(selected(&app), 1, "left goes back to Send");
+        app.on_inline_form_key(key(KeyCode::Tab)).await;
+        assert_eq!(selected(&app), 2, "Tab visits Reset after Send");
+        app.on_inline_form_key(key(KeyCode::Up)).await;
+        assert_eq!(selected(&app), 0, "up from Reset goes to the last field");
+        app.on_inline_form_key(key(KeyCode::BackTab)).await;
+        assert_eq!(selected(&app), 2, "BackTab wraps to Reset");
+        app.on_inline_form_key(key(KeyCode::Down)).await;
+        assert_eq!(selected(&app), 0, "down from Reset wraps to the first field");
+
+        let form = app.active_inline_form.as_mut().unwrap();
+        form.selected = 2;
+        form.inputs = vec!["typed".into()];
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        assert_eq!(
+            app.active_inline_form.as_ref().unwrap().inputs,
+            vec!["da".to_string()],
+            "Enter on the focused Reset resets the form"
+        );
+    }
+
+    #[tokio::test]
+    async fn inline_form_labels_fall_back_to_the_variables_prompt() {
+        let mut app = app_with_blocks(
+            "inline-form-labels",
+            concat!(
+                "<!-- meshfox:var name=A type=string prompt=\"Animal name\" session -->\n",
+                "<!-- meshfox:var name=B type=string session -->\n",
+                "<!-- meshfox:var name=C type=string prompt=\"Ignored\" session -->\n",
+                "```form name=pick\nfield var=A\nfield var=B\nfield var=C label=\"Explicit\"\n```\n",
+            ),
+        )
+        .await;
+        let mut form = app.try_build_inline_form("root", "pick").unwrap();
+        form.editing = true;
+        app.active_inline_form = Some(form);
+        app.render_current_document();
+        let shown = document_text(&app);
+        assert!(shown.contains("Animal name:"), "prompt is the label: {shown}");
+        assert!(shown.contains("B:"), "no prompt: the variable's name: {shown}");
+        assert!(shown.contains("Explicit:"), "label= wins: {shown}");
+        assert!(!shown.contains("Ignored:"), "{shown}");
     }
 
     #[test]

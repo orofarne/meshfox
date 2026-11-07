@@ -2074,6 +2074,23 @@ pub async fn wait_for_runs(
         }
         finished.push(result);
     }
+    // The run's last output line and its bookkeeping end a moment apart; a
+    // caller that sends the form again right away would be refused with
+    // "a run is in progress". Give the worker a moment to settle.
+    for _ in 0..40 {
+        let still_running = list_active_runs(port).await.is_ok_and(|runs| {
+            runs.iter().any(|r| {
+                r.status == "running"
+                    && finished
+                        .iter()
+                        .any(|f| f.node_id == r.node_id && f.block == r.block)
+            })
+        });
+        if !still_running {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     finished
 }
 
