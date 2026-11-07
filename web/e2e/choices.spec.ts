@@ -101,3 +101,26 @@ test("the configure dialog explains a pending select and does not overwrite it w
   await expect(modal).toHaveCount(0);
 });
 
+
+test("the configure button shows a spinner and ignores clicks while its listing loads", async ({ page }) => {
+  // The listing runs the sources of computed choices first, so it can be slow.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  await page.route("**/api/vars/configure", async (route) => {
+    if (route.request().method() === "GET") await gate;
+    await route.continue();
+  });
+
+  const button = page.getByRole("button", { name: /configur/ });
+  await button.click();
+  await expect(button).toBeDisabled();
+  await expect(button).toHaveText(/configuring…/);
+  await expect(button).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator(".vars-modal")).toHaveCount(0);
+
+  release();
+  await expect(page.locator(".vars-modal")).toBeVisible();
+  await expect(button).toBeEnabled();
+  await expect(button).toHaveText("⚙ configure");
+  await page.locator(".vars-modal").getByRole("button", { name: "cancel", exact: true }).click();
+});

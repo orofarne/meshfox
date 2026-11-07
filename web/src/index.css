@@ -4060,3 +4060,20 @@ a {
   color: #c0392b;
   overflow-wrap: anywhere;
 }
+
+/* App.tsx — the toolbar's "configure" button while its listing loads. */
+.toolbar-spinner {
+  display: inline-block;
+  width: 0.8em;
+  height: 0.8em;
+  vertical-align: -0.1em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: activity-spin 0.8s linear infinite;
+}
+
+.deps-toggle:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}

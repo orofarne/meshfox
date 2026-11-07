@@ -2074,11 +2074,18 @@ export default function App() {
   // still needs), pre-filled with each one's currently-resolved value.
   // Always fetches fresh right before opening, same as `handleRun` does
   // for its own gate, rather than reusing whatever `load()` last saw.
+  // The listing can take a while: a `select` fed by a `from=` source runs
+  // that source first (see `materialize_choices_and_defaults`). Until it
+  // arrives the button shows a spinner and ignores further clicks.
+  const [configureLoading, setConfigureLoading] = useState(false);
   const handleConfigure = useCallback(async () => {
+    setConfigureLoading(true);
     try {
       setConfigureVars(await fetchConfigureVars());
     } catch (e) {
       setError(String(e));
+    } finally {
+      setConfigureLoading(false);
     }
   }, []);
 
@@ -3991,9 +3998,17 @@ export default function App() {
           <button
             className="deps-toggle"
             onClick={handleConfigure}
+            disabled={configureLoading}
+            aria-busy={configureLoading}
             title="Interactively resolve every declared meshfox:var and save the answers (see SPEC.md's Variables) — same as `meshfox configure`"
           >
-            ⚙ configure
+            {configureLoading ? (
+              <>
+                <span className="toolbar-spinner" aria-hidden="true" /> configuring…
+              </>
+            ) : (
+              "⚙ configure"
+            )}
           </button>
         )}
         {!workerNoExec && (
@@ -4041,6 +4056,7 @@ export default function App() {
       error,
       hasConfigurableVars,
       handleConfigure,
+      configureLoading,
       themePreference,
       cycleTheme,
       handleResetSession,
