@@ -32,3 +32,22 @@ printf '| name | city |\n'
 printf '|---|---|\n'
 printf '| %s | %s |\n' "$PERSON_NAME" "$PERSON_CITY"
 ```
+
+## Reset
+<!-- meshfox:node id="resetting" -->
+
+A form with the `reset` flag and a `keep` field (SPEC.md's "Form fences",
+"Reset"): after a Send whose `autorun` block succeeds, the plain field goes
+back to its default while the `keep` one stays; the Reset button clears both.
+
+<!-- meshfox:var name="ITEM" prompt="Item" default="" -->
+<!-- meshfox:var name="SHOP" prompt="Shop" default="corner" -->
+
+```form name="reset-form" send="Add" reset
+field var="ITEM" label="Item"
+field var="SHOP" label="Shop" keep
+```
+
+```bash name="note" env="ITEM,SHOP" autorun output="markdown"
+printf 'added %s at %s\n' "$ITEM" "$SHOP"
+```

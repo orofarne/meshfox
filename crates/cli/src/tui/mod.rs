@@ -346,6 +346,22 @@ fn spawn_worker_watcher(
                         return;
                     }
                 }
+                WatchEvent::FormReset {
+                    node_id,
+                    block,
+                    respect_keep,
+                } => {
+                    if external_run_tx
+                        .send(ExternalMsg::FormReset {
+                            node_id,
+                            block,
+                            respect_keep,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 WatchEvent::TtyStarted { node_id, block } => {
                     if external_run_tx
                         .send(ExternalMsg::TtyStarted { node_id, block })
@@ -372,6 +388,13 @@ enum ExternalMsg {
     TtyStarted {
         node_id: String,
         block: String,
+    },
+    /// A form's fields were reset in the worker (see
+    /// `WatchEvent::FormReset`).
+    FormReset {
+        node_id: String,
+        block: String,
+        respect_keep: bool,
     },
 }
 
@@ -586,6 +609,11 @@ async fn main_loop(
                 ExternalMsg::TtyStarted { node_id, block } => {
                     app.on_tty_started(node_id, block).await
                 }
+                ExternalMsg::FormReset {
+                    node_id,
+                    block,
+                    respect_keep,
+                } => app.on_form_reset(&node_id, &block, respect_keep),
             },
             // A table that is still importing (or hasn't answered yet) is
             // polled faster than the general tick below.

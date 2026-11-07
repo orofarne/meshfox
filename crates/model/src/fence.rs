@@ -728,6 +728,7 @@ const FENCE_ATTRS: &[&str] = &[
     "confirm",
     "render",
     "send",
+    "reset",
     "fold",
     "tangle",
     "argv",

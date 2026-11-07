@@ -179,6 +179,37 @@ export async function submitForm(
 }
 
 /**
+ * The Reset side of a `form`-lang fence (see SPEC.md's "Form fences",
+ * "Reset"): drops the session values of its fields so they show their
+ * declared defaults again. Starts nothing — never an `autorun` block.
+ * `respectKeep` leaves the fields marked `keep` alone (what the automatic
+ * reset after a Send does); the Reset button passes nothing, so every
+ * field is reset. Refused with `409` while a foreground run is in progress.
+ */
+export async function resetForm(
+  nodeId: string,
+  block: string,
+  respectKeep = false,
+): Promise<{ cleared: number }> {
+  const res = await fetch("api/form/reset", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodeId, block, respectKeep }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/form/reset: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** The `window` event `watchChanges` raises for the server's `"form-reset"`
+ * (a form's fields went back to their defaults, by the Reset button, the
+ * CLI/MCP, or the automatic reset after a Send): the form with that
+ * `nodeId`/`block` should refetch its fields. */
+export const FORM_RESET_EVENT = "meshfox-form-reset";
+
+/**
  * Replaces the document's whole set of declared `meshfox:option` names
  * (see SPEC.md's "Options") with exactly `options`, in the given order —
  * an empty array removes every declaration. The write path behind the
@@ -1661,6 +1692,10 @@ export function watchChanges(
           onFilesChanged?.();
         } else if (event.type === "tty-started" && event.nodeId !== undefined && event.block !== undefined) {
           onTtyStarted?.(event.nodeId, event.block);
+        } else if (event.type === "form-reset" && event.nodeId !== undefined && event.block !== undefined) {
+          window.dispatchEvent(
+            new CustomEvent(FORM_RESET_EVENT, { detail: { nodeId: event.nodeId, block: event.block } }),
+          );
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
           onRunStarted?.(event.nodeId, event.block, event.runId);
         } else if (event.type === "node-upserted" && event.node !== undefined) {

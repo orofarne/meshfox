@@ -231,6 +231,11 @@ struct AppState {
     /// whatever that specific call's own one-shot override already
     /// supplies — see `effective_overrides`.
     session_vars: Mutex<HashMap<String, String>>,
+    /// Bumped by every form Send. An automatic form reset (`reset` flag)
+    /// waits for the Send's `autorun` blocks to finish; if another Send
+    /// happened meanwhile, the reset is stale and must not wipe the newer
+    /// values.
+    form_submit_seq: std::sync::atomic::AtomicU64,
     /// Last confirmed session path values for previews only. Kept separate
     /// from run overrides so `required` still prompts on every invocation.
     session_paths: Mutex<HashMap<String, String>>,
@@ -4066,6 +4071,17 @@ enum ServerEvent {
     FilesChanged,
     /// Local Markdown image bytes changed; clients must invalidate their cache.
     ImagesChanged,
+    /// A `form` fence's fields were reset (`POST /api/form/reset`, or the
+    /// automatic reset after a Send of a form with the `reset` flag): a
+    /// client showing that form should refetch its fields. Carries only the
+    /// address — the values are the source of truth.
+    FormReset {
+        node_id: String,
+        block: String,
+        /// The fields marked `keep` were left alone (the automatic reset
+        /// after a Send); `false` means every field was reset.
+        respect_keep: bool,
+    },
     RunStarted {
         node_id: String,
         block: String,
@@ -7183,7 +7199,14 @@ async fn run_block_impl_sized(
             };
             if !stream_exec::supports(&block) {
                 yield Ok(ndjson_line(&RunEvent::Error {
-                    message: format!("no executor registered for language {:?}", block.lang),
+                    message: if meshfox_core::is_form(&block.lang) {
+                        format!(
+                            "{:?} is a `form` fence: it isn't run, it is sent — use its Send button, `meshfox form submit` or the MCP `form_submit` tool",
+                            addr.block_name
+                        )
+                    } else {
+                        format!("no executor registered for language {:?}", block.lang)
+                    },
                 }));
                 break;
             }
@@ -8357,6 +8380,10 @@ async fn submit_form(
         }
     }
 
+    let submit_seq = state
+        .form_submit_seq
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let triggered = meshfox_core::autorun_blocks_for_changed_vars(&canvas, &changed);
     for addr in &triggered {
         // Awaited (not `tokio::spawn`ed away) — see `trigger_autorun`'s
@@ -8367,6 +8394,25 @@ async fn submit_form(
         // — `trigger_autorun` calls that for every triggered address, so
         // there's nothing left to broadcast here.
         trigger_autorun(Arc::clone(&state), addr.clone()).await;
+    }
+
+    if form.reset {
+        spawn_auto_form_reset(
+            Arc::clone(&state),
+            req.node_id.clone(),
+            req.block.clone(),
+            form.fields
+                .iter()
+                .filter(|f| !f.keep)
+                .map(|f| f.var.clone())
+                .collect(),
+            triggered
+                .iter()
+                .filter(|a| find_tty_block(&canvas, std::slice::from_ref(a)).is_none())
+                .cloned()
+                .collect(),
+            submit_seq,
+        );
     }
 
     Ok(Json(SubmitFormResponse {
@@ -8380,6 +8426,161 @@ async fn submit_form(
             })
             .collect(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetFormRequest {
+    node_id: String,
+    block: String,
+    /// `true`: leave the fields marked `keep` alone (what the automatic
+    /// reset does). Default `false`: an explicit reset clears every field.
+    #[serde(default)]
+    respect_keep: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetFormResponse {
+    /// How many of the form's variables had a stored value that was dropped.
+    cleared: usize,
+}
+
+/// Forgets the session values of `vars` (a form's own fields): in memory and
+/// in the persisted session store. Commits nothing and starts nothing — in
+/// particular it never reaches `autorun_blocks_for_changed_vars`, so no
+/// `autorun` block runs. Returns how many names actually had a value.
+fn clear_form_vars(state: &AppState, vars: &[String]) -> usize {
+    let cleared = {
+        let mut session_vars = state.session_vars.lock().unwrap();
+        vars.iter()
+            .filter(|name| session_vars.remove(name.as_str()).is_some())
+            .count()
+    };
+    if let Err(e) = state.session_store.delete_vars(vars) {
+        eprintln!("meshfox: failed to drop persisted session variables ({e})");
+    }
+    cleared
+}
+
+/// `POST /api/form/reset` — puts a `form` fence's fields back to their
+/// declared defaults by dropping their session values (see SPEC.md's "Form
+/// fences", "Reset"). Refused with `409` while a foreground run is in
+/// progress, like Send, so a running chain's inputs are never pulled from
+/// under it. Never triggers `autorun`.
+async fn reset_form(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ResetFormRequest>,
+) -> Result<Json<ResetFormResponse>, ApiError> {
+    let raw = state.raw.lock().unwrap().clone();
+    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let node = canvas
+        .node(&req.node_id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
+    let block = node
+        .runnable_blocks()
+        .into_iter()
+        .find(|b| b.name.as_deref() == Some(req.block.as_str()))
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "no runnable block named {:?} in node {:?}",
+                    req.block, node.id
+                ),
+            )
+        })?;
+    if !meshfox_core::is_form(&block.lang) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "block {:?} in node {:?} isn't a `form` fence",
+                req.block, node.id
+            ),
+        ));
+    }
+    let form = meshfox_core::form_block(&block)
+        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    if foreground_run_in_progress(&state) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "a run is in progress — wait for it to finish (or stop it) before resetting the form"
+                .into(),
+        ));
+    }
+    let vars: Vec<String> = form
+        .fields
+        .iter()
+        .filter(|f| !(req.respect_keep && f.keep))
+        .map(|f| f.var.clone())
+        .collect();
+    let cleared = clear_form_vars(&state, &vars);
+    state.canvas_events.push(ServerEvent::FormReset {
+        node_id: req.node_id,
+        block: req.block,
+        respect_keep: req.respect_keep,
+    });
+    Ok(Json(ResetFormResponse { cleared }))
+}
+
+/// Waits until `handle`'s run is over and returns how it ended.
+async fn wait_for_run_outcome(handle: &run_registry::RunHandle) -> run_registry::RunOutcome {
+    let (_, mut rx) = handle.subscribe_from(u64::MAX);
+    loop {
+        let outcome = handle.outcome();
+        if !matches!(outcome, run_registry::RunOutcome::Running) {
+            return outcome;
+        }
+        match rx.recv().await {
+            Ok(run_registry::RunEvent::Done(outcome)) => return outcome,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return handle.outcome(),
+        }
+    }
+}
+
+/// The automatic reset of a form with the `reset` flag: once every
+/// `autorun` block its Send started (`blocks`, `tty` ones excluded — a
+/// terminal can stay open for as long as its user likes) has exited with
+/// code 0, the fields that aren't `keep` go back to their defaults. Any
+/// failure leaves the fields as they are so the input can be fixed, and a
+/// newer Send (`seq` no longer current) cancels it.
+fn spawn_auto_form_reset(
+    state: Arc<AppState>,
+    node_id: String,
+    block: String,
+    vars: Vec<String>,
+    blocks: Vec<meshfox_core::BlockAddr>,
+    seq: u64,
+) {
+    tokio::spawn(async move {
+        for addr in &blocks {
+            let handle = state
+                .runs_registry
+                .lock()
+                .unwrap()
+                .get(&(addr.node_id.clone(), addr.block_name.clone()))
+                .cloned();
+            let Some(handle) = handle else { return };
+            match wait_for_run_outcome(&handle).await {
+                run_registry::RunOutcome::Exited { exit_code: 0 } => {}
+                _ => return,
+            }
+        }
+        if state
+            .form_submit_seq
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != seq
+        {
+            return;
+        }
+        clear_form_vars(&state, &vars);
+        state.canvas_events.push(ServerEvent::FormReset {
+            node_id,
+            block,
+            respect_keep: true,
+        });
+    });
 }
 
 /// The first block in `chain` (if any) flagged `tty`. A chain may contain
@@ -10524,6 +10725,7 @@ async fn build_state_with(
         session_runs: Mutex::new(session_runs),
         session_store,
         session_vars: Mutex::new(session_vars),
+        form_submit_seq: std::sync::atomic::AtomicU64::new(0),
         session_paths: Mutex::new(session_paths),
         services: Mutex::new(HashMap::new()),
         lease_scopes: Mutex::new(HashMap::new()),
@@ -10591,6 +10793,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run/force", get(force_run))
         .route("/api/form/fields", get(get_form_fields))
         .route("/api/form/submit", post(submit_form))
+        .route("/api/form/reset", post(reset_form))
         .route("/api/run/subscribe", get(subscribe_run))
         .route("/api/run/history", get(get_run_history))
         .route("/api/run/tty", get(run_block_tty))
@@ -19847,6 +20050,174 @@ mod form_endpoint_tests {
         assert_eq!(after[0]["value"], "eu");
 
         let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A canvas whose form has the `reset` flag; `Q` is `keep`. The
+    /// autorun block appends `$Q/$N` to `log` and exits with `code`.
+    fn reset_form_canvas(log: &std::path::Path, code: i32) -> String {
+        format!(
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "## Config\n<!-- meshfox:node id=\"config\" -->\n\n",
+                "<!-- meshfox:var name=\"N\" default=\"dflt\" -->\n",
+                "<!-- meshfox:var name=\"Q\" default=\"qd\" -->\n\n",
+                "```form name=\"f\" reset\n",
+                "field var=\"N\"\nfield var=\"Q\" keep\n",
+                "```\n\n",
+                "```bash name=\"add\" env=\"N,Q\" autorun\n",
+                "echo \"$Q/$N\" >> {log}\nexit {code}\n```\n",
+            ),
+            log = log.display(),
+            code = code
+        )
+    }
+
+    async fn field_values(addr: SocketAddr) -> (Option<String>, Option<String>) {
+        let (status, body) = get(addr, "/api/form/fields?nodeId=config&block=f").await;
+        assert_eq!(status, 200, "{body}");
+        let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let get_val = |name: &str| {
+            resp["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["name"] == name)
+                .and_then(|f| f["value"].as_str().map(str::to_string))
+        };
+        (get_val("N"), get_val("Q"))
+    }
+
+    async fn wait_until_log_has(log: &std::path::Path, lines: usize) {
+        for _ in 0..100 {
+            if std::fs::read_to_string(log).is_ok_and(|t| t.lines().count() >= lines) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("autorun block never wrote {lines} line(s) to {}", log.display());
+    }
+
+    #[tokio::test]
+    async fn manual_form_reset_clears_every_field_and_starts_no_autorun() {
+        let log = std::env::temp_dir().join(format!("meshfox-reset-{}.log", uuid::Uuid::new_v4()));
+        let canvas_path = write_test_canvas(&reset_form_canvas(&log, 0));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        // `reset` flag on the form: the Send resets N on its own, Q is kept.
+        let (status, body) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"f","values":{"N":"a","Q":"b"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        wait_until_log_has(&log, 1).await;
+        for _ in 0..100 {
+            if field_values(addr).await.0.as_deref() == Some("dflt") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            field_values(addr).await,
+            (Some("dflt".into()), Some("b".into()))
+        );
+
+        // An explicit reset clears the kept field too -- and runs nothing.
+        let (status, body) = post_json(
+            addr,
+            "/api/form/reset",
+            r#"{"nodeId":"config","block":"f"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            field_values(addr).await,
+            (Some("dflt".into()), Some("qd".into()))
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            1,
+            "a reset must not trigger autorun"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[tokio::test]
+    async fn auto_form_reset_is_skipped_when_the_autorun_block_fails() {
+        let log = std::env::temp_dir().join(format!("meshfox-reset-{}.log", uuid::Uuid::new_v4()));
+        let canvas_path = write_test_canvas(&reset_form_canvas(&log, 1));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, body) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"f","values":{"N":"a","Q":"b"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        wait_until_log_has(&log, 1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            field_values(addr).await,
+            (Some("a".into()), Some("b".into())),
+            "a failed run keeps the input so it can be fixed"
+        );
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[tokio::test]
+    async fn explicit_form_reset_can_respect_keep_and_rejects_non_forms() {
+        let log = std::env::temp_dir().join(format!("meshfox-reset-{}.log", uuid::Uuid::new_v4()));
+        // exit 1: no automatic reset, so the explicit one is what's tested.
+        let canvas_path = write_test_canvas(&reset_form_canvas(&log, 1));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"config","block":"f","values":{"N":"a","Q":"b"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        wait_until_log_has(&log, 1).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/reset",
+            r#"{"nodeId":"config","block":"f","respectKeep":true}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            field_values(addr).await,
+            (Some("dflt".into()), Some("b".into())),
+            "respectKeep leaves the kept field alone"
+        );
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/reset",
+            r#"{"nodeId":"config","block":"add"}"#,
+        )
+        .await;
+        assert_eq!(status, 422, "`add` is a bash block, not a form");
+        let (status, _) = post_json(
+            addr,
+            "/api/form/reset",
+            r#"{"nodeId":"config","block":"nope"}"#,
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&log);
     }
 
     #[tokio::test]

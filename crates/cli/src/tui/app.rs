@@ -2464,6 +2464,9 @@ impl App {
                 self.cycle_inline_form_field(1);
                 self.render_current_document();
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_inline_form().await;
+            }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.active_inline_form.as_ref().and_then(|form| {
                     let i = form.selected;
@@ -2671,6 +2674,70 @@ impl App {
                 self.start_run(addr.node_id, addr.block_name, true).await;
             }
         }
+    }
+
+    /// The `[Reset]` marker / `Ctrl-r`: puts every field of the open form
+    /// back to its default. Like Send, refused while a foreground run is in
+    /// progress. In worker mode the worker drops the session values (and
+    /// announces it — see `on_form_reset`); never starts an `autorun` block.
+    async fn reset_inline_form(&mut self) {
+        if self.foreground_run_in_progress() {
+            self.status = "meshfox: a run is in progress — wait for it to finish (or stop it) before resetting the form".into();
+            return;
+        }
+        let Some((node_id, block_name)) = self
+            .active_inline_form
+            .as_ref()
+            .map(|f| (f.node_id.clone(), f.block_name.clone()))
+        else {
+            return;
+        };
+        if let Some(port) = self.worker_port {
+            if let Err(e) =
+                crate::worker_client::reset_form(port, &node_id, &block_name, false).await
+            {
+                self.status = format!("meshfox: failed to reset form: {e}");
+                return;
+            }
+        }
+        self.on_form_reset(&node_id, &block_name, false);
+        self.status = "meshfox: form reset".into();
+    }
+
+    /// The fields of `(node_id, block_name)` went back to their defaults
+    /// (this TUI's own reset, or `WatchEvent::FormReset`): forget their
+    /// locally remembered values — all of them, or with `respect_keep` all
+    /// but the `keep` ones — and, if that form is open, rebuild it so it
+    /// shows the defaults (the worker then fills in resolved values).
+    pub fn on_form_reset(&mut self, node_id: &str, block_name: &str, respect_keep: bool) {
+        let form = self
+            .display_canvas
+            .node(node_id)
+            .and_then(|node| {
+                node.runnable_blocks()
+                    .into_iter()
+                    .find(|b| b.name.as_deref() == Some(block_name))
+            })
+            .and_then(|block| meshfox_core::form_block(&block).ok());
+        let Some(form) = form else { return };
+        for field in &form.fields {
+            if !(respect_keep && field.keep) {
+                self.session_vars.remove(&field.var);
+            }
+        }
+        let open_here = self
+            .active_inline_form
+            .as_ref()
+            .filter(|f| f.node_id == node_id && f.block_name == block_name)
+            .map(|f| (f.editing, f.selected));
+        if let Some((editing, selected)) = open_here {
+            self.active_inline_form = self.try_build_inline_form(node_id, block_name);
+            if let Some(f) = &mut self.active_inline_form {
+                f.editing = editing;
+                f.selected = selected.min(f.fields.len());
+            }
+        }
+        self.render_current_document();
     }
 
     async fn on_block_picker_key(&mut self, key: KeyEvent) {
@@ -3291,6 +3358,14 @@ impl App {
                 self.select_form_block(&node_id, &block_name);
                 self.ensure_inline_form_open(&node_id, &block_name);
                 self.submit_inline_form().await;
+            }
+            ClickTarget::FormReset {
+                node_id,
+                block_name,
+            } => {
+                self.select_form_block(&node_id, &block_name);
+                self.ensure_inline_form_open(&node_id, &block_name);
+                self.reset_inline_form().await;
             }
             ClickTarget::FormBrowse {
                 node_id,
@@ -9357,6 +9432,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn inline_form_reset_restores_defaults_and_respect_keep_spares_kept_fields() {
+        let mut app = app_with_blocks(
+            "inline-reset",
+            concat!(
+                "<!-- meshfox:var name=A type=string default=da session -->\n",
+                "<!-- meshfox:var name=B type=string default=db session -->\n",
+                "```form name=pick reset\nfield var=A\nfield var=B keep\n```\n",
+            ),
+        )
+        .await;
+        let mut form = app.try_build_inline_form("root", "pick").unwrap();
+        form.editing = true;
+        form.inputs = vec!["xa".into(), "xb".into()];
+        app.active_inline_form = Some(form);
+        app.submit_inline_form().await;
+        assert_eq!(app.session_vars.get("A").map(String::as_str), Some("xa"));
+
+        // The automatic reset (after a Send) leaves the `keep` field.
+        app.on_form_reset("root", "pick", true);
+        assert!(!app.session_vars.contains_key("A"));
+        assert_eq!(app.session_vars.get("B").map(String::as_str), Some("xb"));
+
+        // `Ctrl-r` resets everything and starts no run.
+        let mut form = app.try_build_inline_form("root", "pick").unwrap();
+        form.editing = true;
+        app.active_inline_form = Some(form);
+        app.on_inline_form_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await;
+        assert!(app.session_vars.is_empty());
+        let form = app.active_inline_form.as_ref().unwrap();
+        assert_eq!(form.inputs, vec!["da".to_string(), "db".to_string()]);
+        assert!(form.editing);
+    }
+
     #[test]
     fn number_cursor_handles_unicode_and_field_changes() {
         let mut input = "1 234".to_string();
@@ -11311,7 +11421,7 @@ mod tests {
         assert!(form.editing);
         assert_eq!(form.block_name, "pick");
         assert!(text(&app).contains("· editing"), "{}", text(&app));
-        assert!(text(&app).contains("└─ ↑/↓ field · enter apply · esc done"));
+        assert!(text(&app).contains("└─ ↑/↓ field · enter apply · ^r reset · esc done"));
         app.on_key(key(KeyCode::Esc)).await;
         assert!(!app.active_inline_form.as_ref().unwrap().editing);
         assert!(!text(&app).contains("· editing"));

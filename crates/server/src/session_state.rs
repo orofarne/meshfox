@@ -165,6 +165,17 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Forgets the given session variables (a `form` reset); names that
+    /// aren't stored are ignored.
+    pub fn delete_vars(&self, names: &[String]) -> io::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for name in names {
+            conn.execute("DELETE FROM session_vars WHERE name = ?1", params![name])
+                .map_err(sqlite_err)?;
+        }
+        Ok(())
+    }
+
     pub fn load_vars(&self) -> io::Result<HashMap<String, String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn

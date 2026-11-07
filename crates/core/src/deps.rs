@@ -86,6 +86,8 @@ pub enum DepsError {
     FileNodeUnsupportedAttr(String, &'static str),
     #[error("node {0:?} block {1:?}: `send=` only means anything on a `form` fence")]
     SendWithoutForm(String, String),
+    #[error("node {0:?} block {1:?}: `reset` only means anything on a `form` fence")]
+    ResetWithoutForm(String, String),
     #[error("node {0:?} block {1:?}: `output-attrs=` only means anything with `output=\"image\"`")]
     OutputAttrsWithoutImage(String, String),
     #[error("node {0:?} block {1:?}: invalid output-attrs={2:?} — expected the image-attribute grammar, e.g. `width=50% bg=#fff` (`width=`/`height=` an integer or integer%, `bg=` `#rgb`/`#rrggbb`/`transparent`)")]
@@ -1104,6 +1106,9 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             }
             if block.attrs.contains_key("send") && !crate::exec::is_form(&block.lang) {
                 return Err(DepsError::SendWithoutForm(node.id.clone(), name.clone()));
+            }
+            if block.attrs.contains_key("reset") && !crate::exec::is_form(&block.lang) {
+                return Err(DepsError::ResetWithoutForm(node.id.clone(), name.clone()));
             }
             if let Some(attrs) = block.attrs.get("output-attrs") {
                 if block.attrs.get("output").map(String::as_str) != Some("image") {
@@ -2404,6 +2409,28 @@ mod tests {
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "<!-- meshfox:var name=\"X\" default=\"1\" -->\n\n",
             "```bash name=\"build\" env=\"$X\" autorun\necho build\n```\n",
+        ));
+        assert!(validate(&c).is_ok());
+    }
+
+    #[test]
+    fn validate_catches_reset_on_a_non_form_fence() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" reset\necho build\n```\n",
+        ));
+        assert_eq!(
+            validate(&c).unwrap_err(),
+            DepsError::ResetWithoutForm("root".to_string(), "build".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_accepts_reset_on_a_form_fence() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"X\" default=\"1\" -->\n\n",
+            "```form name=\"pick\" reset\nfield var=\"X\" keep\n```\n",
         ));
         assert!(validate(&c).is_ok());
     }

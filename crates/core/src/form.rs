@@ -24,6 +24,10 @@ pub struct FormField {
     /// fallback shape `crate::vars::VarDecl::prompt` already has relative
     /// to `name`).
     pub label: Option<String>,
+    /// bare `keep` flag — this field survives the form's `reset` (the
+    /// automatic one after Send); an explicit Reset button press clears it
+    /// along with every other field. See SPEC.md's "Form fences".
+    pub keep: bool,
 }
 
 /// A fully-parsed `form` fence: its own `name`/`send` (read straight off
@@ -35,6 +39,10 @@ pub struct FormBlock {
     /// `send="..."` — the Send button's caption. Falls back to a plain
     /// `"Send"` when omitted.
     pub send: Option<String>,
+    /// bare `reset` flag on the fence's info string — after a Send whose
+    /// `autorun` blocks all finished with exit 0, every field that isn't
+    /// `keep` goes back to its declared default.
+    pub reset: bool,
     pub fields: Vec<FormField>,
 }
 
@@ -83,6 +91,7 @@ pub fn parse_form_body(form_name: &str, code: &str) -> Result<Vec<FormField>, Fo
         fields.push(FormField {
             var,
             label: attrs.get("label").cloned(),
+            keep: attrs.get("keep").is_some_and(|v| v != "false"),
         });
     }
     Ok(fields)
@@ -98,6 +107,7 @@ pub fn form_block(block: &crate::fence::CodeBlock) -> Result<FormBlock, FormErro
     Ok(FormBlock {
         name,
         send: block.attrs.get("send").cloned(),
+        reset: block.attrs.get("reset").is_some_and(|v| v != "false"),
         fields,
     })
 }
@@ -128,14 +138,37 @@ mod tests {
             vec![
                 FormField {
                     var: "INSTALL_PATH".to_string(),
-                    label: None
+                    label: None,
+                    keep: false
                 },
                 FormField {
                     var: "REGION".to_string(),
-                    label: Some("AWS Region".to_string())
+                    label: Some("AWS Region".to_string()),
+                    keep: false
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reset_and_keep_flags_are_parsed() {
+        let md = concat!(
+            "```form name=\"f\" send=\"Go\" reset\n",
+            "field var=\"A\" keep\n",
+            "field var=\"B\" keep=\"false\"\n",
+            "field var=\"C\"\n",
+            "```\n",
+        );
+        let form = form_block(&scan_one(md)).unwrap();
+        assert!(form.reset);
+        let keeps: Vec<bool> = form.fields.iter().map(|f| f.keep).collect();
+        assert_eq!(keeps, vec![true, false, false]);
+    }
+
+    #[test]
+    fn reset_defaults_to_off() {
+        let form = form_block(&scan_one("```form name=\"f\"\nfield var=\"X\"\n```\n")).unwrap();
+        assert!(!form.reset);
     }
 
     #[test]

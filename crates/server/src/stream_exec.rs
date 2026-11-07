@@ -108,7 +108,7 @@ pub fn supports(block: &meshfox_core::CodeBlock) -> bool {
     // one. Rejecting it here, rather than letting it fall through to
     // `is_supported_lang`'s otherwise-true answer, is what makes `meshfox
     // run`/`POST /api/run` against a form block fail with a clear
-    // "no executor registered for language \"form\"" instead of silently
+    // error (`run_block_impl` says a form is sent, not run) instead of silently
     // spawning a no-op the way a `button` fence legitimately does.
     if meshfox_core::is_form(&block.lang) {
         return false;

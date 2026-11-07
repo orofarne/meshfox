@@ -157,6 +157,13 @@ specific cases:
   each invocation, including when reached as dependencies. If `run` reports
   confirmation required, ask the user before retrying with `confirm: true`;
   never infer approval from a prior run. CLI uses `--confirm` for automation.
+  A `form` fence is sent, not run: `form_submit` (CLI: `meshfox form submit
+  NODE FORM --set VAR=VAL`) commits the values into the session and starts the
+  `autorun` blocks they reach and waits for them (exit codes and output come
+  back; `wait: false` / `--no-wait` to skip that), which `run` with `vars`
+  does not; `form_reset`
+  (`meshfox form reset NODE FORM`) puts the fields back to their defaults and
+  starts nothing.
   A long chain can outlive a tool call (and its result can be too big to
   read): pass `detach: true` to get the `chain_id` back at once, then read
   the run with `logs` (`id` = that chain_id; pass the previous `next_seq` as

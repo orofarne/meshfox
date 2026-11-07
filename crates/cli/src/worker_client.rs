@@ -1273,6 +1273,14 @@ pub enum WatchEvent {
         node_id: String,
         block: String,
     },
+    /// A `form` fence's fields were reset in the worker (its Reset button
+    /// anywhere, the CLI/MCP, or the automatic reset after a Send):
+    /// `respect_keep` says the `keep` fields were left alone.
+    FormReset {
+        node_id: String,
+        block: String,
+        respect_keep: bool,
+    },
     /// A run (plain or `tty`) started or ended somewhere, or the session was
     /// reset: refetch `GET /api/runs`.
     RunsChanged,
@@ -1383,6 +1391,11 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 node_id: String,
                 block: String,
             },
+            FormReset {
+                node_id: String,
+                block: String,
+                respect_keep: bool,
+            },
             /// A `display="code"` file node's target changed on disk — the
             /// TUI re-reads the document, same as for `"changed"`.
             FilesChanged,
@@ -1441,6 +1454,15 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                     WatchMsg::TtyStarted { node_id, block } => {
                         WatchEvent::TtyStarted { node_id, block }
                     }
+                    WatchMsg::FormReset {
+                        node_id,
+                        block,
+                        respect_keep,
+                    } => WatchEvent::FormReset {
+                        node_id,
+                        block,
+                        respect_keep,
+                    },
                     WatchMsg::ImagesChanged => WatchEvent::ImagesChanged,
                     WatchMsg::RunsChanged => WatchEvent::RunsChanged,
                 };
@@ -1960,7 +1982,7 @@ pub async fn submit_form(
     node_id: &str,
     block: &str,
     values: HashMap<String, String>,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<TriggeredRun>, String> {
     let res = client()
         .post(format!("{}/api/form/submit", base_url(port)))
         .json(&serde_json::json!({ "nodeId": node_id, "block": block, "values": values }))
@@ -1979,21 +2001,117 @@ pub async fn submit_form(
     }
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
-    struct Triggered {
-        node_id: String,
-        block: String,
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Response {
-        autorun_triggered: Vec<Triggered>,
+        autorun_triggered: Vec<TriggeredRun>,
     }
     let response: Response = res.json().await.map_err(|e| e.to_string())?;
-    Ok(response
-        .autorun_triggered
-        .into_iter()
-        .map(|t| (t.node_id, t.block))
-        .collect())
+    Ok(response.autorun_triggered)
+}
+
+/// One `autorun` block a form's Send started in the worker.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggeredRun {
+    pub node_id: String,
+    pub block: String,
+    /// A `tty` block: its terminal is not a run output to wait for.
+    #[serde(default)]
+    pub tty: bool,
+}
+
+/// How one `TriggeredRun` ended, as `wait_for_runs` saw it.
+#[derive(Debug, Clone)]
+pub struct FinishedRun {
+    pub node_id: String,
+    pub block: String,
+    /// `None`: no exit code (killed, or the run could not be followed).
+    pub exit_code: Option<i32>,
+    /// stdout and stderr, merged in the order the worker recorded them.
+    pub output: String,
+    /// The wait gave up before the run ended.
+    pub timed_out: bool,
+}
+
+/// Follows every non-`tty` block of `triggered` until it ends (or `timeout`
+/// from now passes) and returns how each one went — what `meshfox form
+/// submit` and the MCP `form_submit` report, instead of leaving the caller
+/// to find the result with `logs`. A `tty` block is skipped: a terminal can
+/// stay open for as long as its user likes.
+pub async fn wait_for_runs(
+    port: u16,
+    triggered: &[TriggeredRun],
+    timeout: Duration,
+) -> Vec<FinishedRun> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut finished = Vec::new();
+    for run in triggered.iter().filter(|r| !r.tty) {
+        let mut rx = subscribe_run(port, run.node_id.clone(), run.block.clone());
+        let mut result = FinishedRun {
+            node_id: run.node_id.clone(),
+            block: run.block.clone(),
+            exit_code: None,
+            output: String::new(),
+            timed_out: false,
+        };
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Err(_) => {
+                    result.timed_out = true;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(SubscribeEvent::Line { text, .. })) => {
+                    result.output.push_str(&text);
+                    if !text.ends_with('\n') {
+                        result.output.push('\n');
+                    }
+                }
+                Ok(Some(SubscribeEvent::Done { exit_code })) => {
+                    result.exit_code = exit_code;
+                    break;
+                }
+            }
+        }
+        finished.push(result);
+    }
+    finished
+}
+
+/// `POST /api/form/reset` — drops the session values of a `form` fence's
+/// fields (all of them, or with `respect_keep` all but the `keep` ones),
+/// without starting anything. Returns how many stored values were dropped.
+pub async fn reset_form(
+    port: u16,
+    node_id: &str,
+    block: &str,
+    respect_keep: bool,
+) -> Result<usize, String> {
+    let res = client()
+        .post(format!("{}/api/form/reset", base_url(port)))
+        .json(&serde_json::json!({
+            "nodeId": node_id,
+            "block": block,
+            "respectKeep": respect_keep,
+        }))
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(if text.is_empty() {
+            status.to_string()
+        } else {
+            text
+        });
+    }
+    #[derive(serde::Deserialize)]
+    struct Response {
+        cleared: usize,
+    }
+    let response: Response = res.json().await.map_err(|e| e.to_string())?;
+    Ok(response.cleared)
 }
 
 /// Mirrors `crates/server/src/lib.rs`'s own `RunEvent` — the WebSocket

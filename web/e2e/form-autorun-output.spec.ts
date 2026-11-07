@@ -79,3 +79,38 @@ test("the table's own source can still be expanded independently — its output 
   await expect(table.locator(".mesh-code-output")).toBeVisible();
   await expect(table.locator(".mesh-code-output")).toContainText("Ada");
 });
+
+test("a form with `reset` clears its plain fields after a successful Send but keeps `keep` ones", async ({
+  page,
+}) => {
+  const form = block(page, "resetting", "reset-form");
+  const note = block(page, "resetting", "note");
+
+  await form.getByLabel("Item").fill("milk");
+  await form.getByLabel("Shop").fill("market");
+  await form.getByRole("button", { name: "Add" }).click();
+
+  await expect(note.locator(".mesh-code-output")).toContainText("added milk at market");
+  await expect(form.getByLabel("Item")).toHaveValue("");
+  await expect(form.getByLabel("Shop")).toHaveValue("market");
+});
+
+test("the Reset button puts every field back to its default, `keep` ones included, and runs nothing", async ({
+  page,
+}) => {
+  const form = block(page, "resetting", "reset-form");
+  const note = block(page, "resetting", "note");
+
+  await form.getByLabel("Item").fill("bread");
+  await form.getByLabel("Shop").fill("bakery");
+  await form.getByRole("button", { name: "Add" }).click();
+  await expect(note.locator(".mesh-code-output")).toContainText("added bread at bakery");
+
+  await form.getByLabel("Item").fill("typed but not sent");
+  await form.getByRole("button", { name: "Reset" }).click();
+
+  await expect(form.getByLabel("Item")).toHaveValue("");
+  await expect(form.getByLabel("Shop")).toHaveValue("corner");
+  // Reset starts nothing: the last output is still the last Send's.
+  await expect(note.locator(".mesh-code-output")).toContainText("added bread at bakery");
+});

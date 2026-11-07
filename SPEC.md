@@ -1324,6 +1324,32 @@ only ever prompting before a run. Its body is a line-based list, one
   combination this section opened with. A value committed this way is
   visible to every block's `env=` for the rest of that session, not just
   whichever `autorun` block happened to react to this particular Send.
+- **Reset.** A form can put its fields back to their declared defaults
+  (`default`, or the resolved `default_var`) — the way to enter a series of
+  similar records without clearing every field by hand. Two triggers:
+  - the bare `reset` flag on the fence's info string
+    (`` ```form name="tx" send="Add" reset ``) resets automatically after
+    a Send, once every `autorun` block that Send started has finished with
+    exit code 0. If any of them fails, nothing is reset, so the user can
+    fix the input and send again. A field marked with the bare `keep` flag
+    (`field var="CURRENCY" keep`) is left alone by this automatic reset.
+  - the form's **Reset** button (web UI), `[Reset]` marker or `Ctrl-r`
+    while editing (TUI): always available, clears *every* field, `keep` or
+    not.
+
+  A reset deletes the form's variables from the session store (and from its
+  on-disk copy, so a restart does not bring the values back); it commits
+  nothing and **never triggers `autorun`** — only a Send does. Output and
+  status of blocks that already ran are left as they are: a reset says
+  nothing about what those runs did (use "reset session" to forget them).
+  Like Send, a reset is refused (`409`) while a foreground run is in
+  progress. `reset` is accepted only on a `form` fence (`meshfox validate`
+  rejects it elsewhere); `keep` is only read on a form's `field` line. The
+  server endpoint is `POST /api/form/reset` (`respectKeep: true` spares the
+  `keep` fields, as the automatic reset does); it announces the reset on
+  `/api/watch` as `form-reset`, so every open web tab and TUI shows the
+  defaults. `meshfox form reset` and the MCP `form_reset` tool call it (as
+  `meshfox form submit` and `form_submit` call `POST /api/form/submit`).
 - **A form can only be sent while no foreground run is in progress** — a
   plain run, a `tty` session, or the gap between a chain's steps; a
   `service` doesn't count. Send commits the values *and* starts every
@@ -3422,7 +3448,7 @@ leading token instead of a `key=value` pair (`crates/core/src/fence.rs`):
 
     runnable-attr   ::= 'name' | 'cache' | 'default' | 'deps' | 'env' | 'tty'
                      | 'autoclose' | 'service' | 'autostop' | 'always' | 'interpreter'
-                     | 'autorun' | 'render' | 'output' | 'send' | 'fold'
+                     | 'autorun' | 'render' | 'output' | 'send' | 'reset' | 'fold'
                      | 'inputs' | 'outputs' | 'lease' | 'defer' | 'tangle' | 'extends'
     constraint-attr ::= 'constraint' | 'name'
     starlark-render-attr ::= 'render' | 'name' | 'output'
@@ -3435,7 +3461,7 @@ language for in the first place. A constraint
 fence requires `lang = 'starlark'`
 *and* the bare `constraint` flag (see "Constraint fences") — again,
 cross-cutting rules enforced by the fence scanner/`meshfox validate`, not
-expressible in `fence-info` alone. `send=` only means anything on a
+expressible in `fence-info` alone. `send=` and `reset` only mean anything on a
 `lang = 'form'` fence, same as `autoclose` only meaning anything on a
 `tty` one.
 
@@ -3445,7 +3471,7 @@ or code:
 
     form-body  ::= { ws } [ field-line { '\n' { ws } field-line } ] { ws }
     field-line ::= 'field' ws attr-list
-    field-attr ::= 'var' | 'label'
+    field-attr ::= 'var' | 'label' | 'keep'
 
 A blank line between `field-line`s is allowed (and ignored); any other
 non-blank line is a parse error.

@@ -659,6 +659,46 @@ struct RunParams {
 struct SessionResetParams {}
 
 #[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct FormSubmitParams {
+    /// The id of the node that owns the `form` fence.
+    node_id: String,
+    /// The form fence's `name=`.
+    block: String,
+    /// Field values by variable name. Only the variables named here are
+    /// sent; the form's other fields keep their session value or default.
+    /// Never for a `secret` variable — secrets are not passed through this
+    /// tool.
+    #[serde(default)]
+    values: std::collections::BTreeMap<String, String>,
+    /// Wait for the `autorun` blocks the Send started and report each one's
+    /// exit code and output tail (default true). With false the call
+    /// returns as soon as they are started; follow them with `logs`.
+    #[serde(default = "default_true")]
+    wait: bool,
+    /// With `wait`: give up after this many milliseconds (default 10
+    /// minutes, at most an hour); a block still running then is reported
+    /// as `timed_out` and left running.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
+struct FormResetParams {
+    /// The id of the node that owns the `form` fence.
+    node_id: String,
+    /// The form fence's `name=`.
+    block: String,
+    /// Leave the fields marked `keep` alone, as the automatic reset after a
+    /// Send does. Default false: every field goes back to its default.
+    #[serde(default)]
+    respect_keep: bool,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 struct LogsParams {
     /// Block address as in `run`: the node-id path leading to the node, then
     /// the block name (or just the node id for its default block). Omit to
@@ -1403,6 +1443,71 @@ impl CanvasCtx {
             .await
             .map_err(invalid_params)?;
         Ok(CallToolResult::structured(json!({ "reset": true })))
+    }
+
+    /// Sends a `form` fence the way its Send button does: commits the given values into the session and starts every `autorun` block they reach (in the worker). Waits for those blocks (unless `wait: false`) and returns each one's exit code and output tail, with an overall `success` flag. Unlike `run` with `vars`, this changes what the form shows and what later runs see. Refused while a foreground run is in progress. Not for `secret` fields.
+    async fn form_submit(&self, params: FormSubmitParams) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let values: std::collections::HashMap<String, String> =
+            params.values.into_iter().collect();
+        let triggered =
+            crate::worker_client::submit_form(port, &params.node_id, &params.block, values)
+                .await
+                .map_err(invalid_params)?;
+        let mut runs = Vec::new();
+        let mut success = true;
+        if params.wait {
+            let timeout_ms = params
+                .timeout_ms
+                .unwrap_or(DEFAULT_RUN_TIMEOUT_MS)
+                .min(MAX_RUN_TIMEOUT_MS);
+            let finished = crate::worker_client::wait_for_runs(
+                port,
+                &triggered,
+                Duration::from_millis(timeout_ms),
+            )
+            .await;
+            for mut run in finished {
+                let truncated = run.output.len() > RUN_OUTPUT_CAP_BYTES;
+                cap_tail(&mut run.output, RUN_OUTPUT_CAP_BYTES);
+                success &= !run.timed_out && run.exit_code == Some(0);
+                runs.push(json!({
+                    "node_id": run.node_id,
+                    "block": run.block,
+                    "exit_code": run.exit_code,
+                    "timed_out": run.timed_out,
+                    "output": run.output,
+                    "output_truncated": truncated,
+                }));
+            }
+        } else {
+            runs = triggered
+                .iter()
+                .map(|t| json!({ "node_id": t.node_id, "block": t.block }))
+                .collect();
+        }
+        Ok(CallToolResult::structured(json!({
+            "submitted": format!("{}/{}", params.node_id, params.block),
+            "success": success,
+            "autorun": runs,
+        })))
+    }
+
+    /// Puts a `form` fence's fields back to their defaults (forgets their session values). Starts nothing, not even `autorun` blocks; output of blocks that already ran is left alone. Refused while a foreground run is in progress.
+    async fn form_reset(&self, params: FormResetParams) -> Result<CallToolResult, ErrorData> {
+        let port = self.worker_port().await?;
+        let cleared = crate::worker_client::reset_form(
+            port,
+            &params.node_id,
+            &params.block,
+            params.respect_keep,
+        )
+        .await
+        .map_err(invalid_params)?;
+        Ok(CallToolResult::structured(json!({
+            "reset": format!("{}/{}", params.node_id, params.block),
+            "cleared": cleared,
+        })))
     }
 
     /// Renames a node's heading text, leaving its id, heading level, and body untouched.
@@ -2594,6 +2699,46 @@ impl MeshfoxMcpRoot {
             "session_reset",
             call_deadline(None),
             |ctx| async move { ctx.session_reset(inner).await },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Same as form_submit, scoped to canvas_id (see canvas_open) — sends a `form` fence of that canvas like its Send button: commits values into the session, starts the autorun blocks they reach and waits for them (wait: false returns at once)."
+    )]
+    async fn form_submit(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<FormSubmitParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let budget = inner.wait.then(|| {
+            Duration::from_millis(
+                inner
+                    .timeout_ms
+                    .unwrap_or(DEFAULT_RUN_TIMEOUT_MS)
+                    .clamp(1, MAX_RUN_TIMEOUT_MS),
+            )
+        });
+        self.call(
+            &canvas_id,
+            "form_submit",
+            call_deadline(budget),
+            |ctx| async move { ctx.form_submit(inner).await },
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Same as form_reset, scoped to canvas_id (see canvas_open) — puts a `form` fence of that canvas back to its defaults without starting anything."
+    )]
+    async fn form_reset(
+        &self,
+        Parameters(WithCanvas { canvas_id, inner }): Parameters<WithCanvas<FormResetParams>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call(
+            &canvas_id,
+            "form_reset",
+            call_deadline(None),
+            |ctx| async move { ctx.form_reset(inner).await },
         )
         .await
     }

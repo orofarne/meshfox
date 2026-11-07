@@ -38,6 +38,8 @@ import {
   fetchNodeFileContent,
   fetchLinkPreview,
   fetchFormFields,
+  resetForm,
+  FORM_RESET_EVENT,
   type LinkPreview,
   type FormFieldStatus,
   type SaveTextOutcome,
@@ -1988,24 +1990,45 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
   const [submitting, setSubmitting] = useState(false);
   const runInProgress = useContext(ForegroundRunContext);
 
+  const loadFields = useCallback(
+    (isCancelled: () => boolean) =>
+      fetchFormFields(nodeId, seg.name)
+        .then(({ send, fields: f }) => {
+          if (isCancelled()) return;
+          setSendCaption(send);
+          setFields(f);
+          setValues(Object.fromEntries(f.map((field) => [field.name, initialFormFieldValue(field)])));
+        })
+        .catch((e) => {
+          if (!isCancelled()) setError(String(e));
+        }),
+    [nodeId, seg.name],
+  );
+
   useEffect(() => {
     // A form only feeds blocks that run; there is nothing to ask the server.
     if (data.noExec) return;
     let cancelled = false;
-    fetchFormFields(nodeId, seg.name)
-      .then(({ send, fields: f }) => {
-        if (cancelled) return;
-        setSendCaption(send);
-        setFields(f);
-        setValues(Object.fromEntries(f.map((field) => [field.name, initialFormFieldValue(field)])));
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e));
-      });
+    void loadFields(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [nodeId, seg.name, seg.code, data.noExec]);
+  }, [loadFields, seg.code, data.noExec]);
+
+  // The server reset this form's fields (Reset button anywhere, CLI/MCP, or
+  // the automatic reset after a Send): show the defaults again.
+  useEffect(() => {
+    if (data.noExec) return;
+    const onReset = (e: Event) => {
+      const d = (e as CustomEvent<{ nodeId: string; block: string }>).detail;
+      if (d.nodeId === nodeId && d.block === seg.name) {
+        setError(null);
+        void loadFields(() => false);
+      }
+    };
+    window.addEventListener(FORM_RESET_EVENT, onReset);
+    return () => window.removeEventListener(FORM_RESET_EVENT, onReset);
+  }, [nodeId, seg.name, data.noExec, loadFields]);
 
   const set = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }));
 
@@ -2027,6 +2050,13 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleReset = () => {
+    setError(null);
+    resetForm(nodeId, seg.name)
+      .then(() => loadFields(() => false))
+      .catch((e) => setError(String(e)));
   };
 
   const renderField = (f: NonNullable<typeof fields>[number], i: number) => {
@@ -2118,6 +2148,19 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
         onClick={handleSend}
       >
         {sendCaption}
+      </button>
+      <button
+        type="button"
+        className="mesh-run-button"
+        disabled={submitting || runInProgress}
+        title={
+          runInProgress
+            ? "A run is in progress — wait for it to finish (or stop it) before resetting"
+            : "Put every field back to its default"
+        }
+        onClick={handleReset}
+      >
+        Reset
       </button>
     </div>
   );

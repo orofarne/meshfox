@@ -139,6 +139,57 @@ enum SessionOp {
 }
 
 #[derive(Subcommand)]
+enum FormOp {
+    /// Send a `form` fence the way its Send button does: the given values
+    /// are committed into the session, and every `autorun` block they
+    /// reach is started in the worker. Waits for those blocks, prints their
+    /// output and exits non-zero if one fails (`--no-wait` returns at once;
+    /// a `tty` block is never waited for). Only the variables named with `--set` are sent; the
+    /// form's other fields keep their session value (or their default).
+    /// Refused while a foreground run is in progress. Unlike `run --set`,
+    /// this changes what the form shows and what later runs see.
+    Submit {
+        /// The form's owning node (its id, as shown by `meshfox list`).
+        node: String,
+        /// The form fence's `name=`.
+        block: String,
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        /// A field's value, `NAME=VALUE` (repeatable).
+        #[arg(long = "set", value_name = "NAME=VALUE", value_parser = parse_key_val)]
+        set: Vec<(String, String)>,
+        /// Return as soon as the `autorun` blocks are started instead of
+        /// waiting for them to finish (follow them with `meshfox logs
+        /// --follow`).
+        #[arg(long)]
+        no_wait: bool,
+        /// How long to wait for the started blocks, in seconds.
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Put a `form` fence's fields back to their defaults (forget their
+    /// session values). Starts nothing, not even `autorun` blocks; output
+    /// of blocks that already ran is left alone. Refused while a
+    /// foreground run is in progress.
+    Reset {
+        /// The form's owning node (its id).
+        node: String,
+        /// The form fence's `name=`.
+        block: String,
+        /// Path to the .canvas.md file. If omitted: auto-discover the
+        /// single candidate in the current directory.
+        #[arg(long)]
+        canvas: Option<PathBuf>,
+        /// Leave the fields marked `keep` alone, as the automatic reset
+        /// after a Send does (by default every field is reset).
+        #[arg(long)]
+        respect_keep: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Pack a canvas and everything it reads into one file for handing to
     /// someone else: a `.canvas.tar.xz` holding the canvas, its includes,
@@ -347,6 +398,12 @@ enum Command {
     Configure {
         #[command(flatten)]
         canvas: CanvasOpt,
+    },
+    /// Drive a `form` fence from the command line: `submit` is its Send
+    /// button, `reset` its Reset. See SPEC.md's "Form fences".
+    Form {
+        #[command(subcommand)]
+        op: FormOp,
     },
     /// Manage a canvas's *session*: what the core remembers between runs —
     /// which blocks already ran and still look unchanged (so a later `run`
@@ -1405,7 +1462,7 @@ fn splice_leading_canvas(mut args: Vec<String>) -> Vec<String> {
             args.insert(2, "--canvas".to_string());
             args.insert(3, canvas);
         }
-        Some("node") if args.len() >= 3 => {
+        Some("node" | "form") if args.len() >= 3 => {
             args.insert(3, "--canvas".to_string());
             args.insert(4, canvas);
         }
@@ -1710,6 +1767,7 @@ fn main() {
             let canvas_path = canvas.resolve().unwrap_or_else(find_canvas);
             configure(&canvas_path)
         }
+        Command::Form { op } => form_cmd(op),
         Command::Session {
             op: SessionOp::Reset { canvas },
         } => {
@@ -4635,6 +4693,89 @@ fn read_raw_or_exit(canvas_path: &Path) -> String {
             );
             std::process::exit(1);
         })
+}
+
+fn form_cmd(op: FormOp) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    match op {
+        FormOp::Submit {
+            node,
+            block,
+            canvas,
+            set,
+            no_wait,
+            timeout,
+        } => {
+            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let port = worker_port_or_exit(&runtime, &canvas_path);
+            let values: HashMap<String, String> = set.into_iter().collect();
+            let triggered =
+                match runtime.block_on(worker_client::submit_form(port, &node, &block, values)) {
+                    Ok(triggered) => triggered,
+                    Err(e) => {
+                        eprintln!("meshfox form submit: {e} (worker on port {port})");
+                        std::process::exit(1);
+                    }
+                };
+            println!("meshfox form submit: sent {node}/{block}");
+            if no_wait {
+                for t in &triggered {
+                    println!(
+                        "  started {}/{} (meshfox logs --follow {} {})",
+                        t.node_id, t.block, t.node_id, t.block
+                    );
+                }
+                return;
+            }
+            let finished = runtime.block_on(worker_client::wait_for_runs(
+                port,
+                &triggered,
+                std::time::Duration::from_secs(timeout),
+            ));
+            let mut failed = false;
+            for t in triggered.iter().filter(|t| t.tty) {
+                println!("  started {}/{} (a terminal: not waited for)", t.node_id, t.block);
+            }
+            for run in finished {
+                let status = if run.timed_out {
+                    "still running when the wait ended".to_string()
+                } else {
+                    match run.exit_code {
+                        Some(0) => "ok".to_string(),
+                        Some(code) => format!("exit {code}"),
+                        None => "ended without an exit code".to_string(),
+                    }
+                };
+                failed |= run.timed_out || run.exit_code != Some(0);
+                println!("== {}/{}: {status}", run.node_id, run.block);
+                print!("{}", run.output);
+            }
+            if failed {
+                std::process::exit(1);
+            }
+        }
+        FormOp::Reset {
+            node,
+            block,
+            canvas,
+            respect_keep,
+        } => {
+            let canvas_path = canvas.unwrap_or_else(find_canvas);
+            let port = worker_port_or_exit(&runtime, &canvas_path);
+            match runtime.block_on(worker_client::reset_form(port, &node, &block, respect_keep)) {
+                Ok(cleared) => println!(
+                    "meshfox form reset: {node}/{block} back to its defaults ({cleared} stored value(s) dropped)"
+                ),
+                Err(e) => {
+                    eprintln!("meshfox form reset: {e} (worker on port {port})");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 fn session_reset(canvas_path: &Path) {

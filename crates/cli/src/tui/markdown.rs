@@ -102,6 +102,9 @@ pub enum ClickTarget {
     /// directly, no prior field focus needed, same one-click convention
     /// `RunBlock` already has for a `button` fence's marker.
     FormSend { node_id: String, block_name: String },
+    /// The `[Reset]` marker after the send caption — puts every field back
+    /// to its default (SPEC.md's "Form fences", "Reset").
+    FormReset { node_id: String, block_name: String },
     /// The `[Browse… ^o]` marker after a `dir`/`file` field's value —
     /// focuses the field and opens the path picker, same as `Ctrl-O` there.
     FormBrowse {
@@ -1920,9 +1923,17 @@ impl<'a> Renderer<'a> {
                         send_span = send_span
                             .patch_style(Style::default().add_modifier(Modifier::REVERSED));
                     }
-                    lines.push(Line::from(vec![Span::styled("│ ", border), send_span]));
+                    let reset_text = "[Reset]";
+                    let reset_col_start = send_col_end + 2;
+                    let reset_col_end = reset_col_start + reset_text.chars().count() as u16;
+                    lines.push(Line::from(vec![
+                        Span::styled("│ ", border),
+                        send_span,
+                        Span::raw("  "),
+                        Span::styled(reset_text, marker_style),
+                    ]));
                     let foot = if editing_this {
-                        "└─ ↑/↓ field · enter apply · esc done"
+                        "└─ ↑/↓ field · enter apply · ^r reset · esc done"
                     } else {
                         "└─"
                     };
@@ -1965,6 +1976,16 @@ impl<'a> Renderer<'a> {
                             col_start: gutter_chars,
                             col_end: send_col_end,
                             target: ClickTarget::FormSend {
+                                node_id: self.node_id.to_string(),
+                                block_name: block_name.clone(),
+                            },
+                        });
+                        self.click_regions.push(ClickRegion {
+                            segment_index,
+                            line_index: fields.len() + 1,
+                            col_start: reset_col_start,
+                            col_end: reset_col_end,
+                            target: ClickTarget::FormReset {
                                 node_id: self.node_id.to_string(),
                                 block_name: block_name.clone(),
                             },
