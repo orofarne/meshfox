@@ -74,8 +74,27 @@ interpolate() {
   printf '%s' "$out$rest"
 }
 
+unknown_provider() {
+  echo "@agent: unknown interpreters.agent.provider '$provider' (expected claude, codex, opencode or custom)" >&2
+  exit 1
+}
+
+# provider = "custom": a free-form shell command from the config. The prompt
+# is never spliced into the command text — it arrives as "$1" (and
+# $MESHFOX_PROMPT), so quoting inside the prompt can't break or inject.
+run_custom() {
+  local cmd=$1 key=$2
+  if [[ -z "$cmd" ]]; then
+    echo "@agent: provider 'custom' needs interpreters.agent.$key in .meshfox/config.toml" >&2
+    exit 1
+  fi
+  export MESHFOX_PROMPT="$prompt"
+  exec bash -c "$cmd" agent "$prompt"
+}
+
+prompt="$(interpolate "$(cat "$1")")"
+
 if [[ -t 1 ]]; then
-  prompt="$(interpolate "$(cat "$1")")"
   case "$provider" in
     claude)
       # A real interactive session — full tool access, same as running
@@ -87,14 +106,19 @@ if [[ -t 1 ]]; then
       # Interactive CLI, seeded with the prompt; the agent's policy applies.
       exec codex "$prompt"
       ;;
+    opencode)
+      # The TUI, seeded through its own --prompt flag.
+      exec opencode --prompt "$prompt"
+      ;;
+    custom)
+      run_custom "${MESHFOX_CONFIG_INTERPRETERS_AGENT_TTY_COMMAND:-${MESHFOX_CONFIG_INTERPRETERS_AGENT_COMMAND:-}}" tty_command
+      ;;
     *)
-      echo "@agent: unknown interpreters.agent.provider '$provider' (expected claude or codex)" >&2
-      exit 1
+      unknown_provider
       ;;
   esac
 fi
 
-prompt="$(interpolate "$(cat "$1")")"
 case "$provider" in
   claude)
     # Meshfox adds no access restrictions; the agent's own policy applies.
@@ -104,8 +128,14 @@ case "$provider" in
     # Keep Codex's own trust, sandbox and approval settings.
     exec codex exec -- "$prompt"
     ;;
+  opencode)
+    # One-shot run; opencode's own permission settings apply.
+    exec opencode run -- "$prompt"
+    ;;
+  custom)
+    run_custom "${MESHFOX_CONFIG_INTERPRETERS_AGENT_COMMAND:-}" command
+    ;;
   *)
-    echo "@agent: unknown interpreters.agent.provider '$provider' (expected claude or codex)" >&2
-    exit 1
+    unknown_provider
     ;;
 esac

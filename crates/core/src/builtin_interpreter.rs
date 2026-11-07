@@ -332,14 +332,27 @@ pub fn execution_identity(spec: &str, config: &toml::Table) -> Option<String> {
     if builtin.name == "agent" {
         // Project exactly the value exported to agent.sh (including key
         // normalization and the same last-value precedence as envs()).
-        let provider = crate::config::flatten_to_env(config)
-            .into_iter()
-            .rev()
-            .find(|(key, _)| key == "MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER")
-            .map(|(_, value)| value)
-            .filter(|s| !s.is_empty())
+        let flat = crate::config::flatten_to_env(config);
+        let get = |name: &str| {
+            flat.iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .filter(|s| !s.is_empty())
+        };
+        let provider = get("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER")
             .unwrap_or_else(|| "claude".to_string());
         hash.update(provider.as_bytes());
+        if provider == "custom" {
+            // The free-form commands are part of what the block runs.
+            for name in [
+                "MESHFOX_CONFIG_INTERPRETERS_AGENT_COMMAND",
+                "MESHFOX_CONFIG_INTERPRETERS_AGENT_TTY_COMMAND",
+            ] {
+                hash.update(b"\0");
+                hash.update(get(name).unwrap_or_default().as_bytes());
+            }
+        }
     }
     Some(hash.finalize().to_hex().to_string())
 }
@@ -765,7 +778,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = "#!/bin/sh\nfor arg do printf '%s\\000' \"$arg\"; done\n";
-        for provider in ["claude", "codex"] {
+        for provider in ["claude", "codex", "opencode"] {
             let bin = dir.join(provider);
             std::fs::write(&bin, fake).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -773,7 +786,7 @@ mod tests {
         let prompt = dir.join("prompt.txt");
         std::fs::write(&prompt, "A=$A; braced=${A}; B=$B; prefix=$AB; escaped=$$A; unknown=$HOME; price=$5; bad=${A; shell=$(touch NO); unicode=ёж; ctrl=\u{1}").unwrap();
         for shell in ["/bin/bash", "bash"] {
-            for provider in ["claude", "codex"] {
+            for provider in ["claude", "codex", "opencode"] {
                 for names in ["A,B", "B,A"] {
                     let output = builtin_command("@agent", shell, &prompt)
                         .env(
@@ -804,10 +817,10 @@ mod tests {
                         .collect();
                     assert_eq!(
                         args[0],
-                        if provider == "claude" {
-                            b"-p".as_slice()
-                        } else {
-                            b"exec".as_slice()
+                        match provider {
+                            "claude" => b"-p".as_slice(),
+                            "codex" => b"exec".as_slice(),
+                            _ => b"run".as_slice(),
                         }
                     );
                     assert_eq!(args[1], b"--");
@@ -817,6 +830,50 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agent_identity_tracks_custom_commands_only_for_custom() {
+        let cfg = |s: &str| -> toml::Table { s.parse().unwrap() };
+        let a = cfg("[interpreters.agent]\nprovider='custom'\ncommand='a \"$1\"'\n");
+        let b = cfg("[interpreters.agent]\nprovider='custom'\ncommand='b \"$1\"'\n");
+        let t = cfg(
+            "[interpreters.agent]\nprovider='custom'\ncommand='a \"$1\"'\ntty_command='x'\n",
+        );
+        assert_ne!(execution_identity("@agent", &a), execution_identity("@agent", &b));
+        assert_ne!(execution_identity("@agent", &a), execution_identity("@agent", &t));
+        let c1 = cfg("[interpreters.agent]\nprovider='codex'\ncommand='a'\n");
+        let c2 = cfg("[interpreters.agent]\nprovider='codex'\ncommand='b'\n");
+        assert_eq!(execution_identity("@agent", &c1), execution_identity("@agent", &c2));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_custom_command_gets_prompt_as_argument_without_injection() {
+        let dir = std::env::temp_dir().join(format!("meshfox-agent-custom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt = dir.join("prompt.txt");
+        std::fs::write(&prompt, "hi $(touch NO) \"q\" 'x'").unwrap();
+        let run = |cmd: Option<&str>| {
+            let mut c = builtin_command("@agent", "bash", &prompt);
+            c.env("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER", "custom")
+                .env("MESHFOX_ENV_NAMES", "")
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null());
+            if let Some(cmd) = cmd {
+                c.env("MESHFOX_CONFIG_INTERPRETERS_AGENT_COMMAND", cmd);
+            }
+            c.output().unwrap()
+        };
+        let ok = run(Some("printf '%s|%s' \"$1\" \"$MESHFOX_PROMPT\""));
+        assert!(ok.status.success());
+        let want = "hi $(touch NO) \"q\" 'x'";
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), format!("{want}|{want}"));
+        assert!(!dir.join("NO").exists());
+        let missing = run(None);
+        assert!(!missing.status.success());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("interpreters.agent.command"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

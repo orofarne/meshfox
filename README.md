@@ -171,7 +171,7 @@ A canvas in `child/` can then use `![sensor](../docs/sensor.webp)` or link to `.
 | `secret_store` | `plaintext` | Where `secret` variables are saved: `plaintext` (the `.meshfox/*.env` cache, as always) or `keychain` (the system secret store — the **macOS Keychain**, or the **Secret Service** on Linux). Explicit only, no auto mode; an unknown value is an error. Also enables `secrets = [...]` in `[[env]]` and `meshfox secret set/show/rm`. See SPEC.md's "Secret store". |
 | `[files] allow` | `[]` | Additional readable paths, relative to the configuration owner. Inherited by nested canvases; the nearest explicit array replaces the inherited list. |
 | `[[env]]` | none | Shared defaults for `meshfox:var` resolution across canvases, optionally scoped with `path=`. Not a flat setting, so it isn't merged key by key; see SPEC.md's "Shared/global config (`[[env]]`)". |
-| `[interpreters.agent] provider` | `claude` | Which agent CLI the `@agent` macro calls (`claude` or `codex`) — see "Calling an AI agent from a block". Every scalar key in the file is also exported to a `@`-macro's process as `MESHFOX_CONFIG_<PATH>` (`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written `interpreter=` script can read it too. |
+| `[interpreters.agent] provider` | `claude` | Which agent CLI the `@agent` macro calls (`claude`, `codex`, `opencode`, or `custom` with your own `command`/`tty_command`) — see "Calling an AI agent from a block". Every scalar key in the file is also exported to a `@`-macro's process as `MESHFOX_CONFIG_<PATH>` (`MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written `interpreter=` script can read it too. |
 | `[tui] theme` | `darkfox` | Color theme of the terminal viewer — interface, SVG output and the editor's syntax colors. A built-in name or a file `<name>.toml` in `.meshfox/themes/tui/` (next to the canvas, or `~/.meshfox/themes/tui/`) — see "Terminal UI". An unknown or broken theme falls back to `darkfox` and says why in the status line. |
 | `[tui] output_height_pct` | `20` | Initial height of the terminal viewer's Output pane, in percent of the terminal (`1`–`90`; anything else is ignored). Dragging the pane's border still changes it for the session. |
 | `[tui] editor` | none | Command that `e` runs in the terminal viewer instead of the built-in source editor, e.g. `nvim +{line} {file}` — see "External editor" under "Terminal UI". Unset keeps the built-in editor (`$EDITOR` is not consulted). |
@@ -1274,7 +1274,7 @@ trust settings apply. `tty` changes interactivity, not this access contract.
 Dependency results become stale when the builtin script or effective
 provider setting changes.
 
-Which provider a `@name` macro actually calls (`claude` vs. `codex`, for
+Which provider a `@name` macro actually calls (`claude`, `codex` or `opencode`, for
 `@agent`) comes from a small settings file meshfox itself reads —
 `interpreters.agent.provider` in `.meshfox/config.toml` next to the canvas,
 or `~/.meshfox/config.toml` globally (local wins, key by key) — a fact
@@ -1283,6 +1283,23 @@ have to prompt for on every run. Every dotted key in there is exported to
 a macro's own process as `MESHFOX_CONFIG_<PATH>` (e.g.
 `MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER`), so a hand-written
 `interpreter=` script can read the same settings too.
+
+`provider = "opencode"` runs `opencode run -- "$prompt"` (and
+`opencode --prompt "$prompt"` on a `tty` block). `provider = "custom"` runs
+any command of your own:
+
+```toml
+[interpreters.agent]
+provider    = "custom"
+command     = 'aider --yes --message "$1"'   # plain block (output captured)
+tty_command = 'aider "$1"'                   # tty block; defaults to command
+```
+
+The command is a shell snippet run as `bash -c "$command" agent "$prompt"`:
+the prompt (after `$VAR` interpolation) is `$1` and also
+`$MESHFOX_PROMPT`, never spliced into the command text, so quotes in it
+can't break or inject anything. `command` is required for `custom`; a
+changed command makes the block's earlier runs stale.
 
 #### Example
 <!-- meshfox:node id="example-8" type="file" -->
