@@ -91,6 +91,8 @@ import { distributeEdgePorts } from "./edgePorts";
 import { withEdgeGeometry } from "./edgeRouteLayout";
 import { CanvasSourceEditor } from "./CanvasSourceEditor";
 import { foldedStorageKey } from "./foldedStorageKey";
+import { ActivityBar } from "./ActivityBar";
+import { activityIsLive, useRunActivity, type RunActivity } from "./runActivity";
 import { ConsolePanel, type ConsoleLine } from "./ConsolePanel";
 import { getThemePreference, setThemePreference, type ThemePreference } from "./theme";
 
@@ -405,6 +407,8 @@ function CanvasView({
 }
 
 export default function App() {
+  const { activities, begin: beginActivity, event: recordActivity, close: closeActivity, clear: clearActivity } = useRunActivity();
+  const [externalResult, setExternalResult] = useState<RunActivity | null>(null);
   const [canvas, setCanvasState] = useState<CanvasDoc | null>(null);
   const acceptCanvas = useRef(canvasVersionGate());
   const setCanvas = useCallback((next: React.SetStateAction<CanvasDoc | null>) => {
@@ -421,12 +425,12 @@ export default function App() {
   const [services, setServices] = useState<ServiceStatusDto[]>([]);
   // Whether the global service panel (`ServicePanel.tsx`) is open — opened
   // by a title-bar `ServiceBadge` click (scoped to that node, see
-  // `servicePanelFocusNodeId` below) or by the toolbar's own services pill
-  // (unscoped — every service, same "global panel" spot the toolbar's
-  // `constraintStats` pill lives in).
+  // `servicePanelFocusNodeId` below) or by the activity strip's services button
+  // (unscoped — every service, same global panel as the activity strip's
+  // checks indicator).
   const [servicePanelOpen, setServicePanelOpen] = useState(false);
   // Which service to pre-select when the panel opens — `null` for
-  // "whichever" (the toolbar pill's own case). Set alongside
+  // "whichever" (the activity strip's case). Set alongside
   // `servicePanelOpen` itself, never read while it's `false`.
   const [servicePanelFocusNodeId, setServicePanelFocusNodeId] = useState<string | null>(null);
   // A `"lock-conflict"` event awaiting the user's confirm/cancel —
@@ -603,11 +607,13 @@ export default function App() {
   const handleResetSession = useCallback(() => {
     resetSession()
       .then(() => {
+        clearActivity();
+        setExternalResult(null);
         setSessionResetJustNow(true);
         setTimeout(() => setSessionResetJustNow(false), 1500);
       })
       .catch((e) => setError(String(e)));
-  }, []);
+  }, [clearActivity]);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<MeshNodeData>>([]);
   // The latest `nodes`, for callbacks that must compare against what's on screen
   // right now without being re-created on every change.
@@ -1538,6 +1544,8 @@ export default function App() {
           previewChain = [{ nodeId, blockName }];
         }
       }
+      const activityKey = beginActivity({ nodeId, block: blockName },
+        previewChain.map(addr => `${addr.nodeId}::${addr.blockName}`));
       // Auto-open the console only for a real chain — a single block's own
       // output isn't worth losing canvas space over (see the TUI's own
       // `resolved_chain_len` gate for the same rule there).
@@ -1630,6 +1638,7 @@ export default function App() {
           : (onEvent: (event: RunEvent) => void) =>
               runBlockStream(path, blockName, editMode, withDeps, onEvent, vars, saveSecrets, confirm);
         await stream((event: RunEvent) => {
+          recordActivity(activityKey, event);
           switch (event.type) {
             case "started":
               runId = event.runId;
@@ -1777,13 +1786,17 @@ export default function App() {
         blockStuckQueued();
         setError(String(e));
       } finally {
+        closeActivity(activityKey);
+        if (activeStep) patchLiveBlock(activeStep.nodeId, activeStep.block, {
+          status: "done", runId: undefined, startedAt: undefined,
+        });
         for (const key of selfRunKeys) selfInitiatedRuns.current.delete(key);
         openOwnStreams.current -= 1;
         const endedAt = Date.now();
         for (const key of streamedKeys) ownStreamedSteps.current.set(key, endedAt);
       }
     },
-    [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine],
+    [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine, beginActivity, recordActivity, closeActivity],
   );
 
   // Adopts one plain-block run the server reports (`GET /api/runs`) into this
@@ -3913,68 +3926,6 @@ export default function App() {
             </button>
           </>
         )}
-        {constraintStats && (
-          <span
-            className={
-              constraintStats.failed > 0
-                ? "constraint-stats constraint-stats-fail"
-                : "constraint-stats constraint-stats-ok"
-            }
-            title={
-              constraintStats.failed > 0
-                ? `${constraintStats.failed} of ${constraintStats.total} constraints failing`
-                : `All ${constraintStats.total} constraint${constraintStats.total === 1 ? "" : "s"} pass`
-            }
-          >
-            🛡 {constraintStats.total - constraintStats.failed}/{constraintStats.total}
-          </span>
-        )}
-        {/* Nothing runs in a no-exec core, so there is no output to stream and
-         * no session of runs to forget: the controls for either are left out. */}
-        {!workerNoExec && (
-          <button
-            type="button"
-            className="service-stats service-stats-ok"
-            title="Console — a live transcript of the most recent run's output"
-            onClick={() => {
-              setConsolePinned(consoleCollapsed);
-              setConsoleCollapsed(!consoleCollapsed);
-            }}
-          >
-            ⎙ Console
-          </button>
-        )}
-        {services.length > 0 && (
-          <button
-            type="button"
-            className={
-              services.some((s) => (s.status === "crashed" || s.status === "stop_failed"))
-                ? "service-stats service-stats-fail"
-                : "service-stats service-stats-ok"
-            }
-            title={
-              services.some((s) => (s.status === "crashed" || s.status === "stop_failed"))
-                ? `${services.filter((s) => (s.status === "crashed" || s.status === "stop_failed")).length} of ${services.length} service(s) crashed — click to open`
-                : `${services.filter((s) => s.status === "running").length}/${services.length} service(s) running — click to open`
-            }
-            onClick={() => {
-              setServicePanelFocusNodeId(null);
-              setServicePanelOpen(true);
-            }}
-          >
-            ⚙ {services.filter((s) => s.status === "running").length}/{services.length}
-          </button>
-        )}
-        {liveTtySessions.length > 0 && (
-          <button
-            type="button"
-            className="service-stats service-stats-ok"
-            title={`${liveTtySessions.length} live terminal session(s) — click to reopen`}
-            onClick={() => setTtySessionsPanelOpen(true)}
-          >
-            🖥 {liveTtySessions.length}
-          </button>
-        )}
         {workerNoExec && (
           <span className="mode-badge" title={NO_EXEC_MESSAGE}>
             noexec
@@ -4088,8 +4039,6 @@ export default function App() {
       sourceDirty,
       dirty,
       error,
-      constraintStats,
-      services,
       hasConfigurableVars,
       handleConfigure,
       themePreference,
@@ -4126,6 +4075,54 @@ export default function App() {
     }));
   }, [edgeGeometry, routeRenderNodes, onNodesChangeAndMark]);
 
+  const activityItems = useMemo(() => {
+    const owned = new Set(activities.filter(activityIsLive).flatMap(a => a.addresses));
+    const discovered: RunActivity[] = [];
+    const ttyKeys = new Set(liveTtySessions.map(a => `${a.nodeId}::${a.block}`));
+    for (const n of nodes) {
+      for (const [block, value] of Object.entries(n.data.liveBlocks)) {
+        const key = `${n.id}::${block}`;
+        if (owned.has(key) || ttyKeys.has(key) || (value.status !== "running" && value.status !== "queued")) continue;
+        discovered.push({ key, target: { nodeId: n.id, block }, current: { nodeId: n.id, block },
+          phase: value.status === "queued" ? "preparing" : "running", runId: value.runId,
+          startedAt: value.startedAt ?? Date.now(), stepStartedAt: value.startedAt, addresses: [key] });
+      }
+    }
+    for (const tty of liveTtySessions) {
+      const key = `${tty.nodeId}::${tty.block}`;
+      // A delayed /api/runs snapshot must not resurrect a tty whose
+      // foreground stream already reported its final outcome.
+      const ttyStartedAt = tty.startedAt ? Date.parse(tty.startedAt) : undefined;
+      if (owned.has(key) || activities.some(a => a.endedAt !== undefined && a.addresses.includes(key)
+        && (ttyStartedAt === undefined || ttyStartedAt <= a.endedAt))) continue;
+      discovered.push({ key, target: { nodeId: tty.nodeId, block: tty.block },
+        current: { nodeId: tty.nodeId, block: tty.block }, phase: "interactive",
+        startedAt: ttyStartedAt ?? Date.now() - tty.uptimeMs, stepStartedAt: ttyStartedAt ?? Date.now() - tty.uptimeMs, addresses: [key] });
+    }
+    return [...activities, ...discovered];
+  }, [activities, nodes, liveTtySessions]);
+  // Retain outcomes only for external runs actually observed live in this tab,
+  // never turn restored history into a new completion notification.
+  const previousActivities = useRef<RunActivity[]>([]);
+  useEffect(() => {
+    const keys = new Set(activityItems.map(a => a.key));
+    const owned = new Set(activityItems.filter(a => a.key.startsWith("local:") && activityIsLive(a)).flatMap(a => a.addresses));
+    for (const old of previousActivities.current) {
+      if (old.key.startsWith("local:") || keys.has(old.key) || owned.has(old.key)) continue;
+      const value = nodes.find(n => n.id === old.target.nodeId)?.data.liveBlocks[old.target.block];
+      if (value?.status !== "done" && value?.status !== "killed") continue;
+      setExternalResult({ ...old, current: undefined, stepStartedAt: undefined, endedAt: Date.now(),
+        exitCode: value.exitCode, phase: value.status === "killed" ? "killed" : value.exitCode === 0 ? "completed" : "failed" });
+    }
+    previousActivities.current = activityItems;
+  }, [activityItems, nodes]);
+  const [activityFocus, setActivityFocus] = useState<string | null>(null);
+  useEffect(() => {
+    if (!activityFocus || !visibleNodeIdSet.has(activityFocus) || !flowInstance?.getNode(activityFocus)) return;
+    focusNode(activityFocus);
+    setActivityFocus(null);
+  }, [activityFocus, nodes, focusNode, visibleNodeIdSet, flowInstance]);
+
   if (serverGone) {
     return (
       <div className="server-gone">
@@ -4138,7 +4135,7 @@ export default function App() {
   return (
     <FileRefreshContext.Provider value={fileRefreshTick}>
     <ForegroundRunContext.Provider value={foregroundRunInProgress}>
-    <div className="app">
+    <div className="app app-with-activity">
       {toolbar}
       <div className="canvas-area">
         <CanvasView
@@ -4317,6 +4314,22 @@ export default function App() {
           onClose={() => setTtySession(null)}
         />
       )}
+      <ActivityBar activities={externalResult ? [...activityItems, externalResult] : activityItems}
+        executionEnabled={!workerNoExec}
+        checks={constraintStats}
+        ttyCount={liveTtySessions.length}
+        onTerminals={() => setTtySessionsPanelOpen(true)}
+        onServices={() => { setServicePanelFocusNodeId(null); setServicePanelOpen(true); }}
+        services={{ total: services.length, running: services.filter(s => s.status === "running").length,
+          failed: services.filter(s => s.status === "crashed" || s.status === "stop_failed").length }}
+        onLocate={address => { revealAndFocus(address.nodeId); setActivityFocus(address.nodeId); }}
+        onStop={async activity => {
+          try {
+            await killRun(activity.runId ?? activity.current ?? activity.target);
+          } catch (e) { setError(String(e)); }
+        }}
+        consoleOpen={!consoleCollapsed}
+        onConsole={() => { setConsolePinned(consoleCollapsed); setConsoleCollapsed(!consoleCollapsed); }} />
       <ConsolePanel open={!consoleCollapsed} lines={consoleLines} onClose={() => { setConsolePinned(false); setConsoleCollapsed(true); }} />
       {ttySessionsPanelOpen && (
         <TtySessionsPanel

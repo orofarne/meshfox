@@ -3933,3 +3933,62 @@ a {
     display: none;
   }
 }
+
+/* Always-visible chain activity; the console floats above this strip. */
+.app-with-activity { --activity-height: 44px; padding-bottom: var(--activity-height); }
+.app-with-activity .console-panel { bottom: var(--activity-height); }
+.activity-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 46;
+  background: var(--code-head-bg);
+  color: var(--fg);
+  border-top: 1px solid var(--node-border);
+  font: 0.8rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.activity-main, .activity-row { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
+.activity-main { height: 43px; padding: 0.35rem 0.75rem; }
+.activity-summary { flex: 1; min-width: 0; }
+.activity-bar button { background: transparent; color: inherit; border: 1px solid var(--node-border); border-radius: 5px; padding: 0.25rem 0.5rem; font: inherit; cursor: pointer; }
+.activity-bar button:hover { background: var(--node-bg); }
+.activity-bar button:disabled { opacity: 0.6; cursor: wait; }
+.activity-bar .activity-current { border: none; padding: 0; display: flex; gap: 0.5rem; align-items: center; min-width: 0; text-align: left; }
+.activity-current [role="status"] { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-address { font-weight: 600; }
+.activity-time { opacity: 0.75; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.activity-symbol { color: var(--accent); display: inline-block; flex-shrink: 0; }
+.activity-busy { animation: activity-spin 1.5s linear infinite; }
+@keyframes activity-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .activity-busy { animation: none; } }
+.activity-row[data-phase="completed"] .activity-symbol { color: var(--ok); }
+.activity-row[data-phase="failed"] .activity-symbol, .activity-row[data-phase="unknown"] .activity-symbol { color: var(--fail); }
+.activity-bar .activity-stop { margin-left: auto; white-space: nowrap; }
+.activity-idle { opacity: 0.75; }
+.activity-list { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--node-border); background: var(--node-bg); max-height: 35vh; overflow-y: auto; }
+.activity-list .activity-row + .activity-row { margin-top: 0.75rem; }
+@media (max-width: 600px) {
+  .app-with-activity { --activity-height: 104px; }
+  .activity-main { height: 103px; flex-wrap: wrap; align-content: center; }
+  .activity-row { flex-wrap: wrap; gap: 0.25rem 0.5rem; }
+  .activity-current { flex-basis: 100%; }
+}
+/* Portaled terminal pills must not cover the strip's Stop/Console buttons. */
+:root:has(.app-with-activity) .mesh-tty-pill { bottom: 60px; }
+
+.activity-console { display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+.activity-console svg { flex-shrink: 0; }
+
+.activity-actions { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+.activity-checks { display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; padding: 0.25rem 0.5rem; }
+.activity-ok { color: var(--ok); }
+.activity-bar .activity-failed { color: var(--fail); }
+@media (max-width: 800px) {
+  .activity-actions .activity-control-label { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+@media (max-width: 600px) {
+  .activity-summary { flex-basis: 100%; }
+  .activity-actions { width: 100%; justify-content: flex-end; }
+  :root:has(.app-with-activity) .mesh-tty-pill { bottom: 120px; }
+}

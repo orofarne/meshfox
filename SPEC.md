@@ -3569,6 +3569,15 @@ then the block name).
   once when the block finishes; a running block gets a Kill button, for
   when one hangs. A `tty` block instead opens a real interactive terminal
   panel — see "Interactive (`tty`) blocks" above.
+  A persistent activity strip stays visible beneath the canvas and console.
+  It shows the current step's address and elapsed time, or Preparing / Between
+  steps while no process is active. Clicking the address reveals and centers
+  its node; Stop cancels that invocation. Concurrent runs expand into separate
+  rows. Completion, failure, cancellation, and an unknown result after a broken
+  connection remain visible with total elapsed time. The strip also offers
+  Console, the checks summary, live terminal sessions, and service management;
+  these global controls appear only in the bottom strip. Ordinary dependencies of a tty target stay on
+  the canvas; its terminal opens only when that tty step starts.
 - `meshfox validate` — parse-only validation (single root, no duplicate ids,
   no dangling edges, type body rules, no dangling/cyclic `deps=`, no invalid `deps=` `?` conditions); no
   execution, no writes. Exit non-zero on error — usable in CI/pre-commit.

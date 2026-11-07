@@ -21,7 +21,10 @@ test("quick-run on a tty default block opens a terminal, not an error", async ({
 
   await expect(page.locator(".mesh-tty-panel")).toBeVisible();
   await expect(page.locator(".error")).toHaveCount(0);
-
+  // Closing detaches; explicitly end this test's shell so later tests do
+  // not inherit an unrelated live terminal in the global activity strip.
+  await page.locator(".mesh-tty-panel").getByRole("button", { name: /kill/ }).click();
+  await expect(page.locator(".mesh-tty-head-status")).toHaveText("■ Killed");
   await page.locator(".mesh-tty-head-actions button", { hasText: "✕" }).click();
 });
 
@@ -153,9 +156,11 @@ test("tty chain keeps ordinary steps on canvas and transmits Shift+Enter", async
   const panel = page.locator(".mesh-tty-panel");
   await expect(panel).toBeVisible();
   await expect(panel).toContainText("input-ready");
+  await expect(page.getByLabel("Current activity", { exact: true })).toContainText("Interactive: terminal-chain/terminal");
   await expect(panel.locator(".mesh-tty-head-status")).toHaveText("interactive");
   await expect(panel).not.toContainText("preparing-terminal");
   await panel.locator(".xterm-helper-textarea").press("Shift+Enter");
   await expect(panel).toContainText("KEY:1b5b31333b3275");
+  await expect(page.getByLabel("Current activity", { exact: true })).toContainText("Completed: terminal-chain/terminal");
   await expect(panel.locator(".mesh-tty-head-status")).toHaveText("✓ Completed · exit 0");
 });

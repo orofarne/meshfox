@@ -191,7 +191,7 @@ test("console opened manually stays pinned across idle time and subsequent runs"
   test.skip(browserName !== "chromium", "owns one console lifecycle");
   await page.clock.install();
   const consolePanel = page.locator(".console-panel");
-  await page.getByRole("button", { name: "⎙ Console" }).click();
+  await page.getByRole("button", { name: "Console" }).click();
   await page.clock.fastForward(12_000);
   await expect(consolePanel).toHaveClass(/console-panel-open/);
 

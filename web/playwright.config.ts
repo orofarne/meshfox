@@ -73,6 +73,13 @@ function firefoxFixtureCopy(name: string): string {
 }
 const DEPS_FIREFOX_FIXTURE = firefoxFixtureCopy("deps");
 const QUICK_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("quick-run");
+// Activity tests run independently of quick-run; terminal processes must not
+// leak between files or browsers that Playwright schedules concurrently.
+for (const browser of ["chrome", "firefox"]) {
+  fs.copyFileSync(path.join(FIXTURES_DIR, "quick-run.canvas.md"), path.join(FIXTURES_DIR, `activity-${browser}.canvas.md`));
+}
+const ACTIVITY_PORT = 4638;
+const ACTIVITY_FIREFOX_PORT = 4639;
 // reload-live-run.spec.ts runs real blocks and the server remembers their output
 // (a second browser would load the first one's finished runs).
 const RELOAD_LIVE_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("reload-live-run");
@@ -424,6 +431,11 @@ export default defineConfig({
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${RUN_HISTORY_PORT}` },
     },
     {
+      name: `${browser}-activity`,
+      testMatch: /(^|\/)activity-bar\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? ACTIVITY_FIREFOX_PORT : ACTIVITY_PORT}` },
+    },
+    {
       name: `${browser}-quick-run`,
       testMatch: /(^|\/)quick-run\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? QUICK_RUN_FIREFOX_PORT : QUICK_RUN_PORT}` },
@@ -633,6 +645,15 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 60_000,
     },
+    ...(["chrome", "firefox"] as const).map(browser => {
+      const port = browser === "firefox" ? ACTIVITY_FIREFOX_PORT : ACTIVITY_PORT;
+      return {
+        command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/activity-${browser}.canvas.md --port ${port} --no-open --no-auto-exit`,
+        url: `http://127.0.0.1:${port}/api/canvas`,
+        reuseExistingServer: false,
+        timeout: 60_000,
+      };
+    }),
     {
       command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/quick-run.canvas.md --port ${QUICK_RUN_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${QUICK_RUN_PORT}/api/canvas`,

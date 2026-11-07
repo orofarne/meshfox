@@ -20,6 +20,7 @@
     "test:unit": "node --test scripts/*.test.mjs",
     "test:tty-images": "node --test scripts/tty-images.browser.mjs",
     "test:block-details": "node --test scripts/block-details.test.mjs",
+    "test:activity": "npm run build && playwright test --config=activity.playwright.config.ts",
     "test:confirmation": "npm run build && playwright test --config=confirmation.playwright.config.ts",
     "test:single-node": "npm run build && playwright test --config=single-node.playwright.config.ts",
     "test:document-mode": "npm run build && playwright test --config=document-mode.playwright.config.ts",
