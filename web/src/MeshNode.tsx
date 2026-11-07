@@ -11,6 +11,7 @@ import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
 import { highlightToHtml } from "./shiki";
 import { FileTablePreview } from "./TablePreview";
+import { ChoiceSelect } from "./ChoiceSelect";
 import { DateField } from "./DateField";
 import { dateValueProblem, isValidDateValue } from "./dateValues";
 import { PathField } from "./PathPicker";
@@ -2073,13 +2074,14 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
     }
     if (f.type === "select") {
       return (
-        <select value={value} onChange={(e) => set(f.name, e.target.value)} autoFocus={i === 0}>
-          {(f.choices ?? []).map((c) => (
-            <option key={c} value={c}>
-              {c}
-            </option>
-          ))}
-        </select>
+        <ChoiceSelect
+          value={value}
+          choices={f.choices ?? []}
+          onChange={(next) => set(f.name, next)}
+          label={label}
+          autoFocus={i === 0}
+          pending={f.choicesPending}
+        />
       );
     }
     if (f.type === "dir" || f.type === "file") {

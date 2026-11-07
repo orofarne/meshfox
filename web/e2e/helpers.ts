@@ -131,3 +131,11 @@ export async function restoreRaw(page: Page, raw: string) {
   }, raw);
   expect(status, "restoring the fixture via PUT /api/canvas/raw").toBe(204);
 }
+
+/** Picks `option` in a `select` variable's control (`ChoiceSelect`): opens
+ * the list of the field named `label`, narrows it with the option's own
+ * name and clicks the entry. `scope` is the dialog or block holding it. */
+export async function chooseOption(scope: Locator, label: string, option: string) {
+  await scope.getByRole("combobox", { name: label, exact: true }).click();
+  await scope.getByRole("option", { name: option, exact: true }).click();
+}

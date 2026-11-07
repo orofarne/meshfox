@@ -2014,7 +2014,11 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         let mut cursor_index = None;
         let value = match decl.var_type {
             VarType::Bool => format!("‹ {shown} ›"),
-            VarType::Select => format!("[ {shown} ▾ ]"),
+            VarType::Select => match meshfox_core::pending_choices_source(decl) {
+                // No list to open: say where the choices were to come from.
+                Some(source) => format!("[ {shown} ▾ ] (no choices: {source} has no value)"),
+                None => format!("[ {shown} ▾ ]"),
+            },
             VarType::String
             | VarType::Int
             | VarType::Dir

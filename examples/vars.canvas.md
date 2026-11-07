@@ -225,6 +225,21 @@ mechanism `from=` always gets, followed transitively through
 answer (or `--set`) once its choices are known, so this is also without
 `cache`.
 
+Two things to know when the list comes from a script (a font list from
+`fc-list`, a branch list from `git branch`):
+
+- The source block runs **before the form is shown**, with an **empty
+  environment**: it sees no `env=` variable of this canvas (only what its own
+  `deps=` chain published, such as an `interpreter="$PYTHON"` built by a setup
+  block). So the list cannot depend on another
+  variable's answer (a language chosen in the same form, say) — print every
+  option and let the user filter: typing in the picker narrows it, in the web
+  UI, the TUI and the terminal prompt alike.
+- If the source fails (non-zero exit, a missing tool), the field has no
+  choices and says why — which variable they wait for and the end of the
+  block's output (`choicesPending`) — instead of showing an empty list.
+  A run cannot go on past it, and `configure` leaves it unsaved.
+
 ```bash name="list-regions"
 echo "REGIONS_LIST=us-east-1,eu-west-1,ap-southeast-1" >> "$MESHFOX_VARS_OUT"
 ```

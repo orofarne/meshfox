@@ -27,8 +27,26 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
     if decl.secret {
         return ask_secret(decl);
     }
+    // A `select` whose choices could not be computed has nothing to pick
+    // from: keep what it has rather than loop on an unanswerable question.
+    if let Some(source) = meshfox_core::pending_choices_source(decl) {
+        return match current {
+            Some(c) => Ok(c.to_string()),
+            None => Err(io::Error::other(format!(
+                "{}: no choices are available (they come from {source}, which has no value)",
+                decl.name
+            ))),
+        };
+    }
+    // The entries a select shows right now (indices into `decl.choices`):
+    // everything at first, then whatever the last typed filter left.
+    let mut shown: Vec<usize> = (0..decl.choices.len()).collect();
     loop {
-        print_prompt(decl, current)?;
+        if decl.var_type == VarType::Select {
+            print_select(decl, &shown, current)?;
+        } else {
+            print_prompt(decl, current)?;
+        }
         let input = read_line()?;
 
         if input.is_empty() {
@@ -49,10 +67,15 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
         }
 
         match decl.var_type {
-            VarType::Select => match resolve_select(decl, &input) {
-                Some(choice) => return Ok(choice),
-                None => {
-                    println!("Please enter one of: {}", decl.choices.join(", "));
+            VarType::Select => match select_step(&decl.choices, &shown, &input) {
+                SelectStep::Chosen(choice) => return Ok(choice),
+                SelectStep::Narrowed(next) => {
+                    shown = next;
+                    continue;
+                }
+                SelectStep::NoMatch => {
+                    println!("Nothing matches {input:?}; type part of a name, or a number.");
+                    shown = (0..decl.choices.len()).collect();
                     continue;
                 }
             },
@@ -102,19 +125,40 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
     }
 }
 
-fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
-    if decl.var_type == VarType::Select {
-        println!("{}", decl.prompt);
-        for (i, choice) in decl.choices.iter().enumerate() {
-            let marker = if current == Some(choice.as_str()) {
-                "*"
-            } else {
-                " "
-            };
-            println!("  {marker} {}) {choice}", i + 1);
-        }
+/// How many choices a select lists in full; past that it asks for a filter.
+const LIST_LIMIT: usize = 15;
+
+fn print_select(decl: &VarDecl, shown: &[usize], current: Option<&str>) -> io::Result<()> {
+    println!("{}", decl.prompt);
+    let total = decl.choices.len();
+    let narrowed = shown.len() < total;
+    for (n, &i) in shown.iter().take(LIST_LIMIT).enumerate() {
+        let choice = &decl.choices[i];
+        let marker = if current == Some(choice.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!("  {marker} {}) {choice}", n + 1);
+    }
+    if shown.len() > LIST_LIMIT {
+        println!(
+            "    ... and {} more: type part of a name to filter",
+            shown.len() - LIST_LIMIT
+        );
+    } else if narrowed {
+        println!("    ({} of {total} match)", shown.len());
+    }
+    if total > LIST_LIMIT {
+        print!("filter, name or number > ");
+    } else {
         print!("> ");
-    } else if decl.var_type == VarType::Bool {
+    }
+    io::stdout().flush()
+}
+
+fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
+    if decl.var_type == VarType::Bool {
         match current {
             Some(c) => print!("{} (y/n) [{c}]: ", decl.prompt),
             None => print!("{} (y/n): ", decl.prompt),
@@ -133,13 +177,36 @@ fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
     io::stdout().flush()
 }
 
-fn resolve_select(decl: &VarDecl, input: &str) -> Option<String> {
+/// What one line typed at a select's prompt does.
+#[derive(Debug, PartialEq, Eq)]
+enum SelectStep {
+    /// A choice was picked.
+    Chosen(String),
+    /// The text narrowed the list to these entries (indices into the choices).
+    Narrowed(Vec<usize>),
+    /// Nothing contains the text.
+    NoMatch,
+}
+
+/// A number picks that row of the list as shown; an exact name picks it; any
+/// other text is a filter (`meshfox_core::filter_choices`, the rule the TUI
+/// picker and the web combobox use) that picks the only match, or narrows the
+/// list to the matches.
+fn select_step(choices: &[String], shown: &[usize], input: &str) -> SelectStep {
     if let Ok(n) = input.parse::<usize>() {
-        if n >= 1 && n <= decl.choices.len() {
-            return Some(decl.choices[n - 1].clone());
+        if let Some(&i) = n.checked_sub(1).and_then(|n| shown.get(n)) {
+            return SelectStep::Chosen(choices[i].clone());
         }
     }
-    decl.choices.iter().find(|c| c.as_str() == input).cloned()
+    if let Some(choice) = choices.iter().find(|c| c.as_str() == input) {
+        return SelectStep::Chosen(choice.clone());
+    }
+    let matches = meshfox_core::filter_choices(choices, input);
+    match matches.as_slice() {
+        [] => SelectStep::NoMatch,
+        [only] => SelectStep::Chosen(choices[*only].clone()),
+        _ => SelectStep::Narrowed(matches),
+    }
 }
 
 fn read_line() -> io::Result<String> {
@@ -150,4 +217,90 @@ fn read_line() -> io::Result<String> {
 
 fn ask_secret(decl: &VarDecl) -> io::Result<String> {
     rpassword::prompt_password(format!("{}: ", decl.prompt))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fonts() -> Vec<String> {
+        [
+            "Arial",
+            "Arial Black",
+            "Helvetica",
+            "Helvetica Neue",
+            "Noto Sans",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn all(n: usize) -> Vec<usize> {
+        (0..n).collect()
+    }
+
+    #[test]
+    fn a_number_picks_the_row_as_shown() {
+        let c = fonts();
+        assert_eq!(
+            select_step(&c, &all(5), "3"),
+            SelectStep::Chosen("Helvetica".into())
+        );
+        // after narrowing, row 2 is the second match, not the second choice
+        assert_eq!(
+            select_step(&c, &[2, 3], "2"),
+            SelectStep::Chosen("Helvetica Neue".into())
+        );
+        assert_eq!(select_step(&c, &all(5), "9"), SelectStep::NoMatch);
+    }
+
+    #[test]
+    fn an_exact_name_wins_over_a_longer_match() {
+        // "Arial" also matches "Arial Black" as a filter, but it is a choice itself
+        assert_eq!(
+            select_step(&fonts(), &all(5), "Arial"),
+            SelectStep::Chosen("Arial".into())
+        );
+    }
+
+    #[test]
+    fn other_text_filters_and_a_single_match_is_picked() {
+        let c = fonts();
+        assert_eq!(
+            select_step(&c, &all(5), "HELV"),
+            SelectStep::Narrowed(vec![2, 3])
+        );
+        assert_eq!(
+            select_step(&c, &all(5), "neue"),
+            SelectStep::Chosen("Helvetica Neue".into())
+        );
+        assert_eq!(select_step(&c, &all(5), "zzz"), SelectStep::NoMatch);
+    }
+
+    #[test]
+    fn a_select_with_pending_choices_keeps_its_value_or_errors() {
+        let mut decl = VarDecl {
+            name: "FONT".into(),
+            var_type: VarType::Select,
+            prompt: "Font".into(),
+            default: None,
+            choices: Vec::new(),
+            secret: false,
+            required: false,
+            from: None,
+            session: false,
+            default_var: None,
+            choices_var: Some("FONT_LIST".into()),
+            file_mode: None,
+            ext: Vec::new(),
+        };
+        assert_eq!(ask(&decl, Some("Arial")).unwrap(), "Arial");
+        assert!(ask(&decl, None)
+            .unwrap_err()
+            .to_string()
+            .contains("FONT_LIST"));
+        decl.choices_var = None;
+        assert!(meshfox_core::pending_choices_source(&decl).is_none());
+    }
 }

@@ -124,10 +124,11 @@ pub use varout::{
     read_and_cleanup as read_and_cleanup_vars_out, VARS_OUT_ENV,
 };
 pub use vars::{
-    close_over_var_refs, declared_vars, invalid_vars_error, map_block_env, preview_with_shared,
-    resolve as resolve_vars, resolve_block_env, resolve_block_env_with_shared, resolve_with_shared,
-    validate_env_refs, validate_value, validate_var_refs, validate_var_scope, BlockEnvResolution,
-    FileMode, InvalidVar, ResolvedVars, ValueSource, VarDecl, VarType, VarsError,
+    close_over_var_refs, declared_vars, filter_choices, invalid_vars_error, map_block_env,
+    pending_choices_source, preview_with_shared, resolve as resolve_vars, resolve_block_env,
+    resolve_block_env_with_shared, resolve_with_shared, validate_env_refs, validate_value,
+    validate_var_refs, validate_var_scope, BlockEnvResolution, ChoicesPending, FileMode,
+    InvalidVar, ResolvedVars, ValueSource, VarDecl, VarType, VarsError,
 };
 
 pub use attrs::UnknownAttrError;

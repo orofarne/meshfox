@@ -2807,7 +2807,8 @@ a {
 }
 
 .vars-modal-field input,
-.vars-modal-field select {
+.vars-modal-field select,
+.vars-modal-field .choice-select-button {
   font: inherit;
   padding: 0.35rem 0.5rem;
   border: 1px solid var(--node-border);
@@ -3991,4 +3992,71 @@ a {
   .activity-summary { flex-basis: 100%; }
   .activity-actions { width: 100%; justify-content: flex-end; }
   :root:has(.app-with-activity) .mesh-tty-pill { bottom: 120px; }
+}
+
+/* ChoiceSelect.tsx — a `select` variable's filterable list (the browser
+ * counterpart of the TUI's select picker). */
+.choice-select {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.choice-select-button {
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+
+.choice-select-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.choice-select-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.35rem;
+  border: 1px solid var(--node-border);
+  border-radius: 4px;
+  background: var(--bg);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+
+.choice-select-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.choice-select-list li {
+  padding: 0.2rem 0.45rem;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.choice-select-list li[aria-selected="true"] {
+  background: var(--accent, #4a7bd8);
+  color: #fff;
+}
+
+.choice-select-list li.choice-select-current {
+  font-weight: 600;
+}
+
+.choice-select-list li.choice-select-empty {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.choice-select-pending {
+  font-size: 0.8rem;
+  color: #c0392b;
+  overflow-wrap: anywhere;
 }

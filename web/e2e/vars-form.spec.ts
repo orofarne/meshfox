@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { chooseOption, clickFitViewAndWait } from "./helpers";
 
 // Drives web/e2e/fixtures/vars-form.canvas.md — regression coverage for a
 // bug where the "Configure variables" modal's <select> rendered with zero
@@ -25,14 +25,14 @@ test("the vars modal offers a choices_var-declared select's real, from=-computed
 
   const modal = page.locator(".vars-modal");
   await expect(modal).toBeVisible();
-  const select = modal.locator("select");
-  // The reported bug: this rendered with zero <option>s, since the
+  const select = modal.getByRole("combobox", { name: "Region?", exact: true });
+  // The reported bug: this rendered with zero options, since the
   // choices_var chain through REGIONS_LIST (from=-computed) could never
   // resolve during a mere status check.
-  await expect(select.locator("option")).toHaveCount(2);
-  await expect(select.locator("option")).toHaveText(["us-east-1", "eu-west-1"]);
-
-  await select.selectOption("eu-west-1");
+  await select.click();
+  await expect(modal.getByRole("option")).toHaveText(["us-east-1", "eu-west-1"]);
+  await modal.getByRole("option", { name: "eu-west-1", exact: true }).click();
+  await expect(select).toContainText("eu-west-1");
   await modal.locator("button", { hasText: "run" }).click();
 
   await expect(modal).toHaveCount(0);

@@ -584,7 +584,7 @@ pub struct ArgumentStatus {
     /// Set for a `choices_var` argument whose source variable has no value
     /// yet: the choices are not known, so a form must not offer a menu.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub choices_pending: Option<String>,
+    pub choices_pending: Option<vars::ChoicesPending>,
     pub required: bool,
     pub resolved: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -700,7 +700,12 @@ fn prepare_in(
                     arg.choices = vars::split_choices(list);
                     arg.choices_var = None;
                 }
-                None => choices_pending = Some(source.clone()),
+                None => {
+                    choices_pending = Some(vars::ChoicesPending {
+                        var: source.clone(),
+                        reason: None,
+                    })
+                }
             }
         }
         let arg = &arg;
@@ -870,7 +875,13 @@ mod tests {
         // Source not resolved yet: no choices, flagged pending, not bound.
         let prepared =
             prepare_arguments("root", md, "import", &Default::default(), &none, &none).unwrap();
-        assert_eq!(prepared.fields[0].choices_pending.as_deref(), Some("FILES"));
+        assert_eq!(
+            prepared.fields[0]
+                .choices_pending
+                .as_ref()
+                .map(|p| p.var.as_str()),
+            Some("FILES")
+        );
         assert!(prepared.fields[0].choices.is_empty());
         assert!(prepared.block.is_none());
         // Source resolved: choices substituted and the answer is checked.

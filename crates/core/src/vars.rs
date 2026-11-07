@@ -222,6 +222,44 @@ pub fn split_choices(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// A `select` that is still waiting for its choices: they come from the
+/// `choices_var=` variable `var`, which has no value. `reason` says why when
+/// something tried to compute it and failed (or was not allowed to run).
+/// The one shape every status payload (variables, form fields, block
+/// arguments) uses, so every front end explains an empty list the same way.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChoicesPending {
+    pub var: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Indices into `choices` of the entries that contain `query`, ignoring
+/// case — the one filter every front end's `select` picker uses (the TUI
+/// picker, the CLI prompt, the web combobox repeat the same rule), so typing
+/// the same text narrows the same list everywhere. An empty `query` keeps
+/// every entry; the order is the declared one.
+pub fn filter_choices(choices: &[String], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    choices
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.to_lowercase().contains(&query))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The variable a `select` is still waiting on for its choices: set when the
+/// declaration takes them from `choices_var=` but the list is empty (the
+/// source variable was not computed). `None` for a `select` with choices, and
+/// for any other kind of variable.
+pub fn pending_choices_source(decl: &VarDecl) -> Option<&str> {
+    (decl.var_type == VarType::Select && decl.choices.is_empty())
+        .then(|| decl.choices_var.as_deref())
+        .flatten()
+}
+
 /// Every attribute name `build_var_decl` actually reads off a
 /// `meshfox:var` comment — the vocabulary `unknown_var_attr` (below,
 /// `meshfox validate`-only, see `attrs::UnknownAttrError`'s own doc
@@ -1559,6 +1597,44 @@ mod tests {
 
     fn canvas(md: &str) -> Canvas {
         Canvas::from_markdown(md).unwrap()
+    }
+
+    /// The same table runs in `web/src/choiceFilter.test.ts`: a `select`
+    /// narrows to the same entries in the TUI, the CLI and the browser.
+    #[test]
+    fn filter_choices_matches_the_shared_table() {
+        let table: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/choice_filter.json")).unwrap();
+        let choices: Vec<String> = table["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        for case in table["cases"].as_array().unwrap() {
+            let expect: Vec<usize> = case["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i.as_u64().unwrap() as usize)
+                .collect();
+            let query = case["query"].as_str().unwrap();
+            assert_eq!(filter_choices(&choices, query), expect, "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn pending_choices_source_names_the_unresolved_variable() {
+        let decls = scan_var_decls(
+            "<!-- meshfox:var name=\"R\" type=\"select\" choices_var=\"L\" -->\n\
+             <!-- meshfox:var name=\"S\" type=\"select\" choices=\"a,b\" -->\n",
+        )
+        .unwrap();
+        assert_eq!(pending_choices_source(&decls[0]), Some("L"));
+        assert_eq!(pending_choices_source(&decls[1]), None);
+        let mut filled = decls[0].clone();
+        filled.choices = vec!["x".into()];
+        assert_eq!(pending_choices_source(&filled), None);
     }
 
     #[test]

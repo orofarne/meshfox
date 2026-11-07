@@ -71,6 +71,8 @@ function firefoxFixtureCopy(name: string): string {
   fs.copyFileSync(path.join(FIXTURES_DIR, `${name}.canvas.md`), path.join(FIXTURES_DIR, `${copy}.canvas.md`));
   return copy;
 }
+// The `--no-exec` server gets its own copy: it is a different canvas to the worker.
+fs.copyFileSync(path.join(FIXTURES_DIR, "choices.canvas.md"), path.join(FIXTURES_DIR, "choices-no-exec.canvas.md"));
 const DEPS_FIREFOX_FIXTURE = firefoxFixtureCopy("deps");
 const QUICK_RUN_FIREFOX_FIXTURE = firefoxFixtureCopy("quick-run");
 // Activity tests run independently of quick-run; terminal processes must not
@@ -189,6 +191,12 @@ const GROUP_EDGE_ROUTING_PORT = 4629;
 // its own fixture (vars-form.canvas.md, a `choices_var` chain reaching a
 // `from=`-computed variable) and port.
 const VARS_FORM_PORT = 4602;
+// Servers for choices.spec.ts (a `select` fed by a computed list, and one whose
+// list could not be computed) and choices-no-exec.spec.ts (the same fixture
+// started with `--no-exec`, where such a list is never computed and the field
+// must say so). Their own fixture keeps vars-form.canvas.md's height as it was.
+const CHOICES_PORT = 4642;
+const CHOICES_NO_EXEC_PORT = 4640;
 // Fourteenth server + port for move-sibling.spec.ts — same reasoning
 // again, its own fixture (move-sibling.canvas.md, three auto-placed
 // siblings with a positioned one sandwiched between two of them) and
@@ -456,6 +464,16 @@ export default defineConfig({
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${VARS_FORM_PORT}` },
     },
     {
+      name: `${browser}-choices`,
+      testMatch: /(^|\/)choices\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${CHOICES_PORT}` },
+    },
+    {
+      name: `${browser}-choices-no-exec`,
+      testMatch: /(^|\/)choices-no-exec\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${CHOICES_NO_EXEC_PORT}` },
+    },
+    {
       name: `${browser}-move-sibling`,
       testMatch: /(^|\/)move-sibling\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${MOVE_SIBLING_PORT}` },
@@ -675,6 +693,18 @@ export default defineConfig({
     {
       command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/vars-form.canvas.md --port ${VARS_FORM_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${VARS_FORM_PORT}/api/canvas`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/choices.canvas.md --port ${CHOICES_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${CHOICES_PORT}/api/canvas`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/choices-no-exec.canvas.md --port ${CHOICES_NO_EXEC_PORT} --no-open --no-auto-exit --no-exec`,
+      url: `http://127.0.0.1:${CHOICES_NO_EXEC_PORT}/api/canvas`,
       reuseExistingServer: false,
       timeout: 60_000,
     },

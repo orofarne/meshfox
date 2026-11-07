@@ -1,0 +1,12 @@
+{
+  "choices": ["Arial", "Arial Black", "Fira Code", "FiraCode Nerd Font", "Helvetica", "Helvetica Neue", "Noto Sans"],
+  "cases": [
+    { "query": "", "expect": [0, 1, 2, 3, 4, 5, 6] },
+    { "query": "arial", "expect": [0, 1] },
+    { "query": "ARIAL B", "expect": [1] },
+    { "query": "fira", "expect": [2, 3] },
+    { "query": "  neue ", "expect": [5] },
+    { "query": "sans", "expect": [6] },
+    { "query": "zzz", "expect": [] }
+  ]
+}

@@ -1731,6 +1731,24 @@ pub struct VarStatus {
     /// for this `secret` field.
     #[serde(default)]
     pub stored: Option<bool>,
+    /// A `select` whose `choices_var=` source has no value yet.
+    #[serde(default)]
+    pub choices_pending: Option<meshfox_core::ChoicesPending>,
+}
+
+/// The one sentence every terminal front end shows in place of an empty
+/// list of choices.
+pub fn describe_pending(pending: &meshfox_core::ChoicesPending) -> String {
+    match &pending.reason {
+        Some(reason) => format!(
+            "its choices come from {}, which could not be computed: {reason}",
+            pending.var
+        ),
+        None => format!(
+            "its choices come from {}, which has no value yet",
+            pending.var
+        ),
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

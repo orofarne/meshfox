@@ -1179,8 +1179,9 @@ launch form is prepared: `POST /api/args` runs the source blocks the
 `choices_var` chain needs (exactly like the pre-run variable form does for
 `choices_var` on a variable, with an empty environment) and returns the
 field with its real `choices`. If the value still cannot be computed, the
-field carries `choicesPending` (the variable's name) and no choices, and the
-application is not bound. An answer is checked against the substituted
+field carries `choicesPending` (`{"var": <the variable's name>, "reason"?}`, the
+shape every status payload uses — see "Choices that could not be computed")
+and no choices, and the application is not bound. An answer is checked against the substituted
 choices; an application address bound directly (`import[file=x]`) is only
 checked when its form is prepared, since binding a block performs no
 lookups. Dependencies and noninteractive runs never prompt: without a value
@@ -1274,8 +1275,8 @@ only ever prompting before a run. Its body is a line-based list, one
   text, falling back to the variable's own `prompt` (itself defaulting to
   `name`) when omitted. Rendered using exactly the same per-type control
   the document-wide "configure variables" form already uses for that
-  variable's own `type`/`choices` (a checkbox for `bool`, a dropdown for
-  `select`, a masked input for `secret`, ...) — a form fence doesn't
+  variable's own `type`/`choices` (a checkbox for `bool`, a filterable list for
+  `select` (see "Choosing from a `select`"), a masked input for `secret`, ...) — a form fence doesn't
   invent a second type system, it's a different *view* onto the same
   `meshfox:var` declarations. Every `field var=` must resolve to a
   variable actually visible in scope from the form's own node (the same
@@ -2032,7 +2033,8 @@ switches together give a pure viewer that is safe to start any number of times.
 
 What stays unavailable is anything that needs a block's output: a variable with
 `from=`, and the `choices_var=`/`default_var=` that name one, are not computed
-(a `select` with `choicesPending` stays empty). A value already cached in the
+(a `select` stays without choices and reports `choicesPending` with the reason
+"running blocks is switched off"). A value already cached in the
 session or a `.meshfox/<file>.env` still applies.
 
 `GET /api/info` reports `{"readOnly", "noExec"}`. `--no-exec` is enforced twice:
@@ -2813,6 +2815,44 @@ suggested default) end up actually coming from running a script:
   entry above. `meshfox validate` catches a `default_var`/`choices_var`
   naming a variable nothing declares, and a reference cycle.
 
+### Choosing from a `select`, and choices that could not be computed
+
+Every front end offers a `select` the same way, so typing the same text does
+the same thing everywhere:
+
+- **A filterable list.** Typing narrows the list to the choices that contain
+  the text, ignoring case and surrounding whitespace
+  (`meshfox_core::filter_choices`; the browser repeats the rule in
+  `web/src/choiceFilter.ts`, and both are tested against one table,
+  `crates/core/testdata/choice_filter.json`). The order stays the declared
+  one. In the browser (`ChoiceSelect`) and the TUI the list opens from the
+  field: ↑/↓ move and wrap, Home/End jump, Enter picks, `Ctrl-U` clears the
+  text, `Esc` clears the text first and closes the list on the second press.
+  The terminal prompt of `meshfox run`/`meshfox configure` lists up to 15
+  choices and asks for a filter beyond that: a number picks that row of the
+  list as shown, an exact name picks it, any other text filters, and a
+  single match is picked at once.
+- **`choicesPending`.** A `select` with `choices_var=` whose source variable
+  has no value has no list to offer. The status of such a field
+  (`GET /api/vars`, `/api/vars/configure`, `/api/form/fields`, `POST
+  /api/args`) carries `choicesPending: {"var": "<the choices_var variable>",
+  "reason": "..."}` instead of an empty `choices`. `reason` says why the
+  variable was not computed when something tried to: the source block (or one
+  of its `deps=`) exited non-zero (with the last lines of its output), could
+  not be started, or running is switched off (`--no-exec`); it is absent when
+  nothing tried. The web control is disabled and shows the sentence "No
+  choices to pick from: its choices come from X, which could not be computed:
+  <reason>"; the TUI shows `(no choices: X has no value)` on the field and
+  the reason in the status line when it is opened; the CLI prints the same
+  sentence. A run cannot go on past such a field (it names the reason), and
+  configure leaves it out of what it saves rather than writing an empty
+  value over a stored one.
+- **The source runs with an empty environment**, as above, apart from what
+  the steps before it in its own `deps=` chain published: an
+  `interpreter="$PYTHON"` that a setup block builds is expanded and works. A
+  script that needs `env=` input of its own fails there — and the `reason` is
+  how that shows.
+
 ### Configured file access (`[files] allow`)
 
 Every consumer of a document-authored local file reference uses `FileAccess`:
@@ -3065,7 +3105,13 @@ open in the same browser cannot read a listing.
   default, and writing whatever you answer (even if unchanged) back to
   the cache. The explicit "set these up now" step, the same role
   `ccmake`/`cmake -L` plays for a CMake cache; nothing else in meshfox
-  requires running it. Requires a terminal; refuses to run (rather than
+  requires running it. Like every other command it goes through the
+  canvas's worker (started if needed): the list of questions comes from
+  `GET /api/vars/configure`, the same one the web UI and the TUI use, so a
+  `select` with `choices_var=` is asked with its real, computed choices, and
+  the answers are written back with `POST /api/vars/configure` — into the
+  worker's own cache, which later runs read. There is no offline mode.
+  Requires a terminal; refuses to run (rather than
   silently do nothing or apply bare defaults) if stdin isn't one. Secret
   variables are never shown here — asking for one that's never cached
   and immediately discarded again wouldn't do anything useful.

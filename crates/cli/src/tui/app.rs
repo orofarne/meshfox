@@ -96,14 +96,7 @@ pub struct SelectPickerState {
 impl SelectPickerState {
     fn filter(&mut self) {
         let previous = self.filtered.get(self.selected).copied();
-        let query = self.query.to_lowercase();
-        self.filtered = self
-            .choices
-            .iter()
-            .enumerate()
-            .filter(|(_, choice)| choice.to_lowercase().contains(&query))
-            .map(|(i, _)| i)
-            .collect();
+        self.filtered = meshfox_core::filter_choices(&self.choices, &self.query);
         self.selected = previous
             .and_then(|i| self.filtered.iter().position(|&v| v == i))
             .unwrap_or(0);
@@ -794,6 +787,9 @@ pub struct App {
     /// counterpart of `path_picker`; the two are never open together.
     pub date_picker: Option<super::date_picker::DatePickerState>,
     pub select_picker: Option<SelectPickerState>,
+    /// Variable name -> why its `select` has no choices (the worker's
+    /// `choicesPending`), for the status line when such a field is opened.
+    pub choices_notes: HashMap<String, String>,
     /// The `Ctrl-p` command palette (see `super::palette`).
     pub palette: Option<super::palette::Palette>,
     /// A node id to select once the next reload brings it into the tree —
@@ -1394,6 +1390,7 @@ impl App {
             path_picker: None,
             date_picker: None,
             select_picker: None,
+            choices_notes: HashMap::new(),
             palette: None,
             select_after_reload: None,
             activity: super::terminal_status::PanelStatus::default(),
@@ -1996,6 +1993,24 @@ impl App {
     /// pressed; `Bool`/`Select` are a left/right toggle/cycle instead —
     /// typing a character or backspace does nothing to those, since
     /// there's no text to edit.
+    /// Remembers, per variable, why a `select` of these statuses has no
+    /// choices (and forgets it once it has them).
+    fn note_pending_choices(&mut self, statuses: &[crate::worker_client::VarStatus]) {
+        for status in statuses {
+            match &status.choices_pending {
+                Some(p) => {
+                    self.choices_notes.insert(
+                        status.name.clone(),
+                        crate::worker_client::describe_pending(p),
+                    );
+                }
+                None => {
+                    self.choices_notes.remove(&status.name);
+                }
+            }
+        }
+    }
+
     fn open_select_picker(&mut self, target: super::path_picker::PickerTarget) -> bool {
         use super::path_picker::PickerTarget;
         let field = match target {
@@ -2015,7 +2030,16 @@ impl App {
             return false;
         }
         if decl.choices.is_empty() {
-            self.status = "no choices available for this field".into();
+            self.status = match self.choices_notes.get(&decl.name) {
+                Some(note) => format!("{}: {note}", decl.name),
+                None => match meshfox_core::pending_choices_source(decl) {
+                    Some(source) => format!(
+                        "{}: its choices come from {source}, which has no value yet",
+                        decl.name
+                    ),
+                    None => "no choices available for this field".into(),
+                },
+            };
             return true;
         }
         self.select_picker = Some(SelectPickerState {
@@ -5781,6 +5805,19 @@ impl App {
                             let resolved = statuses.iter().find(|s| s.var.name == decl.name);
                             if let Some(status) = resolved {
                                 decl.choices = status.var.choices.clone();
+                                decl.choices_var =
+                                    status.var.choices_pending.as_ref().map(|p| p.var.clone());
+                                match &status.var.choices_pending {
+                                    Some(p) => {
+                                        self.choices_notes.insert(
+                                            decl.name.clone(),
+                                            crate::worker_client::describe_pending(p),
+                                        );
+                                    }
+                                    None => {
+                                        self.choices_notes.remove(&decl.name);
+                                    }
+                                }
                             }
                             if let (true, Some(status)) = (untouched, resolved) {
                                 *input = coerce_field_input(decl, status.var.value.as_deref());
@@ -6010,6 +6047,7 @@ impl App {
                             port,
                             force,
                         });
+                        self.note_pending_choices(&prepared.fields);
                         self.var_form = Some(argument_form_from_statuses(prepared.fields));
                         return;
                     }
@@ -6036,6 +6074,7 @@ impl App {
                             port,
                             force,
                         });
+                        self.note_pending_choices(&missing);
                         self.var_form = Some(var_form_from_statuses(missing));
                         return;
                     }
@@ -7955,6 +7994,26 @@ impl App {
                 return;
             }
         }
+        // A `select` without choices has nothing to answer with. A run can't
+        // go on (say why, keep the form); configure just leaves it alone.
+        if let Some((i, source)) = self.var_form.as_ref().and_then(|vf| {
+            (!vf.configuring)
+                .then(|| {
+                    vf.decls.iter().enumerate().find_map(|(i, d)| {
+                        meshfox_core::pending_choices_source(d).map(|s| (i, s.to_string()))
+                    })
+                })
+                .flatten()
+        }) {
+            let vf = self.var_form.as_mut().unwrap();
+            vf.selected = i;
+            let name = vf.decls[i].name.clone();
+            self.status = match self.choices_notes.get(&name) {
+                Some(note) => format!("{name}: {note}"),
+                None => format!("{name}: its choices come from {source}, which has no value yet"),
+            };
+            return;
+        }
         let Some(vf) = self.var_form.take() else {
             return;
         };
@@ -8036,6 +8095,8 @@ impl App {
             .partition(|(d, _)| d.secret);
         let vars: HashMap<String, String> = plain_pairs
             .into_iter()
+            // A `select` without choices has nothing to save; leave it be.
+            .filter(|(d, _)| meshfox_core::pending_choices_source(d).is_none())
             .map(|(d, v)| (d.name.clone(), v.clone()))
             .collect();
         let secrets: HashMap<String, String> = secret_pairs
@@ -8099,6 +8160,7 @@ impl App {
                                 .into();
                         return;
                     }
+                    self.note_pending_choices(&statuses);
                     let mut form = var_form_from_statuses(statuses);
                     form.configuring = true;
                     self.var_form = Some(form);
@@ -9533,7 +9595,11 @@ mod tests {
         app.on_inline_form_key(key(KeyCode::BackTab)).await;
         assert_eq!(selected(&app), 2, "BackTab wraps to Reset");
         app.on_inline_form_key(key(KeyCode::Down)).await;
-        assert_eq!(selected(&app), 0, "down from Reset wraps to the first field");
+        assert_eq!(
+            selected(&app),
+            0,
+            "down from Reset wraps to the first field"
+        );
 
         let form = app.active_inline_form.as_mut().unwrap();
         form.selected = 2;
@@ -9563,8 +9629,14 @@ mod tests {
         app.active_inline_form = Some(form);
         app.render_current_document();
         let shown = document_text(&app);
-        assert!(shown.contains("Animal name:"), "prompt is the label: {shown}");
-        assert!(shown.contains("B:"), "no prompt: the variable's name: {shown}");
+        assert!(
+            shown.contains("Animal name:"),
+            "prompt is the label: {shown}"
+        );
+        assert!(
+            shown.contains("B:"),
+            "no prompt: the variable's name: {shown}"
+        );
         assert!(shown.contains("Explicit:"), "label= wins: {shown}");
         assert!(!shown.contains("Ignored:"), "{shown}");
     }
@@ -11379,6 +11451,40 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // A `select` whose choices could not be computed has no list to open:
+    // Enter says where they should have come from and why that failed.
+    #[tokio::test]
+    async fn select_without_computed_choices_says_why_instead_of_opening_an_empty_list() {
+        let mut app = app_with_blocks("select-pending", concat!(
+            "<!-- meshfox:var name=\"FONT_LIST\" from=\"root/list-fonts\" -->\n",
+            "<!-- meshfox:var name=\"FONT\" type=\"select\" choices_var=\"FONT_LIST\" session -->\n\n",
+            "```form name=pick\nfield var=\"FONT\"\n```\n\n",
+            "```bash name=\"list-fonts\"\nexit 3\n```\n",
+        )).await;
+        app.set_focus(Focus::Document);
+        app.try_enter_inline_form();
+        app.choices_notes.insert(
+            "FONT".into(),
+            "its choices come from FONT_LIST, which could not be computed: `root/list-fonts` exited with status 3".into(),
+        );
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        assert!(app.select_picker.is_none(), "nothing to pick from");
+        assert!(
+            app.status.contains("FONT_LIST") && app.status.contains("exited with status 3"),
+            "status was {:?}",
+            app.status
+        );
+        // Without a worker's explanation it still names the source variable.
+        app.choices_notes.clear();
+        app.on_inline_form_key(key(KeyCode::Enter)).await;
+        assert!(
+            app.status.contains("FONT_LIST"),
+            "status was {:?}",
+            app.status
+        );
     }
 
     #[tokio::test]

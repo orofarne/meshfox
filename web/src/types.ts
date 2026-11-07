@@ -234,6 +234,16 @@ export interface VarStatus {
   /** `GET /api/vars/configure` only, for a `secret` field: whether the
    * secret store holds a value for it (never the value itself). */
   stored?: boolean;
+  /** A `select` whose `choices_var=` source has no value: there are no
+   * choices, and this says which variable they wait for and, when known,
+   * why it was not computed. */
+  choicesPending?: ChoicesPending;
+}
+
+/** See `VarStatus.choicesPending`; the same shape for block arguments. */
+export interface ChoicesPending {
+  var: string;
+  reason?: string;
 }
 
 /** One entry of `GET /api/fs/list` — see `meshfox_core::fsbrowse`. */

@@ -2323,30 +2323,6 @@ fn load_var_cache_or_exit(canvas_path: &Path) -> VarCache {
     })
 }
 
-/// A non-secret declaration's currently-resolved value with no overrides
-/// in play — env, then cache, then shared/global config, then its own
-/// `default` — same precedence `vars::resolve_with_shared` uses, minus the
-/// `--set`/form-override step `configure` doesn't take. Shown as the
-/// prompt's own default so Enter keeps it. Returns the shared origin
-/// alongside the value when that's where it came from, so `configure` can
-/// annotate the prompt with "(inherited from ...)".
-fn current_value(
-    decl: &VarDecl,
-    cache: &VarCache,
-    shared: &meshfox_core::SharedEnv,
-) -> (Option<String>, Option<meshfox_core::SharedOrigin>) {
-    if let Ok(v) = std::env::var(&decl.name) {
-        return (Some(v), None);
-    }
-    if let Some(v) = cache.get(&decl.name) {
-        return (Some(v.to_string()), None);
-    }
-    if let Some(sv) = shared.get(&decl.name) {
-        return (Some(sv.value.clone()), Some(sv.origin.clone()));
-    }
-    (decl.default.clone(), None)
-}
-
 /// Short, human-readable note for `configure`'s terminal prompt when a
 /// field's current value was inherited from shared/global config — see
 /// `current_value`.
@@ -2365,36 +2341,28 @@ fn shared_origin_note(origin: &meshfox_core::SharedOrigin) -> String {
 }
 
 fn configure(canvas_path: &Path) {
-    let raw = read_raw_or_exit(canvas_path);
-    let decls = declared_vars_or_exit(canvas_path, &raw);
-    // With the plaintext store a `secret` is never cached, so `configure`
-    // has nothing to do for it; with `secret_store = "keychain"` it can be
-    // set (or overridden) here. `session` is never cached either way.
-    let mut cache = load_var_cache_or_exit(canvas_path);
-    let keychain =
-        cache.secret_store_kind() == meshfox_core::secret_store::SecretStoreKind::Keychain;
-    let skipped_count = decls
-        .iter()
-        .filter(|d| d.session || (d.secret && !keychain))
-        .count();
-    let configurable: Vec<&VarDecl> = decls
-        .iter()
-        .filter(|d| !d.session && (keychain || !d.secret))
-        .collect();
+    // The worker owns the variable cache and works out what is configurable
+    // and which choices a `select` really has (a `choices_var=` source may
+    // have to run), exactly as it does for the web UI's and the TUI's
+    // configure forms; this only asks the questions.
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("failed to start async runtime: {e}");
+        std::process::exit(1);
+    });
+    let port = worker_port_or_exit(&runtime, canvas_path);
+    let statuses = runtime
+        .block_on(worker_client::get_configure_vars(port))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox configure: {e}");
+            std::process::exit(1);
+        });
 
-    if configurable.is_empty() {
-        if skipped_count > 0 {
-            println!(
-                "meshfox configure: {skipped_count} declared variable(s) are secret/session — \
-                 never cached, so there's nothing to save for them; they're asked for fresh \
-                 every time a run needs them."
-            );
-        } else {
-            println!(
-                "meshfox configure: {} declares no variables",
-                canvas_path.display()
-            );
-        }
+    if statuses.is_empty() {
+        println!(
+            "meshfox configure: {} declares nothing to configure (secret, session and \
+             computed variables are never cached; they are asked for fresh whenever a run needs them)",
+            canvas_path.display()
+        );
         return;
     }
 
@@ -2403,60 +2371,69 @@ fn configure(canvas_path: &Path) {
         std::process::exit(1);
     }
 
-    let shared = meshfox_core::load_shared_env(canvas_root_dir(canvas_path));
-    if skipped_count > 0 {
-        println!(
-            "({skipped_count} secret/session variable(s) skipped -- never cached, always asked fresh at run time)"
-        );
-    }
-
-    let mut saved = 0;
-    for decl in configurable.iter().copied() {
-        if decl.secret {
-            let stored = matches!(cache.try_get_secret(&decl.name), Ok(Some(_)));
-            let origin = shared.get(&decl.name).map(|sv| sv.origin.clone());
-            let status = match (stored, &origin) {
-                (true, _) => "stored in keychain; Enter keeps it, a new value replaces it \
-                              (`meshfox secret rm` deletes it)"
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let mut secrets: HashMap<String, String> = HashMap::new();
+    for status in &statuses {
+        let origin = status.inherited_from.clone().map(|o| match o {
+            worker_client::VarOrigin::Project => meshfox_core::SharedOrigin::Project,
+            worker_client::VarOrigin::Global { path } => {
+                meshfox_core::SharedOrigin::Global { path }
+            }
+        });
+        let decl = var_decl_from_status(status);
+        if let Some(pending) = &status.choices_pending {
+            println!(
+                "{}: skipped, {} (a value that is already saved stays)",
+                status.prompt,
+                worker_client::describe_pending(pending)
+            );
+            continue;
+        }
+        if status.secret {
+            let note = match (status.stored, &origin) {
+                (Some(true), _) => "stored in keychain; Enter keeps it, a new value replaces it \
+                                    (`meshfox secret rm` deletes it)"
                     .to_string(),
-                (false, Some(o)) => format!(
+                (_, Some(o)) => format!(
                     "set {}; Enter keeps it, a value here overrides it",
                     shared_origin_note(o)
                 ),
-                (false, None) => "not set; Enter skips it".to_string(),
+                _ => "not set; Enter skips it".to_string(),
             };
-            println!("{} [{status}]", decl.prompt);
-            let value = prompt::ask(decl, None).unwrap_or_else(|e| {
+            println!("{} [{note}]", status.prompt);
+            let value = prompt::ask(&decl, None).unwrap_or_else(|e| {
                 eprintln!("failed to read input: {e}");
                 std::process::exit(1);
             });
-            if value.is_empty() {
-                continue;
+            if !value.is_empty() {
+                secrets.insert(status.name.clone(), value);
             }
-            cache.save_secret(&decl.name, &value).unwrap_or_else(|e| {
-                eprintln!("failed to save {}: {e}", decl.name);
-                std::process::exit(1);
-            });
-            saved += 1;
             continue;
         }
-        let (current, origin) = current_value(decl, &cache, &shared);
         if let Some(origin) = &origin {
-            println!("{} {}", decl.prompt, shared_origin_note(origin));
+            println!("{} {}", status.prompt, shared_origin_note(origin));
         }
-        let value = prompt::ask(decl, current.as_deref()).unwrap_or_else(|e| {
+        let value = prompt::ask(&decl, status.value.as_deref()).unwrap_or_else(|e| {
             eprintln!("failed to read input: {e}");
             std::process::exit(1);
         });
-        cache.set(&decl.name, &value).unwrap_or_else(|e| {
-            eprintln!("failed to save {}: {e}", decl.name);
-            std::process::exit(1);
-        });
-        saved += 1;
+        vars.insert(status.name.clone(), value);
     }
 
+    let saved = runtime
+        .block_on(worker_client::post_configure_vars(
+            port,
+            vars,
+            secrets,
+            Vec::new(),
+        ))
+        .unwrap_or_else(|e| {
+            eprintln!("meshfox configure: {e}");
+            std::process::exit(1);
+        });
     println!(
-        "meshfox configure: saved {saved} variable(s) to {}",
+        "meshfox configure: saved {} variable(s) to {}",
+        saved,
         meshfox_core::varcache::cache_path(canvas_path).display()
     );
 }
@@ -4395,6 +4372,13 @@ async fn preflight_worker_vars(
             continue;
         }
         let decl = var_decl_from_status(status);
+        if let Some(pending) = &status.choices_pending {
+            eprintln!(
+                "meshfox: {}: {}",
+                status.name,
+                worker_client::describe_pending(pending)
+            );
+        }
         let value = prompt::ask(&decl, decl.default.as_deref()).map_err(|e| e.to_string())?;
         if !status.secret {
             overrides.insert(status.name.clone(), value.clone());
@@ -4431,7 +4415,7 @@ fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
         from: None,
         session: false,
         default_var: None,
-        choices_var: None,
+        choices_var: status.choices_pending.as_ref().map(|p| p.var.clone()),
         file_mode: (status.var_type == "file").then(|| match status.mode.as_deref() {
             Some("save") => meshfox_core::FileMode::Save,
             _ => meshfox_core::FileMode::Open,
@@ -4737,7 +4721,10 @@ fn form_cmd(op: FormOp) {
             ));
             let mut failed = false;
             for t in triggered.iter().filter(|t| t.tty) {
-                println!("  started {}/{} (a terminal: not waited for)", t.node_id, t.block);
+                println!(
+                    "  started {}/{} (a terminal: not waited for)",
+                    t.node_id, t.block
+                );
             }
             for run in finished {
                 let status = if run.timed_out {

@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { clickFitViewAndWait } from "./helpers";
+import { chooseOption, clickFitViewAndWait } from "./helpers";
 
 test("manual arguments precede global variables and remain per-application", async ({ page }, testInfo) => {
   const canvas = await (await page.request.get("/api/canvas")).json();
@@ -84,10 +84,10 @@ printf '%s:%s:%s\\n' "$lang" "$n" "$REGION" | tee "report_\${lang}.txt"
   const modal = page.locator(".vars-modal");
   await expect(modal).toContainText("Configure arguments");
   await expect(modal.locator('input[type="number"]')).toHaveValue("09");
-  await modal.locator("select").selectOption("hy");
+  await chooseOption(modal, "lang", "hy");
   await modal.getByRole("button", { name: "run", exact: true }).click();
   await expect(modal).toContainText("Configure variables");
-  await modal.locator("select").selectOption("eu-west-1");
+  await chooseOption(modal, "Region?", "eu-west-1");
   await modal.getByRole("button", { name: "run", exact: true }).click();
   await expect(modal).toHaveCount(0);
   const historyUrl = `/api/run/history?${new URLSearchParams({nodeId: "dynamic", block: "extract[lang=hy,n=9]"})}`;
@@ -110,7 +110,7 @@ printf '%s:%s:%s\\n' "$lang" "$n" "$REGION" | tee "report_\${lang}.txt"
   await clickFitViewAndWait(page);
   await run.click();
   await expect(modal).toContainText("Configure arguments");
-  await expect(modal.locator("select")).toHaveValue("en");
+  await expect(modal.getByRole("combobox", { name: "lang", exact: true })).toContainText("en");
   await expect(modal.locator('input[type="number"]')).toHaveValue("09");
   await modal.getByRole("button", { name: "cancel", exact: true }).click();
 });
@@ -142,7 +142,7 @@ Launch hy chain
   await block.getByRole('button', {name: 'run watch', exact: true}).click();
   const modal = page.locator('.vars-modal');
   await expect(modal).toContainText('Configure arguments');
-  await modal.locator('select').selectOption('en');
+  await chooseOption(modal, 'lang', 'en');
   await modal.getByRole('button', {name: 'run', exact: true}).click();
   const application = block.getByRole('combobox', {name: 'Application of watch'});
   await expect(application).toHaveValue('watch[lang=en]');

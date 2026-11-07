@@ -1,4 +1,6 @@
 import { useState, type FormEvent } from "react";
+import { ChoiceSelect } from "./ChoiceSelect";
+import { describePending } from "./choiceFilter";
 import { DateField } from "./DateField";
 import { dateValueProblem, isValidDateValue } from "./dateValues";
 import { PathField } from "./PathPicker";
@@ -37,7 +39,7 @@ interface VarsFormProps {
 // `+`/`-`, digits, nothing else — no decimal point, no scientific
 // notation, no thousands separator) and nothing it doesn't. `bool`/
 // `select` don't need an equivalent check here since their own controls
-// (the checkbox/`<select>` below) can't produce anything invalid in the
+// (the checkbox/`ChoiceSelect` below) can't produce anything invalid in the
 // first place, unlike a free-text number input, which a browser's native
 // `type="number"` validation only partially constrains (it still accepts
 // "3.14", "1e5", ...).
@@ -125,9 +127,20 @@ export function VarsForm({
       );
       return;
     }
+    // A `select` still without choices has nothing to answer with: a run
+    // cannot go on (the message says why), and configure leaves it alone
+    // rather than saving an empty value over whatever was stored.
+    const pending = vars.filter((v) => v.choicesPending);
+    if (pending.length && !configure) {
+      setError(`${pending[0].prompt}: ${describePending(pending[0].choicesPending!)}.`);
+      return;
+    }
     setError(null);
+    const answers = Object.fromEntries(
+      Object.entries(values).filter(([name]) => !pending.some((v) => v.name === name)),
+    );
     onSubmit(
-      values,
+      answers,
       Object.keys(saveSecret).filter((name) => saveSecret[name]),
       Object.keys(clearSecret).filter((name) => clearSecret[name]),
     );
@@ -145,13 +158,14 @@ export function VarsForm({
     }
     if (v.type === "select") {
       return (
-        <select value={values[v.name]} onChange={(e) => set(v.name, e.target.value)} autoFocus={i === 0}>
-          {(v.choices ?? []).map((c) => (
-            <option key={c} value={c}>
-              {c}
-            </option>
-          ))}
-        </select>
+        <ChoiceSelect
+          value={values[v.name]}
+          choices={v.choices ?? []}
+          onChange={(value) => set(v.name, value)}
+          label={v.prompt}
+          autoFocus={i === 0}
+          pending={v.choicesPending}
+        />
       );
     }
     if (v.type === "dir" || v.type === "file") {
