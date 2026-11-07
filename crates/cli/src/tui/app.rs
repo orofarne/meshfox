@@ -790,6 +790,10 @@ pub struct App {
     /// Variable name -> why its `select` has no choices (the worker's
     /// `choicesPending`), for the status line when such a field is opened.
     pub choices_notes: HashMap<String, String>,
+    /// Set while a worker request that can be slow (the configure listing,
+    /// a run's up-front check) is in flight in the background: what it is
+    /// doing, so a second one is not started and the screen can say so.
+    pub busy_checking: Option<&'static str>,
     /// The `Ctrl-p` command palette (see `super::palette`).
     pub palette: Option<super::palette::Palette>,
     /// A node id to select once the next reload brings it into the tree —
@@ -1001,6 +1005,16 @@ pub enum BackgroundMsg {
         url: String,
         image: image::DynamicImage,
     },
+    /// The answer to `request_configure`: what `c` opens its form with.
+    ConfigureVars {
+        result: Result<Vec<crate::worker_client::VarStatus>, String>,
+    },
+    /// The answer to `start_run`'s up-front check (arguments, then variables).
+    RunPreflight {
+        port: u16,
+        with_deps: bool,
+        result: Result<Preflight, String>,
+    },
     /// A `form` fence's fields with their resolved values, from the worker.
     FormFields {
         node_id: String,
@@ -1204,6 +1218,77 @@ pub(super) fn var_form_from_statuses_for_test(
     var_form_from_statuses(statuses)
 }
 
+/// What the worker says about a run before it starts: arguments still to
+/// ask, variables still to ask, or nothing — go.
+#[derive(Debug)]
+pub enum Preflight {
+    Arguments {
+        node_id: String,
+        block_name: String,
+        fields: Vec<crate::worker_client::VarStatus>,
+    },
+    Vars {
+        node_id: String,
+        block_name: String,
+        missing: Vec<crate::worker_client::VarStatus>,
+    },
+    Ready {
+        node_id: String,
+        block_name: String,
+    },
+}
+
+/// The two requests that precede a worker-routed run. Either can be slow:
+/// answering them runs the sources of computed `select` lists.
+async fn fetch_preflight(
+    port: u16,
+    path: Vec<String>,
+    block_name: String,
+    with_deps: bool,
+) -> Result<Preflight, String> {
+    let (mut block_name, mut path) = (block_name, path);
+    let prepared = crate::worker_client::prepare_arguments(
+        port,
+        &path,
+        &block_name,
+        &Default::default(),
+        !with_deps,
+    )
+    .await
+    .map_err(|e| format!("failed to check arguments: {e}"))?;
+    let node_id = prepared.node_id;
+    path = prepared.path;
+    if !block_name.contains('[') {
+        block_name = prepared.definition;
+    }
+    if !prepared.fields.is_empty() && (!block_name.contains('[') || prepared.block.is_none()) {
+        return Ok(Preflight::Arguments {
+            node_id,
+            block_name,
+            fields: prepared.fields,
+        });
+    }
+    if let Some(name) = prepared.block {
+        block_name = name;
+    }
+    let statuses = crate::worker_client::get_vars(port, &path, &block_name, !with_deps)
+        .await
+        .map_err(|e| format!("failed to check variables: {e}"))?;
+    let missing: Vec<_> = statuses.into_iter().filter(|v| !v.resolved).collect();
+    Ok(if missing.is_empty() {
+        Preflight::Ready {
+            node_id,
+            block_name,
+        }
+    } else {
+        Preflight::Vars {
+            node_id,
+            block_name,
+            missing,
+        }
+    })
+}
+
 /// What a run attempt says on a core started with `--no-exec`.
 const NO_EXEC_STATUS: &str = "this core was started with --no-exec: running is disabled";
 
@@ -1391,6 +1476,7 @@ impl App {
             date_picker: None,
             select_picker: None,
             choices_notes: HashMap::new(),
+            busy_checking: None,
             palette: None,
             select_after_reload: None,
             activity: super::terminal_status::PanelStatus::default(),
@@ -1927,7 +2013,7 @@ impl App {
             KeyCode::Char('H') => self.open_history_view().await,
             KeyCode::Char('L') => self.open_run_history().await,
             KeyCode::Char('o') => self.trigger_open_file().await,
-            KeyCode::Char('c') => self.trigger_configure().await,
+            KeyCode::Char('c') => self.request_configure(),
             KeyCode::Char('e') => self.open_source_editor().await,
             // The keyboard counterpart to clicking a pane's own `[+]`/`[-]`
             // title-row icon or double-clicking its title (`on_mouse`) —
@@ -5742,6 +5828,9 @@ impl App {
     /// than something that needs special-casing away.
     pub fn on_background_msg(&mut self, msg: BackgroundMsg) {
         match msg {
+            // Handled by `on_slow_background_msg`, which `mod.rs` tries first;
+            // here only for completeness.
+            BackgroundMsg::ConfigureVars { .. } | BackgroundMsg::RunPreflight { .. } => {}
             BackgroundMsg::WorkerState { services, runs } => {
                 self.worker_refresh_inflight = false;
                 if let Some(list) = services {
@@ -6019,68 +6108,18 @@ impl App {
         }
         let mut node_id = node_id;
         let mut block_name = block_name;
-        let mut path = self.path_to(&node_id);
         if force.is_none() {
-            match crate::worker_client::prepare_arguments(
-                port,
-                &path,
-                &block_name,
-                &Default::default(),
-                !with_deps,
-            )
-            .await
-            {
-                Ok(prepared) => {
-                    node_id = prepared.node_id;
-                    path = prepared.path;
-                    if !block_name.contains('[') {
-                        block_name = prepared.definition;
+            let path = self.path_to(&node_id);
+            match fetch_preflight(port, path, block_name, with_deps).await {
+                Ok(preflight) => match self.apply_preflight(preflight, with_deps, port) {
+                    Some((n, b)) => {
+                        node_id = n;
+                        block_name = b;
                     }
-                    if !prepared.fields.is_empty()
-                        && (!block_name.contains('[') || prepared.block.is_none())
-                    {
-                        self.pending_http_run = Some(PendingHttpRun {
-                            arguments: true,
-                            node_id,
-                            block_name,
-                            with_deps,
-                            port,
-                            force,
-                        });
-                        self.note_pending_choices(&prepared.fields);
-                        self.var_form = Some(argument_form_from_statuses(prepared.fields));
-                        return;
-                    }
-                    if let Some(name) = prepared.block {
-                        block_name = name;
-                    }
-                }
+                    None => return,
+                },
                 Err(e) => {
-                    self.status = format!("meshfox: failed to check arguments: {e}");
-                    return;
-                }
-            }
-        }
-        if force.is_none() {
-            match crate::worker_client::get_vars(port, &path, &block_name, !with_deps).await {
-                Ok(statuses) => {
-                    let missing: Vec<_> = statuses.into_iter().filter(|v| !v.resolved).collect();
-                    if !missing.is_empty() {
-                        self.pending_http_run = Some(PendingHttpRun {
-                            arguments: false,
-                            node_id,
-                            block_name,
-                            with_deps,
-                            port,
-                            force,
-                        });
-                        self.note_pending_choices(&missing);
-                        self.var_form = Some(var_form_from_statuses(missing));
-                        return;
-                    }
-                }
-                Err(e) => {
-                    self.status = format!("meshfox: failed to check variables: {e}");
+                    self.status = format!("meshfox: {e}");
                     return;
                 }
             }
@@ -6754,6 +6793,126 @@ impl App {
         }
     }
 
+    /// Acts on what `fetch_preflight` found: opens the argument or variable
+    /// form (leaving the run pending on its answer), or hands back the block
+    /// to start.
+    fn apply_preflight(
+        &mut self,
+        preflight: Preflight,
+        with_deps: bool,
+        port: u16,
+    ) -> Option<(String, String)> {
+        match preflight {
+            Preflight::Arguments {
+                node_id,
+                block_name,
+                fields,
+            } => {
+                self.pending_http_run = Some(PendingHttpRun {
+                    arguments: true,
+                    node_id,
+                    block_name,
+                    with_deps,
+                    port,
+                    force: None,
+                });
+                self.note_pending_choices(&fields);
+                self.var_form = Some(argument_form_from_statuses(fields));
+                None
+            }
+            Preflight::Vars {
+                node_id,
+                block_name,
+                missing,
+            } => {
+                self.pending_http_run = Some(PendingHttpRun {
+                    arguments: false,
+                    node_id,
+                    block_name,
+                    with_deps,
+                    port,
+                    force: None,
+                });
+                self.note_pending_choices(&missing);
+                self.var_form = Some(var_form_from_statuses(missing));
+                None
+            }
+            Preflight::Ready {
+                node_id,
+                block_name,
+            } => Some((node_id, block_name)),
+        }
+    }
+
+    /// `c`: asks the worker for the configure listing without holding the
+    /// terminal up — building it can run the sources of computed `select`
+    /// lists, which takes a while. The form opens when the answer arrives
+    /// (`on_slow_background_msg`).
+    fn request_configure(&mut self) {
+        if self.var_form.is_some() || self.block_picker.is_some() {
+            return;
+        }
+        if self.run.as_ref().is_some_and(|r| !r.finished) {
+            self.status = "a run is already in progress — press K to kill it first".into();
+            return;
+        }
+        let Some(port) = self.worker_port else {
+            self.status = "no worker for this canvas".into();
+            return;
+        };
+        if self.busy_checking.is_some() {
+            return;
+        }
+        self.busy_checking = Some("listing variables (computing choices)");
+        self.status = "meshfox: listing variables (computing choices)…".into();
+        let tx = self.background_tx.clone();
+        tokio::spawn(async move {
+            let result = crate::worker_client::get_configure_vars(port).await;
+            let _ = tx.send(BackgroundMsg::ConfigureVars { result });
+        });
+    }
+
+    /// The messages whose handling is async (they can start a run); `mod.rs`
+    /// offers every background message here first.
+    pub async fn on_slow_background_msg(&mut self, msg: BackgroundMsg) {
+        match msg {
+            BackgroundMsg::ConfigureVars { result } => {
+                self.busy_checking = None;
+                self.apply_configure_vars(result);
+                self.render_current_document();
+            }
+            BackgroundMsg::RunPreflight {
+                port,
+                with_deps,
+                result,
+            } => {
+                self.busy_checking = None;
+                match result {
+                    Ok(preflight) => {
+                        self.status.clear();
+                        if let Some((node_id, block_name)) =
+                            self.apply_preflight(preflight, with_deps, port)
+                        {
+                            self.begin_http_run(
+                                node_id,
+                                block_name,
+                                with_deps,
+                                port,
+                                HashMap::new(),
+                                std::collections::HashSet::new(),
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => self.status = format!("meshfox: {e}"),
+                }
+                self.render_current_document();
+            }
+            other => self.on_background_msg(other),
+        }
+    }
+
     /// Dispatches to the worker-routed path (`start_run_via_worker`) when a
     /// worker is reachable, `start_run_local`'s original direct-file/
     /// local-process chain-driving otherwise. Every call site here calls
@@ -6764,8 +6923,29 @@ impl App {
             self.status = "no worker for canvas".into();
             return;
         };
-        self.start_run_via_worker(node_id, block_name, with_deps, port, None, HashMap::new())
-            .await;
+        if self.no_exec {
+            self.status = NO_EXEC_STATUS.into();
+            return;
+        }
+        if self.busy_checking.is_some() {
+            self.status = "meshfox: still checking the previous request…".into();
+            return;
+        }
+        // The up-front check can be slow (it runs the sources of computed
+        // `select` lists): do it off the event loop so the screen keeps
+        // updating, and carry on when the answer arrives.
+        self.busy_checking = Some("checking variables (computing choices)");
+        self.status = "meshfox: checking variables (computing choices)…".into();
+        let path = self.path_to(&node_id);
+        let tx = self.background_tx.clone();
+        tokio::spawn(async move {
+            let result = fetch_preflight(port, path, block_name, with_deps).await;
+            let _ = tx.send(BackgroundMsg::RunPreflight {
+                port,
+                with_deps,
+                result,
+            });
+        });
     }
 
     /// Whether the console (Output pane) still needs `mod.rs`'s periodic
@@ -6930,6 +7110,7 @@ impl App {
     /// own ticks.
     pub fn spinner_active(&self) -> bool {
         self.run.as_ref().is_some_and(RunState::is_running)
+            || self.busy_checking.is_some()
             || !self.external_running.is_empty()
             || matches!(
                 self.activity.state,
@@ -8121,57 +8302,43 @@ impl App {
         }
     }
 
-    /// `c` — walks every declared non-secret, non-session, non-`from=`
-    /// variable in the whole document (regardless of which, if any, block
-    /// currently references it via `env=`), same scope `meshfox configure`
-    /// covers, all shown at once with each one's currently-resolved value
-    /// as the pre-filled suggestion. Confirming (even unchanged) writes it
-    /// to the cache — the browser counterpart is `VarsForm` opened from the
-    /// toolbar's "configure" button; see `crates/server/src/lib.rs`'s
-    /// `/api/vars/configure`/`get_configure_vars`, whose filter this
-    /// mirrors: a `from`-declared variable is computed by running its own
-    /// block, never something to configure by hand. A no-op (past a status
-    /// message) when there's nothing configurable, or while a run/another
-    /// form/the block picker is already active.
-    async fn trigger_configure(&mut self) {
-        if self.var_form.is_some() || self.block_picker.is_some() {
-            return;
-        }
-        if self.run.as_ref().is_some_and(|r| !r.finished) {
-            self.status = "a run is already in progress — press K to kill it first".into();
-            return;
-        }
-        // Worker mode: `self.var_cache` is this *process's* own on-disk
-        // cache handle — reading it directly here would show (and, on
-        // submit, write to) a copy the worker's own `state.vars_cache`
-        // never sees, which is what silently made a value "configured" in
-        // the TUI have no effect on a worker-routed run right after (the
-        // run resolves against the *worker's* cache, via `GET /api/vars`,
-        // never this process's own). `GET /api/vars/configure` is the
-        // worker's own already-materialized answer (choices/defaults from
-        // a `from=` source it may have had to run to compute) to exactly
-        // this same question.
-        if let Some(port) = self.worker_port {
-            match crate::worker_client::get_configure_vars(port).await {
-                Ok(statuses) => {
-                    if statuses.is_empty() {
-                        self.status =
-                            "meshfox: this canvas declares no configurable (non-session, non-from=) variable(s)"
-                                .into();
-                        return;
-                    }
-                    self.note_pending_choices(&statuses);
-                    let mut form = var_form_from_statuses(statuses);
-                    form.configuring = true;
-                    self.var_form = Some(form);
-                }
-                Err(e) => {
-                    self.status = format!("meshfox: failed to list configurable variables: {e}");
-                }
+    /// What `c` does with the worker's configure listing: opens the form (or
+    /// says there is nothing to configure / why it failed). A `from`-declared
+    /// variable is computed by running its own block, never something to
+    /// configure by hand — the worker's `GET /api/vars/configure` already
+    /// leaves those out (and has materialized the choices of a `select`).
+    fn apply_configure_vars(
+        &mut self,
+        result: Result<Vec<crate::worker_client::VarStatus>, String>,
+    ) {
+        match result {
+            Ok(statuses) if statuses.is_empty() => {
+                self.status =
+                    "meshfox: this canvas declares no configurable (non-session, non-from=) variable(s)"
+                        .into();
             }
-            return;
+            Ok(statuses) => {
+                self.status.clear();
+                self.note_pending_choices(&statuses);
+                let mut form = var_form_from_statuses(statuses);
+                form.configuring = true;
+                self.var_form = Some(form);
+            }
+            Err(e) => {
+                self.status = format!("meshfox: failed to list configurable variables: {e}");
+            }
         }
-        self.status = "no worker for this canvas".into();
+    }
+
+    /// `request_configure`, waiting for the answer — for tests.
+    #[cfg(test)]
+    async fn trigger_configure(&mut self) {
+        let Some(port) = self.worker_port else {
+            self.status = "no worker for this canvas".into();
+            return;
+        };
+        let result = crate::worker_client::get_configure_vars(port).await;
+        self.apply_configure_vars(result);
     }
 
     /// Whether the footer/help hint for `c` (configure) should be shown at
@@ -10856,6 +11023,81 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(path, tx, None, Some(port)).await.unwrap()
+    }
+
+    /// `app_with_real_worker`, keeping the receiving end of the app's
+    /// background channel so a test can deliver the answers it gets.
+    async fn app_with_real_worker_and_messages(
+        path: PathBuf,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<BackgroundMsg>) {
+        let app = app_with_real_worker(path).await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app;
+        app.background_tx = tx;
+        (app, rx)
+    }
+
+    // `c` and `r` ask the worker something that can take a while (a computed
+    // select's source runs first). The keypress must come back at once, say
+    // what it is waiting for, and finish when the answer arrives — not freeze
+    // the screen meanwhile.
+    #[tokio::test]
+    async fn configure_and_run_checks_wait_in_the_background_and_show_what_they_wait_for() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-slow-check-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"LIST\" from=\"root/slow-list\" -->\n",
+                "<!-- meshfox:var name=\"CFG\" type=\"select\" choices_var=\"LIST\" -->\n",
+                "<!-- meshfox:var name=\"PICK\" type=\"select\" choices_var=\"LIST\" required session -->\n\n",
+                "```bash name=\"slow-list\"\nsleep 1\necho \"LIST=a,b\" >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+                "```bash name=\"use\" env=\"$PICK\"\necho \"$PICK\"\n```\n",
+            ),
+        )
+        .unwrap();
+        let (mut app, mut rx) = app_with_real_worker_and_messages(path).await;
+        app.set_focus(Focus::Document);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // `c`: returns at once, then the form opens with the computed choices.
+        let started = std::time::Instant::now();
+        app.on_key(key(KeyCode::Char('c'))).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the key blocked");
+        assert!(app.status.contains("listing variables"), "status: {}", app.status);
+        assert!(app.busy_checking.is_some() && app.spinner_active());
+        assert!(app.var_form.is_none());
+        // a second `c` while waiting starts nothing new
+        app.on_key(key(KeyCode::Char('c'))).await;
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await
+            .expect("an answer")
+            .unwrap();
+        app.on_slow_background_msg(msg).await;
+        assert!(app.busy_checking.is_none());
+        let form = app.var_form.as_ref().expect("configure form");
+        assert_eq!(form.decls[0].name, "CFG");
+        assert_eq!(form.decls[0].choices, ["a", "b"]);
+        app.var_form = None;
+
+        // a run: the same, and the unanswered select is asked for.
+        let started = std::time::Instant::now();
+        app.start_run("root".into(), "use".into(), true).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the run start blocked");
+        assert!(app.status.contains("checking variables"), "status: {}", app.status);
+        assert!(app.busy_checking.is_some());
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await
+            .expect("an answer")
+            .unwrap();
+        app.on_slow_background_msg(msg).await;
+        assert!(app.busy_checking.is_none());
+        let form = app.var_form.as_ref().expect("the unanswered select is asked for");
+        assert_eq!(form.decls[0].choices, ["a", "b"]);
+        assert!(app.pending_http_run.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

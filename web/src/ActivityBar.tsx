@@ -9,7 +9,7 @@ function duration(ms: number): string {
   const seconds = Math.floor(Math.max(0, ms) / 1000);
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
-export function ActivityBar({ activities, services, onLocate, onStop, onConsole, consoleOpen, checks, ttyCount, onTerminals, onServices, executionEnabled }: {
+export function ActivityBar({ activities, services, onLocate, onStop, onConsole, consoleOpen, checks, ttyCount, onTerminals, onServices, executionEnabled, checkingVars = false }: {
   activities: RunActivity[];
   services: { total: number; running: number; failed: number };
   checks: { total: number; failed: number } | null;
@@ -17,6 +17,9 @@ export function ActivityBar({ activities, services, onLocate, onStop, onConsole,
   onTerminals: () => void;
   onServices: () => void;
   executionEnabled: boolean;
+  /** A run was requested and its variables/arguments are still being
+   * resolved (a computed `select` list may have to run its source first). */
+  checkingVars?: boolean;
   onLocate: (address: ActivityAddress) => void;
   onStop: (activity: RunActivity) => Promise<void>;
   onConsole: () => void;
@@ -62,7 +65,9 @@ export function ActivityBar({ activities, services, onLocate, onStop, onConsole,
     {expanded && live.length > 1 && <div className="activity-list" aria-label="Running chains">{live.map(row)}</div>}
     <div className="activity-main">
       <div className="activity-summary">
-        {live.length > 1 ? <button type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}>
+        {checkingVars ? <span className="activity-idle" role="status">
+          <span className="activity-symbol activity-busy" aria-hidden="true">◌</span> Checking variables…
+        </span> : live.length > 1 ? <button type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}>
           <span className="activity-symbol activity-busy" aria-hidden="true">◌</span> {live.length} running {expanded ? "▾" : "▴"}
         </button> : shown.length ? row(shown[0]) : <span className="activity-idle">{executionEnabled ? "Ready" : "Execution disabled"}</span>}
       </div>

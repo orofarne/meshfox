@@ -1975,6 +1975,7 @@ export default function App() {
       let statuses: VarStatus[];
       let tty = false;
       let autoclose = false;
+      setCheckingVars((n) => n + 1);
       try {
         const prepared = await prepareArguments(path, blockName, {}, withDeps);
         tty = prepared.tty;
@@ -1991,6 +1992,8 @@ export default function App() {
       } catch (e) {
         setError(String(e));
         return;
+      } finally {
+        setCheckingVars((n) => n - 1);
       }
       const missing = statuses.filter((v) => !v.resolved);
       if (missing.length > 0) {
@@ -2013,6 +2016,7 @@ export default function App() {
       if (!canvas) return;
       let path = pathTo(canvas, nodeId);
       let statuses: VarStatus[];
+      setCheckingVars((n) => n + 1);
       try {
         const prepared = await prepareArguments(path, blockName, {}, withDeps);
         nodeId = prepared.nodeId;
@@ -2027,6 +2031,8 @@ export default function App() {
       } catch (e) {
         setError(String(e));
         return;
+      } finally {
+        setCheckingVars((n) => n - 1);
       }
       const missing = statuses.filter((v) => !v.resolved);
       if (missing.length > 0) {
@@ -2044,6 +2050,7 @@ export default function App() {
       const { nodeId, blockName, withDeps, tty, autoclose } = varsModal;
       if (varsModal.arguments) {
         if (!canvas) return;
+        setCheckingVars((n) => n + 1);
         try {
           const prepared = await prepareArguments(pathTo(canvas, nodeId), blockName, answers, withDeps);
           if (!prepared.block) throw new Error("Missing required argument");
@@ -2057,7 +2064,7 @@ export default function App() {
           } else {
             await executeRun(nodeId, prepared.block, withDeps);
           }
-        } catch (e) { setError(String(e)); }
+        } catch (e) { setError(String(e)); } finally { setCheckingVars((n) => n - 1); }
         return;
       }
       setVarsModal(null);
@@ -2078,6 +2085,10 @@ export default function App() {
   // that source first (see `materialize_choices_and_defaults`). Until it
   // arrives the button shows a spinner and ignores further clicks.
   const [configureLoading, setConfigureLoading] = useState(false);
+  // Runs whose variables/arguments are still being checked (`GET /api/vars`
+  // may have to run the source of a computed select list first): shown in the
+  // activity bar so a click on "run" never looks ignored.
+  const [checkingVars, setCheckingVars] = useState(0);
   const handleConfigure = useCallback(async () => {
     setConfigureLoading(true);
     try {
@@ -4331,6 +4342,7 @@ export default function App() {
         />
       )}
       <ActivityBar activities={externalResult ? [...activityItems, externalResult] : activityItems}
+        checkingVars={checkingVars > 0}
         executionEnabled={!workerNoExec}
         checks={constraintStats}
         ttyCount={liveTtySessions.length}

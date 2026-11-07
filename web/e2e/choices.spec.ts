@@ -124,3 +124,23 @@ test("the configure button shows a spinner and ignores clicks while its listing 
   await expect(button).toHaveText("⚙ configure");
   await page.locator(".vars-modal").getByRole("button", { name: "cancel", exact: true }).click();
 });
+
+test("a run request says it is checking variables while the worker computes a select's choices", async ({ page }) => {
+  // Answering `GET /api/vars` runs the source of a computed list first.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  await page.route("**/api/vars?*", async (route) => {
+    await gate;
+    await route.continue();
+  });
+
+  await block(page, "fonts", "use-font").locator("button", { hasText: "run" }).click();
+  const bar = page.getByLabel("Current activity");
+  await expect(bar.getByRole("status")).toContainText("Checking variables…");
+  await expect(page.locator(".vars-modal")).toHaveCount(0);
+
+  release();
+  await expect(page.locator(".vars-modal")).toBeVisible();
+  await expect(bar).not.toContainText("Checking variables…");
+  await page.locator(".vars-modal").getByRole("button", { name: "cancel", exact: true }).click();
+});

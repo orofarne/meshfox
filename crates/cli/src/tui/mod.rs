@@ -595,7 +595,7 @@ async fn main_loop(
                 app.on_external_change(content, display);
             }
             Some(msg) = background_rx.recv() => {
-                app.on_background_msg(msg);
+                app.on_slow_background_msg(msg).await;
             }
             Some(msg) = external_run_rx.recv() => match msg {
                 ExternalMsg::Run(update) => app.on_subscribed_run_event(
