@@ -1096,9 +1096,11 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let venv = canvas_state_dir(&canvas, "venv");
+        // No path in the message: it embeds the user id (CodeQL
+        // `rust/cleartext-logging`), and the assertion alone says enough.
         assert!(
             venv.starts_with(std::env::temp_dir()),
-            "unexpected venv dir: {venv:?}"
+            "the venv dir is not under the system temp dir"
         );
         assert!(
             !venv.starts_with(&dir),
