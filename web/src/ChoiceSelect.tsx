@@ -149,6 +149,9 @@ export function ChoiceSelect({ value, choices, onChange, label, autoFocus, pendi
             e.preventDefault();
             e.stopPropagation();
           }}
+          // Keys typed in the list are the list's own (the filter handles
+          // them); they must not reach the dialog around it.
+          onKeyDown={(e) => e.stopPropagation()}
         >
           <input
             type="text"
@@ -167,8 +170,15 @@ export function ChoiceSelect({ value, choices, onChange, label, autoFocus, pendi
                 role="option"
                 aria-selected={row === active}
                 className={choices[index] === value ? "choice-select-current" : undefined}
+                tabIndex={-1}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => pick(index)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    pick(index);
+                  }
+                }}
               >
                 {choices[index]}
               </li>
