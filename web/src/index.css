@@ -949,6 +949,16 @@ a {
   }
 }
 
+button > .mesh-node-running-spinner {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 0.4em;
+}
+
+.mesh-node-quick-run-icon > .mesh-node-running-spinner {
+  margin-right: 0;
+}
+
 /* A node's own failure indicator (see MeshNode.tsx's `FailedBadge`) — same
  * spot and same "visible even folded/off-screen" rationale as
  * `.mesh-node-running-spinner` above, shown instead of it once the node's

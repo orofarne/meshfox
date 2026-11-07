@@ -14,7 +14,7 @@ const suites = ["reload-live-run"];
 export default defineConfig({
   testDir: "./e2e", workers: 1, timeout: 45_000,
   use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 1000 } },
-  projects: suites.map((name, i) => ({ name, testMatch: `${name}.spec.ts`, use: { baseURL: `http://127.0.0.1:${4641 + i}` } })),
+  projects: suites.map((name, i) => ({ name, testMatch: [`${name}.spec.ts`, "run-feedback.spec.ts"], use: { baseURL: `http://127.0.0.1:${4641 + i}` } })),
   webServer: suites.map((name, i) => ({
     command: `cargo run -q --manifest-path ../Cargo.toml -p meshfox-cli -- view ${dir}/${name}.canvas.md --port ${4641 + i} --no-open --no-auto-exit`,
     env: { HOME: path.join(dir, "home"), CARGO_HOME: process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo"), RUSTUP_HOME: process.env.RUSTUP_HOME ?? path.join(os.homedir(), ".rustup"), PATH: process.env.PATH ?? "" },

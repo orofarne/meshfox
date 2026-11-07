@@ -361,6 +361,7 @@ export interface MeshNodeData {
    * not-yet-reloaded-away run; absent means "show the cached `seg.output`
    * from the file, if any". */
   liveBlocks: Record<string, LiveBlockState>;
+  preparingBlocks?: string[];
   /** Every declared `meshfox:var` in the whole document (see `./vars.ts`),
    * document-wide (not scoped to this node) — used by `RunnableCodeBlock`
    * to compute each of this node's own blocks' *implicit* (variable-based)
@@ -1557,7 +1558,8 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   const { live, application } = applicationState;
   const queued = live?.status === "queued";
   const running = live?.status === "running";
-  const busy = applicationState.busy;
+  const preparing = data.preparingBlocks?.includes(seg.name) ?? false;
+  const busy = applicationState.busy || preparing;
   const chainBusy = (queued || running) && live?.viaChain;
   const runBusy = (queued || running) && !live?.viaChain;
   const hasDeps = seg.deps.length > 0;
@@ -1580,7 +1582,7 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
   // the tag's own dot color/animation right on the block, not just the
   // node-level `ServiceBadge` — see this tag's own render site below.
   const serviceStatus = seg.service ? data.services?.find((s) => s.block === seg.name)?.status : undefined;
-  const runLabel = !runBusy ? `run ${seg.name}` : queued ? "queued…" : `running ${seg.name}…`;
+  const runLabel = preparing && !applicationState.busy ? "preparing…" : !runBusy ? `run ${seg.name}` : queued ? "queued…" : `running ${seg.name}…`;
   const chainLabel = !chainBusy ? `⛓ run chain: ${seg.name}` : queued ? "queued…" : "running chain…";
   // `tty` opens a `TtyPanel` (a real terminal) instead of streaming
   // captured output into this node's body — a separate handler, since
@@ -1690,18 +1692,22 @@ function RunnableCodeBlock({ seg, data, nodeId }: { seg: CodeSegment; data: Mesh
           <>
         <button
           disabled={busy}
+          aria-busy={busy}
           onClick={runHandler}
           title={seg.tty ? "Opens an interactive terminal for this block" : runTitle}
         >
+          {busy && <span className="mesh-node-running-spinner" aria-hidden="true" />}
           {runLabel}
         </button>
         {hasDeps && (
           <button
             className="mesh-run-chain"
             disabled={busy}
+            aria-busy={busy}
             onClick={chainHandler}
             title={seg.tty ? "Runs its dependency chain first, then opens an interactive terminal for this block" : chainTitle}
           >
+            {busy && <span className="mesh-node-running-spinner" aria-hidden="true" />}
             {chainLabel}
           </button>
         )}
@@ -1888,11 +1894,13 @@ function BlockDetails({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeD
  * ever runs its `deps=` chain (the equivalent of "⛓ run chain" — there's
  * no "just this block" to run, since it has no real code of its own). */
 function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
-  const { live, application, busy } = useBlockApplication(seg.name, data.liveBlocks);
+  const { live, application, busy: applicationBusy } = useBlockApplication(seg.name, data.liveBlocks);
+  const preparing = data.preparingBlocks?.includes(seg.name) ?? false;
+  const busy = applicationBusy || preparing;
   const queued = live?.status === "queued";
   const running = live?.status === "running";
   const caption = seg.code.trim() || seg.name;
-  const buttonLabel = !busy ? caption : queued ? "queued…" : "running…";
+  const buttonLabel = preparing && !applicationBusy ? "preparing…" : !busy ? caption : queued ? "queued…" : "running…";
 
   const trigger = useRef<HTMLDivElement>(null);
   const tooltip = useRef<HTMLDivElement>(null);
@@ -1931,9 +1939,11 @@ function ButtonBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeDa
         type="button"
         className="mesh-run-button"
         disabled={busy}
+        aria-busy={busy}
         onClick={() => data.onRun(seg.name, true)}
         aria-details={tooltipId}
       >
+        {busy && <span className="mesh-node-running-spinner" aria-hidden="true" />}
         {buttonLabel}
       </button>
       <div ref={tooltip} id={tooltipId} popover="manual" role="dialog" aria-label={`Details for ${caption}`}
@@ -3225,7 +3235,8 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const quickRunIsTty = quickRunBlock?.tty ?? false;
   const quickRunAutoclose = quickRunBlock?.autoclose ?? false;
   const quickRunLive = quickRunBlockName ? data.liveBlocks[quickRunBlockName] : undefined;
-  const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running";
+  const quickRunBusy = quickRunLive?.status === "queued" || quickRunLive?.status === "running"
+    || !!(quickRunBlockName && data.preparingBlocks?.includes(quickRunBlockName));
   const canOpenFile =
     data.nodeType === "file" &&
     !!data.target &&
@@ -3516,6 +3527,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               type="button"
               className="mesh-node-icon-button mesh-node-quick-run-icon nodrag"
               disabled={quickRunBusy}
+              aria-busy={quickRunBusy}
               onClick={() =>
                 quickRunIsTty
                   ? data.onRunTty(quickRunBlockName, true, quickRunAutoclose)
@@ -3529,7 +3541,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
                     : `⛓ runs its dependency chain first, then ${quickRunBlockName}`
               }
             >
-              ▷
+              {quickRunBusy ? <span className="mesh-node-running-spinner" aria-hidden="true" /> : "▷"}
             </button>
           )}
           {!data.editMode && canOpenFile && (
@@ -3593,6 +3605,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
               type="button"
               className="mesh-node-icon-button mesh-node-quick-run-icon nodrag"
               disabled={quickRunBusy}
+              aria-busy={quickRunBusy}
               onClick={() =>
                 quickRunIsTty
                   ? data.onRunTty(quickRunBlockName, true, quickRunAutoclose)
@@ -3606,7 +3619,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
                     : `⛓ runs its dependency chain first, then ${quickRunBlockName}`
               }
             >
-              ▷
+              {quickRunBusy ? <span className="mesh-node-running-spinner" aria-hidden="true" /> : "▷"}
             </button>
           )}
           {canOpenFile && (

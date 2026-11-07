@@ -776,6 +776,7 @@ export default function App() {
   // the TUI's `c` key. Independent of `varsModal`: this isn't gating a
   // run, it can be opened any time the toolbar button is visible.
   const [runConfirmation, setRunConfirmation] = useState<string[] | null>(null);
+  const runTriggerRef = useRef<HTMLElement | null>(null);
   const runConfirmationResolve = useRef<((approved: boolean | null) => void) | null>(null);
   const finishRunConfirmation = useCallback((approved: boolean | null) => {
     const resolve = runConfirmationResolve.current;
@@ -1621,7 +1622,11 @@ export default function App() {
         `${nodeId}::${blockName}`,
         ...previewChain.map((addr) => `${addr.nodeId}::${addr.blockName}`),
       ];
-      for (const key of selfRunKeys) selfInitiatedRuns.current.add(key);
+      for (const key of selfRunKeys) {
+        selfInitiatedRuns.current.add(key);
+        // A delayed background replay must not replace this new run.
+        beginAddressWatch(key);
+      }
       openOwnStreams.current += 1;
       const streamedKeys = new Set<string>();
       try {
@@ -1796,7 +1801,7 @@ export default function App() {
         for (const key of streamedKeys) ownStreamedSteps.current.set(key, endedAt);
       }
     },
-    [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine, beginActivity, recordActivity, closeActivity],
+    [canvas, editMode, load, blockGraph, setNodes, patchLiveBlock, appendConsoleLine, beginActivity, recordActivity, closeActivity, beginAddressWatch],
   );
 
   // Adopts one plain-block run the server reports (`GET /api/runs`) into this
@@ -1817,7 +1822,7 @@ export default function App() {
       // leftover output instead of (or mixed with) the real current
       // one.
       const isCurrent = beginAddressWatch(`${run.nodeId}::${run.block}`);
-      patchLiveBlock(run.nodeId, run.block, {
+      let replay: LiveBlockState = {
         status: run.status === "killed" ? "killed" : run.status === "exited" ? "done" : "running",
         text: "",
         stdoutText: undefined,
@@ -1830,12 +1835,21 @@ export default function App() {
         startedAt: run.status === "running" ? Date.now() - run.uptimeMs : run.startedAt ? Date.parse(run.startedAt) : undefined,
         historyId: run.historyId,
         durationMs: run.status === "exited" ? run.uptimeMs : undefined,
-      });
+      };
+      const finished = run.status !== "running";
+      // Reconciliation can discover the history id after this tab already
+      // displayed the result. Keep that result until its complete replay is
+      // ready; clearing it first makes text and Markdown images disappear.
+      if (!finished) patchLiveBlock(run.nodeId, run.block, replay);
       let sawDone = false;
       subscribeRun(run.nodeId, run.block, 0, (event) => {
         if (!isCurrent()) return;
         switch (event.type) {
           case "line":
+            if (finished) {
+              replay = appendOutputLine(replay, event);
+              break;
+            }
             // The console is a transcript of what this tab saw happen. A
             // run that already finished when it was adopted is only being
             // replayed into the block's own output — often it is this
@@ -1858,13 +1872,14 @@ export default function App() {
           case "done":
             sawDone = true;
             patchLiveBlock(run.nodeId, run.block, {
+              ...(finished ? replay : {}),
               status: event.outcome === "killed" ? "killed" : "done",
               exitCode: event.exitCode,
               runId: undefined,
             });
             break;
         }
-      }).then(
+      }, run.historyId).then(
         () => {
           if (isCurrent() && !sawDone && run.status === "running") {
             settleUnfinishedWatch(run.nodeId, run.block, retried, () => {});
@@ -1956,6 +1971,25 @@ export default function App() {
       });
   }, [canvas, adoptPlainRun, applyTtyRuns]);
 
+  // Reserve synchronously, before the first request; React's disabled button
+  // alone cannot guard two clicks delivered before its next render.
+  const preparingRunKeys = useRef(new Set<string>());
+  const [preparingRuns, setPreparingRuns] = useState<string[]>([]);
+  const withRunPreparation = useCallback(async (nodeId: string, block: string, action: () => Promise<void>) => {
+    const key = `${nodeId}::${block}`;
+    if (preparingRunKeys.current.has(key)) return;
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    runTriggerRef.current = trigger;
+    preparingRunKeys.current.add(key);
+    setPreparingRuns([...preparingRunKeys.current]);
+    try { await action(); }
+    finally {
+      if (runTriggerRef.current === trigger) runTriggerRef.current = null;
+      preparingRunKeys.current.delete(key);
+      setPreparingRuns([...preparingRunKeys.current]);
+    }
+  }, []);
+
   // Gate in front of `executeRun`: checks whether any declared
   // `meshfox:var` (see SPEC.md's "Variables") is still unresolved before
   // actually starting the run, and opens the modal to ask instead when
@@ -1965,7 +1999,7 @@ export default function App() {
   // resolved something. A runnable `file` node (see `CanvasNode.interpreter`)
   // goes the same way: its implicit block carries `deps=`/`env=`/arguments.
   const handleRun = useCallback(
-    async (nodeId: string, blockName: string, withDeps: boolean) => {
+    async (nodeId: string, blockName: string, withDeps: boolean) => withRunPreparation(nodeId, blockName, async () => {
       if (workerNoExec) {
         setError(NO_EXEC_MESSAGE);
         return;
@@ -2001,14 +2035,14 @@ export default function App() {
         return;
       }
       await executeRun(nodeId, blockName, withDeps);
-    },
-    [canvas, executeRun, workerNoExec],
+    }),
+    [canvas, executeRun, workerNoExec, withRunPreparation],
   );
 
   // TTY runs share the ordinary chain stream. Only a tty-start event
   // opens a terminal; dependencies keep their normal inline output.
   const handleRunTty = useCallback(
-    async (nodeId: string, blockName: string, withDeps: boolean, autoclose: boolean) => {
+    async (nodeId: string, blockName: string, withDeps: boolean, autoclose: boolean) => withRunPreparation(nodeId, blockName, async () => {
       if (workerNoExec) {
         setError(NO_EXEC_MESSAGE);
         return;
@@ -2040,8 +2074,8 @@ export default function App() {
         return;
       }
       await executeRun(nodeId, blockName, withDeps);
-    },
-    [canvas, executeRun, workerNoExec],
+    }),
+    [canvas, executeRun, workerNoExec, withRunPreparation],
   );
 
   const handleVarsSubmit = useCallback(
@@ -3166,6 +3200,7 @@ export default function App() {
         data: {
           ...n.data,
           editMode,
+          preparingBlocks: preparingRuns.filter(key => key.startsWith(`${n.id}::`)).map(key => key.slice(n.id.length + 2)),
           onRun: (blockName: string, withDeps: boolean) => handleRun(n.id, blockName, withDeps),
           onKill: (blockName: string) => handleKill(n.id, blockName),
           onRunTty: (blockName: string, withDeps: boolean, autoclose: boolean) =>
@@ -3179,7 +3214,7 @@ export default function App() {
     setEdges((eds) =>
       eds.map((e) => (e.type === "extra" || e.type === "tree" ? { ...e, data: { ...e.data, editMode } } : e)),
     );
-  }, [editMode, setNodes, setEdges, handleRun, handleKill, handleRunTty, handleSubmitForm, toggleFold, load]);
+  }, [editMode, preparingRuns, setNodes, setEdges, handleRun, handleKill, handleRunTty, handleSubmitForm, toggleFold, load]);
 
   // Every node reachable without descending into a folded subtree, in
   // document (depth-first) order — the same order keyboard nav's j/k walks
@@ -4284,7 +4319,7 @@ export default function App() {
         )}
       </div>
       {runConfirmation && (
-        <RunConfirmDialog blocks={runConfirmation}
+        <RunConfirmDialog blocks={runConfirmation} returnFocusTo={runTriggerRef.current}
           onConfirm={() => finishRunConfirmation(true)}
           onCancel={() => finishRunConfirmation(null)} />
       )}
