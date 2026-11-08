@@ -4093,6 +4093,11 @@ async fn drain_worker_run_events(
                             // cancelled; a cancel arrives as an `Error` event.
                             answer_awaiting_form(port, &node_id, &block).await;
                         }
+                        worker_client::RunEvent::FormAnswered { values, .. } => {
+                            for (name, value) in values {
+                                println!("  {name}={value}");
+                            }
+                        }
                         worker_client::RunEvent::StepSkipped { node_id, block, .. } => {
                             // No equivalent in the in-process loop above,
                             // which always re-executes every step

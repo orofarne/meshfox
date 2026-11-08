@@ -301,6 +301,14 @@ fn print_event(item: &Event, effective: bool) {
             )
         ),
         "killed" => println!("{}", style(format!("{addr}: killed"), "1;31")),
+        "awaiting-form" => println!("{}", style(format!("{addr}: waiting for the form"), "33")),
+        "form-answered" => {
+            if let Some(values) = event["values"].as_object() {
+                for (name, value) in values {
+                    println!("  {name}={}", value.as_str().unwrap_or(""));
+                }
+            }
+        }
         _ => {}
     }
 }

@@ -6374,6 +6374,11 @@ impl App {
         let mut form_awaited: Option<(String, String)> = None;
         match event {
             RunEvent::Started { .. } => {}
+            RunEvent::FormAnswered { values, .. } => {
+                for (name, value) in values {
+                    run.lines.push(format!("  {name}={value}"));
+                }
+            }
             RunEvent::AwaitingForm { node_id, block, .. } => {
                 run.lines
                     .push(format!("waiting for form {node_id}/{block}"));

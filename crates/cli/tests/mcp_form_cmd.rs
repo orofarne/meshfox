@@ -274,6 +274,24 @@ async fn a_run_parks_on_a_form_step_and_form_submit_resumes_it() {
     }
     assert_eq!(text, "prepared\nanswer=yes\n");
 
+    // The transcript records what the form waited for and how it was answered.
+    let mut logs = String::new();
+    for _ in 0..100 {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_meshfox"))
+            .args(["logs", "--canvas", "flow.canvas.md", "--chain", "finish"])
+            .current_dir(&dir)
+            .env("HOME", dir.join("home"))
+            .env("MESHFOX_SERVER_SOCKET", "")
+            .output()
+            .expect("meshfox logs runs");
+        logs = String::from_utf8_lossy(&out.stdout).into_owned();
+        if logs.contains("ANSWER=yes") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(logs.contains("ANSWER=yes"), "form answers in logs: {logs}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

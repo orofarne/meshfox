@@ -947,6 +947,9 @@ export type RunEvent =
    * the form is sent or cancelled (`cancelForm`). The form block shows
    * itself as awaiting an answer. */
   | { type: "awaiting-form"; nodeId: string; block: string; runId: string }
+  /** The non-secret answers a parked form was sent with (for the transcript);
+   * `step-end` for that form follows. */
+  | { type: "form-answered"; nodeId: string; block: string; values: Record<string, string> }
   | { type: "started"; runId: string }
   | { type: "step-start"; nodeId: string; block: string }
   /** Terminal for this one step (the chain keeps going) — this dependency

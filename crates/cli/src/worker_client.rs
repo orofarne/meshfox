@@ -2251,6 +2251,13 @@ pub enum RunEvent {
         block: String,
         run_id: String,
     },
+    /// The answers a parked form was sent with (non-secret), for the
+    /// transcript. Followed by that step's `StepEnd`.
+    FormAnswered {
+        node_id: String,
+        block: String,
+        values: std::collections::BTreeMap<String, String>,
+    },
     Output {
         node_id: String,
         block: String,

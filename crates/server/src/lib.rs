@@ -132,30 +132,41 @@ fn form_prompt(block: &meshfox_core::CodeBlock) -> Option<String> {
     (!form.text.is_empty()).then(|| form.text.join("\n"))
 }
 
-/// The variables that are fields of a `form` step somewhere in `chain`.
+/// The variables a `form` step in `chain` supplies to the steps after it:
+/// its fields, minus any that a step *before* the form already reads (that
+/// step needs the value at admission, the form cannot provide it in time).
 fn chain_form_fields(
     canvas: &meshfox_core::Canvas,
     chain: &[meshfox_core::BlockAddr],
 ) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+    let mut supplied = std::collections::HashSet::new();
+    let mut used_before = std::collections::HashSet::new();
     for addr in chain {
         let Some(node) = canvas.node(&addr.node_id) else {
             continue;
         };
-        let Some(block) = node
+        let block = node
             .runnable_blocks()
             .into_iter()
-            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
-        else {
-            continue;
-        };
-        if meshfox_core::is_form(&block.lang) {
-            if let Ok(form) = meshfox_core::form_block(&block) {
-                out.extend(form.fields.into_iter().map(|f| f.var));
+            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()));
+        match block {
+            Some(block) if meshfox_core::is_form(&block.lang) => {
+                if let Ok(form) = meshfox_core::form_block(&block) {
+                    supplied.extend(
+                        form.fields
+                            .into_iter()
+                            .map(|f| f.var)
+                            .filter(|var| !used_before.contains(var)),
+                    );
+                }
             }
+            _ => used_before.extend(meshfox_core::env_var_names_for_chain(
+                canvas,
+                std::slice::from_ref(addr),
+            )),
         }
     }
-    out
+    supplied
 }
 
 /// A run waiting on a `form` step (see `AppState::parked_forms`).
@@ -4190,6 +4201,13 @@ enum RunEvent {
         block: String,
         run_id: String,
     },
+    /// The form a run was parked on was sent: the non-secret answers, so the
+    /// run's transcript records what was decided. Followed by `StepEnd`.
+    FormAnswered {
+        node_id: String,
+        block: String,
+        values: std::collections::BTreeMap<String, String>,
+    },
     /// Terminal for this run — something failed before/without a step
     /// producing a normal exit code (bad node/block reference, no
     /// executor for the language, an I/O error spawning the process).
@@ -7467,6 +7485,21 @@ async fn run_block_impl_sized(
                     }));
                     break;
                 }
+                let answers: std::collections::BTreeMap<String, String> = {
+                    let session = state.session_vars.lock().unwrap();
+                    meshfox_core::form_block(&block)
+                        .map(|form| form.fields)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|f| !decls.iter().any(|d| d.name == f.var && d.secret))
+                        .filter_map(|f| session.get(&f.var).map(|v| (f.var, v.clone())))
+                        .collect()
+                };
+                yield Ok(ndjson_line(&RunEvent::FormAnswered {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                    values: answers,
+                }));
                 yield Ok(ndjson_line(&RunEvent::StepEnd {
                     node_id: addr.node_id.clone(),
                     block: addr.block_name.clone(),
@@ -20407,6 +20440,12 @@ mod form_endpoint_tests {
         let events = run.await.unwrap();
         let kinds: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
         assert!(kinds.contains(&"awaiting-form"), "{events:?}");
+        let answered = events
+            .iter()
+            .find(|e| e["type"] == "form-answered")
+            .unwrap_or_else(|| panic!("no form-answered event: {events:?}"));
+        assert_eq!(answered["block"], "review");
+        assert_eq!(answered["values"], serde_json::json!({"REGION": "eu"}));
         let text: String = events
             .iter()
             .filter_map(|e| e["text"].as_str())
@@ -20495,6 +20534,26 @@ mod form_endpoint_tests {
         assert_eq!(first["event"]["message"], "Check the file, then continue");
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test]
+    async fn a_variable_read_before_the_form_is_still_required_at_admission() {
+        let canvas_path = write_test_canvas(concat!(
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"REGION\" type=\"select\" choices=\"us,eu\" -->\n\n",
+            "```bash name=\"prep\" env=\"REGION\"\necho prep-$REGION\n```\n\n",
+            "```form name=\"review\" deps=\"prep\"\nfield var=\"REGION\"\n```\n\n",
+            "```bash name=\"apply\" deps=\"review\" env=\"REGION\"\necho region=$REGION\n```\n",
+        ));
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let events = run_ws_events(addr, &[("block", "apply")]).await;
+        let text = events.iter().map(|e| e.to_string()).collect::<String>();
+        assert!(
+            text.contains("missing required variable") && text.contains("REGION"),
+            "{events:?}"
+        );
+        assert!(!text.contains("awaiting-form"), "{events:?}");
+        let _ = std::fs::remove_file(&canvas_path);
     }
 
     #[tokio::test]

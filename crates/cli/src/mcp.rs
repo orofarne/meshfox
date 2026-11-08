@@ -2239,7 +2239,9 @@ impl RunReport {
     fn apply(&mut self, event: crate::worker_client::RunEvent) -> bool {
         use crate::worker_client::RunEvent;
         match event {
-            RunEvent::Started { .. } | RunEvent::TtyStart { .. } => {}
+            RunEvent::Started { .. }
+            | RunEvent::TtyStart { .. }
+            | RunEvent::FormAnswered { .. } => {}
             RunEvent::AwaitingForm {
                 node_id,
                 block,
