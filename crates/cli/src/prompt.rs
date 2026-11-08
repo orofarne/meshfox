@@ -87,8 +87,15 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
                     continue;
                 }
             },
-            VarType::Int | VarType::List => match meshfox_core::validate_value(decl, &input) {
+            VarType::Int => match meshfox_core::validate_value(decl, &input) {
                 Ok(()) => return Ok(input),
+                Err(e) => {
+                    println!("{e}");
+                    continue;
+                }
+            },
+            VarType::List => match list_from_prompt(decl, &input) {
+                Ok(stored) => return Ok(stored),
                 Err(e) => {
                     println!("{e}");
                     continue;
@@ -158,7 +165,26 @@ fn print_select(decl: &VarDecl, shown: &[usize], current: Option<&str>) -> io::R
 }
 
 fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
-    if decl.var_type == VarType::Bool {
+    if decl.var_type == VarType::List {
+        if !decl.choices.is_empty() {
+            for (i, choice) in decl.choices.iter().enumerate() {
+                println!("  {}) {choice}", i + 1);
+            }
+        }
+        let hint = if decl.choices.is_empty() {
+            " (comma-separated, or a JSON array)"
+        } else {
+            " (numbers or names, comma-separated)"
+        };
+        match current {
+            Some(c) => print!(
+                "{}{hint} [{}]: ",
+                decl.prompt,
+                meshfox_core::listvars::to_user_text(c)
+            ),
+            None => print!("{}{hint}: ", decl.prompt),
+        }
+    } else if decl.var_type == VarType::Bool {
         match current {
             Some(c) => print!("{} (y/n) [{c}]: ", decl.prompt),
             None => print!("{} (y/n): ", decl.prompt),
@@ -209,6 +235,34 @@ fn select_step(choices: &[String], shown: &[usize], input: &str) -> SelectStep {
     }
 }
 
+/// What one line typed at a list's prompt means: a JSON array, or elements
+/// separated by commas — for a list with `choices`, each one a number from the
+/// shown menu or the name itself. Returns the stored JSON form, validated
+/// against the declaration.
+fn list_from_prompt(decl: &VarDecl, input: &str) -> Result<String, String> {
+    let stored = if decl.choices.is_empty() || input.trim_start().starts_with('[') {
+        meshfox_core::listvars::from_user_input(input)
+            .map_err(|e| format!("{:?} {e}", decl.name))?
+    } else {
+        let mut items = Vec::new();
+        for token in input.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            let pick = token
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| decl.choices.get(i))
+                .or_else(|| decl.choices.iter().find(|c| c.as_str() == token))
+                .ok_or_else(|| format!("{token:?} is not one of {}", decl.choices.join(", ")))?;
+            if !items.contains(pick) {
+                items.push(pick.clone());
+            }
+        }
+        meshfox_core::listvars::to_json(&items)
+    };
+    meshfox_core::validate_value(decl, &stored)?;
+    Ok(stored)
+}
+
 fn read_line() -> io::Result<String> {
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
@@ -222,6 +276,49 @@ fn ask_secret(decl: &VarDecl) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list_decl(choices: &[&str], of: Option<VarType>) -> VarDecl {
+        VarDecl {
+            of,
+            name: "REGIONS".into(),
+            var_type: VarType::List,
+            prompt: "Regions".into(),
+            default: None,
+            choices: choices.iter().map(|s| s.to_string()).collect(),
+            secret: false,
+            required: false,
+            from: None,
+            session: false,
+            default_var: None,
+            choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_list_prompt_takes_numbers_names_or_json() {
+        let with = list_decl(&["us", "eu", "asia"], None);
+        assert_eq!(list_from_prompt(&with, "1, 3").unwrap(), r#"["us","asia"]"#);
+        assert_eq!(
+            list_from_prompt(&with, "eu,us,eu").unwrap(),
+            r#"["eu","us"]"#
+        );
+        assert_eq!(list_from_prompt(&with, r#"["eu"]"#).unwrap(), r#"["eu"]"#);
+        assert_eq!(list_from_prompt(&with, "").unwrap(), "[]");
+        let err = list_from_prompt(&with, "us, mars").unwrap_err();
+        assert!(
+            err.contains("mars") && err.contains("us, eu, asia"),
+            "{err}"
+        );
+        assert!(list_from_prompt(&with, r#"["mars"]"#).is_err());
+        let free = list_decl(&[], Some(VarType::Int));
+        assert_eq!(
+            list_from_prompt(&free, "3, 1,2").unwrap(),
+            r#"["3","1","2"]"#
+        );
+        assert!(list_from_prompt(&free, "3, x").is_err());
+    }
 
     fn fonts() -> Vec<String> {
         [

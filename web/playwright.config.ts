@@ -171,6 +171,8 @@ const FORM_AUTORUN_TTY_PORT = 4631;
 // form-step.spec.ts — a run parked on a `form` step; its own fixture and
 // port, since a parked run on a shared server would block other suites.
 const FORM_STEP_PORT = 4643;
+// list-form.spec.ts — list fields in a form (checkboxes / lines textarea).
+const LIST_FORM_PORT = 4644;
 // Ninth server + port for document-options.spec.ts — same reasoning
 // again, its own fixture (document-options.canvas.md) and port, so its
 // own `PUT /api/options` writes never collide with any other suite's
@@ -540,6 +542,11 @@ export default defineConfig({
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FORM_STEP_PORT}` },
     },
     {
+      name: `${browser}-list-form`,
+      testMatch: /(^|\/)list-form\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${LIST_FORM_PORT}` },
+    },
+    {
       name: `${browser}-reload-live-run`,
       testMatch: /(^|\/)reload-live-run\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? RELOAD_LIVE_RUN_FIREFOX_PORT : RELOAD_LIVE_RUN_PORT}` },
@@ -791,6 +798,12 @@ export default defineConfig({
     {
       command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/form-step.canvas.md --port ${FORM_STEP_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FORM_STEP_PORT}/api/canvas`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/list-form.canvas.md --port ${LIST_FORM_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${LIST_FORM_PORT}/api/canvas`,
       reuseExistingServer: false,
       timeout: 60_000,
     },

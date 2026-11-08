@@ -1,3 +1,4 @@
+import { FieldBox, ListField } from "./ListField";
 import remarkColorSpans from "./remarkColorSpans";
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Handle, NodeResizer, NodeToolbar, Position, useReactFlow, type NodeProps } from "@xyflow/react";
@@ -1982,6 +1983,7 @@ function initialFormFieldValue(f: FormFieldStatus): string {
   if (f.value !== undefined) return f.value;
   if (f.type === "bool") return "false";
   if (f.type === "select") return f.choices?.[0] ?? "";
+  if (f.type === "list") return "[]";
   return "";
 }
 
@@ -2135,6 +2137,17 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
         />
       );
     }
+    if (f.type === "list") {
+      return (
+        <ListField
+          value={value}
+          choices={f.choices}
+          onChange={(next) => set(f.name, next)}
+          label={label}
+          autoFocus={i === 0}
+        />
+      );
+    }
     if (f.type === "dir" || f.type === "file") {
       return (
         <PathField
@@ -2194,10 +2207,10 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
       ))}
       {error && <p className="vars-modal-error">{error}</p>}
       {fields.map((f, i) => (
-        <label key={f.name} className="vars-modal-field">
+        <FieldBox key={f.name} list={f.type === "list"}>
           <span>{f.label ?? f.prompt}</span>
           {renderField(f, i)}
-        </label>
+        </FieldBox>
       ))}
       <button
         type="button"

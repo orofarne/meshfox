@@ -1453,6 +1453,18 @@ Every value is checked against its type, wherever it comes from: `--set`, prompt
 
 [examples/dates.canvas.md](./examples/dates.canvas.md)
 
+### Lists, map and reduce
+<!-- meshfox:node id="lists-map-and-reduce" -->
+
+[examples/lists.canvas.md](./examples/lists.canvas.md) — a `type="list"` variable holds an ordered list of strings, and a dependency `deps='square[n=*$NUMBERS]'` runs once per element: a producer lists the work, a parameterized block handles one element, and the consumer reads the whole list to reduce. Several `*` bindings give the cartesian product; an empty list simply removes the dependency, and a list a `from=` block has not produced yet is expanded as soon as that block finishes.
+
+The list itself has no separator. A producer writes it as one `NAME[]=item` line per element (or a JSON array), and every block that reads it chooses the shape in its own `env=`: `env="NUMBERS|space"` for shell words, `env="IDS=NUMBERS|pg"` for a PostgreSQL array, no suffix for JSON. A list with `choices` is a set of checkboxes in a `form` and a numbered menu at the terminal. SPEC.md's "List variables" has the formats and the rules.
+
+#### Example
+<!-- meshfox:node id="example-lists" type="file" -->
+
+[examples/lists.canvas.md](./examples/lists.canvas.md)
+
 ### Calling an application in another canvas
 <!-- meshfox:node id="calling-an-application-in-another-canvas" -->
 

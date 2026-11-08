@@ -4087,3 +4087,15 @@ button > .mesh-node-running-spinner {
   cursor: progress;
   opacity: 0.7;
 }
+
+/* `type="list"`: a set of checkboxes (with `choices`) or a lines textarea. */
+.mesh-list-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.mesh-list-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

@@ -82,6 +82,40 @@ pub fn parse_list(value: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// What a person types at a terminal prompt or a plain text field for a list:
+/// a JSON array, or simply items separated by commas (`us, eu`). Returns the
+/// stored JSON form. A comma-separated entry cannot hold an element with a
+/// comma in it — type that one as a JSON array.
+pub fn from_user_input(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.starts_with('[') {
+        return parse_list(input).map(|items| to_json(&items));
+    }
+    let items: Vec<String> = input
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(to_json(&items))
+}
+
+/// The stored JSON as a person would like to see and edit it in a text field:
+/// items joined by `, ` when none of them needs quoting, the JSON array
+/// otherwise (so [`from_user_input`] reads it back unchanged).
+pub fn to_user_text(stored: &str) -> String {
+    match parse_list(stored) {
+        Ok(items)
+            if items
+                .iter()
+                .all(|i| !i.contains(',') && i == i.trim() && !i.starts_with('[')) =>
+        {
+            items.join(", ")
+        }
+        _ => stored.to_string(),
+    }
+}
+
 fn shell_quote(item: &str) -> String {
     let safe = !item.is_empty()
         && item
@@ -177,6 +211,23 @@ mod tests {
         assert!(parse_list("{\"a\":1}").is_err());
         assert!(parse_list("[[1]]").is_err());
         assert!(parse_list("[null]").is_err());
+    }
+
+    #[test]
+    fn user_input_accepts_json_or_commas_and_reads_its_own_text_back() {
+        assert_eq!(from_user_input("us, eu ,").unwrap(), r#"["us","eu"]"#);
+        assert_eq!(from_user_input("").unwrap(), "[]");
+        assert_eq!(
+            from_user_input(r#"["a, b","c"]"#).unwrap(),
+            r#"["a, b","c"]"#
+        );
+        assert!(from_user_input("[oops").is_err());
+        assert_eq!(to_user_text(r#"["us","eu"]"#), "us, eu");
+        // An element with a comma keeps the JSON form, which round-trips.
+        let stored = r#"["a, b","c"]"#;
+        assert_eq!(to_user_text(stored), stored);
+        assert_eq!(from_user_input(&to_user_text(stored)).unwrap(), stored);
+        assert_eq!(to_user_text("not json"), "not json");
     }
 
     #[test]

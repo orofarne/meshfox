@@ -1,3 +1,4 @@
+import { FieldBox, ListField } from "./ListField";
 import { useState, type FormEvent } from "react";
 import { ChoiceSelect } from "./ChoiceSelect";
 import { describePending } from "./choiceFilter";
@@ -72,6 +73,7 @@ function initialValue(v: VarStatus): string {
   if (v.value !== undefined) return v.value;
   if (v.type === "bool") return "false";
   if (v.type === "select") return v.choices?.[0] ?? "";
+  if (v.type === "list") return "[]";
   return "";
 }
 
@@ -168,6 +170,17 @@ export function VarsForm({
         />
       );
     }
+    if (v.type === "list") {
+      return (
+        <ListField
+          value={values[v.name]}
+          choices={v.choices}
+          onChange={(value) => set(v.name, value)}
+          label={v.prompt}
+          autoFocus={i === 0}
+        />
+      );
+    }
     if (v.type === "dir" || v.type === "file") {
       return (
         <PathField
@@ -224,7 +237,7 @@ export function VarsForm({
         {error ? <p className="vars-modal-error">{error}</p> : <p className="vars-modal-hint">{hint ?? defaultHint}</p>}
         {vars.map((v, i) => (
           <div key={v.name} className="vars-modal-field-group">
-          <label className="vars-modal-field">
+          <FieldBox list={v.type === "list"}>
             <span>
               {v.prompt}
               {v.inheritedFrom && (
@@ -241,7 +254,7 @@ export function VarsForm({
               )}
             </span>
             {renderControl(v, i)}
-          </label>
+          </FieldBox>
           {v.secretError && (
             <p className="vars-modal-error" title={v.secretError}>
               Couldn't read the saved value from the secret store: {v.secretError}

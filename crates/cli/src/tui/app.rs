@@ -1108,8 +1108,11 @@ fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
         | VarType::Dir
         | VarType::File
         | VarType::Date
-        | VarType::DateTime
-        | VarType::List => suggestion.map(str::to_string).unwrap_or_default(),
+        | VarType::DateTime => suggestion.map(str::to_string).unwrap_or_default(),
+        // Shown the way it is typed: `us, eu` rather than the stored JSON.
+        VarType::List => suggestion
+            .map(meshfox_core::listvars::to_user_text)
+            .unwrap_or_default(),
     }
 }
 
@@ -1122,6 +1125,8 @@ fn normalize_date_inputs(decls: &[VarDecl], inputs: &mut [String]) {
         let normalized = match decl.var_type {
             VarType::Date => meshfox_core::datevars::normalize_date_input(input),
             VarType::DateTime => meshfox_core::datevars::normalize_datetime_input(input),
+            // A list is typed as `us, eu` (or a JSON array) and stored as JSON.
+            VarType::List => meshfox_core::listvars::from_user_input(input),
             _ => continue,
         };
         if let Ok(value) = normalized {
@@ -12096,6 +12101,38 @@ mod tests {
         assert_eq!(inputs[3], "tomorrow");
         assert!(meshfox_core::validate_value(&decls[3], &inputs[3]).is_err());
         assert!(meshfox_core::validate_value(&decls[1], &inputs[1]).is_ok());
+    }
+
+    #[test]
+    fn list_fields_are_typed_as_text_and_stored_as_json() {
+        let decl = VarDecl {
+            of: None,
+            name: "REGIONS".into(),
+            var_type: VarType::List,
+            prompt: "Regions".into(),
+            default: None,
+            choices: vec!["us".into(), "eu".into()],
+            secret: false,
+            required: false,
+            from: None,
+            session: false,
+            default_var: None,
+            choices_var: None,
+            file_mode: None,
+            ext: Vec::new(),
+        };
+        // Shown the way it is typed ...
+        assert_eq!(coerce_field_input(&decl, Some(r#"["us","eu"]"#)), "us, eu");
+        assert_eq!(coerce_field_input(&decl, None), "");
+        // ... and normalized to the stored JSON before it is validated.
+        let decls = vec![decl];
+        let mut inputs = vec!["eu, us".to_string()];
+        normalize_date_inputs(&decls, &mut inputs);
+        assert_eq!(inputs[0], r#"["eu","us"]"#);
+        assert!(meshfox_core::validate_value(&decls[0], &inputs[0]).is_ok());
+        let mut bad = vec!["mars".to_string()];
+        normalize_date_inputs(&decls, &mut bad);
+        assert!(meshfox_core::validate_value(&decls[0], &bad[0]).is_err());
     }
 
     #[tokio::test]

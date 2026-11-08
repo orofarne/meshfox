@@ -209,7 +209,7 @@ export type VarOrigin = { scope: "project" } | { scope: "global"; path?: string 
 
 export interface VarStatus {
   name: string;
-  type: "string" | "int" | "bool" | "select" | "dir" | "file" | "date" | "datetime";
+  type: "string" | "int" | "bool" | "select" | "dir" | "file" | "date" | "datetime" | "list";
   prompt: string;
   choices?: string[];
   /** `type="file"` only: `open` (the file must exist) or `save` (an output
