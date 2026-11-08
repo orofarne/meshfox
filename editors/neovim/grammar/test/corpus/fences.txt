@@ -29,3 +29,15 @@ field var=age
     (attribute (key) (value (string))))
   (field_line
     (attribute (key) (value (bare_value)))))
+
+================
+form body with prose
+================
+text "Which regions?"
+field var=REGIONS label="Regions"
+---
+(source
+  (text_line (line_text))
+  (field_line
+    (attribute (key) (value (bare_value)))
+    (attribute (key) (value (string)))))

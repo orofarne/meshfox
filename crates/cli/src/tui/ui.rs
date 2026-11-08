@@ -494,7 +494,11 @@ fn render_screen(f: &mut Frame, app: &mut App) {
         f.render_widget(Clear, popup);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Choose · Enter select · Esc cancel ")
+            .title(if picker.multi {
+                " Choose · Space tick · Enter confirm · Esc cancel "
+            } else {
+                " Choose · Enter select · Esc cancel "
+            })
             .title_bottom(" Type to search · ↑/↓ move · Ctrl-U clear ");
         let inner = block.inner(popup);
         f.render_widget(block, popup);
@@ -525,6 +529,9 @@ fn render_screen(f: &mut Frame, app: &mut App) {
             // Map the lowercased match back to original character boundaries:
             // Unicode lowercase may expand one character into several.
             let mut spans = Vec::new();
+            if picker.multi {
+                spans.push(Span::raw(if picker.checked[i] { "[x] " } else { "[ ] " }));
+            }
             let lower = choice.to_lowercase();
             let matched = if query.is_empty() {
                 None
@@ -2174,6 +2181,9 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
     );
     let hint = match vf.decls.get(vf.selected).map(|d| d.var_type) {
         Some(VarType::Select) => "Enter/Space choices",
+        Some(VarType::List) if super::app::is_choice_list(&vf.decls[vf.selected]) => {
+            "Enter/Space choices · or type items, comma-separated"
+        }
         Some(VarType::Bool) => "←/→ toggle",
         Some(VarType::File | VarType::Dir) => "←/→ cursor · Home/End · Ctrl-O browse",
         Some(VarType::Date | VarType::DateTime) => "←/→ cursor · Ctrl-O calendar",

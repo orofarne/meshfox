@@ -83,6 +83,10 @@
         {
           "type": "text",
           "named": true
+        },
+        {
+          "type": "text_line",
+          "named": true
         }
       ]
     }
@@ -96,6 +100,21 @@
     "type": "text",
     "named": true,
     "fields": {}
+  },
+  {
+    "type": "text_line",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "line_text",
+          "named": true
+        }
+      ]
+    }
   },
   {
     "type": "value",
@@ -149,7 +168,15 @@
     "named": true
   },
   {
+    "type": "line_text",
+    "named": true
+  },
+  {
     "type": "tag",
     "named": true
+  },
+  {
+    "type": "text",
+    "named": false
   }
 ]

@@ -2,7 +2,7 @@
  * Tree-sitter grammar for the small meshfox constructs that live inside
  * Markdown: `<!-- meshfox:... -->` marker comments, the attribute tail of a
  * fence info string (everything after the language) and a `form` fence's
- * `field ...` lines. Mirrors SPEC.md's "Formal grammar" section.
+ * `field ...` and `text ...` lines. Mirrors SPEC.md's "Formal grammar" section.
  *
  * It is never used standalone: Markdown's own tree injects it (see
  * queries/markdown/injections.scm), so the root has three alternative shapes,
@@ -23,7 +23,7 @@ module.exports = grammar({
 
   rules: {
     source: $ => choice(
-      repeat1($.field_line),
+      repeat1(choice($.field_line, $.text_line)),
       repeat1($.attribute),
       seq($.marker, repeat(choice($.marker, $.text))),
     ),
@@ -35,6 +35,10 @@ module.exports = grammar({
 
     // A form fence body line: `field var=x label="X"`.
     field_line: $ => seq('field', repeat($.attribute)),
+
+    // A form fence body line of prose: `text "Which regions?"` (a JSON
+    // string, or the rest of the line as written).
+    text_line: $ => seq('text', alias(/[^\n]+/, $.line_text)),
 
     attribute: $ => seq(
       field('key', $.key),

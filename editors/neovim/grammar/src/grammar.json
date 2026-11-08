@@ -8,8 +8,17 @@
         {
           "type": "REPEAT1",
           "content": {
-            "type": "SYMBOL",
-            "name": "field_line"
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "field_line"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "text_line"
+              }
+            ]
           }
         },
         {
@@ -99,6 +108,24 @@
             "type": "SYMBOL",
             "name": "attribute"
           }
+        }
+      ]
+    },
+    "text_line": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "text"
+        },
+        {
+          "type": "ALIAS",
+          "content": {
+            "type": "PATTERN",
+            "value": "[^\\n]+"
+          },
+          "named": true,
+          "value": "line_text"
         }
       ]
     },

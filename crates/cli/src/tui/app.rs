@@ -91,6 +91,11 @@ pub struct SelectPickerState {
     pub selected: usize,
     pub rows: Rect,
     pub offset: usize,
+    /// A `list` with `choices=`: Space ticks entries, Enter commits all
+    /// ticked ones (in `choices` order) — the web form's checkboxes.
+    pub multi: bool,
+    /// Per entry of `choices`; only meaningful when `multi`.
+    pub checked: Vec<bool>,
 }
 
 impl SelectPickerState {
@@ -1116,6 +1121,11 @@ fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
     }
 }
 
+/// A `list` that offers `choices=`: picked from a checklist popup (Ctrl-O).
+pub(super) fn is_choice_list(decl: &VarDecl) -> bool {
+    decl.var_type == VarType::List && !decl.choices.is_empty()
+}
+
 /// Rewrites what a person typed into each `date`/`datetime` field into the
 /// canonical value (`2026-10-25 14:30` → `2026-10-25T14:30:00+03:00`, with
 /// the local offset when none was typed). A value that can't be understood
@@ -2125,7 +2135,8 @@ impl App {
         let Some((decl, input)) = field else {
             return false;
         };
-        if decl.var_type != VarType::Select {
+        let multi = decl.var_type == VarType::List && !decl.choices.is_empty();
+        if decl.var_type != VarType::Select && !multi {
             return false;
         }
         if decl.choices.is_empty() {
@@ -2141,14 +2152,27 @@ impl App {
             };
             return true;
         }
+        let ticked: Vec<String> = if multi {
+            meshfox_core::listvars::from_user_input(input)
+                .and_then(|json| meshfox_core::listvars::parse_list(&json))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         self.select_picker = Some(SelectPickerState {
             target,
             query: String::new(),
             filtered: (0..decl.choices.len()).collect(),
             choices: decl.choices.clone(),
-            selected: decl.choices.iter().position(|c| c == input).unwrap_or(0),
+            selected: if multi {
+                0
+            } else {
+                decl.choices.iter().position(|c| c == input).unwrap_or(0)
+            },
             rows: Rect::default(),
             offset: 0,
+            multi,
+            checked: decl.choices.iter().map(|c| ticked.contains(c)).collect(),
         });
         true
     }
@@ -2166,6 +2190,11 @@ impl App {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 picker.query.clear();
                 picker.filter();
+            }
+            KeyCode::Char(' ') if picker.multi => {
+                if let Some(&i) = picker.filtered.get(picker.selected) {
+                    picker.checked[i] = !picker.checked[i];
+                }
             }
             KeyCode::Char(c)
                 if !key
@@ -2188,30 +2217,46 @@ impl App {
             }
             KeyCode::Home => picker.selected = 0,
             KeyCode::End => picker.selected = picker.filtered.len().saturating_sub(1),
+            KeyCode::Enter if picker.multi => {
+                let picker = self.select_picker.take().unwrap();
+                let items: Vec<String> = picker
+                    .choices
+                    .iter()
+                    .zip(&picker.checked)
+                    .filter(|(_, on)| **on)
+                    .map(|(c, _)| c.clone())
+                    .collect();
+                let value =
+                    meshfox_core::listvars::to_user_text(&meshfox_core::listvars::to_json(&items));
+                self.commit_picked(picker.target, value);
+            }
             KeyCode::Enter if !picker.filtered.is_empty() => {
                 let picker = self.select_picker.take().unwrap();
                 let value = picker.choices[picker.filtered[picker.selected]].clone();
-                match picker.target {
-                    super::path_picker::PickerTarget::VarForm(i) => {
-                        if let Some(input) =
-                            self.var_form.as_mut().and_then(|f| f.inputs.get_mut(i))
-                        {
-                            *input = value;
-                        }
-                    }
-                    super::path_picker::PickerTarget::InlineForm(i) => {
-                        if let Some(input) = self
-                            .active_inline_form
-                            .as_mut()
-                            .and_then(|f| f.inputs.get_mut(i))
-                        {
-                            *input = value;
-                        }
-                    }
-                }
+                self.commit_picked(picker.target, value);
                 self.render_current_document();
             }
             _ => {}
+        }
+    }
+
+    /// Writes a value chosen in the select picker into its form field.
+    fn commit_picked(&mut self, target: super::path_picker::PickerTarget, value: String) {
+        match target {
+            super::path_picker::PickerTarget::VarForm(i) => {
+                if let Some(input) = self.var_form.as_mut().and_then(|f| f.inputs.get_mut(i)) {
+                    *input = value;
+                }
+            }
+            super::path_picker::PickerTarget::InlineForm(i) => {
+                if let Some(input) = self
+                    .active_inline_form
+                    .as_mut()
+                    .and_then(|f| f.inputs.get_mut(i))
+                {
+                    *input = value;
+                }
+            }
         }
     }
 
@@ -2286,7 +2331,8 @@ impl App {
             // Ctrl-O: browse for the focused `dir`/`file` field.
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.var_form.as_ref().and_then(|vf| {
-                    super::date_picker::has_picker(vf.decls[vf.selected].var_type)
+                    let d = &vf.decls[vf.selected];
+                    (super::date_picker::has_picker(d.var_type) || is_choice_list(d))
                         .then_some(super::path_picker::PickerTarget::VarForm(vf.selected))
                 });
                 if let Some(target) = target {
@@ -2636,8 +2682,10 @@ impl App {
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.active_inline_form.as_ref().and_then(|form| {
                     let i = form.selected;
-                    (i < form.decls.len() && super::date_picker::has_picker(form.decls[i].var_type))
-                        .then_some(super::path_picker::PickerTarget::InlineForm(i))
+                    (i < form.decls.len()
+                        && (super::date_picker::has_picker(form.decls[i].var_type)
+                            || is_choice_list(&form.decls[i])))
+                    .then_some(super::path_picker::PickerTarget::InlineForm(i))
                 });
                 if let Some(target) = target {
                     self.open_picker(target).await;
@@ -3170,10 +3218,12 @@ impl App {
                         let index = picker.offset + (mouse.row - picker.rows.y) as usize;
                         if index < picker.filtered.len() {
                             picker.selected = index;
-                            self.on_select_picker_key(KeyEvent::new(
-                                KeyCode::Enter,
-                                KeyModifiers::NONE,
-                            ));
+                            let code = if picker.multi {
+                                KeyCode::Char(' ')
+                            } else {
+                                KeyCode::Enter
+                            };
+                            self.on_select_picker_key(KeyEvent::new(code, KeyModifiers::NONE));
                         }
                     } else {
                         self.select_picker = None;
@@ -4101,6 +4151,9 @@ impl App {
         };
         match var_type {
             Some(VarType::Date | VarType::DateTime) => self.open_date_picker(target),
+            Some(VarType::List) => {
+                self.open_select_picker(target);
+            }
             Some(_) => self.open_path_picker(target).await,
             None => {}
         }
@@ -4363,7 +4416,7 @@ impl App {
                 let idx = *idx;
                 vf.selected = idx;
                 vf.number_cursor = None;
-                if vf.decls[idx].var_type == VarType::Select {
+                if vf.decls[idx].var_type == VarType::Select || is_choice_list(&vf.decls[idx]) {
                     select = Some(idx);
                 }
                 let marker = super::date_picker::marker_for(vf.decls[idx].var_type)
@@ -11875,6 +11928,44 @@ mod tests {
         .await;
         assert!(app.select_picker.is_none());
         assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "three");
+    }
+
+    #[tokio::test]
+    async fn list_with_choices_opens_a_checklist_and_commits_ticked_items_in_order() {
+        let mut app = app_with_blocks(
+            "list-checklist",
+            concat!(
+            "<!-- meshfox:var name=\"REGIONS\" type=\"list\" choices=\"us,eu,ap\" session -->\n\n",
+            "```form name=pick\nfield var=\"REGIONS\"\n```\n",
+        ),
+        )
+        .await;
+        app.set_focus(Focus::Document);
+        app.try_enter_inline_form();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        app.on_inline_form_key(ctrl_o).await;
+        let picker = app.select_picker.as_ref().expect("checklist opens");
+        assert!(picker.multi);
+        // Tick `ap`, then `us`; Enter commits them in `choices` order.
+        app.on_key(key(KeyCode::Down)).await;
+        app.on_key(key(KeyCode::Down)).await;
+        app.on_key(key(KeyCode::Char(' '))).await;
+        app.on_key(key(KeyCode::Home)).await;
+        app.on_key(key(KeyCode::Char(' '))).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "");
+        app.on_key(key(KeyCode::Enter)).await;
+        assert!(app.select_picker.is_none());
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "us, ap");
+        // Reopening starts from what is already ticked; Esc changes nothing.
+        app.on_inline_form_key(ctrl_o).await;
+        assert_eq!(
+            app.select_picker.as_ref().unwrap().checked,
+            [true, false, true]
+        );
+        app.on_key(key(KeyCode::Char(' '))).await;
+        app.on_key(key(KeyCode::Esc)).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "us, ap");
     }
 
     #[tokio::test]
