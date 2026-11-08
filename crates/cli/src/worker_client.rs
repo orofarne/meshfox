@@ -1281,6 +1281,17 @@ pub enum WatchEvent {
         block: String,
         respect_keep: bool,
     },
+    /// A run is parked on this `form` step and waits for it to be sent or
+    /// cancelled.
+    FormAwaited {
+        node_id: String,
+        block: String,
+    },
+    /// The form a run was parked on was sent or cancelled.
+    FormResolved {
+        node_id: String,
+        block: String,
+    },
     /// A run (plain or `tty`) started or ended somewhere, or the session was
     /// reset: refetch `GET /api/runs`.
     RunsChanged,
@@ -1396,6 +1407,14 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                 block: String,
                 respect_keep: bool,
             },
+            FormAwaited {
+                node_id: String,
+                block: String,
+            },
+            FormResolved {
+                node_id: String,
+                block: String,
+            },
             /// A `display="code"` file node's target changed on disk — the
             /// TUI re-reads the document, same as for `"changed"`.
             FilesChanged,
@@ -1463,6 +1482,12 @@ pub fn watch(port: u16) -> tokio::sync::mpsc::UnboundedReceiver<WatchEvent> {
                         block,
                         respect_keep,
                     },
+                    WatchMsg::FormAwaited { node_id, block } => {
+                        WatchEvent::FormAwaited { node_id, block }
+                    }
+                    WatchMsg::FormResolved { node_id, block } => {
+                        WatchEvent::FormResolved { node_id, block }
+                    }
                     WatchMsg::ImagesChanged => WatchEvent::ImagesChanged,
                     WatchMsg::RunsChanged => WatchEvent::RunsChanged,
                 };

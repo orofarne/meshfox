@@ -27,6 +27,7 @@ mod copy;
 mod external_editor;
 mod file_node_run;
 mod fixtures;
+mod form_step;
 mod harness;
 mod history;
 mod image_reload;

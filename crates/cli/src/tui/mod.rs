@@ -362,6 +362,22 @@ fn spawn_worker_watcher(
                         return;
                     }
                 }
+                WatchEvent::FormAwaited { node_id, block } => {
+                    if external_run_tx
+                        .send(ExternalMsg::FormAwaited { node_id, block })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                WatchEvent::FormResolved { node_id, block } => {
+                    if external_run_tx
+                        .send(ExternalMsg::FormResolved { node_id, block })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 WatchEvent::TtyStarted { node_id, block } => {
                     if external_run_tx
                         .send(ExternalMsg::TtyStarted { node_id, block })
@@ -395,6 +411,16 @@ enum ExternalMsg {
         node_id: String,
         block: String,
         respect_keep: bool,
+    },
+    /// A run is parked on this form (see `WatchEvent::FormAwaited`).
+    FormAwaited {
+        node_id: String,
+        block: String,
+    },
+    /// That form was sent or cancelled.
+    FormResolved {
+        node_id: String,
+        block: String,
     },
 }
 
@@ -614,6 +640,12 @@ async fn main_loop(
                     block,
                     respect_keep,
                 } => app.on_form_reset(&node_id, &block, respect_keep),
+                ExternalMsg::FormAwaited { node_id, block } => {
+                    app.on_form_awaited(&node_id, &block)
+                }
+                ExternalMsg::FormResolved { node_id, block } => {
+                    app.on_form_resolved(&node_id, &block)
+                }
             },
             // A table that is still importing (or hasn't answered yet) is
             // polled faster than the general tick below.

@@ -937,6 +937,11 @@ pub struct App {
     /// chain by itself: the rest of the document stays visible/scrollable
     /// around it. Only `editing` does.
     pub active_inline_form: Option<InlineFormState>,
+    /// Forms some run is parked on right now, as `(node_id, block)` — from
+    /// this TUI's own run (`RunEvent::AwaitingForm`) and from the worker's
+    /// watch stream (`WatchEvent::FormAwaited`). A Send of one of these
+    /// continues that run, so it is allowed while a run is in progress.
+    pub awaiting_forms: HashSet<(String, String)>,
     /// Addresses `meshfox_core::autorun_blocks_for_changed_vars` found for
     /// the most recent `submit_inline_form`, still waiting their turn —
     /// there is exactly one foreground run slot (`self.run`), so N
@@ -1521,6 +1526,7 @@ impl App {
             clipboard_method,
             pending_copy_text: None,
             active_inline_form: None,
+            awaiting_forms: HashSet::new(),
             pending_autoruns: std::collections::VecDeque::new(),
         };
         if let Some(target) = initial_node {
@@ -2615,6 +2621,9 @@ impl App {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reset_inline_form().await;
             }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_inline_form().await;
+            }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.active_inline_form.as_ref().and_then(|form| {
                     let i = form.selected;
@@ -2725,7 +2734,11 @@ impl App {
         // The worker refuses a Send while a foreground run is in progress
         // (it commits values *and* starts runs); say so here instead of
         // round-tripping, leaving the form open with what was typed.
-        if self.foreground_run_in_progress() {
+        let answers_a_waiting_run = self.active_inline_form.as_ref().is_some_and(|f| {
+            self.awaiting_forms
+                .contains(&(f.node_id.clone(), f.block_name.clone()))
+        });
+        if !answers_a_waiting_run && self.foreground_run_in_progress() {
             self.status = "meshfox: a run is in progress — wait for it to finish (or stop it) before sending the form".into();
             return;
         }
@@ -2857,6 +2870,59 @@ impl App {
     /// locally remembered values — all of them, or with `respect_keep` all
     /// but the `keep` ones — and, if that form is open, rebuild it so it
     /// shows the defaults (the worker then fills in resolved values).
+    /// A run is parked on this form: remember it, open it for answering if
+    /// it is on screen, and say what to do. Sending it (Enter on `[Send]`)
+    /// continues the run; `Ctrl-x` in the form cancels the run.
+    pub fn on_form_awaited(&mut self, node_id: &str, block_name: &str) {
+        self.awaiting_forms
+            .insert((node_id.to_string(), block_name.to_string()));
+        let on_screen = self.display_canvas.node(node_id).is_some_and(|node| {
+            node.runnable_blocks()
+                .iter()
+                .any(|b| b.name.as_deref() == Some(block_name))
+        });
+        if on_screen {
+            self.select_form_block(node_id, block_name);
+            self.ensure_inline_form_open(node_id, block_name);
+            if let Some(form) = &mut self.active_inline_form {
+                form.editing = true;
+            }
+            self.render_current_document();
+        }
+        self.status = format!(
+            "meshfox: run waiting for form {node_id}/{block_name} — Enter on [Send] continues it, Ctrl-x cancels the run"
+        );
+    }
+
+    /// The form a run was parked on was sent or cancelled.
+    pub fn on_form_resolved(&mut self, node_id: &str, block_name: &str) {
+        self.awaiting_forms
+            .remove(&(node_id.to_string(), block_name.to_string()));
+    }
+
+    /// `Ctrl-x` in an inline form: cancel the run parked on it (it fails
+    /// with a "was cancelled" error). Does nothing if no run waits on it.
+    async fn cancel_inline_form(&mut self) {
+        let Some((node_id, block_name)) = self
+            .active_inline_form
+            .as_ref()
+            .map(|f| (f.node_id.clone(), f.block_name.clone()))
+        else {
+            return;
+        };
+        if !self
+            .awaiting_forms
+            .contains(&(node_id.clone(), block_name.clone()))
+        {
+            self.status = "meshfox: no run is waiting on this form".into();
+            return;
+        }
+        let Some(port) = self.worker_port else { return };
+        if let Err(e) = crate::worker_client::cancel_form(port, &node_id, &block_name).await {
+            self.status = format!("meshfox: couldn't cancel the form: {e}");
+        }
+    }
+
     pub fn on_form_reset(&mut self, node_id: &str, block_name: &str, respect_keep: bool) {
         let form = self
             .display_canvas
@@ -6305,11 +6371,13 @@ impl App {
         // "only redraw if this address's node is the one on screen"
         // gate instead of repeating it per arm.
         let mut touched: Option<BlockAddr> = None;
+        let mut form_awaited: Option<(String, String)> = None;
         match event {
             RunEvent::Started { .. } => {}
             RunEvent::AwaitingForm { node_id, block, .. } => {
                 run.lines
                     .push(format!("waiting for form {node_id}/{block}"));
+                form_awaited = Some((node_id, block));
             }
             RunEvent::StepStart { node_id, block } => {
                 let addr = BlockAddr::new(node_id, block);
@@ -6574,6 +6642,9 @@ impl App {
             {
                 self.render_current_document();
             }
+        }
+        if let Some((node_id, block)) = form_awaited {
+            self.on_form_awaited(&node_id, &block);
         }
     }
 
