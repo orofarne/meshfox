@@ -3135,7 +3135,11 @@ literal. The producer decides how it *writes* the list, each consumer how it
   edge pending, and the runner expands it as soon as the source finishes, like
   any other computed binding. The usual graph limits (128 nested, 4096 distinct
   applications) apply, and one spread may not create more than 4096.
-  Each application has its own history, locks and logs. A static check
+  The expanded applications are ordinary steps, and the executor runs one step
+  at a time: they run **one after another in list order** (the list `3 1 2`
+  runs `cut[page=3]`, `cut[page=1]`, `cut[page=2]`), and a failing element
+  stops the chain like any failing step. Each application has its own history,
+  locks and logs. A static check
   (`meshfox validate`) knows no values: it checks that the list is declared with
   `type="list"` and that its item type fits the argument, and expands nothing.
 
