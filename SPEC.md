@@ -1257,8 +1257,10 @@ A `` ```form `` fence, same non-executing family as `button` above, is a
 small visual form for setting one or more *node-scoped* `meshfox:var`s
 (see "Variables" below) without opening the document-wide "configure
 variables" modal — a way to give a canvas a real input surface instead of
-only ever prompting before a run. Its body is a line-based list, one
-`field` per line, rather than code or a caption:
+only ever prompting before a run. A form is also a step of a run chain: see
+"A form as a step of a run chain" at the end of this section. Its body is a
+line-based list, one `field` or `text` per line, rather than code or a
+caption:
 
     <!-- meshfox:var name="REGION" type="select" choices="us,eu" -->
 
@@ -1297,12 +1299,19 @@ only ever prompting before a run. Its body is a line-based list, one
   omitted.
 - `name="..."` — required, same addressing convention as any other
   runnable fence (`meshfox run`-style `node-id/block-name`, or a bare name
-  within the same node) — except a form is never actually *run* this way:
-  there's no code to execute, so `meshfox run`/`POST /api/run` against a
-  form block fails with a clear error rather than silently doing nothing.
-  It's addressed instead by whatever submits it — the web UI's own
-  rendered Send button, the TUI's inline field-and-Send rendering (`i` to
-  start editing it, or a click) — never by a document's own `deps=`.
+  within the same node). A form has no code to execute, so running it
+  directly (`meshfox run <form>`) runs its `deps=` chain and then parks on
+  the form — see "A form as a step of a run chain". It is sent by whatever
+  submits it: the web UI's own rendered Send button, the TUI's inline
+  field-and-Send rendering (`i` to start editing it, or a click), `meshfox
+  form submit` or the MCP `form_submit` tool.
+- `text "..."` — an explanatory line shown above the fields, in document
+  order (a JSON string literal, or the rest of the line when unquoted).
+  A form with `text` and no `field` is a pure pause: "do this elsewhere, then
+  continue".
+- `cancel="..."` — the Cancel button's caption on the fence's info string,
+  shown while a run is parked on the form; falls back to `"Cancel"`. Accepted
+  only on a `form` fence (`meshfox validate` rejects it elsewhere).
 - In the TUI a `form` is drawn in the same frame as a code block
   (`┌─ form · name` header, `│ ` gutter, `└─` foot) and is selected with
   `[`/`]` in document order, with the same highlight rules: accent border
@@ -1351,22 +1360,62 @@ only ever prompting before a run. Its body is a line-based list, one
   `/api/watch` as `form-reset`, so every open web tab and TUI shows the
   defaults. `meshfox form reset` and the MCP `form_reset` tool call it (as
   `meshfox form submit` and `form_submit` call `POST /api/form/submit`).
-- **A form can only be sent while no foreground run is in progress** — a
-  plain run, a `tty` session, or the gap between a chain's steps; a
-  `service` doesn't count. Send commits the values *and* starts every
-  `autorun` block they reach, so sending on top of a running chain would
-  race its inputs, and an interactive session can last as long as its user
-  likes. The server refuses (`POST /api/form/submit` answers `409`) before
-  committing anything, and the web UI and TUI disable Send (and say why)
-  while one is running. A form that triggers a `tty` block therefore holds
-  further Sends until that terminal is closed or the program exits.
-- A form fence can't declare its own `deps=`, `env=`, `interpreter=`,
-  `cache`, `tty`, `service`, or `autorun` — none of those presuppose a
-  real process of the form's own, which it never has (same reasoning
-  `button` already gives for the four it rejects). It also can't be named
-  in *another* block's `deps=` — unlike a `button`, a form has no "done"
-  state at all (nothing runs, ever), so there's nothing for a dependent
-  to wait on.
+- **A form can only be sent while no foreground run is in progress**, with
+  one exception: a run parked on this very form (below). A plain run, a `tty`
+  session, or the gap between a chain's steps counts; a `service` doesn't.
+  Send commits the values *and* starts every `autorun` block they reach, so
+  sending on top of a running chain would race its inputs, and an interactive
+  session can last as long as its user likes. The server refuses (`POST
+  /api/form/submit` answers `409`) before committing anything, and the web UI
+  and TUI disable Send (and say why) while one is running. A form that
+  triggers a `tty` block therefore holds further Sends until that terminal is
+  closed or the program exits.
+- A form fence can't declare its own `env=`, `interpreter=`, `cache`, `tty`,
+  `service` or `autorun` — none of those presuppose a real process of the
+  form's own, which it never has (same reasoning `button` already gives for
+  the ones it rejects). It *can* declare `deps=` (what must run before the
+  form is asked) and be named in another block's `deps=`.
+
+### A form as a step of a run chain
+
+A form named in some block's `deps=` (or addressed directly by `meshfox run`)
+is a step of that chain. When the run reaches it, the run **parks** there
+until a person sends or cancels the form:
+
+- The step always parks — it is never skipped as "already fresh this session":
+  the answer is the point. Its fields are prefilled from the session.
+- The run stream emits `awaiting-form` (`nodeId`, `block`, `runId`) and
+  `/api/watch` announces `form-awaited` / `form-resolved`. `GET
+  /api/form/awaiting` lists the forms runs are parked on; `GET
+  /api/form/fields` reports `awaiting`, `cancel` and `text` for one form.
+- **Send** (`POST /api/form/submit`, the web/TUI Send button, `meshfox form
+  submit`, the MCP `form_submit` tool) on the form a run is parked on commits
+  the values into the session and releases the run; the 409 rule above does
+  not apply to that form (other forms are still refused while the run is in
+  progress). The run then emits `form-answered` — the non-secret answers, so
+  transcripts and `meshfox logs` record what was decided — and the form's
+  `step-end`. `autorun` blocks reached by the Send are started as ordinary
+  runs, exactly as for an unparked form.
+- **Cancel** (`POST /api/form/cancel`, the web Cancel button, `Ctrl-x` in the
+  TUI form) fails the run: an `error` event ("form ... was cancelled"), exit
+  code 1, and no later step runs. Killing the run also ends the wait.
+- The answers reach later steps through `env=` like any session variable. A
+  variable that is a field of a form step is **not** required before the run
+  starts (neither at admission nor in the pre-run variable form) — unless a
+  step *before* the form already reads it.
+- **Clients.** The CLI asks the fields at the terminal (`[Enter]` sends, `c`
+  cancels); with no terminal there is nobody to ask, so it cancels the form
+  and fails with a clear error. The MCP `run` tool returns `status:
+  "awaiting_form"` with the form's address (not an error) and the run keeps
+  waiting in the worker; the agent answers with `form_submit`. The web UI
+  scrolls to the waiting form and shows its `text`; the TUI opens it for
+  editing.
+- **Coordinator notifications.** The worker also tells its coordinator
+  (`watcher_protocol::Message::Notify`, one-way, best effort, never delaying a
+  run) when a run parks (`form_awaiting`), is released (`form_resolved`), and
+  when any run ends (`run_finished` / `run_failed`). A coordinator that does
+  not know the message ignores it.
+
 - Scope: like `button`, a form's own addressing only ever resolves within
   the same file.
 
@@ -3507,7 +3556,7 @@ language for in the first place. A constraint
 fence requires `lang = 'starlark'`
 *and* the bare `constraint` flag (see "Constraint fences") — again,
 cross-cutting rules enforced by the fence scanner/`meshfox validate`, not
-expressible in `fence-info` alone. `send=` and `reset` only mean anything on a
+expressible in `fence-info` alone. `send=`, `cancel=` and `reset` only mean anything on a
 `lang = 'form'` fence, same as `autoclose` only meaning anything on a
 `tty` one.
 
@@ -3515,12 +3564,15 @@ A `form` fence's own body (unlike every other runnable fence's, which is
 the code/caption itself) is a separate line-based grammar, not Markdown
 or code:
 
-    form-body  ::= { ws } [ field-line { '\n' { ws } field-line } ] { ws }
+    form-body  ::= { ws } [ form-line { '\n' { ws } form-line } ] { ws }
+    form-line  ::= field-line | text-line
     field-line ::= 'field' ws attr-list
     field-attr ::= 'var' | 'label' | 'keep'
+    text-line  ::= 'text' ws ( string | <rest of the line> )
 
-A blank line between `field-line`s is allowed (and ignored); any other
-non-blank line is a parse error.
+A blank line between `form-line`s is allowed (and ignored); any other
+non-blank line is a parse error. A `text-line`'s `string` is a JSON string
+literal; unquoted, the rest of the line is the text.
 
 ### Values with their own inner structure
 

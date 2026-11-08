@@ -28,6 +28,7 @@ pub const FENCE_VALUE_ATTRS: &[&str] = &[
     "output-attrs",
     "render",
     "send",
+    "cancel",
     "argv",
     "extends",
 ];

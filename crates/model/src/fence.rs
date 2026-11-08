@@ -728,6 +728,7 @@ const FENCE_ATTRS: &[&str] = &[
     "confirm",
     "render",
     "send",
+    "cancel",
     "reset",
     "fold",
     "tangle",
@@ -1951,6 +1952,12 @@ mod tests {
     #[test]
     fn unknown_fence_attr_is_none_for_known_attributes_only() {
         let md = "```bash name=\"build\" cache deps=\"other\"\ncargo build\n```\n";
+        assert_eq!(unknown_fence_attr(md), None);
+    }
+
+    #[test]
+    fn cancel_is_a_known_fence_attribute() {
+        let md = "```form name=\"review\" send=\"Go\" cancel=\"Stop\"\n```\n";
         assert_eq!(unknown_fence_attr(md), None);
     }
 
