@@ -168,6 +168,9 @@ const RELOAD_LIVE_RUN_PORT = 4615;
 // sharing this canvas's worker would trip over. Chrome only (see the
 // spec): one server, so no second browser's copy to race it.
 const FORM_AUTORUN_TTY_PORT = 4631;
+// form-step.spec.ts — a run parked on a `form` step; its own fixture and
+// port, since a parked run on a shared server would block other suites.
+const FORM_STEP_PORT = 4643;
 // Ninth server + port for document-options.spec.ts — same reasoning
 // again, its own fixture (document-options.canvas.md) and port, so its
 // own `PUT /api/options` writes never collide with any other suite's
@@ -532,6 +535,11 @@ export default defineConfig({
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FORM_AUTORUN_TTY_PORT}` },
     },
     {
+      name: `${browser}-form-step`,
+      testMatch: /(^|\/)form-step\.spec\.ts$/,
+      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${FORM_STEP_PORT}` },
+    },
+    {
       name: `${browser}-reload-live-run`,
       testMatch: /(^|\/)reload-live-run\.spec\.ts$/,
       use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${browser === "firefox" ? RELOAD_LIVE_RUN_FIREFOX_PORT : RELOAD_LIVE_RUN_PORT}` },
@@ -777,6 +785,12 @@ export default defineConfig({
     {
       command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/form-autorun-tty.canvas.md --port ${FORM_AUTORUN_TTY_PORT} --no-open --no-auto-exit`,
       url: `http://127.0.0.1:${FORM_AUTORUN_TTY_PORT}/api/canvas`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      command: `${MESHFOX_VIEW} ${FIXTURES_DIR}/form-step.canvas.md --port ${FORM_STEP_PORT} --no-open --no-auto-exit`,
+      url: `http://127.0.0.1:${FORM_STEP_PORT}/api/canvas`,
       reuseExistingServer: false,
       timeout: 60_000,
     },

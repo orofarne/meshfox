@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from "react";
 import type { RunEvent } from "./api";
 
 export type ActivityAddress = { nodeId: string; block: string };
-export type ActivityPhase = "preparing" | "running" | "between" | "interactive" | "completed" | "failed" | "killed" | "unknown";
+export type ActivityPhase = "preparing" | "running" | "between" | "interactive" | "waiting" | "completed" | "failed" | "killed" | "unknown";
 export interface RunActivity {
   key: string;
   target: ActivityAddress;
@@ -27,6 +27,7 @@ export function activityEvent(a: RunActivity, event: RunEvent, now: number): Run
     case "step-start": return { ...a, phase: "running", current: event, stepStartedAt: now,
       addresses: [...new Set([...a.addresses, `${event.nodeId}::${event.block}`])] };
     case "tty-start": return { ...a, phase: "interactive", current: event };
+    case "awaiting-form": return { ...a, phase: "waiting", current: event, stepStartedAt: undefined };
     case "step-skipped":
     case "step-end":
     case "service-started": return { ...a, phase: "between", current: undefined, stepStartedAt: undefined };

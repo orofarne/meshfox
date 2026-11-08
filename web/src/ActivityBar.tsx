@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { activityIsLive, type ActivityAddress, type RunActivity } from "./runActivity";
 
 const labels = {
-  preparing: "Preparing…", running: "Running:", between: "Between steps…", interactive: "Interactive:",
+  preparing: "Preparing…", running: "Running:", between: "Between steps…", interactive: "Interactive:", waiting: "Waiting for form:",
   completed: "Completed:", failed: "Failed:", killed: "Killed:", unknown: "Result unknown:",
 };
 function duration(ms: number): string {

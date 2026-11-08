@@ -133,7 +133,16 @@ export type FormFieldStatus = VarStatus & { label?: string };
 export async function fetchFormFields(
   nodeId: string,
   block: string,
-): Promise<{ send: string; fields: FormFieldStatus[] }> {
+): Promise<{
+  send: string;
+  /** `cancel=` caption, defaulted to "Cancel" — shown while `awaiting`. */
+  cancel: string;
+  /** The form's explanatory `text` lines. */
+  text: string[];
+  /** A run is parked on this form right now. */
+  awaiting: boolean;
+  fields: FormFieldStatus[];
+}> {
   const params = new URLSearchParams({ nodeId, block });
   const res = await fetch(`api/form/fields?${params}`);
   if (!res.ok) throw new Error(`GET /api/form/fields: ${res.status}`);
@@ -202,6 +211,28 @@ export async function resetForm(
   }
   return res.json();
 }
+
+/**
+ * Cancels the run parked on a `form` step: that run fails with a "was
+ * cancelled" error. `404` when no run waits on the form.
+ */
+export async function cancelForm(nodeId: string, block: string): Promise<void> {
+  const res = await fetch("api/form/cancel", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodeId, block }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `POST /api/form/cancel: ${res.status}`);
+  }
+}
+
+/** The `window` events `watchChanges` raises when a run parks on a `form`
+ * step (`"form-awaited"`) and when that form is sent or cancelled
+ * (`"form-resolved"`); `detail` is `{ nodeId, block }`. */
+export const FORM_AWAITED_EVENT = "meshfox-form-awaited";
+export const FORM_RESOLVED_EVENT = "meshfox-form-resolved";
 
 /** The `window` event `watchChanges` raises for the server's `"form-reset"`
  * (a form's fields went back to their defaults, by the Reset button, the
@@ -912,6 +943,10 @@ export async function clearNodeId(id: string): Promise<{ id: string; doc: Canvas
 // follow).
 export type RunEvent =
   | { type: "tty-start"; nodeId: string; block: string }
+  /** Not terminal: the chain reached a `form` step and is parked there until
+   * the form is sent or cancelled (`cancelForm`). The form block shows
+   * itself as awaiting an answer. */
+  | { type: "awaiting-form"; nodeId: string; block: string; runId: string }
   | { type: "started"; runId: string }
   | { type: "step-start"; nodeId: string; block: string }
   /** Terminal for this one step (the chain keeps going) — this dependency
@@ -1712,6 +1747,16 @@ export function watchChanges(
         } else if (event.type === "form-reset" && event.nodeId !== undefined && event.block !== undefined) {
           window.dispatchEvent(
             new CustomEvent(FORM_RESET_EVENT, { detail: { nodeId: event.nodeId, block: event.block } }),
+          );
+        } else if (
+          (event.type === "form-awaited" || event.type === "form-resolved") &&
+          event.nodeId !== undefined &&
+          event.block !== undefined
+        ) {
+          window.dispatchEvent(
+            new CustomEvent(event.type === "form-awaited" ? FORM_AWAITED_EVENT : FORM_RESOLVED_EVENT, {
+              detail: { nodeId: event.nodeId, block: event.block },
+            }),
           );
         } else if (event.type === "run-started" && event.nodeId !== undefined && event.block !== undefined) {
           onRunStarted?.(event.nodeId, event.block, event.runId);

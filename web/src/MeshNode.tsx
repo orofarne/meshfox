@@ -41,6 +41,9 @@ import {
   fetchFormFields,
   resetForm,
   FORM_RESET_EVENT,
+  FORM_AWAITED_EVENT,
+  FORM_RESOLVED_EVENT,
+  cancelForm,
   type LinkPreview,
   type FormFieldStatus,
   type SaveTextOutcome,
@@ -1996,6 +1999,12 @@ function initialFormFieldValue(f: FormFieldStatus): string {
 function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData; nodeId: string }) {
   const [fields, setFields] = useState<FormFieldStatus[] | null>(null);
   const [sendCaption, setSendCaption] = useState("Send");
+  const [cancelCaption, setCancelCaption] = useState("Cancel");
+  const [text, setText] = useState<string[]>([]);
+  // A run is parked on this form: it waits for an answer, so Send is allowed
+  // even though a run is in progress, and Cancel fails that run.
+  const [awaiting, setAwaiting] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
   const [values, setValues] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -2004,9 +2013,12 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
   const loadFields = useCallback(
     (isCancelled: () => boolean) =>
       fetchFormFields(nodeId, seg.name)
-        .then(({ send, fields: f }) => {
+        .then(({ send, cancel, text: lines, awaiting: waiting, fields: f }) => {
           if (isCancelled()) return;
           setSendCaption(send);
+          setCancelCaption(cancel);
+          setText(lines);
+          setAwaiting(waiting);
           setFields(f);
           setValues(Object.fromEntries(f.map((field) => [field.name, initialFormFieldValue(field)])));
         })
@@ -2040,6 +2052,35 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
     window.addEventListener(FORM_RESET_EVENT, onReset);
     return () => window.removeEventListener(FORM_RESET_EVENT, onReset);
   }, [nodeId, seg.name, data.noExec, loadFields]);
+
+  // A run parked on / released from this form (any tab, the CLI, MCP).
+  useEffect(() => {
+    if (data.noExec) return;
+    const matches = (e: Event) => {
+      const d = (e as CustomEvent<{ nodeId: string; block: string }>).detail;
+      return d.nodeId === nodeId && d.block === seg.name;
+    };
+    const onAwaited = (e: Event) => {
+      if (!matches(e)) return;
+      setAwaiting(true);
+      void loadFields(() => false);
+      rootRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    };
+    const onResolved = (e: Event) => {
+      if (matches(e)) setAwaiting(false);
+    };
+    window.addEventListener(FORM_AWAITED_EVENT, onAwaited);
+    window.addEventListener(FORM_RESOLVED_EVENT, onResolved);
+    return () => {
+      window.removeEventListener(FORM_AWAITED_EVENT, onAwaited);
+      window.removeEventListener(FORM_RESOLVED_EVENT, onResolved);
+    };
+  }, [nodeId, seg.name, data.noExec, loadFields]);
+
+  const handleCancel = () => {
+    setError(null);
+    cancelForm(nodeId, seg.name).catch((e) => setError(String(e)));
+  };
 
   const set = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }));
 
@@ -2140,7 +2181,17 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
   }
 
   return (
-    <div className="mesh-form-block" id={blockDomId({ nodeId, blockName: seg.name })}>
+    <div
+      className={`mesh-form-block${awaiting ? " mesh-form-awaiting" : ""}`}
+      id={blockDomId({ nodeId, blockName: seg.name })}
+      ref={rootRef}
+    >
+      {awaiting && <p role="status">A run is waiting for this form.</p>}
+      {text.map((line, i) => (
+        <p key={i} className="mesh-form-text">
+          {line}
+        </p>
+      ))}
       {error && <p className="vars-modal-error">{error}</p>}
       {fields.map((f, i) => (
         <label key={f.name} className="vars-modal-field">
@@ -2151,9 +2202,9 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
       <button
         type="button"
         className="mesh-run-button"
-        disabled={submitting || runInProgress}
+        disabled={submitting || (runInProgress && !awaiting)}
         title={
-          runInProgress
+          runInProgress && !awaiting
             ? "A run is in progress — wait for it to finish (or stop it) before sending"
             : undefined
         }
@@ -2161,6 +2212,16 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
       >
         {sendCaption}
       </button>
+      {awaiting && (
+        <button
+          type="button"
+          className="mesh-run-button"
+          title="Fail the run that is waiting on this form"
+          onClick={handleCancel}
+        >
+          {cancelCaption}
+        </button>
+      )}
       <button
         type="button"
         className="mesh-run-button"
