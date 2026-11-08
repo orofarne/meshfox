@@ -2280,6 +2280,26 @@ fn check_updates(yes: bool) {
     }
 }
 
+/// Folds the `--set` pairs into overrides. `--set NAME=value` sets a variable
+/// (the last one wins); `--set 'IDS[]=a' --set 'IDS[]=b'` builds the list
+/// variable `IDS` element by element, in the order given. A plain
+/// `--set IDS=<JSON array>` still sets a list outright.
+fn overrides_from_set(pairs: Vec<(String, String)>) -> HashMap<String, String> {
+    let mut overrides: HashMap<String, String> = HashMap::new();
+    let mut lists: HashMap<String, Vec<String>> = HashMap::new();
+    for (key, value) in pairs {
+        if let Some(name) = key.strip_suffix("[]") {
+            lists.entry(name.to_string()).or_default().push(value);
+        } else {
+            overrides.insert(key, value);
+        }
+    }
+    for (name, items) in lists {
+        overrides.insert(name, meshfox_core::listvars::to_json(&items));
+    }
+    overrides
+}
+
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
@@ -3360,7 +3380,7 @@ async fn run_async(
     // `meshfox:var` only ever lives in the root node, which is always in
     // the primary document — never affected by an `include`.
     let decls = declared_vars_or_exit(canvas_path, &initial_raw);
-    let overrides: HashMap<String, String> = set.into_iter().collect();
+    let overrides: HashMap<String, String> = overrides_from_set(set);
     validate_set_overrides_or_exit(&decls, &overrides);
     let mut var_cache = load_var_cache_or_exit(canvas_path);
     persist_set_overrides(&decls, &overrides, &mut var_cache);
@@ -4773,7 +4793,7 @@ fn form_cmd(op: FormOp) {
         } => {
             let canvas_path = canvas.unwrap_or_else(find_canvas);
             let port = worker_port_or_exit(&runtime, &canvas_path);
-            let values: HashMap<String, String> = set.into_iter().collect();
+            let values: HashMap<String, String> = overrides_from_set(set);
             let triggered =
                 match runtime.block_on(worker_client::submit_form(port, &node, &block, values)) {
                     Ok(triggered) => triggered,
@@ -8647,6 +8667,26 @@ mod run_hint_tests {
             Some("development linting".to_string())
         );
         assert_eq!(closest_node_path(&canvas, "completely-unrelated-id"), None);
+    }
+}
+
+#[cfg(test)]
+mod set_list_tests {
+    use super::*;
+
+    #[test]
+    fn bracket_sets_build_a_list_in_order_and_plain_sets_still_win_last() {
+        let pairs = vec![
+            ("IDS[]".to_string(), "1".to_string()),
+            ("N".to_string(), "a".to_string()),
+            ("IDS[]".to_string(), "Acme, Inc.".to_string()),
+            ("N".to_string(), "b".to_string()),
+            ("J".to_string(), r#"["x","y"]"#.to_string()),
+        ];
+        let overrides = overrides_from_set(pairs);
+        assert_eq!(overrides["IDS"], r#"["1","Acme, Inc."]"#);
+        assert_eq!(overrides["N"], "b");
+        assert_eq!(overrides["J"], r#"["x","y"]"#);
     }
 }
 

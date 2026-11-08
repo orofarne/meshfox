@@ -171,3 +171,14 @@ test('extends entries are kept as written for the block details row', () => {
   const none = parseBody('```bash name="t"\nf\n```', 'root').find(s => s.type === 'code');
   assert.deepEqual(none.extends, []);
 });
+
+test('env formats are part of the fingerprint, like the Rust renderer', () => {
+  // Same vectors as `env_format_is_part_of_the_fingerprint` in crates/model/src/fence.rs.
+  assert.equal(fingerprint('bash', 'x', undefined, 'IDS', undefined), '8124c0c5');
+  assert.equal(fingerprint('bash', 'x', undefined, 'IDS|space', undefined), '555eb9b7');
+  assert.equal(fingerprint('bash', 'x', undefined, 'L=IDS|pg', undefined), '01cf924c');
+  assert.deepEqual(parseEnvList('L=$IDS|pg, X'), [
+    { localName: 'L', varName: 'IDS', format: 'pg' },
+    { localName: 'X', varName: 'X' },
+  ]);
+});

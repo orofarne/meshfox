@@ -150,7 +150,7 @@ fn potential_secrets(
         for dep in &block.dependencies() {
             let app =
                 crate::args::Application::parse(&dep.block_name).map_err(DepsError::Arguments)?;
-            if app.bindings.values().any(|v| matches!(v, crate::args::Binding::Reference(name) if computed_name(decls, name))) {
+            if app.bindings.values().any(|v| matches!(v, crate::args::Binding::Reference(name) | crate::args::Binding::Spread(name) if computed_name(decls, name))) {
                 candidates.push(BlockAddr::new(dep.node_id.as_deref().unwrap_or(node_id), app.definition));
             }
         }

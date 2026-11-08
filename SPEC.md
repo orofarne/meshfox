@@ -1068,8 +1068,9 @@ Applications use named bindings only, appended to the existing block address:
     application ::= [ node-id '/' ] block-name [ '[' bindings ']' ]
     bindings    ::= binding { ',' binding }
     binding     ::= arg-name '=' arg-value
-    arg-value   ::= bare-literal | quoted-literal | reference
+    arg-value   ::= bare-literal | quoted-literal | reference | spread
     reference   ::= '$' identifier | '${' identifier '}'
+    spread      ::= '*' reference
 
 An empty binding list, positional values, unknown names, and duplicate bindings
 are errors. Bare literals are nonempty and contain no whitespace or any of
@@ -1086,6 +1087,13 @@ needed to carry the double-quoted binding strings above without ambiguity.
 An apostrophe within a binding string can be written as JSON `\u0027`.
 Dependency lists split at commas outside brackets and quoted strings. A forced
 dependency retains its existing suffix, e.g. `extract[lang=hy]!`.
+
+**Fan-out over a list.** `name=*$LIST` (a `spread`) binds `name` to each element
+of the `list` variable `LIST` in turn, so one `deps=` entry names one
+application per element — see "List variables". It is written only this way:
+a bare literal may contain `*` but never `$`, so `*$LIST` is unambiguous, and a
+quoted `"*$LIST"` is literal text. A reference to a list without the `*`
+(`name=$LIST`) is an error that says what to write.
 
 Bind names, resolve references, fill optional defaults, validate every resolved
 value, then construct the canonical application identity. Binding order is
@@ -2357,7 +2365,8 @@ Attributes:
   opt-in per block, see "Consumption" below.
 - `type` — `string` (default), `int`, `bool`, `select`, `dir` (see
   "Directory variables" below), `file` (see "File variables"), `date` or
-  `datetime` (see "Date and datetime variables"). It decides how to
+  `datetime` (see "Date and datetime variables"), or `list` (see "List
+  variables"). It decides how to
   *prompt* (a `bool` prompts y/n, a `select` shows its `choices` as a menu,
   a `date` a calendar, ...) and how a UI renders an input for it. **Every**
   value is validated against it, wherever it comes from, so a block never
@@ -3070,6 +3079,82 @@ A `date` holds one calendar day, a `datetime` one instant:
   → `2026-10-25T14:30:00+03:00`). This applies to the CLI prompt and the TUI
   variable form and `form` fences; `--set` and the API do not guess.
 - Starlark has no datetime type; a block's value is the canonical string.
+
+### List variables (`type="list"`)
+
+A `list` holds an ordered list of strings. The variable does not say how a list
+*looks* — there is deliberately no separator attribute — because that depends
+on who reads it: a `bash` block wants shell words, a `psql` one a Postgres array
+literal. The producer decides how it *writes* the list, each consumer how it
+*reads* it.
+
+    <!-- meshfox:var name="PAGES" type="list" of="int" from="root/listing" -->
+
+- `of="int"` — optional item type (any scalar type except `select`; default
+  `string`). Every element is validated against it, wherever the list comes
+  from. With `choices="us,eu"` a list may only hold those elements (forms still
+  show a list as a text field holding the JSON array; a multi-select is planned).
+  A list cannot be `secret`, and it is not a valid type for a `meshfox:arg` (an
+  argument is one value).
+- **Writing a list.** A `from=` source block (or any producer of the variable's
+  value) writes to its `MESHFOX_VARS_OUT` file either one line per element,
+
+      echo 'PAGES[]=3' >> "$MESHFOX_VARS_OUT"
+      echo 'PAGES[]=Acme, Inc.' >> "$MESHFOX_VARS_OUT"
+
+  (any characters but a newline, elements trimmed like every value in that
+  file), or a JSON array on one line: `PAGES=["3","Acme, Inc."]`. Lines apply in
+  order, a later plain `PAGES=` replaces earlier elements, and `PAGES[]=` after
+  a JSON line keeps appending. `default=` takes the JSON array form
+  (`default='["amd64","arm64"]'`). On the command line `--set 'PAGES[]=3' --set
+  'PAGES[]=1'` builds a list element by element and `--set 'PAGES=["3","1"]'`
+  sets it outright.
+- **Reading a list.** In `env=` a format after `|` chooses the rendering for
+  that block, per entry, so two blocks can read one list differently:
+
+      env="PAGES|space"        # PAGES=1 'Acme, Inc.'
+      env="IDS=PAGES|pg"       # IDS={1,"Acme, Inc."}
+
+  | format | result |
+  |---|---|
+  | *(none)*, `json` | a compact JSON array `["1","Acme, Inc."]` — lossless, the default |
+  | `lines` | one element per line |
+  | `space` | shell-quoted words separated by spaces, safe for `eval` and `set --` |
+  | `comma` | elements joined with `,` (no quoting) |
+  | `tab` | elements joined with a tab |
+  | `pg` | a PostgreSQL array literal, quoted where Postgres requires |
+
+  An unknown format, or a format on a variable that is not a list, is a
+  `meshfox validate` error. The format is part of the block's fingerprint.
+- **Fan-out.** `name=*$LIST` in a `deps=` binding (above) runs the dependency
+  once per element. Several spreads in one application give their cartesian
+  product, in binding-name then list order; repeated elements collapse into one
+  application (identity is the canonical application address); an **empty list
+  gives no applications** — the dependency simply disappears and the consumer
+  still runs. A computed list (`from=`) that has not been observed yet keeps the
+  edge pending, and the runner expands it as soon as the source finishes, like
+  any other computed binding. The usual graph limits (128 nested, 4096 distinct
+  applications) apply, and one spread may not create more than 4096.
+  Each application has its own history, locks and logs. A static check
+  (`meshfox validate`) knows no values: it checks that the list is declared with
+  `type="list"` and that its item type fits the argument, and expands nothing.
+
+A *map* is therefore a producer that lists, a parameterized block that handles
+one element, and a consumer whose `deps=` spreads over the list; the consumer
+receives the list itself (`env="PAGES|space"`) to *reduce* over the per-element
+results it finds in files:
+
+    <!-- meshfox:var name="PAGES" type="list" of="int" from="root/listing" -->
+    ```bash name="listing"
+    for p in 3 1 2; do echo "PAGES[]=$p" >> "$MESHFOX_VARS_OUT"; done
+    ```
+    <!-- meshfox:arg name="page" type="int" -->
+    ```bash name="cut" outputs="out/page-${page}.txt"
+    pdftotext -f "$page" -l "$page" doc.pdf "out/page-$page.txt"
+    ```
+    ```bash name="merge" deps='cut[page=*$PAGES]' env="PAGES|space"
+    for p in $PAGES; do cat "out/page-$p.txt"; done > all.txt
+    ```
 
 ### TUI select search
 

@@ -52,19 +52,31 @@ export function attrsFromTokens(tokens: string[]): Record<string, string> {
 export interface EnvRef {
   localName: string;
   varName: string;
+  /** `|format` after the variable (`env="IDS|space"`): how a `list` variable
+   * is rendered for this block. Absent means JSON. */
+  format?: string;
 }
 
 /** A leading `$` is purely cosmetic (`env="$VAR"` and `env="VAR"` mean the
  * same thing) — direct port of `core::fence::parse_env_ref`. */
 function parseEnvRef(s: string): EnvRef {
+  // `NAME`, `LOCAL=NAME`, either optionally followed by `|format`.
+  const splitFormat = (value: string): { varName: string; format?: string } => {
+    const bar = value.indexOf("|");
+    if (bar === -1) return { varName: value.trim().replace(/^\$(?!\{)/, "") };
+    return {
+      varName: value.slice(0, bar).trim().replace(/^\$(?!\{)/, ""),
+      format: value.slice(bar + 1).trim(),
+    };
+  };
   const eq = s.indexOf("=");
   if (eq === -1) {
-    const varName = s.trim().replace(/^\$(?!\{)/, "");
-    return { localName: varName, varName };
+    const { varName, format } = splitFormat(s);
+    return format === undefined ? { localName: varName, varName } : { localName: varName, varName, format };
   }
   const local = s.slice(0, eq).trim();
-  const value = s.slice(eq + 1).trim().replace(/^\$(?!\{)/, "");
-  return { localName: local, varName: value };
+  const { varName, format } = splitFormat(s.slice(eq + 1));
+  return format === undefined ? { localName: local, varName } : { localName: local, varName, format };
 }
 
 /** Splits a fence's raw `env="a,LOCAL=$b"` attribute into its individual
@@ -138,10 +150,6 @@ function fnv1aHex(bytes: Uint8Array): string {
 
 const NUL = "\u0000";
 
-function stripDollar(s: string): string {
-  return s.startsWith("$") ? s.slice(1) : s;
-}
-
 /** Index of the `?` that starts a `deps=` entry's condition (`fix?USE_AGENT`):
  * the first one outside quotes and outside the `[...]` application arguments.
  * Mirrors `core::fence::condition_start`. */
@@ -205,13 +213,10 @@ export function fingerprint(
 ): string {
   const parts = [lang, code, interpreter ?? ""];
   for (const raw of (envAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
-    const eq = raw.indexOf("=");
-    if (eq >= 0) {
-      parts.push(`${raw.slice(0, eq).trim()}${NUL}${stripDollar(raw.slice(eq + 1).trim())}`);
-    } else {
-      const varName = stripDollar(raw);
-      parts.push(`${varName}${NUL}${varName}`);
-    }
+    // Same split as `core::fence::parse_env_ref`: `local\0var` with `|format`
+    // appended to the variable only when one is given.
+    const ref = parseEnvRef(raw);
+    parts.push(`${ref.localName}${NUL}${ref.varName}${ref.format === undefined ? "" : `|${ref.format}`}`);
   }
   for (const raw of (depsAttr ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
     parts.push(normalizeDepToken(raw));

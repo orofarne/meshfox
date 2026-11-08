@@ -1218,7 +1218,9 @@ pub fn fingerprint(block: &CodeBlock) -> String {
         &block.env
     };
     for env in env_refs {
-        parts.push(format!("{}\u{0}{}", env.local_name, env.var_name));
+        // `source_text` adds `|format` only when one is given, so a block
+        // without a format keeps the exact hash it always had.
+        parts.push(format!("{}\u{0}{}", env.local_name, env.source_text()));
     }
     for dep in &block.deps {
         parts.push(dep.render());
@@ -1989,6 +1991,25 @@ mod tests {
     fn unknown_fence_attr_is_none_for_known_attributes_only() {
         let md = "```bash name=\"build\" cache deps=\"other\"\ncargo build\n```\n";
         assert_eq!(unknown_fence_attr(md), None);
+    }
+
+    // `web/src/fence.ts`'s `fingerprint` must hash env formats exactly like
+    // this (see `web/scripts/block-details.test.mjs`, same constants).
+    #[test]
+    fn env_format_is_part_of_the_fingerprint() {
+        let block = |env: &str| {
+            let md = format!("```bash name=\"b\" env=\"{env}\"\nx\n```\n");
+            scan_code_blocks(&md).remove(0)
+        };
+        let plain = fingerprint(&block("IDS"));
+        let space = fingerprint(&block("IDS|space"));
+        let pg = fingerprint(&block("L=IDS|pg"));
+        assert_ne!(plain, space);
+        assert_ne!(space, pg);
+        // Fixed vectors, shared with the TypeScript port.
+        assert_eq!(plain, "8124c0c5");
+        assert_eq!(space, "555eb9b7");
+        assert_eq!(pg, "01cf924c");
     }
 
     #[test]

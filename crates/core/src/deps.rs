@@ -246,6 +246,32 @@ pub fn application_ref(
     values: &HashMap<String, String>,
     decls: &[VarDecl],
 ) -> Result<Option<BlockAddr>, DepsError> {
+    let app = crate::args::Application::parse(&resolve_ref(node_id, dep).block_name)
+        .map_err(DepsError::Arguments)?;
+    if app.has_spread() {
+        return Err(DepsError::Arguments(format!(
+            "{:?}: `name=*$LIST` fans out a deps= edge; lease= and defer= take a single application",
+            dep.block_name
+        )));
+    }
+    Ok(
+        application_refs(canvas, node_id, owner, dep, values, decls)?
+            .into_iter()
+            .next(),
+    )
+}
+
+/// Like [`application_ref`], for an edge that may fan out (`name=*$LIST`):
+/// every application the entry names for these values — empty when the edge
+/// is inactive, still pending, or spreads an empty list.
+pub fn application_refs(
+    canvas: &Canvas,
+    node_id: &str,
+    owner: &crate::fence::CodeBlock,
+    dep: &BlockRef,
+    values: &HashMap<String, String>,
+    decls: &[VarDecl],
+) -> Result<Vec<BlockAddr>, DepsError> {
     let mut scope = canvas.artifact_values.clone();
     scope.extend(values.clone());
     scope.extend(owner.arguments.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -259,10 +285,10 @@ pub fn application_ref(
         // static views and cycle checks see the superset.
         if !condition_allows(condition, &scope, decls) {
             validate_dep_condition(canvas, node_id, owner, dep, decls)?;
-            return Ok(None);
+            return Ok(Vec::new());
         }
     }
-    bind_ref(canvas, node_id, owner, dep, &scope, decls)
+    bind_refs(canvas, node_id, owner, dep, &scope, decls)
 }
 
 /// Whether `condition` lets its edge exist for the values in `scope`. A value
@@ -281,31 +307,70 @@ fn condition_allows(
     }
 }
 
-/// The dependency a `deps=` entry names for the given scope, ignoring its
-/// condition. `None` while an argument binding still waits for a computed value.
-fn bind_ref(
+/// The dependencies a `deps=` entry names for the given scope, ignoring its
+/// condition: one for an ordinary entry, one per element for a `name=*$LIST`
+/// spread, none while an argument binding or a spread list still waits for a
+/// computed value (or when a spread list is empty).
+fn bind_refs(
     canvas: &Canvas,
     node_id: &str,
     owner: &crate::fence::CodeBlock,
     dep: &BlockRef,
     scope: &HashMap<String, String>,
     decls: &[VarDecl],
-) -> Result<Option<BlockAddr>, DepsError> {
+) -> Result<Vec<BlockAddr>, DepsError> {
     let addr = resolve_ref(node_id, dep);
     let app = crate::args::Application::parse(&addr.block_name).map_err(DepsError::Arguments)?;
-    if app.bindings.values().any(|binding| match binding {
-        crate::args::Binding::Reference(name) => {
-            !scope.contains_key(name)
-                && decls
-                    .iter()
-                    .any(|decl| decl.name == *name && decl.from.is_some())
+    let pending = |name: &str| {
+        !scope.contains_key(name)
+            && decls
+                .iter()
+                .any(|decl| decl.name == name && decl.from.is_some())
+    };
+    if app.has_spread() {
+        // Schema validation catches unknown arguments, a spread over
+        // something that is not a list, and mismatched item types.
+        validate_application_ref(canvas, node_id, owner, dep, decls)?;
+        let expanded = app.expand(scope).map_err(DepsError::Arguments)?;
+        let Some(expanded) = expanded else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for app in expanded {
+            if let Some(bound) = bind_application(canvas, &addr.node_id, &app, scope, &pending)? {
+                out.push(bound);
+            }
         }
+        return Ok(out);
+    }
+    if app.bindings.values().any(|binding| match binding {
+        crate::args::Binding::Reference(name) => pending(name),
         _ => false,
     }) {
         // Schema validation still catches unknown/missing arguments and bad literals.
         validate_application_ref(canvas, node_id, owner, dep, decls)?;
+        return Ok(Vec::new());
+    }
+    let bound = find_block_with_values(canvas, &addr, scope)?;
+    Ok(vec![BlockAddr::new(addr.node_id, bound.name.unwrap())])
+}
+
+/// Binds one concrete (spread-free) application, `None` while it still waits
+/// for a computed value.
+fn bind_application(
+    canvas: &Canvas,
+    node_id: &str,
+    app: &crate::args::Application,
+    scope: &HashMap<String, String>,
+    pending: &dyn Fn(&str) -> bool,
+) -> Result<Option<BlockAddr>, DepsError> {
+    if app.bindings.values().any(|binding| match binding {
+        crate::args::Binding::Reference(name) => pending(name),
+        _ => false,
+    }) {
         return Ok(None);
     }
+    let addr = BlockAddr::new(node_id, app.render());
     let bound = find_block_with_values(canvas, &addr, scope)?;
     Ok(Some(BlockAddr::new(addr.node_id, bound.name.unwrap())))
 }
@@ -337,13 +402,12 @@ pub(crate) fn gated_targets(
             Some(condition) => condition_allows(condition, &scope, decls),
             None => true,
         };
-        let Some(target) = bind_ref(canvas, node_id, owner, dep, &scope, decls)? else {
-            continue;
-        };
-        if allowed {
-            on.insert(target);
-        } else {
-            off.insert(target);
+        for target in bind_refs(canvas, node_id, owner, dep, &scope, decls)? {
+            if allowed {
+                on.insert(target);
+            } else {
+                off.insert(target);
+            }
         }
     }
     Ok(off.difference(&on).cloned().collect())
@@ -568,6 +632,38 @@ fn validate_application_ref(
                         owner.name.as_deref().unwrap_or("")
                     )));
                 }
+                if let Some(decl) = decls.iter().find(|decl| decl.name == *name) {
+                    if decl.var_type == crate::vars::VarType::List && !local.contains(name) {
+                        return Err(DepsError::Arguments(format!(
+                            "argument {} is bound to the list ${name}; write {}=*${name} to run one application per element",
+                            arg.name, arg.name
+                        )));
+                    }
+                }
+            }
+            crate::args::Binding::Spread(list) => {
+                let Some(decl) = decls.iter().find(|decl| decl.name == *list) else {
+                    return Err(DepsError::Arguments(format!(
+                        "unknown list *${list} in {node_id}/{}",
+                        owner.name.as_deref().unwrap_or("")
+                    )));
+                };
+                if decl.var_type != crate::vars::VarType::List {
+                    return Err(DepsError::Arguments(format!(
+                        "*${list} spreads a list, but {list:?} is type={}",
+                        decl.var_type.as_str()
+                    )));
+                }
+                if let Some(item) = decl.of {
+                    if arg.var_type != crate::vars::VarType::String && item != arg.var_type {
+                        return Err(DepsError::Arguments(format!(
+                            "argument {:?} is type={}, but *${list} holds {} elements",
+                            arg.name,
+                            arg.var_type.as_str(),
+                            item.as_str()
+                        )));
+                    }
+                }
             }
         }
     }
@@ -696,16 +792,14 @@ fn visit(
     dep_addrs.extend(crate::artifacts::producer_deps(canvas, &addr, &block)?);
     if follow_deps {
         for dep in &block.dependencies() {
-            if let Some(dep) = application_ref(
+            dep_addrs.extend(application_refs(
                 canvas,
                 &addr.node_id,
                 &block,
                 dep,
                 &canvas.artifact_values,
                 decls,
-            )? {
-                dep_addrs.push(dep);
-            }
+            )?);
         }
     }
 
@@ -851,9 +945,7 @@ pub fn compute_forced_reruns_planned(
         let mut cascaded = false;
         let mut edges = Vec::new();
         for dep in &block.dependencies() {
-            if let Some(resolved) =
-                application_ref(canvas, &addr.node_id, &block, dep, &values, &decls)?
-            {
+            for resolved in application_refs(canvas, &addr.node_id, &block, dep, &values, &decls)? {
                 cascaded |= forced.contains(&resolved);
                 edges.push((resolved, dep.sync));
             }
@@ -969,9 +1061,14 @@ pub fn closure_fingerprint_with(
         check_expansion(stack.len(), memo.len() + stack.len())?;
         let mut deps = Vec::new();
         for dep in &block.dependencies() {
-            if let Some(dep) = application_ref(canvas, &addr.node_id, &block, dep, values, decls)? {
-                deps.push(dep);
-            }
+            deps.extend(application_refs(
+                canvas,
+                &addr.node_id,
+                &block,
+                dep,
+                values,
+                decls,
+            )?);
         }
         deps.sort_by_key(BlockAddr::key);
         deps.dedup();
@@ -2800,6 +2897,155 @@ echo target
             compute_forced_reruns_after(&canvas, &chain, |_, _| HashMap::new(), cache, &executed)
                 .unwrap();
         assert!(forced.contains(&BlockAddr::new("root", "extract[lang=hy]")));
+    }
+
+    const SPREAD: &str = r#"<!-- meshfox:var name="PAGES" type="list" of="int" -->
+```bash name="pick"
+echo pick
+```
+<!-- meshfox:arg name="page" type="int" -->
+<!-- meshfox:arg name="side" type="select" choices="l,r" default="l" -->
+```bash name="cut" deps="pick"
+echo cut
+```
+```bash name="merge" deps='cut[page=*$PAGES]'
+echo merge
+```"#;
+
+    fn with_pages(extra: &str, pages: Option<&str>) -> Canvas {
+        let mut canvas = doc(&format!("{SPREAD}\n{extra}"));
+        if let Some(pages) = pages {
+            canvas.artifact_values.insert("PAGES".into(), pages.into());
+        }
+        canvas
+    }
+
+    #[test]
+    fn a_spread_edge_fans_out_one_application_per_element() {
+        let canvas = with_pages("", Some(r#"["3","1","2","1"]"#));
+        validate(&canvas).unwrap();
+        let chain = resolve_chain(&canvas, BlockAddr::new("root", "merge")).unwrap();
+        // Elements keep their order, repeats collapse into one application,
+        // and the shared dependency runs once.
+        assert_eq!(
+            names(&chain),
+            [
+                "pick",
+                "cut[page=3,side=l]",
+                "cut[page=1,side=l]",
+                "cut[page=2,side=l]",
+                "merge"
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_accepts_a_spread_over_a_list_with_no_known_value() {
+        // `meshfox validate` has no resolved values: it must neither fail nor
+        // invent elements.
+        let canvas = with_pages("", None);
+        validate(&canvas).unwrap();
+    }
+
+    #[test]
+    fn an_empty_list_removes_the_edge() {
+        let canvas = with_pages("", Some("[]"));
+        let chain = resolve_chain(&canvas, BlockAddr::new("root", "merge")).unwrap();
+        assert_eq!(names(&chain), ["merge"]);
+    }
+
+    #[test]
+    fn several_spreads_make_a_cartesian_product() {
+        let canvas = with_pages(
+            r#"<!-- meshfox:var name="SIDES" type="list" -->
+```bash name="both" deps='cut[page=*$PAGES,side=*$SIDES]'
+echo both
+```"#,
+            Some(r#"["1","2"]"#),
+        );
+        let mut canvas = canvas;
+        canvas
+            .artifact_values
+            .insert("SIDES".into(), r#"["l","r"]"#.into());
+        let chain = resolve_chain(&canvas, BlockAddr::new("root", "both")).unwrap();
+        assert_eq!(
+            names(&chain),
+            [
+                "pick",
+                "cut[page=1,side=l]",
+                "cut[page=1,side=r]",
+                "cut[page=2,side=l]",
+                "cut[page=2,side=r]",
+                "both"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_computed_list_keeps_the_edge_pending_until_observed() {
+        let mut canvas = doc(&format!(
+            r#"<!-- meshfox:var name="PAGES" type="list" from="listing" -->
+```bash name="listing"
+echo 'PAGES[]=1' >> "$MESHFOX_VARS_OUT"
+```
+<!-- meshfox:arg name="page" type="int" -->
+```bash name="cut"
+echo cut
+```
+```bash name="merge" deps='cut[page=*$PAGES]'
+echo merge
+```{}"#,
+            ""
+        ));
+        validate(&canvas).unwrap();
+        let merge = BlockAddr::new("root", "merge");
+        assert_eq!(
+            names(&resolve_chain(&canvas, merge.clone()).unwrap()),
+            ["listing", "merge"]
+        );
+        canvas
+            .artifact_values
+            .insert("PAGES".into(), r#"["1","2"]"#.into());
+        assert_eq!(
+            names(&resolve_chain(&canvas, merge).unwrap()),
+            ["listing", "cut[page=1]", "cut[page=2]", "merge"]
+        );
+    }
+
+    #[test]
+    fn spreading_something_that_is_not_a_list_is_an_error() {
+        let canvas = doc(r#"<!-- meshfox:var name="ONE" -->
+<!-- meshfox:arg name="n2" type="int" -->
+```bash name="t" deps='download[n=*$ONE]'
+echo t
+```"#);
+        let err = validate(&canvas).unwrap_err().to_string();
+        assert!(err.contains("spreads a list"), "{err}");
+    }
+
+    #[test]
+    fn binding_a_list_without_a_star_is_an_error_that_says_what_to_write() {
+        let canvas = doc(r#"<!-- meshfox:var name="PAGES" type="list" -->
+```bash name="t" deps='download[n=$PAGES]'
+echo t
+```"#);
+        let err = validate(&canvas).unwrap_err().to_string();
+        assert!(err.contains("n=*$PAGES"), "{err}");
+    }
+
+    #[test]
+    fn a_spread_needs_a_declared_list_and_matching_item_types() {
+        let undeclared = doc("```bash name=\"t\" deps='download[n=*$NOPE]'\necho t\n```");
+        assert!(validate(&undeclared)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown list"));
+        let mismatch = doc(r#"<!-- meshfox:var name="WORDS" type="list" of="bool" -->
+```bash name="t" deps='download[n=*$WORDS]'
+echo t
+```"#);
+        let err = validate(&mismatch).unwrap_err().to_string();
+        assert!(err.contains("bool"), "{err}");
     }
 
     #[test]

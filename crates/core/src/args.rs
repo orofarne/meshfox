@@ -223,6 +223,12 @@ pub fn validate(canvas: &Canvas) -> Result<(), ArgsError> {
 pub enum Binding {
     Literal(String),
     Reference(String),
+    /// `name=*$LIST` — fans the edge out over the elements of the `list`
+    /// variable `LIST`: one application per element (several spreads in one
+    /// application give their cartesian product; an empty list gives none).
+    /// Only meaningful in a `deps=` edge, where it is expanded before the
+    /// application is bound (see [`Application::expand`]).
+    Spread(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +262,21 @@ impl Application {
             if !identifier(name) {
                 return Err(format!("invalid argument name {name:?}"));
             }
-            let binding = if value.starts_with('"') {
+            let binding = if let Some(list) = value.strip_prefix('*').filter(|v| v.starts_with('$'))
+            {
+                let list = &list[1..];
+                let list = if list.starts_with('{') {
+                    list.strip_prefix('{')
+                        .and_then(|s| s.strip_suffix('}'))
+                        .ok_or("invalid list reference")?
+                } else {
+                    list
+                };
+                if !identifier(list) {
+                    return Err("invalid list reference".into());
+                }
+                Binding::Spread(list.into())
+            } else if value.starts_with('"') {
                 Binding::Literal(
                     serde_json::from_str::<String>(value)
                         .map_err(|e| format!("invalid argument string: {e}"))?,
@@ -292,6 +312,104 @@ impl Application {
             definition: definition.into(),
             bindings,
         })
+    }
+}
+
+/// The most applications one spread edge may expand to (the graph-wide limit
+/// in `deps.rs` applies on top).
+const MAX_SPREAD: usize = 4096;
+
+impl Application {
+    /// The address text of this application, with literal values quoted only
+    /// when they have to be and references/spreads written as in a `deps=`.
+    pub fn render(&self) -> String {
+        if self.bindings.is_empty() {
+            return self.definition.clone();
+        }
+        let entries: Vec<String> = self
+            .bindings
+            .iter()
+            .map(|(name, binding)| match binding {
+                Binding::Literal(value) => {
+                    let literal = if !value.is_empty()
+                        && !value
+                            .chars()
+                            .any(|c| c.is_whitespace() || ",[]=!$\"\\".contains(c))
+                    {
+                        value.clone()
+                    } else {
+                        serde_json::to_string(value).expect("string encoding")
+                    };
+                    format!("{name}={literal}")
+                }
+                Binding::Reference(var) => format!("{name}=${var}"),
+                Binding::Spread(var) => format!("{name}=*${var}"),
+            })
+            .collect();
+        format!("{}[{}]", self.definition, entries.join(","))
+    }
+
+    pub fn has_spread(&self) -> bool {
+        self.bindings
+            .values()
+            .any(|b| matches!(b, Binding::Spread(_)))
+    }
+
+    /// Expands every `name=*$LIST` binding into literal bindings, one
+    /// application per element (cartesian product across several spreads, in
+    /// binding-name then list order; repeated elements collapse). `Ok(None)`
+    /// means a list has no value yet — a computed variable not observed, or a
+    /// static check with no resolved values at all: the edge stays pending
+    /// (a real run resolves every non-computed variable before planning, and
+    /// the runner replans after each observation). An empty list expands to
+    /// no applications.
+    pub fn expand(
+        &self,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<Option<Vec<Application>>, String> {
+        let mut combos: Vec<std::collections::BTreeMap<String, Binding>> = vec![Default::default()];
+        for (name, binding) in &self.bindings {
+            match binding {
+                Binding::Spread(list) => {
+                    let Some(raw) = values.get(list) else {
+                        return Ok(None);
+                    };
+                    let items = crate::listvars::parse_list(raw)
+                        .map_err(|e| format!("the list ${list} {e}"))?;
+                    if combos.len().saturating_mul(items.len()) > MAX_SPREAD {
+                        return Err(format!(
+                            "spreading ${list} would create more than {MAX_SPREAD} applications"
+                        ));
+                    }
+                    let mut next = Vec::with_capacity(combos.len() * items.len());
+                    for combo in &combos {
+                        for item in &items {
+                            let mut c = combo.clone();
+                            c.insert(name.clone(), Binding::Literal(item.clone()));
+                            next.push(c);
+                        }
+                    }
+                    combos = next;
+                }
+                other => {
+                    for combo in &mut combos {
+                        combo.insert(name.clone(), other.clone());
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for bindings in combos {
+            let app = Application {
+                definition: self.definition.clone(),
+                bindings,
+            };
+            if seen.insert(app.render()) {
+                out.push(app);
+            }
+        }
+        Ok(Some(out))
     }
 }
 
@@ -360,7 +478,7 @@ pub fn dependency_refs(block: &CodeBlock) -> Vec<String> {
         .filter_map(|dep| Application::parse(&dep.block_name).ok())
         .flat_map(|app| app.bindings.into_values())
         .filter_map(|binding| match binding {
-            Binding::Reference(name) => Some(name),
+            Binding::Reference(name) | Binding::Spread(name) => Some(name),
             Binding::Literal(_) => None,
         })
         .chain(conditions)
@@ -549,6 +667,12 @@ fn bind_in(
                 .get(name)
                 .cloned()
                 .ok_or_else(|| format!("unresolved argument reference ${name}"))?,
+            Some(Binding::Spread(name)) => {
+                return Err(format!(
+                "argument {:?} is bound to the list *${name}, which only a deps= edge can spread",
+                arg.name
+            ))
+            }
             None if !arg.is_required() => arg.default.clone().unwrap(),
             None => {
                 return Err(format!(
@@ -695,6 +819,12 @@ fn prepare_in(
                     .cloned()
                     .ok_or_else(|| format!("unresolved argument reference ${name}"))?,
             ),
+            Some(Binding::Spread(name)) => {
+                return Err(format!(
+                "argument {:?} is bound to the list *${name}, which only a deps= edge can spread",
+                arg.name
+            ))
+            }
             None => None,
         };
         let resolved = value.is_some() || !arg.is_required();

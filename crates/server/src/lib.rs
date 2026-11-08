@@ -17199,6 +17199,94 @@ mod run_block_ws_tests {
         let _ = std::fs::remove_file(&canvas_path);
     }
 
+    /// Map and reduce over a computed list: the producer's `PAGES[]=` lines are
+    /// observed mid-run, the `cut[page=*$PAGES]` edge fans out into one
+    /// application per element, and the reducer reads the list in its own
+    /// format.
+    #[tokio::test]
+    async fn a_spread_edge_fans_out_over_a_list_observed_during_the_run() {
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-spread-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canvas_path = dir.join("doc.canvas.md");
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"PAGES\" type=\"list\" of=\"int\" from=\"root/listing\" -->\n\n",
+                "```bash name=\"listing\"\n",
+                "for p in 3 1 2; do echo \"PAGES[]=$p\" >> \"$MESHFOX_VARS_OUT\"; done\n```\n\n",
+                "<!-- meshfox:arg name=\"page\" type=\"int\" -->\n",
+                "```bash name=\"cut\"\necho \"cut $page\" >> cuts.txt\n```\n\n",
+                "```bash name=\"merge\" deps='cut[page=*$PAGES]' env=\"PAGES|space\"\n",
+                "echo \"merge $PAGES\"\n```\n",
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let events = run_ws_events(addr, "block=merge&persist=false").await;
+        assert_eq!(events.last().unwrap()["exitCode"], 0, "{events:?}");
+        let started: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "step-start")
+            .filter_map(|e| e["block"].as_str())
+            .collect();
+        assert_eq!(
+            started,
+            [
+                "listing",
+                "cut[page=3]",
+                "cut[page=1]",
+                "cut[page=2]",
+                "merge"
+            ],
+            "{events:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|e| e["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("merge 3 1 2"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cuts.txt")).unwrap(),
+            "cut 3\ncut 1\ncut 2\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty list means the edge disappears: the consumer still runs.
+    #[tokio::test]
+    async fn an_empty_list_runs_the_consumer_without_any_fan_out() {
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-spread-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let canvas_path = dir.join("doc.canvas.md");
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"PAGES\" type=\"list\" from=\"root/listing\" -->\n\n",
+                "```bash name=\"listing\"\necho 'PAGES=[]' >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+                "<!-- meshfox:arg name=\"page\" -->\n",
+                "```bash name=\"cut\"\necho cut >> cuts.txt\n```\n\n",
+                "```bash name=\"merge\" deps='cut[page=*$PAGES]'\necho merged\n```\n",
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let events = run_ws_events(addr, "block=merge&persist=false").await;
+        assert_eq!(events.last().unwrap()["exitCode"], 0, "{events:?}");
+        let started: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "step-start")
+            .filter_map(|e| e["block"].as_str())
+            .collect();
+        assert_eq!(started, ["listing", "merge"], "{events:?}");
+        assert!(!dir.join("cuts.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Not include-specific — just reuses this module's own `post_json`/
     /// `ndjson_events` helpers. Each `"output"` `RunEvent` over `/api/run`'s
     /// NDJSON stream now carries a `stream` field (`stream_exec::OutputStream`,
