@@ -76,7 +76,11 @@ async fn show(mcp: &Client) -> String {
     .await
     .unwrap();
     assert!(!is_error, "{result}");
-    result["steps"][0]["output"].as_str().unwrap().trim().to_string()
+    result["steps"][0]["output"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .to_string()
 }
 
 #[tokio::test]
@@ -112,10 +116,24 @@ async fn form_submit_commits_values_and_starts_autorun_and_form_reset_undoes_it(
         .iter()
         .map(|r| r["block"].as_str().unwrap())
         .collect();
-    assert!(blocks.contains(&"log") && blocks.contains(&"maybe-fail"), "{sent}");
-    assert!(sent["autorun"].as_array().unwrap().iter().all(|r| r["exit_code"] == 0), "{sent}");
+    assert!(
+        blocks.contains(&"log") && blocks.contains(&"maybe-fail"),
+        "{sent}"
+    );
+    assert!(
+        sent["autorun"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["exit_code"] == 0),
+        "{sent}"
+    );
     assert_eq!(autorun_lines(&dir), vec!["hello"]);
-    assert_eq!(show(&mcp).await, "N=hello", "the submitted value is the session's");
+    assert_eq!(
+        show(&mcp).await,
+        "N=hello",
+        "the submitted value is the session's"
+    );
 
     let (is_error, reset) = call(
         &mcp,
@@ -207,15 +225,26 @@ fn cli_form_submit_waits_for_the_autorun_blocks_prints_their_output_and_fails_wi
 
     let ok = submit("hi", &[]);
     let stdout = String::from_utf8_lossy(&ok.stdout);
-    assert!(ok.status.success(), "{stdout}{}", String::from_utf8_lossy(&ok.stderr));
+    assert!(
+        ok.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
     assert!(stdout.contains("== root/log: ok"), "{stdout}");
-    assert_eq!(autorun_lines(&dir), vec!["hi"], "the block finished before the CLI returned");
+    assert_eq!(
+        autorun_lines(&dir),
+        vec!["hi"],
+        "the block finished before the CLI returned"
+    );
 
     let bad = submit("boom", &[]);
     let stdout = String::from_utf8_lossy(&bad.stdout);
     assert_eq!(bad.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("== root/maybe-fail: exit 3"), "{stdout}");
-    assert!(stdout.contains("bad"), "the failing block's output is shown: {stdout}");
+    assert!(
+        stdout.contains("bad"),
+        "the failing block's output is shown: {stdout}"
+    );
 
     let detached = submit("later", &["--no-wait"]);
     let stdout = String::from_utf8_lossy(&detached.stdout);

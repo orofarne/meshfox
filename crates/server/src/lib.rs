@@ -19077,7 +19077,11 @@ mod vars_endpoint_tests {
         let addr = spawn_test_server(canvas_path.clone()).await;
         let (_, body) = get(addr, "/api/vars/configure").await;
         let statuses: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
-        assert_eq!(statuses[0]["choices"], serde_json::json!(["x", "y"]), "{body}");
+        assert_eq!(
+            statuses[0]["choices"],
+            serde_json::json!(["x", "y"]),
+            "{body}"
+        );
         assert!(statuses[0].get("choicesPending").is_none(), "{body}");
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));

@@ -3814,7 +3814,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let inherited = std::collections::HashMap::from([("t".to_string(), "python3 -u".to_string())]);
+        let inherited =
+            std::collections::HashMap::from([("t".to_string(), "python3 -u".to_string())]);
         assert!(header(&inherited).contains("#!python3 -u"));
         assert!(!header(&Default::default()).contains("#!"));
     }
@@ -3842,7 +3843,10 @@ mod tests {
             .map(|line| line.to_string())
             .collect();
         assert!(text.iter().any(|l| l.contains("extends: defs")), "{text:?}");
-        assert!(text.iter().any(|l| l.contains("extends: lib/more")), "{text:?}");
+        assert!(
+            text.iter().any(|l| l.contains("extends: lib/more")),
+            "{text:?}"
+        );
         let jumps = clicks
             .iter()
             .filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. }))

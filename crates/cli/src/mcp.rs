@@ -1448,8 +1448,7 @@ impl CanvasCtx {
     /// Sends a `form` fence the way its Send button does: commits the given values into the session and starts every `autorun` block they reach (in the worker). Waits for those blocks (unless `wait: false`) and returns each one's exit code and output tail, with an overall `success` flag. Unlike `run` with `vars`, this changes what the form shows and what later runs see. Refused while a foreground run is in progress. Not for `secret` fields.
     async fn form_submit(&self, params: FormSubmitParams) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
-        let values: std::collections::HashMap<String, String> =
-            params.values.into_iter().collect();
+        let values: std::collections::HashMap<String, String> = params.values.into_iter().collect();
         let triggered =
             crate::worker_client::submit_form(port, &params.node_id, &params.block, values)
                 .await

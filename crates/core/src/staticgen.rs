@@ -487,7 +487,7 @@ pub fn build_document_for_static_export(
         block_attrs: Default::default(),
         target_digest: None,
         block_fingerprint: None,
-            extended: Default::default(),
+        extended: Default::default(),
     };
     let canvas = Canvas {
         nodes: vec![node],

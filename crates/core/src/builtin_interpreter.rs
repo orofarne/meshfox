@@ -838,14 +838,22 @@ mod tests {
         let cfg = |s: &str| -> toml::Table { s.parse().unwrap() };
         let a = cfg("[interpreters.agent]\nprovider='custom'\ncommand='a \"$1\"'\n");
         let b = cfg("[interpreters.agent]\nprovider='custom'\ncommand='b \"$1\"'\n");
-        let t = cfg(
-            "[interpreters.agent]\nprovider='custom'\ncommand='a \"$1\"'\ntty_command='x'\n",
+        let t =
+            cfg("[interpreters.agent]\nprovider='custom'\ncommand='a \"$1\"'\ntty_command='x'\n");
+        assert_ne!(
+            execution_identity("@agent", &a),
+            execution_identity("@agent", &b)
         );
-        assert_ne!(execution_identity("@agent", &a), execution_identity("@agent", &b));
-        assert_ne!(execution_identity("@agent", &a), execution_identity("@agent", &t));
+        assert_ne!(
+            execution_identity("@agent", &a),
+            execution_identity("@agent", &t)
+        );
         let c1 = cfg("[interpreters.agent]\nprovider='codex'\ncommand='a'\n");
         let c2 = cfg("[interpreters.agent]\nprovider='codex'\ncommand='b'\n");
-        assert_eq!(execution_identity("@agent", &c1), execution_identity("@agent", &c2));
+        assert_eq!(
+            execution_identity("@agent", &c1),
+            execution_identity("@agent", &c2)
+        );
     }
 
     #[test]
@@ -869,7 +877,10 @@ mod tests {
         let ok = run(Some("printf '%s|%s' \"$1\" \"$MESHFOX_PROMPT\""));
         assert!(ok.status.success());
         let want = "hi $(touch NO) \"q\" 'x'";
-        assert_eq!(String::from_utf8_lossy(&ok.stdout), format!("{want}|{want}"));
+        assert_eq!(
+            String::from_utf8_lossy(&ok.stdout),
+            format!("{want}|{want}")
+        );
         assert!(!dir.join("NO").exists());
         let missing = run(None);
         assert!(!missing.status.success());

@@ -11065,8 +11065,15 @@ mod tests {
         // `c`: returns at once, then the form opens with the computed choices.
         let started = std::time::Instant::now();
         app.on_key(key(KeyCode::Char('c'))).await;
-        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the key blocked");
-        assert!(app.status.contains("listing variables"), "status: {}", app.status);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the key blocked"
+        );
+        assert!(
+            app.status.contains("listing variables"),
+            "status: {}",
+            app.status
+        );
         assert!(app.busy_checking.is_some() && app.spinner_active());
         assert!(app.var_form.is_none());
         // a second `c` while waiting starts nothing new
@@ -11085,8 +11092,15 @@ mod tests {
         // a run: the same, and the unanswered select is asked for.
         let started = std::time::Instant::now();
         app.start_run("root".into(), "use".into(), true).await;
-        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the run start blocked");
-        assert!(app.status.contains("checking variables"), "status: {}", app.status);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "the run start blocked"
+        );
+        assert!(
+            app.status.contains("checking variables"),
+            "status: {}",
+            app.status
+        );
         assert!(app.busy_checking.is_some());
         let msg = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
             .await
@@ -11094,7 +11108,10 @@ mod tests {
             .unwrap();
         app.on_slow_background_msg(msg).await;
         assert!(app.busy_checking.is_none());
-        let form = app.var_form.as_ref().expect("the unanswered select is asked for");
+        let form = app
+            .var_form
+            .as_ref()
+            .expect("the unanswered select is asked for");
         assert_eq!(form.decls[0].choices, ["a", "b"]);
         assert!(app.pending_http_run.is_some());
         let _ = std::fs::remove_dir_all(&dir);
