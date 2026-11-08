@@ -1108,7 +1108,8 @@ fn coerce_field_input(decl: &VarDecl, suggestion: Option<&str>) -> String {
         | VarType::Dir
         | VarType::File
         | VarType::Date
-        | VarType::DateTime => suggestion.map(str::to_string).unwrap_or_default(),
+        | VarType::DateTime
+        | VarType::List => suggestion.map(str::to_string).unwrap_or_default(),
     }
 }
 
@@ -1139,6 +1140,7 @@ fn normalize_date_inputs(decls: &[VarDecl], inputs: &mut [String]) {
 fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
     let var_type = VarType::parse(&status.var_type).unwrap_or(VarType::String);
     VarDecl {
+        of: None,
         name: status.name.clone(),
         var_type,
         prompt: status.prompt.clone(),
@@ -2321,7 +2323,8 @@ impl App {
                         | VarType::Dir
                         | VarType::File
                         | VarType::Date
-                        | VarType::DateTime => true,
+                        | VarType::DateTime
+                        | VarType::List => true,
                         // A leading `+`/`-` (once, only as the very first
                         // character — same grammar `i64::from_str` itself
                         // accepts, see `meshfox_core::validate_value`)
@@ -2381,7 +2384,8 @@ impl App {
             | VarType::Dir
             | VarType::File
             | VarType::Date
-            | VarType::DateTime => {}
+            | VarType::DateTime
+            | VarType::List => {}
         }
     }
 
@@ -2655,7 +2659,8 @@ impl App {
                             | VarType::Dir
                             | VarType::File
                             | VarType::Date
-                            | VarType::DateTime => true,
+                            | VarType::DateTime
+                            | VarType::List => true,
                             VarType::Int => {
                                 c.is_ascii_digit()
                                     || ((c == '-' || c == '+') && form.inputs[i].is_empty())
@@ -2713,7 +2718,8 @@ impl App {
             | VarType::Dir
             | VarType::File
             | VarType::Date
-            | VarType::DateTime => {}
+            | VarType::DateTime
+            | VarType::List => {}
         }
     }
 
@@ -12055,6 +12061,7 @@ mod tests {
     #[test]
     fn typed_dates_are_normalized_before_validation() {
         let decl = |name: &str, var_type| VarDecl {
+            of: None,
             name: name.into(),
             var_type,
             prompt: name.into(),

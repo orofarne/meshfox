@@ -32,6 +32,11 @@ pub enum VarType {
     Date,
     /// An instant, RFC3339 with an offset (`2026-10-25T14:30:00+03:00`).
     DateTime,
+    /// An ordered list of strings (SPEC.md, "List variables"). Stored as a
+    /// JSON array; how it reads in a block's environment is chosen by the
+    /// consumer (`env="NAME|format"`), never by the variable. `of=` types the
+    /// items.
+    List,
 }
 
 /// `mode=` of a `type="file"` variable.
@@ -72,6 +77,7 @@ impl VarType {
             "file" => Some(VarType::File),
             "date" => Some(VarType::Date),
             "datetime" => Some(VarType::DateTime),
+            "list" => Some(VarType::List),
             _ => None,
         }
     }
@@ -86,6 +92,7 @@ impl VarType {
             VarType::File => "file",
             VarType::Date => "date",
             VarType::DateTime => "datetime",
+            VarType::List => "list",
         }
     }
 }
@@ -164,6 +171,9 @@ pub struct VarDecl {
     /// leading dot). Never validated against a value. Only meaningful for
     /// `type="file"`.
     pub ext: Vec<String>,
+    /// `of="int"` — the item type of a `type="list"` variable (`None` means
+    /// plain strings). Only `Some` for a list.
+    pub of: Option<VarType>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -172,12 +182,22 @@ pub enum VarsError {
     EnvNameTemplate(String, String, String),
     #[error("a meshfox:var comment is missing its required name= attribute")]
     MissingName,
-    #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, select, dir, file, date, or datetime)")]
+    #[error("meshfox:var {0:?} has unknown type={1:?} (expected string, int, bool, select, dir, file, date, datetime, or list)")]
     UnknownType(String, String),
     #[error("meshfox:var {0:?} has mode= or ext= but type={1:?} (expected file)")]
     FileAttrRequiresFile(String, String),
     #[error("meshfox:var {0:?} has unknown mode={1:?} (expected open or save)")]
     UnknownFileMode(String, String),
+    #[error("meshfox:var {0:?} has of= but type={1:?} (expected list)")]
+    OfRequiresList(String, String),
+    #[error("meshfox:var {0:?} has unknown of={1:?} (expected string, int, bool, dir, file, date, or datetime)")]
+    UnknownListItemType(String, String),
+    #[error("meshfox:var {0:?}: a list can't be secret")]
+    ListSecret(String),
+    #[error("node {0:?} block {1:?}: unknown env format |{2} (expected one of {})", crate::listvars::ListFormat::NAMES.join(", "))]
+    UnknownEnvFormat(String, String, String),
+    #[error("node {0:?} block {1:?}: env=\"{2}|{3}\" — a format only applies to a `list` variable, and {2:?} is {4}")]
+    EnvFormatOnNonList(String, String, String, String, String),
     #[error("meshfox:var {0:?} has type=select but no choices= attribute")]
     SelectMissingChoices(String),
     #[error("duplicate meshfox:var name {0:?}")]
@@ -278,6 +298,7 @@ const VAR_ATTRS: &[&str] = &[
     "from",
     "mode",
     "ext",
+    "of",
 ];
 
 pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, VarsError> {
@@ -331,7 +352,23 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         ));
     }
     let file_mode = (var_type == VarType::File).then(|| file_mode.unwrap_or(FileMode::Open));
+    let of = match attrs.get("of") {
+        None => None,
+        Some(_) if var_type != VarType::List => {
+            return Err(VarsError::OfRequiresList(
+                name,
+                var_type.as_str().to_string(),
+            ))
+        }
+        Some(t) => match VarType::parse(t) {
+            Some(item) if !matches!(item, VarType::List | VarType::Select) => Some(item),
+            _ => return Err(VarsError::UnknownListItemType(name, t.clone())),
+        },
+    };
     let secret = attrs.get("secret").map(|v| v != "false").unwrap_or(false);
+    if secret && var_type == VarType::List {
+        return Err(VarsError::ListSecret(name));
+    }
     let required = attrs.get("required").map(|v| v != "false").unwrap_or(false);
     let session = attrs.get("session").map(|v| v != "false").unwrap_or(false);
     let prompt = attrs.get("prompt").cloned().unwrap_or_else(|| name.clone());
@@ -372,6 +409,7 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         }
     }
     Ok(VarDecl {
+        of,
         name,
         var_type,
         prompt,
@@ -477,6 +515,33 @@ fn validate_file_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A list value is a JSON array; every element must satisfy the item type
+/// (`of=`), and be one of `choices=` when the list declares any.
+fn validate_list_value(decl: &VarDecl, value: &str) -> Result<(), String> {
+    let items = crate::listvars::parse_list(value)
+        .map_err(|e| format!("{:?} {e}, got {value:?}", decl.name))?;
+    let item_decl = VarDecl {
+        var_type: decl.of.unwrap_or(VarType::String),
+        of: None,
+        choices: Vec::new(),
+        choices_var: None,
+        default: None,
+        default_var: None,
+        ..decl.clone()
+    };
+    for item in &items {
+        if !decl.choices.is_empty() && !decl.choices.contains(item) {
+            return Err(format!(
+                "{:?}: {item:?} is not one of {}",
+                decl.name,
+                decl.choices.join(", ")
+            ));
+        }
+        validate_value(&item_decl, item)?;
+    }
+    Ok(())
+}
+
 pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     match decl.var_type {
         VarType::String => Ok(()),
@@ -512,6 +577,7 @@ pub fn validate_value(decl: &VarDecl, value: &str) -> Result<(), String> {
                 ))
             }
         }
+        VarType::List => validate_list_value(decl, value),
         VarType::Select => {
             if decl.choices.is_empty() && decl.choices_var.is_some() {
                 // A `choices_var`-declared select's real choices only
@@ -907,6 +973,31 @@ pub fn validate_env_refs(canvas: &Canvas) -> Result<(), VarsError> {
                         .map(|n| (n, "deps")),
                 )
                 .collect();
+            for er in &block.env {
+                let Some(format) = &er.format else { continue };
+                let block_name = block.name.clone().unwrap_or_default();
+                if crate::listvars::ListFormat::parse(format).is_none() {
+                    return Err(VarsError::UnknownEnvFormat(
+                        node.id.clone(),
+                        block_name,
+                        format.clone(),
+                    ));
+                }
+                if er.var_name.contains("${") {
+                    continue;
+                }
+                if let Some(decl) = decls.iter().find(|d| d.name == er.var_name) {
+                    if decl.var_type != VarType::List {
+                        return Err(VarsError::EnvFormatOnNonList(
+                            node.id.clone(),
+                            block_name,
+                            er.var_name.clone(),
+                            format.clone(),
+                            format!("type={}", decl.var_type.as_str()),
+                        ));
+                    }
+                }
+            }
             let argument_names: std::collections::HashSet<_> =
                 crate::args::scan_node_signatures(node)
                     .unwrap_or_default()
@@ -1576,6 +1667,22 @@ pub fn resolve_block_env_with_shared(
 /// resolved a whole run chain's worth of variables at once (e.g. the
 /// server, before streaming any output) doesn't need to re-run `resolve`
 /// per block just to relabel them.
+/// A `list` variable's value as one block asked for it (`env="IDS|space"`);
+/// anything that is not a list, or has no (valid) format, is passed through.
+fn render_env_value(er: &crate::fence::EnvRef, value: &str) -> String {
+    let Some(format) = er
+        .format
+        .as_deref()
+        .and_then(crate::listvars::ListFormat::parse)
+    else {
+        return value.to_string();
+    };
+    match crate::listvars::parse_list(value) {
+        Ok(items) => format.render(&items),
+        Err(_) => value.to_string(),
+    }
+}
+
 pub fn map_block_env(
     env_refs: &[crate::fence::EnvRef],
     resolved_values: &HashMap<String, String>,
@@ -1585,7 +1692,7 @@ pub fn map_block_env(
         .filter_map(|er| {
             resolved_values
                 .get(&er.var_name)
-                .map(|v| (er.local_name.clone(), v.clone()))
+                .map(|v| (er.local_name.clone(), render_env_value(er, v)))
         })
         .collect()
 }
@@ -2012,6 +2119,7 @@ mod tests {
 
     fn required_decl(name: &str, default: Option<&str>, secret: bool, required: bool) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type: VarType::String,
             prompt: name.to_string(),
@@ -2209,6 +2317,7 @@ mod tests {
 
     fn typed_decl(name: &str, var_type: VarType, choices: &[&str]) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type,
             prompt: name.to_string(),
@@ -2227,6 +2336,7 @@ mod tests {
 
     fn from_decl(name: &str, from: crate::fence::BlockRef) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type: VarType::String,
             prompt: name.to_string(),
@@ -2628,6 +2738,99 @@ mod tests {
     }
 
     #[test]
+    fn env_formats_apply_to_lists_and_are_validated() {
+        let doc = |attr: &str, var: &str| {
+            format!(
+                "# Root\n\n{var}\n\n## Use\n<!-- meshfox:node id=\"use\" -->\n\n```bash name=\"use\" env=\"{attr}\"\necho hi\n```\n"
+            )
+        };
+        let list =
+            "<!-- meshfox:var name=\"IDS\" type=\"list\" of=\"int\" default='[\"1\",\"2\"]' -->";
+        assert!(validate_env_refs(&canvas(&doc("IDS|space", list))).is_ok());
+        assert!(validate_env_refs(&canvas(&doc("P=IDS|pg", list))).is_ok());
+        assert!(matches!(
+            validate_env_refs(&canvas(&doc("IDS|tabs", list))).unwrap_err(),
+            VarsError::UnknownEnvFormat(_, _, f) if f == "tabs"
+        ));
+        let string = "<!-- meshfox:var name=\"IDS\" -->";
+        assert!(matches!(
+            validate_env_refs(&canvas(&doc("IDS|space", string))).unwrap_err(),
+            VarsError::EnvFormatOnNonList(..)
+        ));
+    }
+
+    #[test]
+    fn a_block_gets_a_list_in_the_format_it_asked_for() {
+        let doc = concat!(
+            "# Root\n\n",
+            "<!-- meshfox:var name=\"IDS\" type=\"list\" default='[\"1\",\"Acme, Inc.\"]' -->\n\n",
+            "## Use\n<!-- meshfox:node id=\"use\" -->\n\n",
+            "```bash name=\"a\" env=\"IDS|space\"\n:\n```\n\n",
+            "```bash name=\"b\" env=\"L=IDS|pg\"\n:\n```\n\n",
+            "```bash name=\"c\" env=\"IDS\"\n:\n```\n\n",
+            "```bash name=\"d\" env=\"IDS|tab\"\n:\n```\n",
+        );
+        let c = canvas(doc);
+        let decls = declared_vars(&c).unwrap();
+        let values: HashMap<String, String> = resolve_with_shared(
+            &decls,
+            &HashMap::new(),
+            &crate::varcache::VarCache::default(),
+            &HashMap::new(),
+            &crate::shared_env::SharedEnv::default(),
+        )
+        .values;
+        let node = c.node("use").unwrap();
+        let env_of = |name: &str| {
+            let block = node
+                .runnable_blocks()
+                .into_iter()
+                .find(|b| b.name.as_deref() == Some(name))
+                .unwrap();
+            map_block_env(&block.env, &values)
+        };
+        assert_eq!(env_of("a")["IDS"], "1 'Acme, Inc.'");
+        assert_eq!(env_of("b")["L"], r#"{1,"Acme, Inc."}"#);
+        assert_eq!(env_of("c")["IDS"], r#"["1","Acme, Inc."]"#);
+        assert_eq!(env_of("d")["IDS"], "1\tAcme, Inc.");
+    }
+
+    #[test]
+    fn list_values_are_validated_item_by_item() {
+        let c = canvas(concat!(
+            "# Root\n\n",
+            "<!-- meshfox:var name=\"N\" type=\"list\" of=\"int\" -->\n",
+            "<!-- meshfox:var name=\"R\" type=\"list\" choices=\"us,eu\" -->\n",
+        ));
+        let decls = declared_vars(&c).unwrap();
+        let (n, r) = (&decls[0], &decls[1]);
+        assert!(validate_value(n, r#"["1","2"]"#).is_ok());
+        assert!(validate_value(n, "[]").is_ok());
+        assert!(validate_value(n, r#"["1","x"]"#).is_err());
+        assert!(validate_value(n, "1,2").is_err());
+        assert!(validate_value(r, r#"["us"]"#).is_ok());
+        assert!(validate_value(r, r#"["asia"]"#).is_err());
+    }
+
+    #[test]
+    fn a_list_cannot_be_secret_and_of_needs_a_list() {
+        assert!(matches!(
+            build_var_decl(crate::attrs::parse_attrs("name=\"X\" type=\"list\" secret")),
+            Err(VarsError::ListSecret(_))
+        ));
+        assert!(matches!(
+            build_var_decl(crate::attrs::parse_attrs("name=\"X\" of=\"int\"")),
+            Err(VarsError::OfRequiresList(..))
+        ));
+        assert!(matches!(
+            build_var_decl(crate::attrs::parse_attrs(
+                "name=\"X\" type=\"list\" of=\"list\""
+            )),
+            Err(VarsError::UnknownListItemType(..))
+        ));
+    }
+
+    #[test]
     fn validate_env_refs_catches_an_undeclared_reference() {
         let doc = concat!(
             "# Root\n\n",
@@ -2670,6 +2873,7 @@ mod tests {
             decl("UNRELATED", None, false),
         ];
         let env_refs = vec![crate::fence::EnvRef {
+            format: None,
             local_name: "INSTALL_PATH".to_string(),
             var_name: "INSTALL_PATH".to_string(),
         }];
@@ -2689,6 +2893,7 @@ mod tests {
     fn resolve_block_env_renames_to_the_local_name() {
         let decls = vec![decl("INSTALL_PATH", Some("/opt"), false)];
         let env_refs = vec![crate::fence::EnvRef {
+            format: None,
             local_name: "PREFIX".to_string(),
             var_name: "INSTALL_PATH".to_string(),
         }];
@@ -2706,6 +2911,7 @@ mod tests {
     fn resolve_block_env_reports_missing_by_declared_name() {
         let decls = vec![decl("INSTALL_PATH", None, false)];
         let env_refs = vec![crate::fence::EnvRef {
+            format: None,
             local_name: "PREFIX".to_string(),
             var_name: "INSTALL_PATH".to_string(),
         }];
@@ -2725,6 +2931,7 @@ mod tests {
             true,
         )];
         let env_refs = vec![crate::fence::EnvRef {
+            format: None,
             local_name: "INSTALL_PATH".to_string(),
             var_name: "INSTALL_PATH".to_string(),
         }];
@@ -2895,6 +3102,7 @@ mod tests {
     fn resolve_block_env_surfaces_unresolved_from_for_a_referenced_computed_var() {
         let decls = vec![from_decl("X", block_ref("provision", "create"))];
         let env_refs = vec![crate::fence::EnvRef {
+            format: None,
             local_name: "X".to_string(),
             var_name: "X".to_string(),
         }];
@@ -2910,6 +3118,7 @@ mod tests {
 
     fn session_decl(name: &str, required: bool) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type: VarType::String,
             prompt: name.to_string(),
@@ -3058,6 +3267,7 @@ mod tests {
 
     fn default_var_decl(name: &str, default_var: &str) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type: VarType::String,
             prompt: name.to_string(),
@@ -3076,6 +3286,7 @@ mod tests {
 
     fn choices_var_decl(name: &str, choices_var: &str) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type: VarType::Select,
             prompt: name.to_string(),
@@ -3183,6 +3394,7 @@ mod tests {
             choices_var_decl("REGION", "REGIONS_LIST"),
         ];
         let env_refs = vec![crate::fence::EnvRef {
+            format: None,
             local_name: "REGION".to_string(),
             var_name: "REGION".to_string(),
         }];

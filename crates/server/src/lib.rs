@@ -17159,6 +17159,46 @@ mod run_block_ws_tests {
         events
     }
 
+    /// A list variable written by a `from=` producer as `NAME[]=item` lines
+    /// reaches each consumer in the format that consumer asked for.
+    #[tokio::test]
+    async fn a_list_from_a_producer_is_rendered_per_consumer() {
+        let canvas_path = std::env::temp_dir().join(format!(
+            "meshfox-list-env-test-{}.canvas.md",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &canvas_path,
+            concat!(
+                "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+                "<!-- meshfox:var name=\"IDS\" type=\"list\" from=\"root/list\" -->\n\n",
+                "```bash name=\"list\"\n",
+                "echo 'IDS[]=1' >> \"$MESHFOX_VARS_OUT\"\n",
+                "echo 'IDS[]=Acme, Inc.' >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+                "```bash name=\"shell\" deps=\"list\" env=\"IDS|space\"\necho \"shell=$IDS\"\n```\n\n",
+                "```bash name=\"pg\" deps=\"list\" env=\"IDS|pg\"\necho \"pg=$IDS\"\n```\n\n",
+                "```bash name=\"raw\" deps=\"list\" env=\"IDS\"\necho \"raw=$IDS\"\n```\n",
+            ),
+        )
+        .unwrap();
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let mut seen = std::collections::HashMap::new();
+        for block in ["shell", "pg", "raw"] {
+            let events = run_ws_events(addr, &format!("block={block}&persist=false")).await;
+            assert_eq!(events.last().unwrap()["exitCode"], 0, "{events:?}");
+            let text: String = events
+                .iter()
+                .filter_map(|e| e["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            seen.insert(block, text);
+        }
+        assert_eq!(seen["shell"], "shell=1 'Acme, Inc.'");
+        assert_eq!(seen["pg"], r#"pg={1,"Acme, Inc."}"#);
+        assert_eq!(seen["raw"], r#"raw=["1","Acme, Inc."]"#);
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
     /// Not include-specific — just reuses this module's own `post_json`/
     /// `ndjson_events` helpers. Each `"output"` `RunEvent` over `/api/run`'s
     /// NDJSON stream now carries a `stream` field (`stream_exec::OutputStream`,
@@ -18843,6 +18883,7 @@ mod var_status_tests {
         secret: bool,
     ) -> meshfox_core::VarDecl {
         meshfox_core::VarDecl {
+            of: None,
             name: name.to_string(),
             var_type: meshfox_core::VarType::String,
             prompt: name.to_string(),

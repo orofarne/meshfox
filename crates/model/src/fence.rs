@@ -415,6 +415,20 @@ fn parse_deps(attrs: &HashMap<String, String>) -> Vec<BlockRef> {
 pub struct EnvRef {
     pub local_name: String,
     pub var_name: String,
+    /// `|format` after the variable (`env="IDS|space"`): how a `list` variable
+    /// is rendered into this block's environment (`None` = JSON). Chosen by
+    /// the consumer, never by the variable.
+    pub format: Option<String>,
+}
+
+impl EnvRef {
+    /// The variable side as written: `NAME` or `NAME|format`.
+    pub fn source_text(&self) -> String {
+        match &self.format {
+            Some(format) => format!("{}|{format}", self.var_name),
+            None => self.var_name.clone(),
+        }
+    }
 }
 
 /// A leading `$` is purely cosmetic — `env="$VAR"` and `env="VAR"` mean the
@@ -433,16 +447,31 @@ fn strip_dollar(s: &str) -> &str {
 }
 
 fn parse_env_ref(s: &str) -> EnvRef {
+    // `NAME`, `LOCAL=NAME`, either optionally followed by `|format`.
+    let split_format = |value: &str| -> (String, Option<String>) {
+        match value.split_once('|') {
+            Some((name, format)) => (
+                strip_dollar(name.trim()).to_string(),
+                Some(format.trim().to_string()),
+            ),
+            None => (strip_dollar(value.trim()).to_string(), None),
+        }
+    };
     match s.split_once('=') {
-        Some((local, value)) => EnvRef {
-            local_name: local.trim().to_string(),
-            var_name: strip_dollar(value.trim()).to_string(),
-        },
+        Some((local, value)) => {
+            let (var_name, format) = split_format(value);
+            EnvRef {
+                local_name: local.trim().to_string(),
+                var_name,
+                format,
+            }
+        }
         None => {
-            let var_name = strip_dollar(s.trim()).to_string();
+            let (var_name, format) = split_format(s);
             EnvRef {
                 local_name: var_name.clone(),
                 var_name,
+                format,
             }
         }
     }
@@ -1610,6 +1639,7 @@ mod tests {
         assert_eq!(
             env,
             &vec![EnvRef {
+                format: None,
                 local_name: "INSTALL_PATH".to_string(),
                 var_name: "INSTALL_PATH".to_string()
             }]
@@ -1623,6 +1653,7 @@ mod tests {
         assert_eq!(
             env,
             &vec![EnvRef {
+                format: None,
                 local_name: "INSTALL_PATH".to_string(),
                 var_name: "INSTALL_PATH".to_string()
             }]
@@ -1637,10 +1668,12 @@ mod tests {
             env,
             &vec![
                 EnvRef {
+                    format: None,
                     local_name: "PREFIX".to_string(),
                     var_name: "INSTALL_PATH".to_string()
                 },
                 EnvRef {
+                    format: None,
                     local_name: "MODE2".to_string(),
                     var_name: "MODE".to_string()
                 },
@@ -1656,14 +1689,17 @@ mod tests {
             env,
             &vec![
                 EnvRef {
+                    format: None,
                     local_name: "A".to_string(),
                     var_name: "A".to_string()
                 },
                 EnvRef {
+                    format: None,
                     local_name: "B".to_string(),
                     var_name: "B".to_string()
                 },
                 EnvRef {
+                    format: None,
                     local_name: "C".to_string(),
                     var_name: "D".to_string()
                 },

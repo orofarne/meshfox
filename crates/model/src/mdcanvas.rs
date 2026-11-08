@@ -1285,9 +1285,9 @@ fn render_env(env: &[EnvRef]) -> String {
     env.iter()
         .map(|e| {
             if e.local_name == e.var_name {
-                format!("${}", e.var_name)
+                format!("${}", e.source_text())
             } else {
-                format!("{}=${}", e.local_name, e.var_name)
+                format!("{}=${}", e.local_name, e.source_text())
             }
         })
         .collect::<Vec<_>>()

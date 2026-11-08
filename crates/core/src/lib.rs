@@ -42,6 +42,7 @@ pub mod gateway_header;
 pub use meshfox_model::host;
 pub use meshfox_model::image_attrs;
 pub mod include;
+pub mod listvars;
 pub use meshfox_model::locate;
 pub mod mdcanvas;
 pub use meshfox_model::merge;

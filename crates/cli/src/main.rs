@@ -4482,6 +4482,7 @@ async fn preflight_worker_vars(
 /// defaults, since none of them change `ask`'s own prompting behavior.
 fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
     VarDecl {
+        of: None,
         name: status.name.clone(),
         var_type: VarType::parse(&status.var_type).unwrap_or(VarType::String),
         prompt: status.prompt.clone(),
@@ -4709,9 +4710,9 @@ fn annotate(block: &meshfox_core::CodeBlock) -> String {
             .iter()
             .map(|e| {
                 if e.local_name == e.var_name {
-                    e.var_name.clone()
+                    e.source_text()
                 } else {
-                    format!("{}={}", e.local_name, e.var_name)
+                    format!("{}={}", e.local_name, e.source_text())
                 }
             })
             .collect();
@@ -8655,6 +8656,7 @@ mod set_override_tests {
 
     fn decl(name: &str, var_type: meshfox_core::VarType, choices: &[&str]) -> VarDecl {
         VarDecl {
+            of: None,
             name: name.to_string(),
             var_type,
             prompt: name.to_string(),

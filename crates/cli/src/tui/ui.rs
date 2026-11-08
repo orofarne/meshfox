@@ -2024,7 +2024,8 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
             | VarType::Dir
             | VarType::File
             | VarType::Date
-            | VarType::DateTime => {
+            | VarType::DateTime
+            | VarType::List => {
                 if i == vf.selected {
                     let mut value = shown.to_string();
                     let mut pos = vf

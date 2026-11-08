@@ -80,6 +80,12 @@ fn declaration(rest: &str) -> Result<ArgDecl, String> {
     if !identifier(&decl.name) || decl.name.starts_with("MESHFOX_") {
         return Err(format!("invalid or reserved argument name {:?}", decl.name));
     }
+    if decl.var_type == vars::VarType::List {
+        return Err(
+            "an argument is a single value; a list is spread into several applications with name=*$LIST in a binding"
+                .into(),
+        );
+    }
     if decl.var_type != vars::VarType::Select && !decl.choices.is_empty() {
         return Err("choices requires type=select".into());
     }
@@ -724,6 +730,7 @@ fn prepare_in(
                 vars::VarType::File => "file",
                 vars::VarType::Date => "date",
                 vars::VarType::DateTime => "datetime",
+                vars::VarType::List => "list",
             },
             prompt: arg.prompt.clone(),
             choices: arg.choices.clone(),

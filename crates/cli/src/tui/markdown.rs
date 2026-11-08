@@ -3224,6 +3224,7 @@ mod tests {
         let hl = Highlighter::new();
         let md = "```form name=\"f\"\nfield var=\"NAME\" label=\"Name\"\n```\n";
         let decls = vec![meshfox_core::vars::VarDecl {
+            of: None,
             name: "NAME".to_string(),
             prompt: "Name".to_string(),
             var_type: meshfox_core::vars::VarType::String,

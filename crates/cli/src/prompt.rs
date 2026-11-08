@@ -87,7 +87,7 @@ pub fn ask(decl: &VarDecl, current: Option<&str>) -> io::Result<String> {
                     continue;
                 }
             },
-            VarType::Int => match meshfox_core::validate_value(decl, &input) {
+            VarType::Int | VarType::List => match meshfox_core::validate_value(decl, &input) {
                 Ok(()) => return Ok(input),
                 Err(e) => {
                     println!("{e}");
@@ -281,6 +281,7 @@ mod tests {
     #[test]
     fn a_select_with_pending_choices_keeps_its_value_or_errors() {
         let mut decl = VarDecl {
+            of: None,
             name: "FONT".into(),
             var_type: VarType::Select,
             prompt: "Font".into(),

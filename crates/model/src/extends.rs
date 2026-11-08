@@ -116,14 +116,14 @@ pub(crate) fn merge_interpreter(
 pub(crate) fn merge_env(ext: &mut Extended, parent: &CodeBlock, owner: &str) -> Result<(), String> {
     for e in &parent.env {
         match ext.env.iter().find(|(local, _)| local == &e.local_name) {
-            Some((_, var)) if var != &e.var_name => {
+            Some((_, var)) if var != &e.source_text() => {
                 return Err(format!(
                     "extends= of {owner:?}: parents bind {:?} to different variables ({var} / {})",
                     e.local_name, e.var_name
                 ));
             }
             Some(_) => {}
-            None => ext.env.push((e.local_name.clone(), e.var_name.clone())),
+            None => ext.env.push((e.local_name.clone(), e.source_text())),
         }
     }
     Ok(())

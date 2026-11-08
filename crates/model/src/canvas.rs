@@ -497,9 +497,16 @@ impl Node {
                 }
                 for (local, var) in &ext.env {
                     if !block.env.iter().any(|e| &e.local_name == local) {
+                        // `var` is the variable side as written, possibly
+                        // `NAME|format` (see `EnvRef::source_text`).
+                        let (var_name, format) = match var.split_once('|') {
+                            Some((name, format)) => (name.to_string(), Some(format.to_string())),
+                            None => (var.clone(), None),
+                        };
                         block.env.push(crate::fence::EnvRef {
                             local_name: local.clone(),
-                            var_name: var.clone(),
+                            var_name,
+                            format,
                         });
                     }
                 }

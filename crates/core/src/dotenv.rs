@@ -25,9 +25,74 @@ pub(crate) fn parse(contents: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Like [`parse`], for a block's `MESHFOX_VARS_OUT` file: a `NAME[]=item` line
+/// *appends* an element to the list variable `NAME` (one element per line, any
+/// characters but a newline), and the result holds `NAME` as the JSON array
+/// that is the stored form of a list. A plain `NAME=<value>` line sets the
+/// value outright (for a list variable it must be a JSON array); lines are
+/// applied in order, so a later one wins over an earlier one. Elements are
+/// trimmed like every dotenv value.
+pub(crate) fn parse_with_lists(contents: &str) -> HashMap<String, String> {
+    let mut values: HashMap<String, String> = HashMap::new();
+    let mut lists: HashMap<String, Vec<String>> = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if let Some(name) = key.strip_suffix("[]") {
+            let name = name.trim_end();
+            let list = lists.entry(name.to_string()).or_insert_with(|| {
+                // `NAME=["a"]` earlier, then `NAME[]=b`: keep appending.
+                values
+                    .remove(name)
+                    .and_then(|v| crate::listvars::parse_list(&v).ok())
+                    .unwrap_or_default()
+            });
+            list.push(value.to_string());
+        } else {
+            lists.remove(key);
+            values.insert(key.to_string(), value.to_string());
+        }
+    }
+    for (name, items) in lists {
+        values.insert(name, crate::listvars::to_json(&items));
+    }
+    values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracket_lines_append_list_elements_in_order() {
+        let out = parse_with_lists("IDS[]=1\nOTHER=x\nIDS[]=Acme, Inc.\nIDS[]= 3 \n");
+        assert_eq!(out["IDS"], r#"["1","Acme, Inc.","3"]"#);
+        assert_eq!(out["OTHER"], "x");
+    }
+
+    #[test]
+    fn a_json_line_sets_the_list_and_appends_continue_it() {
+        let out = parse_with_lists("IDS=[\"a\",\"b\"]\nIDS[]=c\n");
+        assert_eq!(out["IDS"], r#"["a","b","c"]"#);
+    }
+
+    #[test]
+    fn a_later_plain_line_replaces_earlier_appends() {
+        let out = parse_with_lists("IDS[]=1\nIDS[]=2\nIDS=[\"z\"]\n");
+        assert_eq!(out["IDS"], r#"["z"]"#);
+    }
+
+    #[test]
+    fn plain_parse_is_unchanged_by_brackets() {
+        let out = parse("IDS[]=1\n");
+        assert_eq!(out.get("IDS[]").map(String::as_str), Some("1"));
+    }
 
     #[test]
     fn parses_simple_key_value_lines() {

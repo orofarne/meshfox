@@ -59,7 +59,7 @@ pub fn allocate_path() -> PathBuf {
 /// block deleted it itself, isn't a failure either).
 pub fn read_and_cleanup(path: &Path) -> io::Result<HashMap<String, String>> {
     let values = match std::fs::read_to_string(path) {
-        Ok(contents) => crate::dotenv::parse(&contents),
+        Ok(contents) => crate::dotenv::parse_with_lists(&contents),
         Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
         Err(e) => return Err(e),
     };
