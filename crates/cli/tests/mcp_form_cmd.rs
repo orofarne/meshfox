@@ -192,18 +192,87 @@ async fn form_submit_commits_values_and_starts_autorun_and_form_reset_undoes_it(
     .unwrap();
     assert!(nowait["autorun"][0].get("exit_code").is_none(), "{nowait}");
 
-    // Running a form (rather than sending it) says what to do instead.
-    let ran = call(
+    // Running a form directly parks on it; sending it releases the run.
+    let (is_error, ran) = call(
         &mcp,
         "run",
         serde_json::json!({ "canvas_id": id, "node_id": "root", "block": "f" }),
     )
-    .await;
-    let message = match ran {
-        Err(m) => m,
-        Ok((_, v)) => v.to_string(),
-    };
-    assert!(message.contains("it is sent"), "unhelpful error: {message}");
+    .await
+    .unwrap();
+    assert!(!is_error, "{ran}");
+    assert_eq!(ran["status"], "awaiting_form", "{ran}");
+    assert_eq!(ran["awaiting_form"]["block"], "f", "{ran}");
+    let (is_error, released) = call(
+        &mcp,
+        "form_submit",
+        serde_json::json!({
+            "canvas_id": id, "node_id": "root", "block": "f",
+            "values": { "N": "dflt" }, "wait": false
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error, "{released}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const FLOW: &str = concat!(
+    "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+    "<!-- meshfox:var name=\"ANSWER\" -->\n\n",
+    "```bash name=\"prep\"\necho prepared > flow.txt\n```\n\n",
+    "```form name=\"review\" deps=\"prep\"\ntext \"Check flow.txt\"\nfield var=\"ANSWER\"\n```\n\n",
+    "```bash name=\"finish\" deps=\"review\" env=\"ANSWER\"\necho \"answer=$ANSWER\" >> flow.txt\n```\n",
+);
+
+#[tokio::test]
+async fn a_run_parks_on_a_form_step_and_form_submit_resumes_it() {
+    let dir = unique_dir();
+    std::fs::write(dir.join("flow.canvas.md"), FLOW).unwrap();
+    let mcp = start(&dir).await;
+    let id = "flow.canvas.md";
+    call(&mcp, "canvas_open", serde_json::json!({ "path": id }))
+        .await
+        .unwrap();
+
+    let (is_error, parked) = call(
+        &mcp,
+        "run",
+        serde_json::json!({ "canvas_id": id, "node_id": "root", "block": "finish" }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error, "{parked}");
+    assert_eq!(parked["status"], "awaiting_form", "{parked}");
+    assert_eq!(parked["awaiting_form"]["node_id"], "root", "{parked}");
+    assert_eq!(parked["awaiting_form"]["block"], "review", "{parked}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("flow.txt")).unwrap(),
+        "prepared\n",
+        "finish must not run before the form is answered"
+    );
+
+    let (is_error, sent) = call(
+        &mcp,
+        "form_submit",
+        serde_json::json!({
+            "canvas_id": id, "node_id": "root", "block": "review",
+            "values": { "ANSWER": "yes" }
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error, "{sent}");
+    let mut text = String::new();
+    for _ in 0..100 {
+        text = std::fs::read_to_string(dir.join("flow.txt")).unwrap_or_default();
+        if text.contains("answer=yes") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(text, "prepared\nanswer=yes\n");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -251,5 +320,29 @@ fn cli_form_submit_waits_for_the_autorun_blocks_prints_their_output_and_fails_wi
     assert!(detached.status.success(), "{stdout}");
     assert!(stdout.contains("started root/log"), "{stdout}");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_run_without_a_terminal_cancels_a_chain_parked_on_a_form() {
+    let dir = unique_dir();
+    std::fs::write(dir.join("flow.canvas.md"), FLOW).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_meshfox"))
+        .args(["run", "--canvas", "flow.canvas.md", "finish"])
+        .stdin(std::process::Stdio::null())
+        .current_dir(&dir)
+        .env("HOME", dir.join("home"))
+        .env("MESHFOX_SERVER_SOCKET", "")
+        .output()
+        .expect("meshfox runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("no terminal to ask it"), "{stderr}");
+    assert!(stderr.contains("was cancelled"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("flow.txt")).unwrap(),
+        "prepared\n",
+        "finish must not run"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

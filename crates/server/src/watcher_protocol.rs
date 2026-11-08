@@ -10,11 +10,14 @@
 //! a worker never needs to know or care whether the process on the other
 //! end is this crate's own watcher or something else entirely.
 //!
-//! Six messages. One is genuinely one-way — no response payload a caller
+//! Seven messages. Two are genuinely one-way — no response payload a caller
 //! needs to act on:
 //! - [`Message::Ready`] — sent once by a freshly-spawned worker, right
 //!   after it binds its listener. Replaces the old `--port-file` polling
 //!   entirely: the coordinator just gets told, instead of having to notice.
+//!
+//! - [`Message::Notify`] — sent by a worker when a run parks on a form or
+//!   finishes/fails; the coordinator decides what to do with it.
 //!
 //! The other five all get a reply on the same connection — every
 //! coordinator implementation that wants to be usable at all (not just
@@ -120,6 +123,46 @@ pub enum Message {
     /// coordinator like `Open`'s path. Replies `no such core` if none is
     /// tracked for it.
     Kill { canvas_path: PathBuf },
+    /// One-way, best-effort: "something happened in a worker's canvas that
+    /// a person may want to know about" — a run parked on a form, a run
+    /// finished or failed. What to do with it (a desktop notification, an
+    /// editor toast, nothing) is entirely the coordinator's decision.
+    /// Acked with `{}` like the other one-way message; a coordinator that
+    /// does not know the op simply drops the line, which the sender treats
+    /// as delivered. See [`notify_event`].
+    Notify {
+        canvas_path: PathBuf,
+        event: CoordinatorEvent,
+    },
+}
+
+/// `kind` values of a [`CoordinatorEvent`]. The set is open: a coordinator
+/// must ignore kinds it does not know.
+pub mod event_kind {
+    /// A run reached a `form` step and waits for an answer.
+    pub const FORM_AWAITING: &str = "form_awaiting";
+    /// The form a run waited on was sent or cancelled.
+    pub const FORM_RESOLVED: &str = "form_resolved";
+    /// A run ended with exit code 0.
+    pub const RUN_FINISHED: &str = "run_finished";
+    /// A run ended with a non-zero exit code, an error, or was cancelled.
+    pub const RUN_FAILED: &str = "run_failed";
+}
+
+/// What happened, for [`Message::Notify`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorEvent {
+    /// One of [`event_kind`] (open set).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Human-readable detail (an error text, a form's prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// One live worker, as reported by [`Message::ListCores`].
@@ -203,6 +246,24 @@ async fn send(socket_path: &Path, msg: &Message) -> io::Result<()> {
         Ok(Err(e)) => Err(e),
         _ => Ok(()),
     }
+}
+
+/// [`Message::Notify`] — a single delivery attempt, no retries: a lost
+/// notification must never delay or fail the run it describes. Callers run
+/// this off the hot path (`tokio::spawn`) and ignore the result.
+pub async fn notify_event(
+    socket_path: &Path,
+    canvas_path: &Path,
+    event: CoordinatorEvent,
+) -> io::Result<()> {
+    send(
+        socket_path,
+        &Message::Notify {
+            canvas_path: canvas_path.to_path_buf(),
+            event,
+        },
+    )
+    .await
 }
 
 /// How many times [`notify_ready`] attempts delivery before giving up, and
@@ -508,6 +569,27 @@ async fn request_kill_with_timeout(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notify_serializes_as_a_plain_op_and_omits_empty_fields() {
+        let msg = super::Message::Notify {
+            canvas_path: "/c/doc.canvas.md".into(),
+            event: super::CoordinatorEvent {
+                kind: super::event_kind::FORM_AWAITING.to_string(),
+                node_id: Some("root".into()),
+                block: Some("review".into()),
+                run_id: None,
+                message: None,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"notify","canvas_path":"/c/doc.canvas.md","event":{"kind":"form_awaiting","node_id":"root","block":"review"}}"#
+        );
+        let back: super::Message = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, super::Message::Notify { .. }));
+    }
+
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;

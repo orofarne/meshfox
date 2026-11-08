@@ -88,14 +88,14 @@ pub enum DepsError {
     SendWithoutForm(String, String),
     #[error("node {0:?} block {1:?}: `reset` only means anything on a `form` fence")]
     ResetWithoutForm(String, String),
+    #[error("node {0:?} block {1:?}: `cancel=` only means anything on a `form` fence")]
+    CancelWithoutForm(String, String),
     #[error("node {0:?} block {1:?}: `output-attrs=` only means anything with `output=\"image\"`")]
     OutputAttrsWithoutImage(String, String),
     #[error("node {0:?} block {1:?}: invalid output-attrs={2:?} — expected the image-attribute grammar, e.g. `width=50% bg=#fff` (`width=`/`height=` an integer or integer%, `bg=` `#rgb`/`#rrggbb`/`transparent`)")]
     InvalidOutputAttrs(String, String, String),
     #[error("node {0:?} block {1:?}: unknown render={2:?} — known kinds are {3:?}")]
     UnknownRenderKind(String, String, String, &'static [&'static str]),
-    #[error("node {0:?} block {1:?}: `deps=` names {2:?}, a `form` fence — a form has no \"done\" state, so nothing can depend on it")]
-    FormCannotBeDepsTarget(String, String, BlockAddr),
     #[error(transparent)]
     Vars(#[from] crate::vars::VarsError),
     #[error(transparent)]
@@ -1107,6 +1107,9 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             if block.attrs.contains_key("send") && !crate::exec::is_form(&block.lang) {
                 return Err(DepsError::SendWithoutForm(node.id.clone(), name.clone()));
             }
+            if block.attrs.contains_key("cancel") && !crate::exec::is_form(&block.lang) {
+                return Err(DepsError::CancelWithoutForm(node.id.clone(), name.clone()));
+            }
             if block.attrs.contains_key("reset") && !crate::exec::is_form(&block.lang) {
                 return Err(DepsError::ResetWithoutForm(node.id.clone(), name.clone()));
             }
@@ -1172,8 +1175,6 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     Some("service")
                 } else if block.autorun {
                     Some("autorun")
-                } else if !block.deps.is_empty() {
-                    Some("deps")
                 } else {
                     None
                 };
@@ -1229,7 +1230,11 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
                     ));
                 }
                 if let Some(error) = node.extends_error(name) {
-                    return Err(DepsError::Extends(node.id.clone(), name.clone(), error.into()));
+                    return Err(DepsError::Extends(
+                        node.id.clone(),
+                        name.clone(),
+                        error.into(),
+                    ));
                 }
             }
             if block.tangle() && block.interpreter.is_none() {
@@ -1241,15 +1246,7 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             for dep in &block.dependencies() {
                 validate_dep_condition(canvas, &node.id, block, dep, &decls)?;
                 validate_conditional_sources(&node.id, block, &decls)?;
-                let dep_addr = resolve_ref(&node.id, dep);
-                let dep_block = validate_application_ref(canvas, &node.id, block, dep, &decls)?;
-                if crate::exec::is_form(&dep_block.lang) {
-                    return Err(DepsError::FormCannotBeDepsTarget(
-                        node.id.clone(),
-                        name.clone(),
-                        dep_addr,
-                    ));
-                }
+                validate_application_ref(canvas, &node.id, block, dep, &decls)?;
             }
             for edge in block.leases().iter().chain(block.defers().iter()) {
                 if edge.condition.is_some() {
@@ -1772,10 +1769,7 @@ mod tests {
         );
         // the parents themselves are unchanged, the fence still holds only its own code
         assert_eq!(source_of(&c, "mid"), "base() { :; }\nmid() { :; }");
-        assert_eq!(
-            c.node("root").unwrap().runnable_blocks()[3].code,
-            "top"
-        );
+        assert_eq!(c.node("root").unwrap().runnable_blocks()[3].code, "top");
     }
 
     #[test]
@@ -1796,9 +1790,8 @@ mod tests {
     fn extends_changes_the_fingerprint_with_the_parent_code() {
         let a = extended("```sh name=\"b\"\none\n```\n```sh name=\"t\" extends=\"b\"\nx\n```\n");
         let b = extended("```sh name=\"b\"\ntwo\n```\n```sh name=\"t\" extends=\"b\"\nx\n```\n");
-        let fp = |c: &Canvas| {
-            crate::fence::fingerprint(&c.node("root").unwrap().runnable_blocks()[1])
-        };
+        let fp =
+            |c: &Canvas| crate::fence::fingerprint(&c.node("root").unwrap().runnable_blocks()[1]);
         assert_ne!(fp(&a), fp(&b));
     }
 
@@ -2586,16 +2579,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_catches_form_with_its_own_deps() {
+    fn a_form_may_have_its_own_deps() {
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
-            "```bash name=\"build\" cache\necho build\n```\n\n",
+            "```bash name=\"build\"\necho build\n```\n\n",
             "```form name=\"pick\" deps=\"build\"\n```\n",
         ));
-        assert_eq!(
-            validate(&c).unwrap_err(),
-            DepsError::FormAttrConflict("root".to_string(), "pick".to_string(), "deps")
-        );
+        assert_eq!(validate(&c), Ok(()));
     }
 
     #[test]
@@ -2611,19 +2601,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_catches_a_form_fence_as_someone_elses_deps_target() {
+    fn a_form_fence_may_be_someone_elses_deps_target() {
         let c = canvas(concat!(
             "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
             "```form name=\"pick\"\n```\n\n",
             "```bash name=\"build\" deps=\"pick\"\necho build\n```\n",
         ));
+        assert_eq!(validate(&c), Ok(()));
+        let chain = resolve_chain(&c, BlockAddr::new("root", "build")).unwrap();
+        assert_eq!(
+            chain,
+            vec![
+                BlockAddr::new("root", "pick"),
+                BlockAddr::new("root", "build")
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_is_only_meaningful_on_a_form() {
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "```bash name=\"build\" cancel=\"x\"\necho build\n```\n",
+        ));
         assert_eq!(
             validate(&c).unwrap_err(),
-            DepsError::FormCannotBeDepsTarget(
-                "root".to_string(),
-                "build".to_string(),
-                BlockAddr::new("root", "pick"),
-            )
+            DepsError::CancelWithoutForm("root".to_string(), "build".to_string())
         );
     }
 

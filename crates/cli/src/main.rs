@@ -4088,6 +4088,11 @@ async fn drain_worker_run_events(
                             run_output::banner(&format!("{node_id}/{block}"), "\n");
                             current_step = Some((node_id, block));
                         }
+                        worker_client::RunEvent::AwaitingForm { node_id, block, .. } => {
+                            // The run is parked until this form is sent or
+                            // cancelled; a cancel arrives as an `Error` event.
+                            answer_awaiting_form(port, &node_id, &block).await;
+                        }
                         worker_client::RunEvent::StepSkipped { node_id, block, .. } => {
                             // No equivalent in the in-process loop above,
                             // which always re-executes every step
@@ -4168,6 +4173,73 @@ async fn drain_worker_run_events(
         DrainResult::Failed
     } else {
         DrainResult::Ok
+    }
+}
+
+/// A chain is parked on a `form` step: ask the person at the terminal, then
+/// send (or cancel) it so the worker's run goes on. Without a terminal there
+/// is nobody to ask, so the form is cancelled — the run fails with a clear
+/// error instead of waiting forever. (Send it from elsewhere with
+/// `meshfox form submit`, or run from a terminal.)
+async fn answer_awaiting_form(port: u16, node_id: &str, block: &str) {
+    let addr = format!("{node_id}/{block}");
+    let cancel = || async {
+        let _ = worker_client::cancel_form(port, node_id, block).await;
+    };
+    let info = match worker_client::get_form_info(port, node_id, block).await {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("can't read form {addr}: {e}");
+            cancel().await;
+            return;
+        }
+    };
+    if !prompt::stdin_is_tty() {
+        eprintln!(
+            "the run is waiting for form {addr}, and there is no terminal to ask it — cancelling \
+             (run from a terminal, or send the form with `meshfox form submit`)"
+        );
+        cancel().await;
+        return;
+    }
+    let _waiting = terminal_status::waiting("form");
+    let send = info.send.clone();
+    let cancel_caption = info.cancel.clone();
+    let asked = tokio::task::spawn_blocking(
+        move || -> std::io::Result<Option<HashMap<String, String>>> {
+            for line in &info.text {
+                println!("{line}");
+            }
+            eprint!("[Enter] {send}, [c] {cancel_caption}: ");
+            let _ = std::io::stderr().flush();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if answer.trim().eq_ignore_ascii_case("c") {
+                return Ok(None);
+            }
+            let mut values = HashMap::new();
+            for field in &info.fields {
+                let decl = var_decl_from_status(&field.var);
+                let value = prompt::ask(&decl, field.var.value.as_deref())?;
+                values.insert(field.var.name.clone(), value);
+            }
+            Ok(Some(values))
+        },
+    )
+    .await;
+    match asked {
+        Ok(Ok(Some(values))) => {
+            if let Err(e) = worker_client::submit_form(port, node_id, block, values).await {
+                eprintln!("couldn't send form {addr}: {e}");
+                cancel().await;
+            }
+        }
+        Ok(Ok(None)) => cancel().await,
+        Ok(Err(e)) => {
+            eprintln!("failed to read input: {e}");
+            cancel().await;
+        }
+        Err(_) => cancel().await,
     }
 }
 

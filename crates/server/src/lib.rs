@@ -125,6 +125,52 @@ pub fn find_web_asset(prefix: &str, suffix: &str) -> Option<Vec<u8>> {
         .map(|file| file.data.into_owned())
 }
 
+/// The explanatory text of a `form` block, joined — the detail a
+/// notification shows ("Edit out.csv, then continue").
+fn form_prompt(block: &meshfox_core::CodeBlock) -> Option<String> {
+    let form = meshfox_core::form_block(block).ok()?;
+    (!form.text.is_empty()).then(|| form.text.join("\n"))
+}
+
+/// The variables that are fields of a `form` step somewhere in `chain`.
+fn chain_form_fields(
+    canvas: &meshfox_core::Canvas,
+    chain: &[meshfox_core::BlockAddr],
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for addr in chain {
+        let Some(node) = canvas.node(&addr.node_id) else {
+            continue;
+        };
+        let Some(block) = node
+            .runnable_blocks()
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(addr.block_name.as_str()))
+        else {
+            continue;
+        };
+        if meshfox_core::is_form(&block.lang) {
+            if let Ok(form) = meshfox_core::form_block(&block) {
+                out.extend(form.fields.into_iter().map(|f| f.var));
+            }
+        }
+    }
+    out
+}
+
+/// A run waiting on a `form` step (see `AppState::parked_forms`).
+struct ParkedForm {
+    run_id: String,
+    tx: oneshot::Sender<FormDecision>,
+}
+
+/// What a person decided for a form a run is parked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormDecision {
+    Submitted,
+    Cancelled,
+}
+
 struct AppState {
     canvas_path: PathBuf,
     /// `display="table"` sessions (one `duckdb` child per table node) and
@@ -236,6 +282,10 @@ struct AppState {
     /// happened meanwhile, the reset is stale and must not wipe the newer
     /// values.
     form_submit_seq: std::sync::atomic::AtomicU64,
+    /// Runs currently parked on a `form` step, keyed by the form's address.
+    /// A Send (or Cancel) for that address is delivered to the waiting run
+    /// through the stored sender instead of being refused with `409`.
+    parked_forms: Mutex<HashMap<(String, String), ParkedForm>>,
     /// Last confirmed session path values for previews only. Kept separate
     /// from run overrides so `required` still prompts on every invocation.
     session_paths: Mutex<HashMap<String, String>>,
@@ -283,6 +333,33 @@ struct AppState {
 }
 
 impl AppState {
+    /// Tells this worker's coordinator (if any) that something happened a
+    /// person may care about. Fire and forget: spawned off, one attempt,
+    /// result ignored — a lost notification never affects the run.
+    fn notify_coordinator(
+        &self,
+        kind: &str,
+        node_id: Option<&str>,
+        block: Option<&str>,
+        run_id: Option<&str>,
+        message: Option<String>,
+    ) {
+        let Some(socket) = self.watcher_socket.clone() else {
+            return;
+        };
+        let canvas_path = self.canvas_path.clone();
+        let event = watcher_protocol::CoordinatorEvent {
+            kind: kind.to_string(),
+            node_id: node_id.map(str::to_string),
+            block: block.map(str::to_string),
+            run_id: run_id.map(str::to_string),
+            message,
+        };
+        tokio::spawn(async move {
+            let _ = watcher_protocol::notify_event(&socket, &canvas_path, event).await;
+        });
+    }
+
     /// Starts one mutation of the canvas: waits for any other mutation to
     /// finish, then adopts whatever is on disk right now if it differs
     /// from the in-memory view (`reconcile_external`). The returned guard
@@ -3434,9 +3511,12 @@ async fn get_vars_with_plan(
     // fills in — it's produced by running its own source block mid-chain
     // (see `meshfox_core::varout`) — so the pre-run form must never offer
     // one as a field, regardless of whether it's currently "resolved".
+    // Nor is a field of a `form` step in the chain: the run parks there and
+    // asks for it, so the pre-run form must not ask twice.
+    let form_fields = chain_form_fields(&canvas, &chain);
     let relevant: Vec<_> = decls
         .iter()
-        .filter(|d| needed.contains(&d.name) && d.from.is_none())
+        .filter(|d| needed.contains(&d.name) && d.from.is_none() && !form_fields.contains(&d.name))
         .cloned()
         .collect();
 
@@ -4101,6 +4181,15 @@ enum RunEvent {
         node_id: String,
         block: String,
     },
+    /// Not terminal: the chain reached a `form` step and is parked there
+    /// until the form is sent (`POST /api/form/submit`) or cancelled
+    /// (`POST /api/form/cancel`). `StepEnd` follows a Send; a Cancel ends
+    /// the run with an `Error`.
+    AwaitingForm {
+        node_id: String,
+        block: String,
+        run_id: String,
+    },
     /// Terminal for this run — something failed before/without a step
     /// producing a normal exit code (bad node/block reference, no
     /// executor for the language, an I/O error spawning the process).
@@ -4181,6 +4270,20 @@ enum ServerEvent {
         /// The fields marked `keep` were left alone (the automatic reset
         /// after a Send); `false` means every field was reset.
         respect_keep: bool,
+    },
+    /// A run reached a `form` step and is parked until someone sends or
+    /// cancels it. Clients show the form as awaiting an answer.
+    FormAwaited {
+        node_id: String,
+        block: String,
+        run_id: String,
+    },
+    /// The parked form was sent or cancelled; the run continues or ends.
+    FormResolved {
+        node_id: String,
+        block: String,
+        run_id: String,
+        cancelled: bool,
     },
     RunStarted {
         node_id: String,
@@ -6981,7 +7084,11 @@ async fn run_block_impl_sized(
     validate_var_overrides(&relevant_decls, &req.vars)?;
     let mut resolved_vars = {
         let mut cache = state.vars_cache.lock().unwrap();
-        let resolved = plan.resolved;
+        let mut resolved = plan.resolved;
+        // A variable that is a field of a `form` step in this chain gets its
+        // value from that form while the run is parked on it — not missing.
+        let form_fields = chain_form_fields(&canvas, &chain);
+        resolved.missing.retain(|d| !form_fields.contains(&d.name));
         if !resolved.missing.is_empty() {
             let names: Vec<&str> = resolved.missing.iter().map(|d| d.name.as_str()).collect();
             return Err(ApiError(
@@ -7297,16 +7404,86 @@ async fn run_block_impl_sized(
                 }));
                 break;
             };
+            if meshfox_core::is_form(&block.lang) {
+                // A form is a graph step that waits for a person: the run
+                // parks here until the form is sent or cancelled. It always
+                // parks (never skipped as fresh) — the answer is the point.
+                let key = (addr.node_id.clone(), addr.block_name.clone());
+                let step_started = std::time::Instant::now();
+                yield Ok(ndjson_line(&RunEvent::StepStart {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                }));
+                let (form_tx, form_rx) = oneshot::channel::<FormDecision>();
+                state.parked_forms.lock().unwrap().insert(
+                    key.clone(),
+                    ParkedForm { run_id: run_id.clone(), tx: form_tx },
+                );
+                state.canvas_events.push(ServerEvent::FormAwaited {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                    run_id: run_id.clone(),
+                });
+                state.notify_coordinator(
+                    watcher_protocol::event_kind::FORM_AWAITING,
+                    Some(&addr.node_id),
+                    Some(&addr.block_name),
+                    Some(&run_id),
+                    form_prompt(&block),
+                );
+                yield Ok(ndjson_line(&RunEvent::AwaitingForm {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                    run_id: run_id.clone(),
+                }));
+                let decision = tokio::select! {
+                    d = form_rx => d.ok(),
+                    _ = &mut kill_rx => { killed = true; killed_addr = Some(addr.clone()); None }
+                };
+                state.parked_forms.lock().unwrap().remove(&key);
+                state.canvas_events.push(ServerEvent::FormResolved {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                    run_id: run_id.clone(),
+                    cancelled: decision != Some(FormDecision::Submitted),
+                });
+                state.notify_coordinator(
+                    watcher_protocol::event_kind::FORM_RESOLVED,
+                    Some(&addr.node_id),
+                    Some(&addr.block_name),
+                    Some(&run_id),
+                    (decision != Some(FormDecision::Submitted)).then(|| "cancelled".to_string()),
+                );
+                if let Some(id) = held_locks.remove(&key) {
+                    let _ = state.run_ledger.discard_reservation(id);
+                }
+                if killed {
+                    break;
+                }
+                if decision != Some(FormDecision::Submitted) {
+                    final_exit_code = 1;
+                    yield Ok(ndjson_line(&RunEvent::Error {
+                        message: format!("form {:?} in node {:?} was cancelled", addr.block_name, addr.node_id),
+                    }));
+                    break;
+                }
+                yield Ok(ndjson_line(&RunEvent::StepEnd {
+                    node_id: addr.node_id.clone(),
+                    block: addr.block_name.clone(),
+                    exit_code: 0,
+                    duration_ms: step_started.elapsed().as_millis() as u64,
+                }));
+                // The session values the Send committed now apply to the
+                // rest of this chain.
+                for (name, value) in state.session_vars.lock().unwrap().iter() {
+                    resolved_vars.insert(name.clone(), value.clone());
+                }
+                final_exit_code = 0;
+                continue;
+            }
             if !stream_exec::supports(&block) {
                 yield Ok(ndjson_line(&RunEvent::Error {
-                    message: if meshfox_core::is_form(&block.lang) {
-                        format!(
-                            "{:?} is a `form` fence: it isn't run, it is sent — use its Send button, `meshfox form submit` or the MCP `form_submit` tool",
-                            addr.block_name
-                        )
-                    } else {
-                        format!("no executor registered for language {:?}", block.lang)
-                    },
+                    message: format!("no executor registered for language {:?}", block.lang),
                 }));
                 break;
             }
@@ -8026,8 +8203,26 @@ async fn run_block_impl_sized(
         // no `Done` follows it.
         if killed {
             let addr = killed_addr.as_ref().unwrap_or(&target);
+            state.notify_coordinator(
+                watcher_protocol::event_kind::RUN_FAILED,
+                Some(&target.node_id),
+                Some(&target.block_name),
+                Some(&run_id),
+                Some("killed".to_string()),
+            );
             yield Ok(ndjson_line(&RunEvent::Killed { node_id: addr.node_id.clone(), block: addr.block_name.clone() }));
         } else {
+            state.notify_coordinator(
+                if final_exit_code == 0 {
+                    watcher_protocol::event_kind::RUN_FINISHED
+                } else {
+                    watcher_protocol::event_kind::RUN_FAILED
+                },
+                Some(&target.node_id),
+                Some(&target.block_name),
+                Some(&run_id),
+                (final_exit_code != 0).then(|| format!("exit code {final_exit_code}")),
+            );
             yield Ok(ndjson_line(&RunEvent::Done { exit_code: final_exit_code }));
         }
     };
@@ -8280,6 +8475,14 @@ struct FormFieldsResponse {
     /// than leaving it `None` for the client to default) so every
     /// consumer agrees on the fallback.
     send: String,
+    /// `cancel="..."` caption, defaulted to `"Cancel"`. Only meaningful
+    /// while `awaiting`.
+    cancel: String,
+    /// The form's explanatory `text` lines.
+    text: Vec<String>,
+    /// A run is parked on this form right now: Send continues it and Cancel
+    /// fails it.
+    awaiting: bool,
     fields: Vec<FormFieldStatus>,
 }
 
@@ -8388,8 +8591,16 @@ async fn get_form_fields(
             FormFieldStatus { label, var }
         })
         .collect();
+    let awaiting = state
+        .parked_forms
+        .lock()
+        .unwrap()
+        .contains_key(&(query.node_id.clone(), query.block.clone()));
     Ok(Json(FormFieldsResponse {
         send: form.send.unwrap_or_else(|| "Send".to_string()),
+        cancel: form.cancel.unwrap_or_else(|| "Cancel".to_string()),
+        text: form.text,
+        awaiting,
         fields,
     }))
 }
@@ -8440,7 +8651,12 @@ async fn submit_form(
     // interactive `tty` session, say, can last as long as its user likes).
     // Checked before anything is committed, so a refused Send changes
     // nothing.
-    if foreground_run_in_progress(&state) {
+    let parked_here = state
+        .parked_forms
+        .lock()
+        .unwrap()
+        .contains_key(&(req.node_id.clone(), req.block.clone()));
+    if !parked_here && foreground_run_in_progress(&state) {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "a run is in progress — wait for it to finish (or stop it) before sending the form"
@@ -8484,6 +8700,16 @@ async fn submit_form(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         + 1;
     let triggered = meshfox_core::autorun_blocks_for_changed_vars(&canvas, &changed);
+    // Values are committed; let the run parked on this form (if any)
+    // continue. Its `autorun` consequences below run as ordinary runs.
+    if let Some(parked) = state
+        .parked_forms
+        .lock()
+        .unwrap()
+        .remove(&(req.node_id.clone(), req.block.clone()))
+    {
+        let _ = parked.tx.send(FormDecision::Submitted);
+    }
     for addr in &triggered {
         // Awaited (not `tokio::spawn`ed away) — see `trigger_autorun`'s
         // own doc comment for why this needs to run synchronously far
@@ -8525,6 +8751,66 @@ async fn submit_form(
             })
             .collect(),
     }))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AwaitedForm {
+    node_id: String,
+    block: String,
+    run_id: String,
+}
+
+/// `GET /api/form/awaiting` — the forms runs are currently parked on, so a
+/// client that connected late (or an agent polling over MCP) learns what is
+/// waiting for an answer. Sorted for a stable order.
+async fn awaiting_forms(State(state): State<Arc<AppState>>) -> Json<Vec<AwaitedForm>> {
+    let mut forms: Vec<AwaitedForm> = state
+        .parked_forms
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|((node_id, block), parked)| AwaitedForm {
+            node_id: node_id.clone(),
+            block: block.clone(),
+            run_id: parked.run_id.clone(),
+        })
+        .collect();
+    forms.sort_by(|a, b| (&a.node_id, &a.block).cmp(&(&b.node_id, &b.block)));
+    Json(forms)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelFormRequest {
+    node_id: String,
+    block: String,
+}
+
+/// `POST /api/form/cancel` — cancels the run parked on this form; that run
+/// fails with an error. `404` when no run is waiting on it.
+async fn cancel_form(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CancelFormRequest>,
+) -> Result<StatusCode, ApiError> {
+    let parked = state
+        .parked_forms
+        .lock()
+        .unwrap()
+        .remove(&(req.node_id.clone(), req.block.clone()));
+    match parked {
+        Some(parked) => {
+            let _ = parked.tx.send(FormDecision::Cancelled);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no run is waiting on form {:?} in node {:?}",
+                req.block, req.node_id
+            ),
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -10825,6 +11111,7 @@ async fn build_state_with(
         session_store,
         session_vars: Mutex::new(session_vars),
         form_submit_seq: std::sync::atomic::AtomicU64::new(0),
+        parked_forms: Mutex::new(HashMap::new()),
         session_paths: Mutex::new(session_paths),
         services: Mutex::new(HashMap::new()),
         lease_scopes: Mutex::new(HashMap::new()),
@@ -10892,6 +11179,8 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/run/force", get(force_run))
         .route("/api/form/fields", get(get_form_fields))
         .route("/api/form/submit", post(submit_form))
+        .route("/api/form/awaiting", get(awaiting_forms))
+        .route("/api/form/cancel", post(cancel_form))
         .route("/api/form/reset", post(reset_form))
         .route("/api/run/subscribe", get(subscribe_run))
         .route("/api/run/history", get(get_run_history))
@@ -19891,6 +20180,9 @@ mod form_endpoint_tests {
         assert_eq!(status, 200, "unexpected body: {body}");
         let resp: serde_json::Value = serde_json::from_str(&body).expect("valid response JSON");
         assert_eq!(resp["send"], "Apply");
+        assert_eq!(resp["cancel"], "Cancel");
+        assert_eq!(resp["awaiting"], false);
+        assert_eq!(resp["text"], serde_json::json!([]));
         assert_eq!(resp["fields"].as_array().unwrap().len(), 1);
         assert_eq!(resp["fields"][0]["label"], "AWS Region");
         assert_eq!(resp["fields"][0]["name"], "REGION");
@@ -20055,6 +20347,194 @@ mod form_endpoint_tests {
     );
 
     const SEND_EU: &str = r#"{"nodeId":"config","block":"pick-region","values":{"REGION":"eu"}}"#;
+
+    const PARKED_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"REGION\" type=\"select\" choices=\"us,eu\" -->\n\n",
+        "```bash name=\"prep\"\necho prepared\n```\n\n",
+        "```form name=\"review\" deps=\"prep\" send=\"Go\" cancel=\"Stop\"\n",
+        "text \"Check the file, then continue\"\n",
+        "field var=\"REGION\"\n",
+        "```\n\n",
+        "```form name=\"other\"\nfield var=\"REGION\"\n```\n\n",
+        "```bash name=\"apply\" deps=\"review\" env=\"$REGION\"\necho region=$REGION\n```\n",
+    );
+
+    /// Polls `GET /api/form/awaiting` until `block` is listed (or ~5 s pass).
+    async fn wait_for_awaiting(addr: SocketAddr, block: &str) -> bool {
+        for _ in 0..250 {
+            let (status, body) = get(addr, "/api/form/awaiting").await;
+            if status == 200 && body.contains(&format!("\"block\":\"{block}\"")) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_run_parks_on_a_form_step_and_continues_after_send() {
+        let canvas_path = write_test_canvas(PARKED_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let run = tokio::spawn(async move { run_ws_events(addr, &[("block", "apply")]).await });
+
+        assert!(wait_for_awaiting(addr, "review").await, "run never parked");
+        let (_, body) = get(addr, "/api/form/fields?nodeId=root&block=review").await;
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["awaiting"], true, "{body}");
+        assert_eq!(info["cancel"], "Stop");
+        assert_eq!(
+            info["text"],
+            serde_json::json!(["Check the file, then continue"])
+        );
+        // Another form is still refused while a run is in progress.
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"root","block":"other","values":{"REGION":"us"}}"#,
+        )
+        .await;
+        assert_eq!(status, 409);
+
+        let (status, body) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"root","block":"review","values":{"REGION":"eu"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        let events = run.await.unwrap();
+        let kinds: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert!(kinds.contains(&"awaiting-form"), "{events:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|e| e["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("region=eu"), "{events:?}");
+        assert_eq!(events.last().unwrap()["exitCode"], 0, "{events:?}");
+        let (_, body) = get(addr, "/api/form/awaiting").await;
+        assert_eq!(body.trim(), "[]");
+        let _ = std::fs::remove_file(&canvas_path);
+    }
+
+    /// A coordinator that records every line it receives and acks it.
+    fn recording_coordinator(socket: &std::path::Path) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind coordinator socket");
+        let sink = Arc::clone(&received);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let sink = Arc::clone(&sink);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    if BufReader::new(read).read_line(&mut line).await.unwrap_or(0) > 0 {
+                        if let Ok(v) = serde_json::from_str(line.trim()) {
+                            sink.lock().unwrap().push(v);
+                        }
+                        let _ = write.write_all(b"{}\n").await;
+                    }
+                });
+            }
+        });
+        received
+    }
+
+    #[tokio::test]
+    async fn the_coordinator_is_told_about_the_form_wait_and_the_run_outcome() {
+        let canvas_path = write_test_canvas(PARKED_CANVAS);
+        let socket = std::env::temp_dir().join(format!(
+            "mfx-{}.sock",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
+        let received = recording_coordinator(&socket);
+        let state = build_state(canvas_path.clone(), false, Some(socket.clone()))
+            .await
+            .expect("valid test canvas");
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
+
+        let run = tokio::spawn(async move { run_ws_events(addr, &[("block", "apply")]).await });
+        assert!(wait_for_awaiting(addr, "review").await, "run never parked");
+        let (status, _) = post_json(
+            addr,
+            "/api/form/submit",
+            r#"{"nodeId":"root","block":"review","values":{"REGION":"eu"}}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        run.await.unwrap();
+
+        let mut kinds = Vec::new();
+        for _ in 0..100 {
+            kinds = received
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| m["event"]["kind"].as_str().unwrap_or_default().to_string())
+                .collect();
+            if kinds.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(kinds, ["form_awaiting", "form_resolved", "run_finished"]);
+        let first = received.lock().unwrap()[0].clone();
+        assert_eq!(first["op"], "notify");
+        assert_eq!(first["event"]["block"], "review");
+        assert_eq!(first["event"]["message"], "Check the file, then continue");
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_parked_form_fails_the_run() {
+        let canvas_path = write_test_canvas(PARKED_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        let run = tokio::spawn(async move { run_ws_events(addr, &[("block", "apply")]).await });
+
+        assert!(wait_for_awaiting(addr, "review").await, "run never parked");
+        let (status, _) = post_json(
+            addr,
+            "/api/form/cancel",
+            r#"{"nodeId":"root","block":"review"}"#,
+        )
+        .await;
+        assert_eq!(status, 204);
+
+        let events = run.await.unwrap();
+        let error = events
+            .iter()
+            .find(|e| e["type"] == "error")
+            .unwrap_or_else(|| panic!("no error event: {events:?}"));
+        assert!(error["message"].as_str().unwrap().contains("cancelled"));
+        assert_eq!(events.last().unwrap()["exitCode"], 1, "{events:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|e| e["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!text.contains("region="), "apply must not run: {events:?}");
+
+        let (status, _) = post_json(
+            addr,
+            "/api/form/cancel",
+            r#"{"nodeId":"root","block":"review"}"#,
+        )
+        .await;
+        assert_eq!(status, 404);
+        let _ = std::fs::remove_file(&canvas_path);
+    }
 
     /// The `status` of `node_id`/`block`'s entry in `GET /api/runs`, polled
     /// until it is `want` (or ~5 s pass).

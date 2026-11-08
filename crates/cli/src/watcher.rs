@@ -593,6 +593,11 @@ async fn handle_connection(
             .map(|_| ());
             let _ = write_half.write_all(ack_json(&result).as_bytes()).await;
         }
+        // Events are informational. A private watcher has nobody to show
+        // them to (the page itself already does), so it only acknowledges.
+        Message::Notify { .. } => {
+            let _ = write_half.write_all(ack_json(&Ok(())).as_bytes()).await;
+        }
         Message::OpenFile { path } => {
             let result = open_plain_file(path).await;
             let _ = write_half.write_all(ack_json(&result).as_bytes()).await;

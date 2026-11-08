@@ -6307,6 +6307,10 @@ impl App {
         let mut touched: Option<BlockAddr> = None;
         match event {
             RunEvent::Started { .. } => {}
+            RunEvent::AwaitingForm { node_id, block, .. } => {
+                run.lines
+                    .push(format!("waiting for form {node_id}/{block}"));
+            }
             RunEvent::StepStart { node_id, block } => {
                 let addr = BlockAddr::new(node_id, block);
                 self.child_steps.remove(&addr);

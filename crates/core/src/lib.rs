@@ -102,7 +102,7 @@ pub use file_read::{
     confine, confine_in, preview, preview_in, ConfineError, FilePreview, PreviewError,
     FILE_PREVIEW_MAX_BYTES,
 };
-pub use form::{form_block, parse_form_body, FormBlock, FormError, FormField};
+pub use form::{form_block, parse_form_body, parse_form_content, FormBlock, FormError, FormField};
 pub use include::IncludeError;
 pub use locate::{locate_node, LocateError, LocatedNode};
 pub use mdcanvas::{parse_fold_override, parse_tags, FenceAttrsPatch, NodeMeta, ParseError};

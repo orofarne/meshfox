@@ -43,6 +43,12 @@ pub struct FormBlock {
     /// `autorun` blocks all finished with exit 0, every field that isn't
     /// `keep` goes back to its declared default.
     pub reset: bool,
+    /// `cancel="..."` — the Cancel button's caption, shown while a run is
+    /// parked on this form. Falls back to a plain `"Cancel"` when omitted.
+    pub cancel: Option<String>,
+    /// Explanatory `text "..."` lines, in document order. A form with text
+    /// and no fields is a pure pause: "do the thing, then continue".
+    pub text: Vec<String>,
     pub fields: Vec<FormField>,
 }
 
@@ -64,12 +70,37 @@ pub enum FormError {
 /// harmless); any other non-`field` line is a parse error — there's nothing
 /// else a form fence's body is for.
 pub fn parse_form_body(form_name: &str, code: &str) -> Result<Vec<FormField>, FormError> {
+    parse_form_content(form_name, code).map(|(_, fields)| fields)
+}
+
+/// Like [`parse_form_body`], also returning the `text "..."` lines. A `text`
+/// argument is a JSON string literal (`text "Edit \"out.csv\""`), or the
+/// rest of the line verbatim when it isn't quoted.
+pub fn parse_form_content(
+    form_name: &str,
+    code: &str,
+) -> Result<(Vec<String>, Vec<FormField>), FormError> {
+    let mut text = Vec::new();
     let mut fields = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for line in code.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("text") {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                let arg = rest.trim();
+                let line = if arg.starts_with('"') {
+                    serde_json::from_str::<String>(arg).map_err(|_| {
+                        FormError::UnexpectedLine(form_name.to_string(), trimmed.to_string())
+                    })?
+                } else {
+                    arg.to_string()
+                };
+                text.push(line);
+                continue;
+            }
         }
         let rest = match trimmed.strip_prefix("field") {
             Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => r,
@@ -94,7 +125,7 @@ pub fn parse_form_body(form_name: &str, code: &str) -> Result<Vec<FormField>, Fo
             keep: attrs.get("keep").is_some_and(|v| v != "false"),
         });
     }
-    Ok(fields)
+    Ok((text, fields))
 }
 
 /// Builds a `FormBlock` from an already-scanned `form`-lang `CodeBlock`
@@ -103,11 +134,13 @@ pub fn parse_form_body(form_name: &str, code: &str) -> Result<Vec<FormField>, Fo
 /// `crate::exec::is_button`).
 pub fn form_block(block: &crate::fence::CodeBlock) -> Result<FormBlock, FormError> {
     let name = block.name.clone().ok_or(FormError::MissingName)?;
-    let fields = parse_form_body(&name, &block.code)?;
+    let (text, fields) = parse_form_content(&name, &block.code)?;
     Ok(FormBlock {
         name,
         send: block.attrs.get("send").cloned(),
         reset: block.attrs.get("reset").is_some_and(|v| v != "false"),
+        cancel: block.attrs.get("cancel").cloned(),
+        text,
         fields,
     })
 }
@@ -213,6 +246,20 @@ mod tests {
             err,
             FormError::DuplicateFieldVar("f".to_string(), "X".to_string())
         );
+    }
+
+    #[test]
+    fn text_lines_are_collected_and_a_form_may_be_text_only() {
+        let md = concat!(
+            "```form name=\"f\" cancel=\"Abort\"\n",
+            "text \"Edit \\\"out.csv\\\" first\"\n",
+            "text plain line\n",
+            "```\n",
+        );
+        let form = form_block(&scan_one(md)).unwrap();
+        assert_eq!(form.text, vec!["Edit \"out.csv\" first", "plain line"]);
+        assert_eq!(form.cancel.as_deref(), Some("Abort"));
+        assert!(form.fields.is_empty());
     }
 
     #[test]

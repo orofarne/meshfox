@@ -1870,9 +1870,19 @@ pub struct FormFieldStatus {
     pub var: VarStatus,
 }
 
-#[derive(serde::Deserialize)]
-struct FormFieldsResponse {
-    fields: Vec<FormFieldStatus>,
+/// `GET /api/form/fields` in full: captions, explanatory text, whether a
+/// run is parked on the form, and the fields.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FormInfo {
+    pub send: String,
+    pub cancel: String,
+    #[serde(default)]
+    pub text: Vec<String>,
+    /// Read by the TUI/web form views to show an "awaiting an answer" state.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub awaiting: bool,
+    pub fields: Vec<FormFieldStatus>,
 }
 
 /// `GET /api/fs/list` — one directory of the worker's file system, for the
@@ -1919,6 +1929,11 @@ pub async fn get_form_fields(
     node_id: &str,
     block: &str,
 ) -> Result<Vec<FormFieldStatus>, String> {
+    get_form_info(port, node_id, block).await.map(|i| i.fields)
+}
+
+/// `GET /api/form/fields`, with everything the endpoint reports.
+pub async fn get_form_info(port: u16, node_id: &str, block: &str) -> Result<FormInfo, String> {
     let res = client()
         .get(format!("{}/api/form/fields", base_url(port)))
         .query(&[("nodeId", node_id), ("block", block)])
@@ -1935,10 +1950,28 @@ pub async fn get_form_fields(
             text
         });
     }
-    res.json::<FormFieldsResponse>()
+    res.json::<FormInfo>().await.map_err(|e| e.to_string())
+}
+
+/// `POST /api/form/cancel` — fails the run parked on this form.
+pub async fn cancel_form(port: u16, node_id: &str, block: &str) -> Result<(), String> {
+    let res = client()
+        .post(format!("{}/api/form/cancel", base_url(port)))
+        .json(&serde_json::json!({ "nodeId": node_id, "block": block }))
+        .timeout(time_limit(QUICK))
+        .send()
         .await
-        .map(|r| r.fields)
-        .map_err(|e| e.to_string())
+        .map_err(|e| describe(&e))?;
+    if res.status().is_success() {
+        return Ok(());
+    }
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    Err(if text.is_empty() {
+        status.to_string()
+    } else {
+        text
+    })
 }
 
 /// `POST /api/vars/configure` — writes every entry in `vars` naming a
@@ -2185,6 +2218,13 @@ pub enum RunEvent {
         block: String,
         output: String,
         duration_ms: u64,
+    },
+    /// The chain reached a `form` step and is parked there until the form
+    /// is sent or cancelled (`POST /api/form/submit` / `/api/form/cancel`).
+    AwaitingForm {
+        node_id: String,
+        block: String,
+        run_id: String,
     },
     Output {
         node_id: String,

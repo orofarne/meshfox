@@ -1445,7 +1445,7 @@ impl CanvasCtx {
         Ok(CallToolResult::structured(json!({ "reset": true })))
     }
 
-    /// Sends a `form` fence the way its Send button does: commits the given values into the session and starts every `autorun` block they reach (in the worker). Waits for those blocks (unless `wait: false`) and returns each one's exit code and output tail, with an overall `success` flag. Unlike `run` with `vars`, this changes what the form shows and what later runs see. Refused while a foreground run is in progress. Not for `secret` fields.
+    /// Sends a `form` fence the way its Send button does: commits the given values into the session and starts every `autorun` block they reach (in the worker). Waits for those blocks (unless `wait: false`) and returns each one's exit code and output tail, with an overall `success` flag. Unlike `run` with `vars`, this changes what the form shows and what later runs see. Also the way to answer a form a `run` is parked on (`run` then reports `status: awaiting_form`): the parked run continues in the worker. Otherwise refused while a foreground run is in progress. Not for `secret` fields.
     async fn form_submit(&self, params: FormSubmitParams) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
         let values: std::collections::HashMap<String, String> = params.values.into_iter().collect();
@@ -2188,7 +2188,8 @@ struct RunStepReport {
     node_id: String,
     block: String,
     /// `ran`, `failed`, `skipped` (already fresh this session), `running`
-    /// (still going when the call ended), `service_started` or `killed`.
+    /// (still going when the call ended), `service_started`, `killed` or
+    /// `awaiting_form` (parked on a `form` step until it is submitted).
     status: &'static str,
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
@@ -2201,6 +2202,8 @@ struct RunStepReport {
 #[derive(Default)]
 struct RunReport {
     steps: Vec<RunStepReport>,
+    /// The chain parked on a `form` step: `(node_id, block, run_id)`.
+    awaiting_form: Option<(String, String, String)>,
     timed_out: bool,
     done: Option<i32>,
     error: Option<String>,
@@ -2237,6 +2240,17 @@ impl RunReport {
         use crate::worker_client::RunEvent;
         match event {
             RunEvent::Started { .. } | RunEvent::TtyStart { .. } => {}
+            RunEvent::AwaitingForm {
+                node_id,
+                block,
+                run_id,
+            } => {
+                // The run keeps waiting in the worker without us; the agent
+                // answers with `form_submit` (or the form is cancelled).
+                self.step_mut(&node_id, &block).status = "awaiting_form";
+                self.awaiting_form = Some((node_id, block, run_id));
+                return true;
+            }
             RunEvent::StepStart { node_id, block } => {
                 self.step_mut(&node_id, &block);
             }
@@ -2323,6 +2337,20 @@ impl RunReport {
                 .steps
                 .iter()
                 .all(|s| matches!(s.status, "ran" | "skipped" | "service_started"));
+        if let Some((node_id, block, run_id)) = self.awaiting_form.take() {
+            // Not a failure: the run is parked until the form is answered.
+            return Ok(CallToolResult::structured(json!({
+                "success": false,
+                "status": "awaiting_form",
+                "awaiting_form": {
+                    "node_id": node_id,
+                    "block": block,
+                    "run_id": run_id,
+                    "next": "read the form with its fields, then call form_submit for this node_id/block to continue the run",
+                },
+                "steps": self.steps,
+            })));
+        }
         let value = json!({
             "success": success,
             "exit_code": self.done,

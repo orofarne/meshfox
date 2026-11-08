@@ -994,6 +994,10 @@ fn print_tty_transcript_event(event: crate::worker_client::RunEvent) -> TtyPrelu
             TtyPreludeOutcome::EnterPty
         }
         RunEvent::Started { .. } | RunEvent::ServiceStarted { .. } => TtyPreludeOutcome::Continue,
+        RunEvent::AwaitingForm { node_id, block, .. } => {
+            print!("waiting for form {node_id}/{block} — send it from another client\r\n");
+            TtyPreludeOutcome::Continue
+        }
         RunEvent::StepStart { node_id, block } => {
             crate::terminal_status::running(&block);
             crate::run_output::banner(&format!("{node_id}/{block}"), "\r\n");
