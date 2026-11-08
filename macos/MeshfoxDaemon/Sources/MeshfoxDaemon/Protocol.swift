@@ -31,6 +31,27 @@ enum WatcherMessage {
     /// (`no such core: ...` when nothing is tracked). Mirrors the Rust
     /// side's `Message::Kill`.
     case kill(canvasPath: String)
+    /// "Something happened in `canvasPath`" — one-way, acked with `{}`.
+    /// Mirrors the Rust side's `Message::Notify`. Kinds this daemon does
+    /// not act on are ignored (the set is open).
+    case notify(canvasPath: String, event: CoordinatorEvent)
+}
+
+/// Mirrors the Rust side's `watcher_protocol::CoordinatorEvent`.
+struct CoordinatorEvent: Decodable {
+    let kind: String
+    let nodeId: String?
+    let block: String?
+    let runId: String?
+    let message: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case nodeId = "node_id"
+        case block
+        case runId = "run_id"
+        case message
+    }
 }
 
 extension WatcherMessage: Decodable {
@@ -41,6 +62,7 @@ extension WatcherMessage: Decodable {
         case fragment
         case path
         case noExec = "no_exec"
+        case event
     }
 
     init(from decoder: Decoder) throws {
@@ -68,6 +90,10 @@ extension WatcherMessage: Decodable {
         case "kill":
             let path = try container.decode(String.self, forKey: .canvasPath)
             self = .kill(canvasPath: path)
+        case "notify":
+            let path = try container.decode(String.self, forKey: .canvasPath)
+            let event = try container.decode(CoordinatorEvent.self, forKey: .event)
+            self = .notify(canvasPath: path, event: event)
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .op,

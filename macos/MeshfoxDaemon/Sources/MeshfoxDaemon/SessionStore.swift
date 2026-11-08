@@ -92,6 +92,9 @@ final class SessionStore {
     /// `AppDelegate` rebuilds the menu from `allSessions` in response.
     var onChange: (() -> Void)?
 
+    /// A worker reported an event (`notify`). Called on a socket thread.
+    var onNotify: ((String, CoordinatorEvent) -> Void)?
+
     init(socketPath: String, meshfoxPath: String) {
         self.socketPath = socketPath
         self.meshfoxPath = meshfoxPath
@@ -143,6 +146,8 @@ final class SessionStore {
         switch message {
         case .ready(let canvasPath, let port):
             markReady(canvasPath: canvasPath, port: port)
+        case .notify(let canvasPath, let event):
+            onNotify?(canvasPath, event)
         case .open, .openFile, .getPort, .listCores, .kill:
             // Never actually reaches here — `UnixSocketServer` intercepts
             // all of these itself and calls `openCanvas(path:fragment:

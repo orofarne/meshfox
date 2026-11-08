@@ -4,6 +4,7 @@ import Foundation
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var store: SessionStore!
+    private var notifier: FormNotifier?
     private let meshfoxPath: String
     private let socketPath: String
 
@@ -36,6 +37,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         store = SessionStore(socketPath: socketPath, meshfoxPath: meshfoxPath)
         store.onChange = { [weak self] in self?.rebuildMenu() }
+        notifier = FormNotifier { [weak self] path, nodeId in
+            self?.store.openCanvas(path: path, fragment: nodeId, completion: Self.logIfFailed)
+        }
+        store.onNotify = { [weak self] path, event in self?.notifier?.handle(canvasPath: path, event: event) }
         do {
             try store.start()
         } catch {
