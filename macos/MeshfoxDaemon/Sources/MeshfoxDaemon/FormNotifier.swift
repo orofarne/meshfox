@@ -3,7 +3,7 @@ import Foundation
 import UserNotifications
 
 /// Native notification for "a run is waiting for a form" — the
-/// `form_awaiting` kind of `watcher_protocol.rs`'s `Message::Notify`. Every
+/// `form_awaiting` kind of `watcher_protocol.rs`'s `Message::Notify`. `form_resolved` withdraws it again. Every
 /// other kind is ignored for now. Clicking the notification opens the
 /// canvas at the form's node.
 ///
@@ -12,6 +12,7 @@ import UserNotifications
 /// `osascript`'s `display notification` (no click action there).
 final class FormNotifier: NSObject, UNUserNotificationCenterDelegate {
     static let formAwaiting = "form_awaiting"
+    static let formResolved = "form_resolved"
     private static let canvasKey = "canvas_path"
     private static let nodeKey = "node_id"
 
@@ -33,7 +34,21 @@ final class FormNotifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    private static func identifier(_ canvasPath: String, _ event: CoordinatorEvent) -> String {
+        "form-\(canvasPath)-\(event.nodeId ?? "")-\(event.block ?? "form")"
+    }
+
     func handle(canvasPath: String, event: CoordinatorEvent) {
+        if event.kind == Self.formResolved {
+            // Answered or cancelled elsewhere: the banner is stale now.
+            if bundled {
+                let center = UNUserNotificationCenter.current()
+                let id = Self.identifier(canvasPath, event)
+                center.removeDeliveredNotifications(withIdentifiers: [id])
+                center.removePendingNotificationRequests(withIdentifiers: [id])
+            }
+            return
+        }
         guard event.kind == Self.formAwaiting else { return }
         let canvas = ((canvasPath as NSString).lastPathComponent as NSString).deletingPathExtension
         let title = "Meshfox is waiting for you"
@@ -48,7 +63,7 @@ final class FormNotifier: NSObject, UNUserNotificationCenterDelegate {
             content.sound = .default
             content.userInfo = [Self.canvasKey: canvasPath, Self.nodeKey: event.nodeId ?? ""]
             // One notification per parked form: a repeat replaces it.
-            let id = "form-\(canvasPath)-\(event.nodeId ?? "")-\(form)"
+            let id = Self.identifier(canvasPath, event)
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
         } else {
             Self.osascript(title: title, body: body)

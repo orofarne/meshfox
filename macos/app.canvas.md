@@ -75,7 +75,7 @@ not bridged into Swift by any higher-level framework.
 
 The package seeds a private `~/.local/bin/meshfox` for each user from the bundled release binary under `Contents/Resources`. The daemon prefers that personal CLI, then falls back to the bundled one. `MESHFOX_BIN` overrides both for development/testing.
 
-`FormNotifier.swift` shows a native notification for the `notify` message's `form_awaiting` event (a run parked on a `form` step); other event kinds are ignored. In the bundled app it uses `UserNotifications` (clicking opens the canvas at the form's node); an unbundled `swift run` falls back to `osascript`'s `display notification` (no click action).
+`FormNotifier.swift` shows a native notification for the `notify` message's `form_awaiting` event (a run parked on a `form` step); `form_resolved` withdraws it again; other event kinds are ignored. In the bundled app it uses `UserNotifications` (clicking opens the canvas at the form's node); an unbundled `swift run` falls back to `osascript`'s `display notification` (no click action).
 
 ## Build & package
 <!-- meshfox:node id="build" -->
