@@ -38,7 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.socketPath = socketPath
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    func applicationDidFinishLaunching(_: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.title = "🦊"
         statusItem.button?.toolTip = "Meshfox"
@@ -78,7 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// carrying `.md`). Each `url` becomes an ordinary `openCanvas` call,
     /// same as any other source of an "open this" request — see
     /// `SessionStore.openCanvas`'s own doc comment.
-    func application(_ application: NSApplication, open urls: [URL]) {
+    func application(_: NSApplication, open urls: [URL]) {
         guard store != nil else {
             pendingOpenPaths.append(contentsOf: urls.map(\.path))
             return

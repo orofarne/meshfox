@@ -277,12 +277,13 @@ async fn a_run_parks_on_a_form_step_and_form_submit_resumes_it() {
     // The transcript records what the form waited for and how it was answered.
     let mut logs = String::new();
     for _ in 0..100 {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_meshfox"))
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_meshfox"))
             .args(["logs", "--canvas", "flow.canvas.md", "--chain", "finish"])
             .current_dir(&dir)
             .env("HOME", dir.join("home"))
             .env("MESHFOX_SERVER_SOCKET", "")
             .output()
+            .await
             .expect("meshfox logs runs");
         logs = String::from_utf8_lossy(&out.stdout).into_owned();
         if logs.contains("ANSWER=yes") {

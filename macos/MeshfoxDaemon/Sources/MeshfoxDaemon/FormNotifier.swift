@@ -71,7 +71,7 @@ final class FormNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
+        _: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
@@ -85,8 +85,8 @@ final class FormNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// Show banners even while the daemon is the active app.
     func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
+        _: UNUserNotificationCenter,
+        willPresent _: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         completionHandler([.banner, .sound])
