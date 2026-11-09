@@ -688,6 +688,11 @@ Every `<!-- meshfox:... -->` marker comment is also highlighted on top of the bu
 
 Prefer Neovim to the built-in editor? Edit canvases in it directly: the plugin gives marker highlighting, and `meshfox lsp` the same completion and heading-to-node action as `Ctrl-p`/`Ctrl-n` above. Or keep the TUI and set `[tui] editor = "nvim +{line} {file}"` (see "External editor").
 
+#### Neovim plugin: install and test
+<!-- meshfox:node id="neovim-plugin-development" type="file" -->
+
+[editors/neovim/README.canvas.md](./editors/neovim/README.canvas.md)
+
 #### TUI themes: live preview
 <!-- meshfox:node id="tui-themes-live-preview" type="link" -->
 
@@ -764,6 +769,11 @@ On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName
 <!-- meshfox:node id="vscode-extension-readme" type="file" -->
 
 [editors/vscode/README.md](./editors/vscode/README.md)
+
+#### VS Code extension: build and test
+<!-- meshfox:node id="vscode-extension-development" type="file" -->
+
+[editors/vscode/README.canvas.md](./editors/vscode/README.canvas.md)
 
 ### Static export (experimental)
 <!-- meshfox:node id="usage-static" -->
@@ -1708,24 +1718,19 @@ npx playwright install webkit
 npm run test:wasm-editor
 ```
 
-### VS Code end-to-end tests
-<!-- meshfox:node id="vs-code-end-to-end-tests" -->
+### Editor tests
+<!-- meshfox:node id="editor-tests" -->
 
-`editors/vscode/e2e/` is a separate, deliberately opt-in [Playwright](https://playwright.dev) suite from the one above — it drives a real, already-installed VS Code via Playwright's Electron support (`_electron.launch()`), not headless Chromium, because the bug it exists to catch (TODO.canvas.md: "VSCode: вставка текста (Cmd+V и контекстное меню) в редактор ноды не работает") only reproduces inside a real VS Code window: a genuinely trusted Cmd+V against `web/src/NodeTextEditor.tsx`'s Monaco editor fires a normal `paste` DOM event in any real browser tab (confirmed directly, and covered by `web/e2e/copy-paste.spec.ts`'s own round-trip test) but never does inside VS Code's own webview — a long-standing, still-open class of upstream VS Code/Electron limitation (nested-iframe focus resolution for a native accelerator-driven paste command; see [microsoft/vscode#129178](https://github.com/microsoft/vscode/issues/129178)), not a bug in this app. `web/src/textPasteFallback.ts` works around it (falls back to `navigator.clipboard.readText()` when a real `paste` event doesn't show up within 250ms of a Ctrl/Cmd+V keydown) — this suite is what actually proves that fallback works, end to end, in the one environment that matters for it. Confirmed the same investigation's way: the node body editor's own title field and NodeSettings' ID field (both plain `<input>`s, no `EditContext` involved) already paste correctly via real Cmd+V in VS Code with no fallback needed at all — the gap is specific to Monaco's `EditContext` input surface, not general to every input in the app.
+The editor integrations keep their own build and test instructions in their own canvases — [editors/neovim/README.canvas.md](./editors/neovim/README.canvas.md) (the tree-sitter grammar corpus, the highlight checks, and a headless Neovim pass over every canvas in this repository) and [editors/vscode/README.canvas.md](./editors/vscode/README.canvas.md) (the extension's build, and its Playwright suite against a real, installed VS Code). The blocks below call into them, so `full-check` runs them with everything else.
 
-Heavier and more fragile than the browser suite above on purpose (see `playwright.config.ts`'s own doc comment): a real VS Code + extension-host + meshfox-worker launch costs ~15-20s per file, needs a real VS Code install on the machine running it (`VSCODE_ELECTRON_PATH` env var overrides the default macOS/Linux install-path guesses in `helpers.ts`), and isn't part of `e2e-tests` above or any CI gate — run it by hand when touching real-VS-Code-specific behavior (`editors/vscode/`, or anything paste/clipboard-related in the Monaco editors).
-
-```sh name="vscode-e2e-prep"
-cd editors/vscode/e2e
-npm install
+```meshfox name="neovim-tests"
+canvas: editors/neovim/README.canvas.md
+run: testing test
 ```
 
-```sh name="vscode-e2e-run" deps="vscode-e2e-prep"
-export CARGO_TERM_COLOR=always FORCE_COLOR=1
-cargo build -p meshfox-cli
-cd web && npm run build && cd ..
-cd editors/vscode && npm run compile && cd e2e
-npm test
+```meshfox name="vscode-e2e"
+canvas: editors/vscode/README.canvas.md
+run: e2e-tests e2e-run
 ```
 
 ### TUI end-to-end tests
@@ -1866,7 +1871,7 @@ echo "binary: target/release/meshfox"
 
 Run unit tests (macOS host and the Linux VM), the WebAssembly model's checks, typecheck, and e2e tests (including the in-browser build's):
 
-```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,e2e-tests/run!,e2e-tests/wasm-editor!,release-build/release-build!"
+```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,e2e-tests/run!,e2e-tests/wasm-editor!,editor-tests/neovim-tests!,editor-tests/vscode-e2e!,release-build/release-build!"
 echo "done"
 ```
 

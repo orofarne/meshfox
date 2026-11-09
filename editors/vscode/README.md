@@ -16,7 +16,8 @@ server — at [meshfox.orofarne.net](https://meshfox.orofarne.net/).
 On the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Orofarne.meshfox-vscode)
 as `Orofarne.meshfox-vscode` — install from there (Extensions view, search
 "meshfox", or `ext install Orofarne.meshfox-vscode`) rather than building
-it yourself; the rest of this file is for developing the extension itself.
+it yourself. (Building and testing the extension: `README.canvas.md`
+next to this file.)
 
 To start a new canvas, run **meshfox: New canvas** from the Command Palette
 (or just create an empty `*.canvas.md` file yourself — meshfox fills in the
@@ -100,77 +101,3 @@ with `ENOENT`), an error notification offers **Install** — same as running
 the **"meshfox: Install"** command directly — which types the same install
 one-liner the root README documents into an integrated terminal, Enter
 left to you: never runs it on your behalf.
-
-## How it works
-
-The extension acts as its own private coordinator (see `src/coordinator.ts`)
-— it binds a Unix socket, and for each file opened through either
-`viewType` spawns `meshfox view <path> --port 0 --watcher-socket <that
-socket>`. Once the worker reports its bound port over the socket, the
-editor tab's webview fetches that worker's own `index.html` and becomes it
-directly (`src/canvasEditorProvider.ts`/`canvasHtml.ts`) — not an
-`<iframe>` pointed at it. A `<base href="http://127.0.0.1:<port>/">`
-injected into the fetched page's `<head>` makes every one of its
-root-absolute asset/`fetch()` references resolve against that server
-instead of the webview's own origin, so the app runs exactly as it does in
-a real browser tab, just hosted directly in the tab's own webview document.
-Closing the tab kills that worker; a "↗ open" link to another canvas
-inside the UI opens (or focuses) another VS Code tab the same way.
-
-Being the webview's own top-level document means it's also subject to two
-things a real browser tab never has to deal with, both worked around in
-`canvasAppHtml` (`canvasHtml.ts`): the injected CSP needs `'wasm-unsafe-
-eval'` on `script-src` (Shiki's default syntax-highlighting engine is
-WASM — without it, every code block quietly renders unhighlighted rather
-than erroring), and a small `<style>` reset undoes VS Code's own default
-webview stylesheet, which paints a `background-color` onto every bare
-`<code>` element (meant for a short inline `` `snippet` `` in a
-markdown-preview-style webview) — Shiki's `<pre class="shiki"><code>`
-wrapping means that paints over/behind a highlighted block's own intended
-background and washes out its colors otherwise.
-
-This wasn't the original design — an earlier version *did* use an
-`<iframe>`, and copy/paste plus the right-click context menu silently
-didn't work inside it. That turned out to be a long-standing, still-open
-upstream VS Code limitation specific to a *nested cross-origin iframe*
-inside a webview, not to a webview's own top-level content (see
-[microsoft/vscode#180234](https://github.com/microsoft/vscode/issues/180234),
-[#68799](https://github.com/microsoft/vscode/issues/68799),
-[#121580](https://github.com/microsoft/vscode/issues/121580)) — switching
-to loading the app as the webview's own document sidesteps the whole bug
-class rather than working around its symptoms. If anything still feels off
-compared to a real browser tab, the **"meshfox: Open in Browser"** command
-(also a button in the editor tab's own title bar) opens the exact same
-already-running worker in a real browser tab instead, which is never
-subject to any webview limitation at all.
-
-## Developing
-
-```sh
-cd editors/vscode
-npm install
-```
-
-Press **F5** (or Run → "Run meshfox extension") to launch an Extension
-Development Host with the extension loaded — this compiles automatically
-via the `npm: compile` pre-launch task. `npm run watch` recompiles on save
-if you'd rather keep a dev host open across edits (reload it with
-`Cmd/Ctrl+R` after each change instead of relaunching).
-
-## Building a local `.vsix`
-
-For testing a dev build without waiting on a Marketplace release:
-
-```sh
-npx @vscode/vsce package
-```
-
-produces `meshfox-vscode-<version>.vsix`, installable with:
-
-```sh
-code --install-extension meshfox-vscode-<version>.vsix
-```
-
-or via the Extensions view → "..." → "Install from VSIX". `vsce package`
-needs no publisher account/token — that's only for actually publishing a
-new version to the Marketplace.

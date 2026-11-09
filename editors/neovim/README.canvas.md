@@ -129,13 +129,15 @@ Corpus tests for the grammar (`grammar/test/corpus/`), then a headless Neovim pa
 ```sh name="test" deps="install/build" default
 set -eu
 (cd grammar && tree-sitter test)
-nvim --headless -u NONE -i NONE -l test/colors.lua
+nvim --headless -u NONE -i NONE --cmd 'set packpath=' -l test/colors.lua
 repo=$(git rev-parse --show-toplevel)
 # shellcheck disable=SC2046
-nvim --headless -u NONE -l test/check.lua \
+nvim --headless -u NONE --cmd 'set packpath=' -l test/check.lua \
   "$repo/README.md" "$repo/SPEC.md" \
   $(find "$repo" -name '*.canvas.md' -not -path '*/node_modules/*' -not -path '*/target/*' -not -path '*/.git/*')
 ```
+
+`--cmd 'set packpath='` keeps Neovim from loading a copy of the plugin you installed earlier (its parser may be older than this checkout's).
 
 The dedicated color-span check asserts attribute highlight ranges, short hex colors, and exclusion of inline code and invalid values. The general tree-sitter pass checks parse errors only (see the gotchas below). The language server is tested from the Rust side: `cargo test -p meshfox-core suggest`, `cargo test -p meshfox-cli --bin meshfox lsp::` and `cargo test -p meshfox-cli --test lsp_cmd` (the real binary over stdio).
 
