@@ -143,6 +143,8 @@ pub mod event_kind {
     pub const FORM_AWAITING: &str = "form_awaiting";
     /// The form a run waited on was sent or cancelled.
     pub const FORM_RESOLVED: &str = "form_resolved";
+    /// A run began (its `run_id` is on every later event of that run).
+    pub const RUN_STARTED: &str = "run_started";
     /// A run ended with exit code 0.
     pub const RUN_FINISHED: &str = "run_finished";
     /// A run ended with a non-zero exit code, an error, or was cancelled.

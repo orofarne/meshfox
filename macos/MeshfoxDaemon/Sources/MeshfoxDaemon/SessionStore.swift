@@ -39,6 +39,11 @@ final class Session {
     /// by `SessionStore.lock` like everything else here, not its own lock,
     /// since it's only ever touched alongside other session state anyway.
     var capturedStderr = ""
+    /// `run_id`s of the runs this worker reported started and not yet ended
+    /// (`notify`: `run_started` / `run_finished` / `run_failed`). Guarded by
+    /// `SessionStore.lock`. Dies with the session, so a worker that exits
+    /// mid-run cannot leave a spinner behind.
+    var activeRuns = Set<String>()
 
     init(canvasPath: String, process: Process, pendingOpen: PendingOpen, noExec: Bool) {
         self.canvasPath = canvasPath
@@ -147,6 +152,7 @@ final class SessionStore {
         case .ready(let canvasPath, let port):
             markReady(canvasPath: canvasPath, port: port)
         case .notify(let canvasPath, let event):
+            trackRun(canvasPath: canvasPath, event: event)
             onNotify?(canvasPath, event)
         case .open, .openFile, .getPort, .listCores, .kill:
             // Never actually reaches here — `UnixSocketServer` intercepts
@@ -157,6 +163,30 @@ final class SessionStore {
             // connection. Kept only so this switch stays exhaustive.
             break
         }
+    }
+
+    /// Keeps each session's set of running `run_id`s up to date.
+    private func trackRun(canvasPath: String, event: CoordinatorEvent) {
+        guard let runId = event.runId else { return }
+        let canonical = Self.canonicalize(canvasPath)
+        lock.lock()
+        var changed = false
+        if let session = sessions[canonical] {
+            switch event.kind {
+            case "run_started": changed = session.activeRuns.insert(runId).inserted
+            case "run_finished", "run_failed": changed = session.activeRuns.remove(runId) != nil
+            default: break
+            }
+        }
+        lock.unlock()
+        if changed { notifyChange() }
+    }
+
+    /// Canvases with at least one run in progress.
+    func busyCanvasPaths() -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(sessions.values.filter { !$0.activeRuns.isEmpty }.map(\.canvasPath))
     }
 
     /// "Get-or-spawn a worker for `canvasPath`, tell me its port" —

@@ -5,6 +5,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var store: SessionStore!
     private var notifier: FormNotifier?
+    /// Animation state for "a run is in progress": one timer drives the
+    /// tray icon and every busy canvas's menu title.
+    private static let spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    private var spinnerTimer: Timer?
+    private var spinnerFrame = 0
+    private var busyItems: [String: (item: NSMenuItem, title: String)] = [:]
     private let meshfoxPath: String
     private let socketPath: String
 
@@ -93,6 +99,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildMenu() {
         let menu = NSMenu()
+        let busy = store.busyCanvasPaths()
+        busyItems = [:]
 
         let sessions = store.allSessions
         if sessions.isEmpty {
@@ -106,6 +114,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // submenu. Kept enabled even while starting so Kill stays reachable.
                 let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 item.toolTip = session.canvasPath
+                if busy.contains(session.canvasPath) {
+                    busyItems[session.canvasPath] = (item, title)
+                    item.title = "\(Self.spinnerFrames[spinnerFrame]) \(title)"
+                }
 
                 let submenu = NSMenu()
                 let openItem = NSMenuItem(title: "Open", action: #selector(openSession(_:)), keyEquivalent: "")
@@ -148,6 +160,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+        updateSpinner(busy: !busy.isEmpty)
+    }
+
+    /// Starts or stops the shared spinner timer. It runs in `.common` modes
+    /// so it keeps turning while the menu is open (menu tracking uses its
+    /// own run-loop mode).
+    private func updateSpinner(busy: Bool) {
+        if busy {
+            guard spinnerTimer == nil else { return }
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tickSpinner() }
+            RunLoop.main.add(timer, forMode: .common)
+            spinnerTimer = timer
+            tickSpinner()
+        } else {
+            spinnerTimer?.invalidate()
+            spinnerTimer = nil
+            statusItem.button?.title = "🦊"
+        }
+    }
+
+    private func tickSpinner() {
+        spinnerFrame = (spinnerFrame + 1) % Self.spinnerFrames.count
+        let frame = Self.spinnerFrames[spinnerFrame]
+        statusItem.button?.title = "🦊\(frame)"
+        for (_, entry) in busyItems {
+            entry.item.title = "\(frame) \(entry.title)"
+        }
     }
 
     @objc private func openSession(_ sender: NSMenuItem) {

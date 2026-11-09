@@ -1420,8 +1420,8 @@ until a person sends or cancels the form:
   editing.
 - **Coordinator notifications.** The worker also tells its coordinator
   (`watcher_protocol::Message::Notify`, one-way, best effort, never delaying a
-  run) when a run parks (`form_awaiting`), is released (`form_resolved`), and
-  when any run ends (`run_finished` / `run_failed`). A coordinator that does
+  run) when a run starts (`run_started`), parks (`form_awaiting`), is released
+  (`form_resolved`), and when any run ends (`run_finished` / `run_failed`). A coordinator that does
   not know the message ignores it.
 
 - Scope: like `button`, a form's own addressing only ever resolves within

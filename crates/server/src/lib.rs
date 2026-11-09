@@ -7312,6 +7312,13 @@ async fn run_block_impl_sized(
         // block's own step ever being reached below.
         let mut _reservation_guard = ResolveReservationOnDrop(target_reservation.clone());
 
+        state.notify_coordinator(
+            watcher_protocol::event_kind::RUN_STARTED,
+            Some(&chain.last().expect("nonempty run plan").node_id),
+            Some(&chain.last().expect("nonempty run plan").block_name),
+            Some(&run_id),
+            None,
+        );
         yield Ok::<_, io::Error>(ndjson_line(&RunEvent::Started { run_id: run_id.clone(), chain_id: Some(journal_id) }));
 
         let mut final_exit_code = 0;
@@ -20651,13 +20658,23 @@ mod form_endpoint_tests {
                 .iter()
                 .map(|m| m["event"]["kind"].as_str().unwrap_or_default().to_string())
                 .collect();
-            if kinds.len() >= 3 {
+            if kinds.len() >= 4 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(kinds, ["form_awaiting", "form_resolved", "run_finished"]);
-        let first = received.lock().unwrap()[0].clone();
+        assert_eq!(
+            kinds,
+            [
+                "run_started",
+                "form_awaiting",
+                "form_resolved",
+                "run_finished"
+            ]
+        );
+        let started = received.lock().unwrap()[0].clone();
+        assert!(started["event"]["run_id"].is_string());
+        let first = received.lock().unwrap()[1].clone();
         assert_eq!(first["op"], "notify");
         assert_eq!(first["event"]["block"], "review");
         assert_eq!(first["event"]["message"], "Check the file, then continue");
