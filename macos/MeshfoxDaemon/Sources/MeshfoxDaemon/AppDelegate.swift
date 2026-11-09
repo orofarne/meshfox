@@ -8,9 +8,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Animation state for "a run is in progress": one timer drives the
     /// tray icon and every busy canvas's menu title.
     /// The timer ticks every 50 ms: the tray fox fades in and out over
-    /// `pulseTicks` ticks (1.6 s), the menu's braille spinner advances every
+    /// `pulseTicks` ticks (3.2 s), the menu's braille spinner advances every
     /// second tick.
-    private static let pulseTicks = 32
+    private static let pulseTicks = 64
     private static let menuFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     private var spinnerTimer: Timer?
     private var spinnerFrame = 0
