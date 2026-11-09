@@ -1,4 +1,5 @@
 //! Native canvas calls go through the same worker path as every frontend.
+mod common;
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -19,6 +20,9 @@ fn fixture(child: &str, parent_options: &str, parent_body: &str) -> (PathBuf, Pa
     (dir, parent)
 }
 fn command(dir: &Path, parent: &Path) -> Command {
+    command_for(dir, parent, "invoke")
+}
+fn command_for(dir: &Path, parent: &Path, block: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_meshfox"));
     let bin = Path::new(env!("CARGO_BIN_EXE_meshfox")).parent().unwrap();
     cmd.env("HOME", dir)
@@ -32,7 +36,7 @@ fn command(dir: &Path, parent: &Path) -> Command {
             ),
         )
         .arg(parent)
-        .args(["run", "invoke", "--terminal-status", "off"]);
+        .args(["run", block, "--terminal-status", "off"]);
     cmd
 }
 #[test]
@@ -219,4 +223,78 @@ fn a_local_lease_returns_without_following_the_released_service() {
         assert!(!stdout.contains("service(s) running"), "{stdout}");
         assert_eq!(dir.join("external").exists(), borrowed);
     }
+}
+
+// The child worker is asked to prepare the call before the chain starts, but
+// only invoked when its own step is reached. Whatever happens to the worker
+// in between (a coordinator-owned worker exits after its idle grace period)
+// must not matter: the executing block resolves the worker again at the
+// moment it runs.
+#[test]
+fn a_child_worker_that_exited_while_earlier_steps_ran_is_started_again_for_the_call() {
+    let (dir, parent) = fixture(
+        "```bash name=work\necho child-output\n```",
+        "deps=before",
+        "```bash name=before\nsleep 25\n```\n",
+    );
+    let socket_dir = common::unique_dir();
+    let socket = socket_dir.join("s.sock");
+    let mut serve = common::Reaper(
+        common::meshfox(&socket_dir)
+            .args(["serve", "--socket"])
+            .arg(&socket)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::wait_for("the socket", || socket.exists());
+    let out = command(&dir, &parent)
+        .env("MESHFOX_SERVER_SOCKET", &socket)
+        .output()
+        .unwrap();
+    common::terminate(&mut serve);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("child-output"),
+        "{:?}",
+        out
+    );
+}
+
+// A child that has finished its call and holds nothing exits once idle. When
+// the chain ends much later, releasing the lease on that child finds nobody
+// listening; there is nothing left to release, so this is not a failure.
+#[test]
+fn releasing_the_lease_on_a_child_worker_that_already_exited_is_not_an_error() {
+    let (dir, parent) = fixture("```bash name=work\necho child-output\n```", "", "");
+    let mut text = std::fs::read_to_string(&parent).unwrap();
+    text.push_str("```bash name=after deps=invoke\nsleep 25\n```\n");
+    std::fs::write(&parent, text).unwrap();
+    let socket_dir = common::unique_dir();
+    let socket = socket_dir.join("s.sock");
+    let mut serve = common::Reaper(
+        common::meshfox(&socket_dir)
+            .args(["serve", "--socket"])
+            .arg(&socket)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    common::wait_for("the socket", || socket.exists());
+    let out = command_for(&dir, &parent, "after")
+        .env("MESHFOX_SERVER_SOCKET", &socket)
+        .output()
+        .unwrap();
+    common::terminate(&mut serve);
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

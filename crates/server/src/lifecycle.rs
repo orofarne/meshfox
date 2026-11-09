@@ -97,6 +97,10 @@ pub(super) async fn release_scope(state: &AppState, id: &str) -> Vec<String> {
                 },
                 Err(e) => errors.push(format!("child lease cleanup: {e}")),
             },
+            // Nobody is listening: the child exited on its own (a worker with
+            // no retained lease leaves once idle), and with it everything it
+            // could have held for this scope. Nothing is left to release.
+            Err(e) if e.is_connect() => {}
             Err(e) => errors.push(format!("child lease cleanup: {e}")),
         }
     }

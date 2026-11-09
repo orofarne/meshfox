@@ -40,7 +40,12 @@ pub(super) struct Preparation {
 }
 #[derive(Clone)]
 pub(super) struct PreparedCall {
+    /// The worker that answered `prepare`. Only a hint for the preparation
+    /// itself: a child worker exits once idle, and the chain may reach this
+    /// block long after planning, so the run asks for the worker again
+    /// (see [`attach`]) instead of trusting this port.
     port: u16,
+    watcher_socket: Option<PathBuf>,
     canvas: PathBuf,
     local: bool,
     spec: CanvasCall,
@@ -96,7 +101,14 @@ async fn post(
 // TUI/run has no watcher: acquire the same discovery lock and serve a quiet
 // worker on a separate runtime, without depending on a possibly stale PATH.
 async fn port(state: &AppState, path: &std::path::Path) -> Result<u16, ApiError> {
-    if let Some(socket) = &state.watcher_socket {
+    resolve_port(state.watcher_socket.as_deref(), path).await
+}
+
+async fn resolve_port(
+    watcher_socket: Option<&std::path::Path>,
+    path: &std::path::Path,
+) -> Result<u16, ApiError> {
+    if let Some(socket) = watcher_socket {
         return watcher_protocol::request_port(socket, path)
             .await
             .map_err(error);
@@ -220,6 +232,7 @@ pub(super) async fn plan(
             addr.clone(),
             PreparedCall {
                 port,
+                watcher_socket: state.watcher_socket.clone(),
                 local: target == state.canvas_path.canonicalize().map_err(error)?,
                 canvas: target,
                 spec,
@@ -428,6 +441,20 @@ pub(super) fn attach(
         .filter_map(|name| name.strip_prefix(&namespace).map(str::to_string))
         .collect();
     run_registry::attach_native(handle, row, move |handle, mut kill| async move {
+        // The worker is resolved by the block that executes, not by the plan:
+        // earlier steps may have run for longer than a child worker stays up.
+        let mut call = call;
+        match resolve_port(call.watcher_socket.as_deref(), &call.canvas).await {
+            Ok(port) => call.port = port,
+            Err(e) => {
+                handle.publish_child(
+                    stream_exec::OutputStream::Stderr,
+                    e.1,
+                    json!({"canvas":call.canvas,"type":"error"}),
+                );
+                return run_registry::RunOutcome::Exited { exit_code: 1 };
+            }
+        }
         let request = RunRequest {
             source: "canvas".into(),
             path: call.prepared.path.clone(),
