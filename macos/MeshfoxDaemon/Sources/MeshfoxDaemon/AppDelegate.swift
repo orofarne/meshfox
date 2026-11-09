@@ -7,10 +7,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notifier: FormNotifier?
     /// Animation state for "a run is in progress": one timer drives the
     /// tray icon and every busy canvas's menu title.
-    /// 12 ticks per turn of the tray ring; the menu's text spinner has 4
-    /// frames, each held for 3 ticks.
-    private static let spinnerTicks = 12
-    private static let menuFrames = ["◐", "◓", "◑", "◒"]
+    /// The timer ticks every 50 ms: the tray fox fades in and out over
+    /// `pulseTicks` ticks (1.6 s), the menu's braille spinner advances every
+    /// second tick.
+    private static let pulseTicks = 32
+    private static let menuFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     private var spinnerTimer: Timer?
     private var spinnerFrame = 0
     private var busyItems: [String: (item: NSMenuItem, title: String)] = [:]
@@ -119,7 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 item.toolTip = session.canvasPath
                 if busy.contains(session.canvasPath) {
                     busyItems[session.canvasPath] = (item, title)
-                    item.title = "\(Self.menuFrames[spinnerFrame / 3]) \(title)"
+                    item.title = "\(Self.menuFrames[(spinnerFrame / 2) % Self.menuFrames.count]) \(title)"
                 }
 
                 let submenu = NSMenu()
@@ -176,43 +177,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateSpinner(busy: Bool) {
         if busy {
             guard spinnerTimer == nil else { return }
-            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tickSpinner() }
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.tickSpinner() }
             RunLoop.main.add(timer, forMode: .common)
             spinnerTimer = timer
             tickSpinner()
         } else {
             spinnerTimer?.invalidate()
             spinnerTimer = nil
-            statusItem.button?.image = nil
+            statusItem.button?.alphaValue = 1
             statusItem.button?.title = "🦊"
         }
     }
 
-    /// The fox with a ring segment turning around it, drawn at the menu
-    /// bar's size so the status item keeps its width.
-    private static func trayImage(tick: Int) -> NSImage {
-        let size = NSSize(width: 20, height: 20)
-        return NSImage(size: size, flipped: false) { rect in
-            let fox = NSAttributedString(string: "🦊", attributes: [.font: NSFont.systemFont(ofSize: 11)])
-            let box = fox.size()
-            fox.draw(at: NSPoint(x: rect.midX - box.width / 2, y: rect.midY - box.height / 2))
-            let start = 90 - CGFloat(tick) * 360 / CGFloat(spinnerTicks)
-            let ring = NSBezierPath()
-            ring.appendArc(withCenter: NSPoint(x: rect.midX, y: rect.midY), radius: 8.4,
-                           startAngle: start, endAngle: start - 100, clockwise: true)
-            ring.lineWidth = 1.6
-            ring.lineCapStyle = .round
-            NSColor.labelColor.setStroke()
-            ring.stroke()
-            return true
-        }
-    }
-
     private func tickSpinner() {
-        spinnerFrame = (spinnerFrame + 1) % Self.spinnerTicks
-        let frame = Self.menuFrames[spinnerFrame / 3]
-        statusItem.button?.title = ""
-        statusItem.button?.image = Self.trayImage(tick: spinnerFrame)
+        spinnerFrame &+= 1
+        let frame = Self.menuFrames[(spinnerFrame / 2) % Self.menuFrames.count]
+        // Cosine fade between 0.35 and 1.0, starting from full opacity.
+        let phase = 2 * Double.pi * Double(spinnerFrame % Self.pulseTicks) / Double(Self.pulseTicks)
+        statusItem.button?.alphaValue = CGFloat(0.675 + 0.325 * cos(phase))
         for (_, entry) in busyItems {
             entry.item.title = "\(frame) \(entry.title)"
         }
