@@ -248,6 +248,35 @@ a {
   font-size: 0.85rem;
 }
 
+/* Both app bars share the activity strip's compact button style. */
+.toolbar > button,
+.activity-bar button {
+  background: transparent;
+  color: inherit;
+  border: 1px solid var(--node-border);
+  border-radius: 5px;
+  padding: 0.25rem 0.5rem;
+  font: 0.8rem ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  cursor: pointer;
+  opacity: 1;
+}
+
+.toolbar > button:hover,
+.activity-bar button:hover {
+  background: var(--node-bg);
+}
+
+.toolbar > button:disabled,
+.activity-bar button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.toolbar > .deps-toggle-active {
+  border-color: var(--dep);
+  color: var(--dep);
+}
+
 .mode-badge {
   font-size: 0.75rem;
   padding: 0.15rem 0.5rem;
@@ -3962,9 +3991,6 @@ button > .mesh-node-running-spinner {
 .activity-main, .activity-row { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
 .activity-main { height: 43px; padding: 0.35rem 0.75rem; }
 .activity-summary { flex: 1; min-width: 0; }
-.activity-bar button { background: transparent; color: inherit; border: 1px solid var(--node-border); border-radius: 5px; padding: 0.25rem 0.5rem; font: inherit; cursor: pointer; }
-.activity-bar button:hover { background: var(--node-bg); }
-.activity-bar button:disabled { opacity: 0.6; cursor: wait; }
 .activity-bar .activity-current { border: none; padding: 0; display: flex; gap: 0.5rem; align-items: center; min-width: 0; text-align: left; }
 .activity-current [role="status"] { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .activity-address { font-weight: 600; }

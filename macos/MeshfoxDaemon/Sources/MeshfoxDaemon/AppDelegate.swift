@@ -137,9 +137,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let configureItem = NSMenuItem(title: "Connect CLI to Daemon…", action: #selector(configureCLI), keyEquivalent: "")
-        configureItem.target = self
-        menu.addItem(configureItem)
+        // Only offered while the CLI isn't pointed at a daemon yet; if the
+        // config can't be read, keep it so the click reports the error.
+        if (try? SocketConfiguration.hasServerSocket()) != true {
+            let configureItem = NSMenuItem(title: "Connect CLI to Daemon…", action: #selector(configureCLI), keyEquivalent: "")
+            configureItem.target = self
+            menu.addItem(configureItem)
+        }
 
         let versionItem = NSMenuItem(title: "Meshfox Daemon \(Self.daemonVersion)", action: nil, keyEquivalent: "")
         versionItem.isEnabled = false
@@ -238,6 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             try SocketConfiguration.configure(socketPath: socketPath)
+            rebuildMenu()
         } catch {
             showConfigurationError(error)
         }
