@@ -219,7 +219,7 @@ impl TuiSession {
             }
         });
 
-        TuiSession {
+        let session = TuiSession {
             parser,
             raw,
             writer,
@@ -227,6 +227,27 @@ impl TuiSession {
             _master: pair.master,
             fixture_dir,
             _permit: permit,
+        };
+        session.wait_for_first_frame();
+        session
+    }
+
+    /// Blocks until the TUI has drawn anything at all, up to 30s.
+    ///
+    /// Startup (terminal probing, the embedded worker, a loaded machine)
+    /// can take well over the 3-5s the tests give a *screen condition*, and
+    /// then every test that looks for `Root` right after `spawn` fails at
+    /// random with an empty screen. Waiting here, once, keeps those short
+    /// deadlines about the behaviour under test rather than about boot time.
+    /// A session that never draws is left for the test's own `wait_for` to
+    /// report, with its usual message.
+    fn wait_for_first_frame(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if !self.screen_text().trim().is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(30));
         }
     }
 

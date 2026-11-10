@@ -154,7 +154,8 @@ fn code_drag_excludes_the_gutter_and_does_not_run_the_block() {
     expect_clipboard(&session, "printf");
     assert!(!session.screen_text().contains("Output (running"));
     session.send_keys("\x1b");
-    session.wait_for("›─[", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_keys("q");
     assert!(
         session.wait_for_exit(WAIT),

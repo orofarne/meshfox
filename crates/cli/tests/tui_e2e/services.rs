@@ -75,7 +75,7 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
         .wait_for("srv log", Duration::from_secs(5))
         .expect("the services view's log pane should be titled after the selected service");
     session
-        .wait_for("tui-e2e-service-marker", Duration::from_secs(5))
+        .wait_for("tui-e2e-service-marker", Duration::from_secs(20))
         .expect("the service's own real stdout should show up in its log pane");
     session.send_keys("q");
 

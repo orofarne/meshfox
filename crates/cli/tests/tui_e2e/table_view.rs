@@ -153,11 +153,9 @@ fn a_table_shows_inline_and_opens_full_screen_with_sort_filter_and_search() {
     session
         .wait_for("Document", Duration::from_secs(5))
         .expect("back in the three-pane view");
-    assert!(
-        !session.screen_text().contains("q close"),
-        "the full-screen table is gone:\n{}",
-        session.screen_text()
-    );
+    session
+        .wait_absent("q close", Duration::from_secs(10))
+        .expect("the full-screen table is gone");
 }
 
 #[test]

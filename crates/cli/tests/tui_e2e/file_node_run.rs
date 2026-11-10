@@ -32,11 +32,13 @@ fn a_file_node_is_drawn_and_run_like_a_fence() {
     session
         .wait_for("[history]", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("no block header: {e}\n{}", session.screen_text()));
-    let screen = session.screen_text();
-    assert!(screen.contains("[run]"), "{screen}");
-    assert!(screen.contains("[chain]"), "{screen}");
-    assert!(screen.contains("prepare/prep"), "{screen}");
-    assert!(screen.contains("Runs the hello script."), "{screen}");
+    // The header is drawn over several frames on a loaded machine: wait for
+    // each part rather than asserting on one snapshot.
+    for part in ["[run]", "[chain]", "prepare/prep", "Runs the hello script."] {
+        session
+            .wait_for(part, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("missing {part:?}: {e}"));
+    }
 
     // `R` runs only the file; its output lands under the block.
     session.send_keys("R");
