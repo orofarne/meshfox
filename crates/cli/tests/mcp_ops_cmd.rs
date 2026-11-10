@@ -638,3 +638,39 @@ async fn env_tools_list_and_remove_a_live_canvas_environment_inside_the_root() {
     assert!(!venv.exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn node_add_with_bad_tags_fails_without_leaving_a_node_behind() {
+    let dir = unique_dir();
+    let mcp = start(&dir, None).await;
+    let id = open(&mcp).await;
+
+    // A JSON-encoded tag list is rejected — and must be rejected *before* the
+    // node is created, or the retry the error invites makes a duplicate.
+    let (is_error, _) = call(
+        &mcp,
+        "node_add",
+        serde_json::json!({
+            "canvas_id": id, "parent_id": "root", "title": "Fresh", "tags": "[\"discuss\"]",
+        }),
+    )
+    .await
+    .map(|(e, v)| (e, v))
+    .unwrap_or((true, serde_json::Value::Null));
+    assert!(is_error, "the bad tags should have been refused");
+    let on_disk = std::fs::read_to_string(dir.join("doc.canvas.md")).unwrap();
+    assert!(!on_disk.contains("Fresh"), "a node was left behind: {on_disk}");
+
+    let (is_error, added) = call(
+        &mcp,
+        "node_add",
+        serde_json::json!({
+            "canvas_id": id, "parent_id": "root", "title": "Fresh", "tags": "discuss",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error, "{added}");
+    assert_eq!(added["node_id"], "fresh", "{added}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

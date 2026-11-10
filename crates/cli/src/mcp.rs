@@ -1086,6 +1086,16 @@ impl CanvasCtx {
     /// Adds a new child node under parent_id, as the last item in its subtree. Optionally sets its body and meta fields in the same call. Returns the new node's id.
     async fn node_add(&self, params: NodeAddParams) -> Result<CallToolResult, ErrorData> {
         let port = self.worker_port().await?;
+        // Validate the tags and fields before creating anything: a bad value
+        // must fail the call without leaving a half-configured node behind
+        // (a retry would then create a duplicate).
+        let mut meta_fields = params.fields.into_node_meta_fields();
+        meta_fields.tags = params.tags;
+        let update = if meta_fields.is_set() {
+            Some(crate::node_update_from_fields(&meta_fields, None).map_err(invalid_params)?)
+        } else {
+            None
+        };
         // The body goes in with the node itself — a node that doesn't exist
         // yet has no earlier body revision to be stale against.
         let new_id = crate::worker_client::create_node(
@@ -1097,11 +1107,7 @@ impl CanvasCtx {
         )
         .await
         .map_err(invalid_params)?;
-        let mut meta_fields = params.fields.into_node_meta_fields();
-        meta_fields.tags = params.tags;
-        if meta_fields.is_set() {
-            let update =
-                crate::node_update_from_fields(&meta_fields, None).map_err(invalid_params)?;
+        if let Some(update) = update {
             crate::worker_client::update_node(port, &new_id, &update)
                 .await
                 .map_err(invalid_params)?;
