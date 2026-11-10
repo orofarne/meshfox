@@ -1599,8 +1599,10 @@ fn main() {
     if args.len() == 2 && !args[1].starts_with('-') && args[1].to_ascii_lowercase().ends_with(".md")
     {
         // A bare `meshfox test.md`, no subcommand: open it, same as
-        // clicking the file — `meshfox view`'s own defaults otherwise.
-        return view_watcher(PathBuf::from(&args[1]), 0, true, true);
+        // clicking the file — `meshfox view`'s own defaults otherwise, so a
+        // configured `server_socket` coordinator gets the canvas too instead
+        // of this process starting a worker of its own.
+        return view_or_hand_off(PathBuf::from(&args[1]), 0, false, false);
     }
 
     let cli = parse_cli(args);

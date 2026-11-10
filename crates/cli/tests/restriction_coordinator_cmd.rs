@@ -239,6 +239,31 @@ fn view_no_exec_hands_the_restriction_on_to_the_coordinator() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A bare `meshfox canvas.md` (no subcommand) is `view`'s shorthand, so it
+/// must honor `server_socket` the same way: ask the coordinator to open the
+/// canvas instead of starting a worker of its own.
+#[test]
+fn bare_canvas_path_hands_off_to_the_external_coordinator() {
+    let dir = unique_dir();
+    let canvas = write_canvas(&dir);
+    let coordinator = FakeCoordinator::start(&dir, None);
+
+    let out_path = dir.join("bare.out");
+    let log = std::fs::File::create(&out_path).unwrap();
+    let child = meshfox(&dir)
+        .env("MESHFOX_SERVER_SOCKET", &coordinator.socket)
+        .arg(&canvas)
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let _child = Reaper(child);
+
+    let request = coordinator.wait_for_request();
+    assert_eq!(request["op"], "open", "{request}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn no_exec_client_refuses_an_unrestricted_worker_from_the_coordinator() {
     let dir = unique_dir();
