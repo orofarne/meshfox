@@ -221,7 +221,7 @@ echo "Linux tests passed"
 
 `web/`'s TypeScript type-checking (`tsc --noEmit`) — no ESLint yet, see TODO.canvas.md (not tracked in this repo) for why. `name=`d so it's runnable like any other block here, deliberately without `cache`, same reasoning as "Unit tests":
 
-```sh name="typecheck" default
+```sh name="typecheck"
 cd web && npm run typecheck -- --pretty
 ```
 
