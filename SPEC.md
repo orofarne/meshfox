@@ -2721,6 +2721,27 @@ unlockable default keyring, it fails loudly on first use. With it:
   claims to be, and a symlink is refused. It runs in the CLI's own process, not
   in a worker, since it spans every canvas in a directory, including ones that
   no longer exist. Secrets in the system store are `meshfox secret prune`'s.
+- `meshfox mv SRC DST [--dry-run]` — moves a canvas file or a whole directory
+  of canvases together with what meshfox keeps for them. For a file, the
+  `.meshfox/<canvas file>.env` variable cache and
+  `.meshfox/<canvas file>.session.sqlite3` run history (with its
+  `-wal`/`-shm` companions) are renamed with it, and a leftover
+  `.worker.lock` is dropped; a directory is moved as one, `.meshfox/`
+  included. With `secret_store = "keychain"` the saved answers are filed under
+  the canvas's absolute path (`doc:<path>`, and an `[[env]]` section's under
+  `project:<directory>`), so they are copied to the new scope first, the files
+  move, and only then are the old ones deleted; if the move fails the copies
+  are removed again. (Plaintext answers live in the `.env` file and just move
+  with it.) The `.venv` and `.node` environments hold absolute paths, so they
+  are deleted, not moved — the next run of the setup block builds them again.
+  Nothing is overwritten: `DST` must not exist (unlike `mv(1)`, an existing
+  directory is not moved *into*), its directory must, and a directory cannot
+  go inside itself. It refuses while a worker is running for any of the
+  canvases. Other canvases under `SRC`'s parent directory that seem to refer
+  to the moved one, and the relative links of a file moved to another
+  directory, are listed with their line numbers but never rewritten.
+  `--dry-run` prints all of this and moves nothing. Across filesystems it
+  copies and then deletes. Like `prune`, it runs in the CLI's own process.
 - `meshfox env list [CANVAS|DIR] [--recursive]` and `meshfox env rm CANVAS
   [--name NAME] [--python | --node]` — the environments `@python_venv`
   (`.meshfox/<canvas file>.venv`) and `@node_env`

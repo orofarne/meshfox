@@ -53,6 +53,7 @@ pub mod pack;
 pub use meshfox_model::render;
 pub mod process_env;
 pub mod prune;
+pub mod relocate;
 pub mod run_plan;
 pub mod secret_index;
 pub mod secret_store;

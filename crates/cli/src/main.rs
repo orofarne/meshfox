@@ -36,6 +36,7 @@ mod gateway_index;
 mod logs_cmd;
 mod lsp;
 mod mcp;
+mod mv_cmd;
 mod pdf;
 mod prompt;
 mod prune_cmd;
@@ -444,6 +445,25 @@ enum Command {
         /// Remove what is listed instead of only listing it.
         #[arg(long)]
         yes: bool,
+    },
+    /// Move a canvas file, or a whole directory of canvases, together with
+    /// what meshfox keeps for them: `.meshfox/<canvas>.env` and
+    /// `.session.sqlite3` follow a renamed file (a moved directory takes its
+    /// `.meshfox/` along), and secrets saved in the system store
+    /// (`secret_store = "keychain"`) are filed under the new path. The
+    /// Python/Node environments are deleted, not moved — they hold absolute
+    /// paths and are rebuilt by the next run of their setup block. Nothing
+    /// is overwritten: the destination must not exist. Refused while a
+    /// worker is running for any of the canvases. Other canvases that refer
+    /// to the moved one are listed, not rewritten.
+    Mv {
+        /// The canvas file or directory to move.
+        src: PathBuf,
+        /// Its new path (must not exist; its directory must).
+        dst: PathBuf,
+        /// Show what would be moved without moving anything.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
     /// List or delete the Python and Node environments meshfox builds for a
     /// canvas (`.meshfox/<canvas>.venv` and `.meshfox/<canvas>.node`):
@@ -1796,6 +1816,12 @@ fn main() {
         Command::Env { op } => {
             if let Err(e) = env_cmd::run(op) {
                 eprintln!("meshfox env: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Mv { src, dst, dry_run } => {
+            if let Err(e) = mv_cmd::run(src, dst, dry_run) {
+                eprintln!("meshfox mv: {e}");
                 std::process::exit(1);
             }
         }
