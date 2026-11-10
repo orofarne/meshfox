@@ -9,7 +9,7 @@
    copied straight from that npm package's own build (`fonts/`, OFL-1.1,
    see `fonts/LICENSE`). This template is this repo's own working example
    (used to publish README.md itself, see the "Static export" section
-   there), so it only carries the one Unicode subset that content actually
+   in EXPORT.canvas.md), so it only carries the one Unicode subset that content actually
    needs — `latin` (English text, ordinary Latin-1 punctuation); a template
    built for a canvas with other content (Cyrillic, Central/Eastern-
    European accents, ...) can add whatever subsets it needs back from that

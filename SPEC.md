@@ -1879,7 +1879,7 @@ process can start the resource between probe and start; tools requiring strict
 ownership must provide their own atomic acquisition/locking. Abrupt worker death
 still cannot guarantee cleanup of acquired external resources.
 
-The [Linux tests in README.md](README.md#linux-tests) demonstrate this with Lima:
+The [Linux tests in DEVELOPMENT.canvas.md](DEVELOPMENT.canvas.md#linux-tests) demonstrate this with Lima:
 creation is persistent, the VM is leased through provisioning and tests, and a
 VM already running beforehand is preserved. Unexpected Lima statuses abort
 instead of claiming the VM. See the [Lima list reference](https://lima-vm.io/docs/reference/limactl_list/)
@@ -3303,7 +3303,7 @@ Currently defined options:
   "Timestamps" above). Off by default — meshfox is first and foremost a
   documentation format, and most documents don't want bookkeeping churn on
   every regeneration (a `cache`d block's output changing on every doc
-  build, say, the way this project's own README.md's does). Worth turning
+  build, say, the way this project's own CLI.canvas.md's does). Worth turning
   on for a document that's genuinely a living record instead — a personal
   task tracker, a running log — where knowing when something was created
   or last touched is itself useful. Doesn't affect an explicit `node meta

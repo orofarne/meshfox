@@ -38,7 +38,7 @@ import { defineConfig } from "@playwright/test";
 // All three are cheap to re-run and safe to skip once already done for a
 // given change — left as manual steps rather than an automated `pretest`
 // hook specifically so this suite stays opt-in/manual (see this repo's
-// README.md "VS Code end-to-end tests" section) rather than something that
+// DEVELOPMENT.canvas.md "VS Code end-to-end tests" section) rather than something that
 // silently triggers a Rust build on every invocation.
 export default defineConfig({
   testDir: ".",

@@ -105,7 +105,7 @@ that node, as `meshfox view` does.
 
 ## Serving it (security headers)
 
-The `editor-bundle` block in the root `README.md` (node `online-editor-in-the-browser`) builds the site into `editor-bundle/`, ready for
+The `editor-bundle` block in the root `DEVELOPMENT.canvas.md` (node `editor-bundle-upload`) builds the site into `editor-bundle/`, ready for
 Cloudflare Pages. The build writes `_headers` (from `securityHeaders.ts`; Pages
 reads it itself); the preview server the tests run against sends the same
 headers, so the suite runs under the Content-Security-Policy.

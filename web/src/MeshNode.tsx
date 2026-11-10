@@ -1253,7 +1253,7 @@ function ensureRangeVisible(
     // window-visibility check and canvas-pan target below with an x
     // coordinate that was never actually the match's true on-screen
     // position, wherever this element's own clipped box happens to sit
-    // (confirmed directly against README.md's own cached `meshfox -h`
+    // (confirmed directly against CLI.canvas.md's own cached `meshfox -h`
     // output — the "3rd match" in `mcp` landed the camera on empty
     // canvas because the pan target's x came from this exact gap).
     if (ancestor.scrollWidth > ancestor.clientWidth) {
@@ -1297,7 +1297,7 @@ const STABLE_RECT_MAX_FRAMES = 30;
  * autolayout.ts's real measurement — a `ResizeObserver`-driven reflow in
  * App.tsx (`measuredSignature`) — can take several of its own render
  * passes to settle, not just one, when unfolding reveals a whole subtree
- * rather than a single node (confirmed directly against README.md's own
+ * rather than a single node (confirmed directly against INTERFACES.canvas.md's own
  * "MCP server" section, several levels deep: two fixed frames settled a
  * small two-level test fixture fine but still occasionally landed the
  * camera on a position the real page hadn't actually reached yet). Rather
