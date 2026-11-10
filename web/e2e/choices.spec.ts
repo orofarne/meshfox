@@ -144,3 +144,28 @@ test("a run request says it is checking variables while the worker computes a se
   await expect(bar).not.toContainText("Checking variables…");
   await page.locator(".vars-modal").getByRole("button", { name: "cancel", exact: true }).click();
 });
+
+// Intercept the initial listing, before the toolbar knows whether vars exist.
+test("configure stays visible and busy during initial variable resolution", async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  await page.route("**/api/vars/configure", async (route) => {
+    if (route.request().method() === "GET") await gate;
+    await route.continue();
+  });
+  try {
+    await page.reload();
+    const button = page.getByRole("button", { name: /configur/ });
+    await expect(button).toBeVisible();
+    await expect(button).toBeDisabled();
+    await expect(button).toHaveAttribute("aria-busy", "true");
+    await expect(button.locator(".toolbar-spinner")).toBeVisible();
+    await expect(page.locator(".vars-modal")).toHaveCount(0);
+    release();
+    await expect(button).toBeEnabled();
+    await expect(button).toHaveText("⚙ configure");
+    await expect(button.locator(".toolbar-spinner")).toHaveCount(0);
+  } finally {
+    release();
+  }
+});

@@ -756,13 +756,9 @@ export default function App() {
      * answered — see `handleRunTty`'s own `autoclose` param. */
     autoclose?: boolean;
   } | null>(null);
-  // Whether the toolbar's "configure" button should even appear — set from
-  // `load()`'s own `fetchConfigureVars` call, so it's known without a
-  // click. `null` while unknown yet (first load in flight) is treated the
-  // same as `false` below; a canvas that declares only `secret` variables
-  // (or none at all) reports empty here, same as the TUI's own
-  // `has_configurable_vars`.
-  const [hasConfigurableVars, setHasConfigurableVars] = useState(false);
+  // Resolving the listing can run computed choices/defaults. While unknown,
+  // keep Configure visible and busy rather than hiding it until resolution.
+  const [hasConfigurableVars, setHasConfigurableVars] = useState<boolean | null>(null);
   // Toolbar undo/redo buttons' own enabled state — reflects the *whole
   // document's* history, not just this tab's own edits (see
   // `crates/server/src/undo_log.rs`'s own doc comment: one shared linear
@@ -4050,15 +4046,15 @@ export default function App() {
             {documentMode ? "Canvas" : "Document"}
           </button>
         )}
-        {hasConfigurableVars && !workerNoExec && !workerReadOnly && (
+        {hasConfigurableVars !== false && !workerNoExec && !workerReadOnly && (
           <button
             className="deps-toggle"
             onClick={handleConfigure}
-            disabled={configureLoading}
-            aria-busy={configureLoading}
+            disabled={hasConfigurableVars === null || configureLoading}
+            aria-busy={hasConfigurableVars === null || configureLoading}
             title="Interactively resolve every declared meshfox:var and save the answers (see SPEC.md's Variables) — same as `meshfox configure`"
           >
-            {configureLoading ? (
+            {hasConfigurableVars === null || configureLoading ? (
               <>
                 <span className="toolbar-spinner" aria-hidden="true" /> configuring…
               </>
