@@ -3973,7 +3973,8 @@ mod tests {
     #[test]
     fn readme_component_edges_do_not_cross_cards() {
         let canvas =
-            meshfox_core::Canvas::from_markdown(include_str!("../../../../README.md")).unwrap();
+            meshfox_core::Canvas::from_markdown(include_str!("../../../../ARCHITECTURE.canvas.md"))
+                .unwrap();
         let area = Rect::new(0, 0, 128, 50);
         let nodes = spatial::layout(&canvas, "component-diagram", area, "mcp-root");
         let rect = |id: &str| nodes.iter().find(|node| node.id == id).unwrap().rect;

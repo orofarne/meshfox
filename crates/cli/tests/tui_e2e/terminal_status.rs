@@ -27,7 +27,7 @@ fn terminal_status_tracks_run_and_clears_on_quit() {
     let mut session = session("```bash name=build\nsleep 0.3; echo done\n```\n");
     session.clear_raw();
     session.send_keys("r");
-    session.wait_for_raw("status=running: build;", Duration::from_secs(5));
+    session.wait_for_raw("status=running: root/build;", Duration::from_secs(5));
     session.wait_for_raw("status=done: build;", Duration::from_secs(5));
     session.clear_raw();
     session.send_keys("q");
@@ -75,7 +75,7 @@ fn terminal_status_observes_runs_started_by_another_cli() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    session.wait_for_raw("status=running: job;", Duration::from_secs(5));
+    session.wait_for_raw("status=running: root/job;", Duration::from_secs(5));
     session.wait_for_raw("status=done: job;", Duration::from_secs(5));
     session.send_keys("q");
     assert!(session.wait_for_exit(Duration::from_secs(5)));
@@ -86,7 +86,7 @@ fn terminal_status_observes_runs_started_by_another_cli() {
 fn terminal_status_clears_on_external_shutdown_signal() {
     let mut session = session("```bash name=build\nsleep 30\n```\n");
     session.send_keys("r");
-    session.wait_for_raw("status=running: build;", Duration::from_secs(5));
+    session.wait_for_raw("status=running: root/build;", Duration::from_secs(5));
     session.clear_raw();
     session.send_signal(libc::SIGTERM);
     assert!(session.wait_for_exit(Duration::from_secs(5)));
@@ -102,9 +102,9 @@ fn native_canvas_call_collects_child_input_and_reports_child_step() {
     std::fs::write(child, "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n<!-- meshfox:var name=\"TOKEN\" type=\"string\" -->\n```bash name=work env=\"$TOKEN\"\nprintf '%s\\n' \"$TOKEN\"; sleep 0.5\n```\n").unwrap();
     session.send_keys("r");
     session.wait_for_raw("status=waiting: build;", Duration::from_secs(10));
-    session.send_keys("from-parent\r");
+    session.send_keys("from-parent\r\r");
     session.wait_for_raw(
-        "status=running: build → child.md: work;",
+        "status=running: root/build → child.md: work;",
         Duration::from_secs(10),
     );
     session.wait_for_raw("status=done: build;", Duration::from_secs(10));

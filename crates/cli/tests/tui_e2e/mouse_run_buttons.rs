@@ -12,7 +12,7 @@ fn selecting_a_button_with_brackets_and_enter_runs_its_chain() {
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);
     session.wait_for("Go", Duration::from_secs(5)).unwrap();
     session.send_keys("\t]]");
-    session.wait_for("button:", Duration::from_secs(3)).unwrap();
+    session.wait_for("›─[", Duration::from_secs(3)).unwrap();
     session.send_keys("\r");
     session
         .wait_for("tui-e2e-button-marker", Duration::from_secs(10))

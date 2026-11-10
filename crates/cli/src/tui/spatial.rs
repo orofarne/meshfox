@@ -391,7 +391,8 @@ mod tests {
 
     #[test]
     fn readme_neighboring_lower_nodes_keep_the_same_window() {
-        let canvas = Canvas::from_markdown(include_str!("../../../../README.md")).unwrap();
+        let canvas =
+            Canvas::from_markdown(include_str!("../../../../ARCHITECTURE.canvas.md")).unwrap();
         let area = Rect::new(0, 0, 128, 35);
         let first = project(
             &canvas,
@@ -425,7 +426,8 @@ mod tests {
 
     #[test]
     fn readme_horizontal_navigation_follows_visible_rows_and_columns() {
-        let canvas = Canvas::from_markdown(include_str!("../../../../README.md")).unwrap();
+        let canvas =
+            Canvas::from_markdown(include_str!("../../../../ARCHITECTURE.canvas.md")).unwrap();
         let next = |id, direction| neighbor(&canvas, "component-diagram", id, direction);
         assert_eq!(
             next("coordinator-resolve", Direction::Right).as_deref(),

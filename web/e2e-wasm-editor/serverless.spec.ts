@@ -61,10 +61,9 @@ test("constraint fences run in the page and badge the nodes", async ({ page }) =
   await expect(page.getByText("3/3")).toBeVisible();
 });
 
-test("README resolves its include from the picked folder", async ({ page }) => {
+test("DEVELOPMENT canvas resolves its include from the picked folder", async ({ page }) => {
   await page.goto("/");
-  await page.locator("input[webkitdirectory]").setInputFiles(repoFolder("README.md", "TEMPLATES.md"));
-  await page.getByRole("button", { name: "README.md" }).click();
+  await page.locator("input[webkitdirectory]").setInputFiles(repoFolder("DEVELOPMENT.canvas.md", "TEMPLATES.md"));
   await expect(page.locator(".react-flow__node").first()).toBeVisible();
   const canvas = await canvasJson(page);
   const included = canvas.nodes.find((n) => n.id === "static-site-templates")!;

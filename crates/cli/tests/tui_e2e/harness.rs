@@ -256,7 +256,14 @@ impl TuiSession {
             }
             assert!(
                 Instant::now() < deadline,
-                "missing terminal sequence {sequence:?}; screen:\n{}",
+                "missing terminal sequence {sequence:?}; status sequences seen: {:?}; screen:\n{}",
+                {
+                    let raw = String::from_utf8_lossy(&self.raw.lock().unwrap()).into_owned();
+                    raw.split("\x1b]21337;")
+                        .skip(1)
+                        .filter_map(|s| s.split(';').next().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                },
                 self.screen_text()
             );
             std::thread::sleep(Duration::from_millis(25));
@@ -382,6 +389,26 @@ impl TuiSession {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out after {timeout:?} waiting for {needle:?} — last screen:\n{screen}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    /// Polls `screen_text()` every 30ms until it no longer contains
+    /// `needle`, up to `timeout`. The inverse of [`Self::wait_for`], for
+    /// states the footer shows only while they last (a text selection, a
+    /// search counter).
+    pub fn wait_absent(&self, needle: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.screen_text();
+            if !screen.contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for {needle:?} to leave — last screen:\n{screen}"
                 ));
             }
             std::thread::sleep(Duration::from_millis(30));

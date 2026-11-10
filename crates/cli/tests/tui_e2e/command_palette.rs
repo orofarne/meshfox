@@ -275,7 +275,7 @@ fn block_statistics_follow_run_history_block_resolution() {
     session.send_keys("j");
     open_palette(&mut session, "block statistics");
     session
-        .wait_for("leaf::leaf", Duration::from_secs(5))
+        .wait_for("leaf/leaf", Duration::from_secs(5))
         .expect("the report should be for the node's only block");
     session.send_keys("q");
     // Document focus with a selected block: that block.
@@ -283,6 +283,6 @@ fn block_statistics_follow_run_history_block_resolution() {
     session.send_keys("]");
     open_palette(&mut session, "block statistics");
     session
-        .wait_for("leaf::leaf", Duration::from_secs(5))
+        .wait_for("leaf/leaf", Duration::from_secs(5))
         .expect("the report should be for the selected block");
 }

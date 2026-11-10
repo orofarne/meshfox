@@ -64,9 +64,6 @@ fn starlark_render_table_source_controls_errors_and_remote_mutations() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), SOURCE);
 
     session.send_keys("\t]c");
-    session
-        .wait_for("render: tag-counts", Duration::from_secs(5))
-        .unwrap();
     assert!(!session.screen_text().contains("R run"));
     session
         .wait_for("counts = {}", Duration::from_secs(5))

@@ -45,7 +45,7 @@ fn keyboard_block_selection_targets_run_and_history_and_esc_restores_picker() {
         .unwrap();
     session.send_keys("\t]]");
     session
-        .wait_for("block: second", Duration::from_secs(5))
+        .wait_for("›─[▾] [code ▸]  sh · second", Duration::from_secs(5))
         .unwrap();
     session.send_keys("R");
     session
@@ -74,7 +74,7 @@ fn keyboard_block_selection_targets_run_and_history_and_esc_restores_picker() {
         .wait_for("SECOND_RESULT", Duration::from_secs(5))
         .unwrap();
     session.send_keys("\x1b");
-    wait_absent(&session, "block: second");
+    wait_absent(&session, "›─[");
     session.send_keys("r");
     session
         .wait_for("which block?", Duration::from_secs(5))

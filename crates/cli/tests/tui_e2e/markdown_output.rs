@@ -65,7 +65,8 @@ fn parameterized_record_shows_running_status_and_output_beneath_its_source() {
     session
         .wait_for("arguments for this application", Duration::from_secs(5))
         .expect("argument form");
-    session.send_keys("\r");
+    // Enter on the field moves to [ Submit ]; the second one presses it.
+    session.send_keys("\r\r");
     // This header exists only in the Document pane, never in the console.
     session
         .wait_for("output: record ·", Duration::from_secs(10))

@@ -65,16 +65,22 @@ fn mouse_and_keyboard_selection_use_terminal_by_default() {
     session.send_keys("y");
     expect_clipboard(&session, "alpha");
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_mouse_click(row, col);
     session.send_keys("v \x1b[F"); // End selects the first logical line.
     session.wait_for("SELECT", WAIT).unwrap();
     session.send_keys("y");
     expect_clipboard(&session, "alpha beta gamma delta");
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 #[test]
 #[ignore = "pty-based e2e"]
@@ -100,9 +106,14 @@ fn palette_plain_text_keeps_selection_and_returns_with_mouse_enabled() {
     session.send_keys("y");
     expect_clipboard(&session, "alpha");
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 #[test]
 #[ignore = "pty-based e2e"]
@@ -123,9 +134,14 @@ fn text_config_and_explicit_terminal_override_are_independent() {
     session.send_keys("\r");
     session.wait_for("SELECT", WAIT).unwrap();
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 #[test]
 #[ignore = "pty-based e2e"]
@@ -138,9 +154,13 @@ fn code_drag_excludes_the_gutter_and_does_not_run_the_block() {
     expect_clipboard(&session, "printf");
     assert!(!session.screen_text().contains("Output (running"));
     session.send_keys("\x1b");
-    session.wait_for("block: hello", WAIT).unwrap();
+    session.wait_for("›─[", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 
 #[test]
@@ -149,7 +169,7 @@ fn single_code_click_keeps_normal_keys_and_double_click_selects_a_word() {
     let mut session = spawn("");
     let (row, col) = session.find("printf COPY_OUTPUT").unwrap();
     session.send_mouse_click(row, col);
-    session.wait_for("block: hello", WAIT).unwrap();
+    session.wait_for("›─[", WAIT).unwrap();
     session.send_keys("c");
     session.wait_for("code ▸", WAIT).unwrap();
     session.send_keys("c");
@@ -159,9 +179,13 @@ fn single_code_click_keeps_normal_keys_and_double_click_selects_a_word() {
     session.send_keys("y");
     expect_clipboard(&session, "alpha");
     session.send_keys("\x1b");
-    session.wait_for("v sel", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 
 #[test]
@@ -200,9 +224,14 @@ fn copying_flashes_the_selection_then_restores_it_without_input() {
         std::thread::sleep(Duration::from_millis(10));
     }
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 
 #[test]
@@ -243,9 +272,14 @@ fn keyboard_cursor_can_choose_and_replace_a_middle_selection_without_exiting() {
     session.send_keys("y");
     expect_clipboard(&session, "gamma delta");
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
 
 #[test]
@@ -289,8 +323,13 @@ fn text_selection_preserves_images() {
         "image vanished while selecting"
     );
     session.send_keys("\x1b");
-    session.wait_for("v select text", WAIT).unwrap();
+    session.wait_absent("  ·  SELECT", WAIT).unwrap();
+    session.wait_absent("  ·  CURSOR", WAIT).unwrap();
     assert_eq!(session.bgcolor_at(row, col), color);
     session.send_keys("q");
-    assert!(session.wait_for_exit(WAIT));
+    assert!(
+        session.wait_for_exit(WAIT),
+        "q did not quit; screen:\n{}",
+        session.screen_text()
+    );
 }
