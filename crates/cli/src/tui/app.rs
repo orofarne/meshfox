@@ -1453,7 +1453,7 @@ impl App {
             tree_width_pct: ui::DEFAULT_TREE_WIDTH_PCT,
             spatial_width_pct: None,
             spatial_viewports: HashMap::new(),
-            show_all_map_edges: false,
+            show_all_map_edges: true,
             tree_collapsed: false,
             auto_expanded_pane: None,
             output_height_pct,
