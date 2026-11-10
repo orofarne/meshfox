@@ -225,6 +225,12 @@ echo "Linux tests passed"
 cd web && npm run typecheck -- --pretty
 ```
 
+Rust formatting: `cargo fmt --check` fails (and prints the diff) if any crate is not `rustfmt`-formatted; run `cargo fmt --all` to fix it. Part of `full-check`, so an unformatted change is caught before it is committed:
+
+```sh name="rustfmt"
+cargo fmt --all -- --check
+```
+
 ## Release build
 <!-- meshfox:node id="release-build" -->
 
@@ -248,9 +254,9 @@ echo "binary: target/release/meshfox"
 ## Full check
 <!-- meshfox:node id="full-check" -->
 
-Run unit tests (macOS host and the Linux VM), the WebAssembly model's checks, typecheck, and e2e tests (including the in-browser build's and the TUI's pty suite):
+Run unit tests (macOS host and the Linux VM), the WebAssembly model's checks, typecheck, Rust formatting (`cargo fmt --check`), and e2e tests (including the in-browser build's and the TUI's pty suite):
 
-```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,e2e-tests/run!,e2e-tests/wasm-editor!,editor-tests/neovim-tests!,editor-tests/vscode-e2e!,tui-end-to-end-tests/tui-e2e-run!,release-build/release-build!"
+```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,linting/rustfmt!,e2e-tests/run!,e2e-tests/wasm-editor!,editor-tests/neovim-tests!,editor-tests/vscode-e2e!,tui-end-to-end-tests/tui-e2e-run!,release-build/release-build!"
 echo "done"
 ```
 

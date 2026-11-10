@@ -655,11 +655,13 @@ async fn node_add_with_bad_tags_fails_without_leaving_a_node_behind() {
         }),
     )
     .await
-    .map(|(e, v)| (e, v))
     .unwrap_or((true, serde_json::Value::Null));
     assert!(is_error, "the bad tags should have been refused");
     let on_disk = std::fs::read_to_string(dir.join("doc.canvas.md")).unwrap();
-    assert!(!on_disk.contains("Fresh"), "a node was left behind: {on_disk}");
+    assert!(
+        !on_disk.contains("Fresh"),
+        "a node was left behind: {on_disk}"
+    );
 
     let (is_error, added) = call(
         &mcp,
