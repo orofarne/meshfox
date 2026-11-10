@@ -578,6 +578,7 @@ fn build_node_view(
                 node.asset_base.as_deref(),
                 ctx,
                 assets,
+                canvas_links,
                 None,
             ));
         }
@@ -638,6 +639,7 @@ fn build_node_view(
                 node.asset_base.as_deref(),
                 ctx,
                 assets,
+                canvas_links,
                 first_link_override,
             ));
             html_body
@@ -661,6 +663,7 @@ fn build_node_view(
                 node.asset_base.as_deref(),
                 ctx,
                 assets,
+                canvas_links,
                 None,
             ));
             html_body.push_str("</details>");
@@ -675,6 +678,7 @@ fn build_node_view(
                     node.asset_base.as_deref(),
                     ctx,
                     assets,
+                    canvas_links,
                     None,
                 ));
             }
@@ -688,6 +692,7 @@ fn build_node_view(
             node.asset_base.as_deref(),
             ctx,
             assets,
+            canvas_links,
             first_link_override,
         ));
         (html_body, target)
@@ -1096,6 +1101,7 @@ fn render_markdown(
     asset_base: Option<&str>,
     ctx: &RenderCtx,
     assets: &mut Vec<Asset>,
+    canvas_links: &mut Vec<CanvasLinkTarget>,
     first_link_override: Option<&str>,
 ) -> String {
     // Taken (once) by the very first `Tag::Link` event below, if set —
@@ -1187,9 +1193,10 @@ fn render_markdown(
                 title,
                 id,
             }) => {
-                let new_url = first_link_override
-                    .take()
-                    .unwrap_or_else(|| resolve_link_url(&dest_url, ctx));
+                let new_url = first_link_override.take().unwrap_or_else(|| {
+                    resolve_canvas_page_link(&dest_url, base_dir, ctx, canvas_links)
+                        .unwrap_or_else(|| resolve_link_url(&dest_url, ctx))
+                });
                 events.push(Event::Start(Tag::Link {
                     link_type,
                     dest_url: new_url.into(),
@@ -1659,6 +1666,65 @@ fn relative_slot_path(from_slot: &str, to_slot: &str) -> String {
 /// through anyway rather than special-cased away, in case that invariant
 /// ever changes.
 ///
+/// The relative `href` of `resolved`'s own rendered canvas page (a
+/// `other.canvas.md#node-id` deep link carries its fragment over as
+/// `#node-<id>`), queuing the canvas into `canvas_links` for the caller to
+/// actually build and render. Shared by a `file` node's target and a plain
+/// Markdown link, so both land on the same page.
+fn canvas_page_href(
+    url: &str,
+    resolved: PathBuf,
+    ctx: &RenderCtx,
+    canvas_links: &mut Vec<CanvasLinkTarget>,
+) -> String {
+    let root_canvas_dir = ctx
+        .root_canvas_path
+        .parent()
+        .unwrap_or(ctx.root_canvas_path);
+    // The root canvas itself always renders at the `--out` root
+    // (`current_slot: ""`) by convention, not wherever
+    // `canvas_link_subdir` would naively place it by its own
+    // filename — a link back to it (directly, or via a longer
+    // cycle) needs to land there too, not at a nonexistent
+    // filename-derived subdirectory.
+    let target_slot = if resolved == ctx.root_canvas_path {
+        String::new()
+    } else {
+        canvas_link_subdir(&resolved, root_canvas_dir)
+    };
+    let href_dir = relative_slot_path(ctx.current_slot, &target_slot);
+    let fragment = url.split_once('#').map(|(_, f)| f);
+    let href = match fragment {
+        Some(f) if !f.is_empty() => format!("{href_dir}/index.html#node-{f}"),
+        _ => format!("{href_dir}/index.html"),
+    };
+    canvas_links.push(CanvasLinkTarget {
+        resolved,
+        kind: PageKind::Canvas,
+        subdir: target_slot,
+    });
+    href
+}
+
+/// A plain Markdown link to a local canvas, with `--copy-files --recursive`:
+/// that canvas is rendered as a page of the site anyway, so the link goes
+/// there rather than to the source file on `links_base_url` (a canvas read
+/// as raw Markdown, `meshfox:` comments and all). `None` for anything else —
+/// external or unresolvable targets, plain files and Markdown documents — and
+/// without both flags, which leave it to `resolve_link_url` as before.
+fn resolve_canvas_page_link(
+    url: &str,
+    base_dir: &Path,
+    ctx: &RenderCtx,
+    canvas_links: &mut Vec<CanvasLinkTarget>,
+) -> Option<String> {
+    if !(ctx.copy_files && ctx.recursive) || is_external_or_absolute(url) {
+        return None;
+    }
+    let resolved = resolve_canvas_relative(url, base_dir, ctx.access)?;
+    is_canvas_file(&resolved).then(|| canvas_page_href(url, resolved, ctx, canvas_links))
+}
+
 /// A target that resolves to a `.canvas.md` file, with `ctx.recursive`:
 /// rewritten to a relative link at that target's own rendered page (see
 /// `canvas_link_subdir`/`relative_slot_path`, and — for a
@@ -1701,33 +1767,7 @@ fn resolve_file_target_for_copy(
                 // correctness, only for not panicking on the way there.
                 return resolve_link_url(url, ctx);
             }
-            let root_canvas_dir = ctx
-                .root_canvas_path
-                .parent()
-                .unwrap_or(ctx.root_canvas_path);
-            // The root canvas itself always renders at the `--out` root
-            // (`current_slot: ""`) by convention, not wherever
-            // `canvas_link_subdir` would naively place it by its own
-            // filename — a link back to it (directly, or via a longer
-            // cycle) needs to land there too, not at a nonexistent
-            // filename-derived subdirectory.
-            let target_slot = if resolved == ctx.root_canvas_path {
-                String::new()
-            } else {
-                canvas_link_subdir(&resolved, root_canvas_dir)
-            };
-            let href_dir = relative_slot_path(ctx.current_slot, &target_slot);
-            let fragment = url.split_once('#').map(|(_, f)| f);
-            let href = match fragment {
-                Some(f) if !f.is_empty() => format!("{href_dir}/index.html#node-{f}"),
-                _ => format!("{href_dir}/index.html"),
-            };
-            canvas_links.push(CanvasLinkTarget {
-                resolved,
-                kind: PageKind::Canvas,
-                subdir: target_slot,
-            });
-            href
+            canvas_page_href(url, resolved, ctx, canvas_links)
         }
         // A plain Markdown file, with `--recursive`: rendered as a document
         // page (see `build_document_for_static_export`) rather than copied
@@ -2994,6 +3034,54 @@ mod tests {
         );
         assert!(assets.is_empty(), "{assets:?}");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recursive_sends_a_plain_link_to_a_canvas_to_its_rendered_page() {
+        let dir = temp_dir("recursive-plain-link");
+        write(
+            &dir,
+            "other.canvas.md",
+            b"# Other\n<!-- meshfox:node id=\"root\" -->\n",
+        );
+        write(&dir, "notes.txt", b"not a canvas");
+        write(&dir, "doc.canvas.md", b"unused: `c` is given directly");
+        let root_path = dir.join("doc.canvas.md");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "See [other](other.canvas.md#sec), [notes](notes.txt) and [web](https://example.com).\n",
+        ));
+
+        let links = "https://github.com/me/repo/blob/main/";
+        let (site, _assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", Some(links), None, true, true)
+                .unwrap();
+        let body = &site.root.html_body;
+        assert!(
+            body.contains("href=\"other/index.html#node-sec\""),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("href=\"{links}notes.txt\"")),
+            "a plain file keeps going to links_base_url: {body}"
+        );
+        assert!(body.contains("href=\"https://example.com\""), "{body}");
+        assert_eq!(canvas_links.len(), 1, "{canvas_links:?}");
+        assert_eq!(canvas_links[0].subdir, "other");
+
+        // Without `--recursive` there is no page to go to: unchanged.
+        let (site, _assets, canvas_links) =
+            build_for_static_export(&c, &dir, &root_path, "", Some(links), None, false, false)
+                .unwrap();
+        assert!(
+            site.root
+                .html_body
+                .contains(&format!("href=\"{links}other.canvas.md#sec\"")),
+            "{}",
+            site.root.html_body
+        );
+        assert!(canvas_links.is_empty());
         fs::remove_dir_all(&dir).ok();
     }
 
