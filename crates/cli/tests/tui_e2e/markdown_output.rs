@@ -30,10 +30,10 @@ fn a_finished_markdown_block_renders_its_output_inline_under_the_block() {
     session
         .wait_for("ZMARKERZ", Duration::from_secs(10))
         .expect("the block's stdout should show up inline under it");
-    // The frame's header flips to "done" once the run finishes, which is
+    // The frame's header flips to "exit 0" once the run finishes, which is
     // also when the raw text is swapped for the rendered table.
     session
-        .wait_for("markdown · done", Duration::from_secs(10))
+        .wait_for("markdown · exit 0", Duration::from_secs(10))
         .expect("the live frame should reach its done state");
 
     let screen = session.screen_text();
@@ -84,7 +84,7 @@ fn parameterized_record_shows_running_status_and_output_beneath_its_source() {
         "stdout beneath source:\n{screen}"
     );
     session
-        .wait_for("live · done", Duration::from_secs(10))
+        .wait_for("live · exit 0", Duration::from_secs(10))
         .expect("block completion");
     assert!(session
         .screen_text()

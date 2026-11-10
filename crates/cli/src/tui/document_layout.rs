@@ -102,7 +102,7 @@ impl LayoutContext {
         // Grids are already laid out; outer paragraph wrapping would split
         // columns again. File previews intentionally clip excess columns.
         let wrap = matches!(segment, Segment::Text(_));
-        let lines = match segment {
+        let mut lines = match segment {
             Segment::Text(lines) => lines.clone(),
             Segment::Button { caption, selected } => {
                 button_lines(caption, *selected, self.size.width)
@@ -127,6 +127,11 @@ impl LayoutContext {
             }
             Segment::Image { .. } => return None,
         };
+        // Preserve the outcome and duration on narrow panes by shortening
+        // only the block name. Do this here so resizing needs no reparse.
+        for line in &mut lines {
+            compact_live_output_header(line, usize::from(self.size.width));
+        }
         let mut rows = 0usize;
         let line_row_starts = lines
             .iter()
@@ -251,6 +256,39 @@ pub(super) fn wrapped_click_rects(line: &Line<'_>, width: u16, start: u16, end: 
         }
     }
     rects
+}
+
+fn compact_live_output_header(line: &mut Line<'static>, width: usize) {
+    let overflow = line.width().saturating_sub(width);
+    if overflow == 0 {
+        return;
+    }
+    let Some(first) = line.spans.first() else {
+        return;
+    };
+    let Some(rest) = first.content.strip_prefix("┌─ output: ") else {
+        return;
+    };
+    let Some((name, suffix)) = rest.rsplit_once(" · live") else {
+        return;
+    };
+    let name_width = Span::raw(name).width();
+    let budget = name_width.saturating_sub(overflow);
+    if budget >= name_width {
+        return;
+    }
+    let mut shortened = String::new();
+    let mut used = 0;
+    for grapheme in Span::raw(name).styled_graphemes(Style::default()) {
+        let w = Span::raw(grapheme.symbol).width();
+        if used + w > budget.saturating_sub(1) {
+            break;
+        }
+        shortened.push_str(grapheme.symbol);
+        used += w;
+    }
+    shortened.push('…');
+    line.spans[0].content = format!("┌─ output: {shortened} · live{suffix}").into();
 }
 
 /// Wrap each cell independently, preserving grapheme widths and inline styles.
@@ -406,6 +444,30 @@ pub(super) fn wrapped_text_layout(total: u16, skip: u16, available: u16) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_live_header_keeps_outcome_duration_and_style() {
+        let status_style = Style::default().fg(super::super::theme::fail());
+        let original = Line::from(vec![
+            Span::raw("┌─ output: 長い名前のビルド-task · live · "),
+            Span::styled("exit 127", status_style),
+            Span::raw(" · 1.1s ──"),
+        ]);
+        let segment = Segment::Text(vec![original.clone()]);
+        let narrow = LayoutContext::new(Size::new(48, 10))
+            .text(&segment)
+            .unwrap();
+        assert_eq!(narrow.rows(), 1);
+        let line = &narrow.lines[0];
+        assert!(line.width() <= 48);
+        assert!(line.to_string().contains("… · live · exit 127 · 1.1s"));
+        assert_eq!(line.spans[1].style, status_style);
+        let wide = LayoutContext::new(Size::new(120, 10))
+            .text(&segment)
+            .unwrap();
+        assert_eq!(wide.lines[0], original);
+    }
+
     use std::{collections::HashMap, path::Path};
 
     #[test]

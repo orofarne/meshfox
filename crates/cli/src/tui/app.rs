@@ -7378,7 +7378,7 @@ impl App {
     }
 
     /// Shows each `tty` block's latest finished run under it in the Document
-    /// pane — the same `output: <block> · live · done|failed · <time>` frame a
+    /// pane — the same `output: <block> · live · exit N|failed · <time>` frame a
     /// plain block gets, just with no output (a terminal session's isn't
     /// stored). Plain blocks get theirs by replaying their stored run
     /// (`mod.rs`'s `reconcile_runs` / `on_external_run_event`); a `tty` block
@@ -11682,14 +11682,17 @@ mod tests {
                 .join("\n")
         };
         let text = drawn(&app);
-        assert!(text.contains("output: term · live · done · 2.8s"), "{text}");
+        assert!(
+            text.contains("output: term · live · exit 0 · 2.8s"),
+            "{text}"
+        );
 
         // A newer failing run replaces it.
         app.block_runs = Some(vec![run("term", "tty", "exited", Some(3))]);
         app.sync_tty_results();
         assert_eq!(app.step_output[&addr].exit_code, 3);
         assert!(
-            drawn(&app).contains("output: term · live · failed"),
+            drawn(&app).contains("output: term · live · exit 3"),
             "{}",
             drawn(&app)
         );

@@ -1004,23 +1004,41 @@ impl<'a> Renderer<'a> {
         // at all (see `StepOutput::running`'s own doc comment) — its own
         // exit code/duration are already real by the time this struct
         // exists.
+        let header_style = self.block_header(Some(block_name));
         let header = if live.running {
-            format!("┌─ output: {block_name} · ⠋ live{kind} · running ──")
+            Line::from(Span::styled(
+                format!("┌─ output: {block_name} · ⠋ live{kind} · running ──"),
+                header_style,
+            ))
         } else {
-            let status = if live.exit_code == 0 {
-                "done"
+            // Negative values are internal sentinels (killed / no process
+            // status), not actual exit codes.
+            let status = if live.exit_code < 0 {
+                "failed".to_string()
             } else {
-                "failed"
+                format!("exit {}", live.exit_code)
             };
-            format!(
-                "┌─ output: {block_name} · live{kind} · {status} · {} ──",
-                meshfox_core::format_duration_ms(live.duration_ms)
-            )
+            let color = if live.exit_code == 0 {
+                super::theme::ok()
+            } else {
+                super::theme::fail()
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("┌─ output: {block_name} · live{kind} · "),
+                    header_style,
+                ),
+                Span::styled(status, header_style.fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(
+                        " · {} ──",
+                        meshfox_core::format_duration_ms(live.duration_ms)
+                    ),
+                    header_style,
+                ),
+            ])
         };
-        let mut framed: Vec<Line<'static>> = vec![Line::from(Span::styled(
-            header,
-            self.block_header(Some(block_name)),
-        ))];
+        let mut framed: Vec<Line<'static>> = vec![header];
         let mut any_output = false;
         // Only the first piece of this frame goes through `push_segment`
         // (which adds the blank separator above it); every later piece is
@@ -2888,6 +2906,31 @@ mod tests {
     }
 
     #[test]
+    fn live_header_shows_real_exit_codes_even_without_output() {
+        for (code, status) in [
+            (0, "exit 0"),
+            (1, "exit 1"),
+            (127, "exit 127"),
+            (-1, "failed"),
+        ] {
+            let mut live = table_output(false, false);
+            live.exit_code = code;
+            live.text.clear();
+            live.stdout.clear();
+            live.stderr.clear();
+            let text = live_doc_text(live);
+            assert!(text.contains(&format!("live · {status} · 5ms")), "{text}");
+            assert!(text.contains("(no output)"), "{text}");
+            assert!(!text.contains("exit -1"), "{text}");
+        }
+        let mut live = table_output(false, true);
+        live.exit_code = 127;
+        let text = live_doc_text(live);
+        assert!(text.contains("live · running"), "{text}");
+        assert!(!text.contains("exit 127"), "{text}");
+    }
+
+    #[test]
     fn finished_markdown_live_output_is_rendered_inside_its_frame() {
         let text = live_doc_text(table_output(true, false));
         assert!(text.contains("ZMARKERZ"), "cell text should show:\n{text}");
@@ -2896,7 +2939,7 @@ mod tests {
             "raw table syntax should be rendered, not literal:\n{text}"
         );
         assert!(
-            text.contains("output: t · live · markdown · done"),
+            text.contains("output: t · live · markdown · exit 0"),
             "frame header:\n{text}"
         );
         let table_line = text.lines().find(|l| l.contains("ZMARKERZ")).unwrap();
