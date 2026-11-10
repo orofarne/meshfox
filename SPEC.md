@@ -918,7 +918,8 @@ terminal relay on top), so it consults the same per-session record.
 
 For a built-in `@name` interpreter, runtime freshness also includes the
 embedded script's content identity and settings that affect its invocation
-(currently `interpreters.agent.provider`, with `claude` as the default).
+(currently `interpreters.agent.provider`, with `claude` as the default, and
+`interpreters.python_venv.python`).
 Configuration is resolved from the block's execution directory, including
 included content's own directory. These changes invalidate dependent runs
 and restored session results without changing the authored fence's static
@@ -2479,6 +2480,36 @@ no options. The resolver passes the selected directory through
 `MESHFOX_VENV_DIR` / `MESHFOX_NODE_DIR` and the output key through
 `MESHFOX_ENVIRONMENT_VAR`; normal computed-variable dependency planning
 and interpreter substitution apply.
+
+### Choosing the Python for `@python_venv`
+
+A new venv is built with the first of these that applies:
+
+1. `[interpreters.python_venv] python = "python3.12"` in `config.toml` (a
+   command name or a path; exported to the script as
+   `MESHFOX_CONFIG_INTERPRETERS_PYTHON_VENV_PYTHON`). A command that is not
+   found is an error, not a fallback.
+2. For a `toml` fence, the pyproject's own `project.requires-python`: `python3`
+   if it satisfies the specifier, otherwise the newest `python3.N` on `PATH`
+   that does. The specifier is evaluated for `>=`, `<=`, `>`, `<`, `==`, `!=`,
+   `~=` and `==X.Y.*`, comma-separated; anything else is reported and ignored
+   (the system `python3` is used). If no interpreter on `PATH` satisfies it the
+   block fails and lists the versions it found.
+3. Otherwise the `python3` first on `PATH`.
+
+An existing venv is rebuilt when (1) or (2) applies and the venv contradicts
+it — its minor version differs from the configured interpreter's, or it falls
+outside `requires-python` — so editing the config key or the block's
+`requires-python` is enough; the requirements are then installed again.
+With neither (a `text` fence and no config key, or a `toml` fence without
+`requires-python`) a venv is never rebuilt, whatever Python it was made with.
+Only a venv meshfox itself created is emptied (it carries a `.meshfox-venv`
+marker, or the `python3-mf` launcher); any other directory at the fallback
+`.venv` is reported as a mismatch and left alone. Rebuilding keeps the
+`.named/` environments nested in the same directory, but anything running from
+the old venv at that moment (a `service`, a `tty` session) loses its
+interpreter. Changing the config key invalidates the block's runtime
+freshness (see above), so a re-run really executes the script.
 
 ### The `@agent` builtin
 

@@ -329,17 +329,25 @@ pub fn execution_identity(spec: &str, config: &toml::Table) -> Option<String> {
     let builtin = lookup(spec.strip_prefix('@')?)?;
     let mut hash = blake3::Hasher::new();
     hash.update(builtin.script.as_bytes());
+    // Project exactly the values exported to the script (including key
+    // normalization and the same last-value precedence as envs()).
+    let flat = crate::config::flatten_to_env(config);
+    let get = |name: &str| {
+        flat.iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .filter(|s| !s.is_empty())
+    };
+    if builtin.name == "python_venv" {
+        // Which Python builds (and, when it changes, rebuilds) the venv.
+        hash.update(
+            get("MESHFOX_CONFIG_INTERPRETERS_PYTHON_VENV_PYTHON")
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
     if builtin.name == "agent" {
-        // Project exactly the value exported to agent.sh (including key
-        // normalization and the same last-value precedence as envs()).
-        let flat = crate::config::flatten_to_env(config);
-        let get = |name: &str| {
-            flat.iter()
-                .rev()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.clone())
-                .filter(|s| !s.is_empty())
-        };
         let provider = get("MESHFOX_CONFIG_INTERPRETERS_AGENT_PROVIDER")
             .unwrap_or_else(|| "claude".to_string());
         hash.update(provider.as_bytes());
@@ -992,6 +1000,200 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&unsupported.stderr).contains("expected a text or toml block")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fake interpreters that stand in for several Python versions: `-c` answers
+    /// the script's version probe (`$VER`) and its `requires-python` check
+    /// (exit status `$FAKE_SAT_<VER>`, 0 by default), `-m venv DIR` makes a
+    /// venv holding a copy of itself, and `-m pip …` just logs to `$CALLS`.
+    #[cfg(unix)]
+    fn write_fake_python(path: &Path, ver: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let script = r#"#!/bin/sh
+VER=@VER@
+case "$1" in
+  -c)
+    case "$2" in
+      "import sys; print"*) echo "$VER" ;;
+      *) v=FAKE_SAT_$(echo "$VER" | tr . _); eval "exit \${$v:-0}" ;;
+    esac ;;
+  -m)
+    if [ "$2" = venv ]; then
+      for d; do :; done
+      mkdir -p "$d/bin"
+      cp "$0" "$d/bin/python3"
+    else
+      echo pip >> "$CALLS"
+    fi ;;
+esac
+"#
+        .replace("@VER@", ver);
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn python_venv_identity_tracks_the_configured_python_only() {
+        let empty = toml::Table::new();
+        let py312: toml::Table = "[interpreters.python_venv]\npython = 'python3.12'\n"
+            .parse()
+            .unwrap();
+        let py313: toml::Table = "[interpreters.python_venv]\npython = 'python3.13'\n"
+            .parse()
+            .unwrap();
+        let unrelated: toml::Table =
+            "[interpreters.python_venv]\npython = 'python3.12'\n[tables]\ncache_max_bytes = 1\n"
+                .parse()
+                .unwrap();
+        assert_ne!(
+            execution_identity("@python_venv", &empty),
+            execution_identity("@python_venv", &py312)
+        );
+        assert_ne!(
+            execution_identity("@python_venv", &py312),
+            execution_identity("@python_venv", &py313)
+        );
+        assert_eq!(
+            execution_identity("@python_venv", &py312),
+            execution_identity("@python_venv", &unrelated)
+        );
+        // An unset key and an empty one are the same effective setting.
+        let blank: toml::Table = "[interpreters.python_venv]\npython = ''\n".parse().unwrap();
+        assert_eq!(
+            execution_identity("@python_venv", &empty),
+            execution_identity("@python_venv", &blank)
+        );
+        // @node_env does not look at it.
+        assert_eq!(
+            execution_identity("@node_env", &empty),
+            execution_identity("@node_env", &py312)
+        );
+    }
+
+    /// Which Python builds the venv, and when an existing venv is rebuilt:
+    /// only on a stated requirement (config key or `requires-python`) the
+    /// venv contradicts, and only a venv meshfox made.
+    #[test]
+    #[cfg(unix)]
+    fn python_venv_picks_its_python_and_rebuilds_a_mismatched_venv() {
+        let dir = std::env::temp_dir().join(format!(
+            "meshfox-python-venv-pick-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = dir.join("bin");
+        write_fake_python(&bin.join("python3"), "3.15");
+        write_fake_python(&bin.join("python3.12"), "3.12");
+        let venv = dir.join("venv");
+        let calls = dir.join("calls");
+        let vars = dir.join("vars");
+        let text = dir.join("requirements");
+        let toml = dir.join("pyproject");
+        std::fs::write(&text, "tabulate\n").unwrap();
+        std::fs::write(
+            &toml,
+            "[project]\nname = \"x\"\nversion = \"0\"\nrequires-python = \">=3.10,<3.14\"\n",
+        )
+        .unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let run = |lang: &str, input: &Path, envs: &[(&str, &str)]| {
+            let mut c = builtin_command("@python_venv", "bash", input);
+            c.env("PATH", &path)
+                .env("MESHFOX_BLOCK_LANG", lang)
+                .env("MESHFOX_VENV_DIR", &venv)
+                .env("MESHFOX_VARS_OUT", &vars)
+                .env("CALLS", &calls)
+                .env_remove("MESHFOX_CONFIG_INTERPRETERS_PYTHON_VENV_PYTHON");
+            for (k, v) in envs {
+                c.env(k, v);
+            }
+            c.output().unwrap()
+        };
+        let venv_version = || {
+            let out = std::process::Command::new(venv.join("bin/python3"))
+                .args(["-c", "import sys; print(sys.version_info)"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let stderr = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).to_string();
+
+        // requires-python rules out the system 3.15, so 3.12 builds the venv.
+        let out = run("toml", &toml, &[("FAKE_SAT_3_15", "1")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(venv_version(), "3.12");
+        assert!(venv.join(".meshfox-venv").exists());
+        // Same inputs again: nothing is rebuilt.
+        let out = run("toml", &toml, &[("FAKE_SAT_3_15", "1")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(!stderr(&out).contains("rebuilding"), "{}", stderr(&out));
+        // The requirement moves away from the venv's Python: rebuilt on 3.15.
+        let out = run("toml", &toml, &[("FAKE_SAT_3_12", "1")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(stderr(&out).contains("rebuilding"), "{}", stderr(&out));
+        assert_eq!(venv_version(), "3.15");
+        // No requirement (text block, no config): the venv is left alone...
+        let out = run("text", &text, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(!stderr(&out).contains("rebuilding"), "{}", stderr(&out));
+        assert_eq!(venv_version(), "3.15");
+        // ...until the configured python names another minor version.
+        let out = run(
+            "text",
+            &text,
+            &[(
+                "MESHFOX_CONFIG_INTERPRETERS_PYTHON_VENV_PYTHON",
+                "python3.12",
+            )],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(stderr(&out).contains("rebuilding"), "{}", stderr(&out));
+        assert_eq!(venv_version(), "3.12");
+        // Named environments nested under the rebuilt directory survive.
+        std::fs::create_dir_all(venv.join(".named/xls")).unwrap();
+        let out = run("toml", &toml, &[("FAKE_SAT_3_12", "1")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(venv_version(), "3.15");
+        assert!(venv.join(".named/xls").is_dir());
+        // Nothing satisfies: a message that lists what was found, no venv change.
+        let out = run(
+            "toml",
+            &toml,
+            &[("FAKE_SAT_3_12", "1"), ("FAKE_SAT_3_15", "1")],
+        );
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            stderr(&out).contains("no matching python") && stderr(&out).contains("3.12"),
+            "{}",
+            stderr(&out)
+        );
+        // A configured command that does not exist is an error, not a fallback.
+        let out = run(
+            "text",
+            &text,
+            &[(
+                "MESHFOX_CONFIG_INTERPRETERS_PYTHON_VENV_PYTHON",
+                "python9.99",
+            )],
+        );
+        assert_eq!(out.status.code(), Some(2));
+        assert!(stderr(&out).contains("python9.99"), "{}", stderr(&out));
+        // A venv meshfox did not make is never emptied.
+        std::fs::remove_file(venv.join(".meshfox-venv")).unwrap();
+        let _ = std::fs::remove_file(venv.join("bin/python3-mf"));
+        let out = run("toml", &toml, &[("FAKE_SAT_3_15", "1")]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(
+            stderr(&out).contains("not created by meshfox"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(venv.join("bin/python3").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

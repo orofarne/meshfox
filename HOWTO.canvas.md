@@ -33,6 +33,23 @@ shell script of your own to keep in sync. `PYTHON` points at a small launcher,
 directory added to `PYTHONPATH` — so a block can `import` a module that sits
 next to its canvas without a `sys.path.insert(0, os.getcwd())` of its own.
 
+**Which Python.** By default the venv is built with the `python3` first on
+`$PATH` — which may be too new for some packages (a wheel that doesn't exist yet
+for the latest release). Two ways to pick another one. In a `toml` fence,
+state it in the pyproject: `requires-python = ">=3.10,<3.14"` makes the
+builtin use `python3` if that fits and otherwise the newest `python3.N` that
+does (the block fails, listing what it found, if none does). Or, for any fence,
+name the interpreter per machine or project in `.meshfox/config.toml`:
+
+```toml
+[interpreters.python_venv]
+python = "python3.12"   # a command name or a path; wins over requires-python
+```
+
+An existing venv that contradicts either is emptied and rebuilt with the
+chosen Python (the requirements are installed again; a venv meshfox didn't
+create is never touched). With neither, a venv keeps whatever Python made it.
+
 For independent environments in the same canvas, set `name=` and `var=`
 inside the interpreter specification. Both are optional: `name=` selects a
 subdirectory of the canvas's usual venv, and `var=` changes the exported
