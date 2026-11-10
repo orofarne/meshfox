@@ -307,3 +307,39 @@ meshfox static README.md --template ./site-template-archive --out ./site-dist --
 ```
 
 [`scripts/build-site.sh`](./scripts/build-site.sh) is the full build used for deploys: it also fetches the released `meshfox` binary and the DuckDB CLI (`display="table"` nodes in the examples need `duckdb` on `PATH`), and generates the Parquet file the tables example points at before running this command. `--sitemap-git-dates` needs a full git history, not a shallow clone.
+
+## Cleanup
+<!-- meshfox:node id="cleanup" -->
+<!-- meshfox:var name="KEEP_DAYS" prompt="Keep artifacts accessed within this many days" type="int" default="3" -->
+
+Frees disk space. `target/` grows without bound: every build and every test run leaves new hashed artifacts (test binaries with debug info, per-crate incremental caches) next to the ones cargo no longer uses, and it reached ~90 GB. The block removes the files in `target/*/**/deps/` and `target/*/**/incremental/` that have not been *accessed* for `KEEP_DAYS` days (default 3). It judges by access time, not modification time: a dependency that has not been rebuilt for weeks but is linked on every build keeps a fresh access time and stays. Whatever is missing is simply rebuilt by the next `cargo` run. It needs no extra tool (`cargo-sweep` is unmaintained upstream).
+
+```sh name="cleanup" default env="KEEP_DAYS"
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+days="${KEEP_DAYS:-3}"
+
+# A running build would lose files it is about to link.
+if pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null; then
+  echo "cargo/rustc is running — finish or stop it first" >&2
+  exit 1
+fi
+[ -d target ] || { echo "no target/ — nothing to clean"; exit 0; }
+
+stale() {
+  find target -type f -atime +"$days" \( -path '*/deps/*' -o -path '*/incremental/*' \) "$@"
+}
+
+before=$(du -sk target | cut -f1)
+count=$(stale -print | wc -l | tr -d ' ')
+
+stale -delete
+find target -type d -empty -delete 2>/dev/null || true
+
+after=$(du -sk target | cut -f1)
+echo "removed $count files not accessed for $days days: target/ $((before / 1048576)) GB -> $((after / 1048576)) GB"
+df -h . | tail -1
+```
+
+`meshfox DEVELOPMENT.canvas.md run cleanup --set KEEP_DAYS=1` cuts deeper; the first build afterwards is slower. For a full reset use `cargo clean` (the next build then recompiles everything). Other state is left alone: `.meshfox/` holds run history and environments, and `web/node_modules`, `editors/vscode/node_modules` are small.
