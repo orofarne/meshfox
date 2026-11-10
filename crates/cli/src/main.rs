@@ -4135,6 +4135,12 @@ async fn drain_worker_run_events(
                             if let Some(label) = child.as_ref().and_then(worker_client::child_step_label) {
                                 terminal_status::running(&format!("{name} → {label}"));
                             }
+                            // The child's own step lines get the colors a plain run gives
+                            // them; program output is printed as it came.
+                            let text = match child.as_ref().and_then(worker_client::child_line_color) {
+                                Some(color) => run_output::paint(&text, color),
+                                None => text,
+                            };
                             match stream {
                                 meshfox_server::stream_exec::OutputStream::Stdout => println!("{text}"),
                                 meshfox_server::stream_exec::OutputStream::Stderr => eprintln!("{text}"),

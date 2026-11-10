@@ -3353,6 +3353,53 @@ mod tests {
     }
 }
 
+/// SGR color for one of meshfox's own lines relayed from a native child call
+/// (a step banner or result), the same colors `run_output` gives the
+/// corresponding line of a plain run; `None` for program output.
+pub fn child_line_color(child: &serde_json::Value) -> Option<&'static str> {
+    let mut event = &child["event"];
+    while let Some(inner) = event.get("child").filter(|c| c.is_object()) {
+        event = &inner["event"];
+    }
+    match event["type"].as_str()? {
+        "step-start" | "step-skipped" | "service-started" => Some("1;36"),
+        "step-end" if event["exitCode"] == 0 => Some("32"),
+        "step-end" => Some("31"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod child_line_color_tests {
+    use super::child_line_color;
+    use serde_json::json;
+
+    #[test]
+    fn colors_meshfox_lines_but_not_program_output() {
+        let meta = |event| json!({"canvas": "c.canvas.md", "port": 1, "event": event});
+        assert_eq!(
+            child_line_color(&meta(json!({"type": "step-start"}))),
+            Some("1;36")
+        );
+        assert_eq!(
+            child_line_color(&meta(json!({"type": "step-skipped"}))),
+            Some("1;36")
+        );
+        assert_eq!(
+            child_line_color(&meta(json!({"type": "step-end", "exitCode": 0}))),
+            Some("32")
+        );
+        assert_eq!(
+            child_line_color(&meta(json!({"type": "step-end", "exitCode": 7}))),
+            Some("31")
+        );
+        assert_eq!(child_line_color(&meta(json!({"type": "output"}))), None);
+        // A call inside a call: the innermost event decides.
+        let nested = meta(json!({"type": "output", "child": meta(json!({"type": "step-start"}))}));
+        assert_eq!(child_line_color(&nested), Some("1;36"));
+    }
+}
+
 /// Read a native child's current step from its event, never from output text.
 pub fn child_step_label(child: &serde_json::Value) -> Option<String> {
     let event = &child["event"];

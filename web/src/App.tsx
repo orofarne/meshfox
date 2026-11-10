@@ -1,5 +1,6 @@
 import { canvasVersionGate } from "./canvasVersion";
 import { retainLiveBlocks } from "./liveBlockSnapshot";
+import { colorMeshfoxLine } from "./meshfoxLine";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   ReactFlow,
@@ -334,8 +335,12 @@ function positionFor(
  * untouched). Shared by `executeRun`'s own `"output"`
  * handling below — see `LiveBlockState.stdoutText`'s own doc comment for
  * why the split exists at all (`output="markdown"` mode's live view). */
-function appendOutputLine(prev: LiveBlockState, event: { stream: "stdout" | "stderr"; text: string }): LiveBlockState {
-  const append = (s: string | undefined) => (s ? `${s}\n${event.text}` : event.text);
+function appendOutputLine(
+  prev: LiveBlockState,
+  event: { stream: "stdout" | "stderr"; text: string; child?: { canvas: string; port: number; event: unknown } },
+): LiveBlockState {
+  const text = colorMeshfoxLine(event.text, event.child);
+  const append = (s: string | undefined) => (s ? `${s}\n${text}` : text);
   return {
     ...prev,
     text: append(prev.text),
@@ -1039,10 +1044,15 @@ export default function App() {
   // re-render on, only ever read from the auto-collapse effect below.
   const consoleLastActivityRef = useRef<number>(0);
   const appendConsoleLine = useCallback(
-    (nodeId: string, block: string, event: { stream: "stdout" | "stderr"; text: string }) => {
+    (
+      nodeId: string,
+      block: string,
+      event: { stream: "stdout" | "stderr"; text: string; child?: { canvas: string; port: number; event: unknown } },
+    ) => {
       consoleLastActivityRef.current = Date.now();
+      const text = colorMeshfoxLine(event.text, event.child);
       setConsoleLines((lines) => {
-        const next = [...lines, { nodeId, block, stream: event.stream, text: event.text }];
+        const next = [...lines, { nodeId, block, stream: event.stream, text }];
         return next.length > CONSOLE_MAX_LINES ? next.slice(next.length - CONSOLE_MAX_LINES) : next;
       });
     },

@@ -16,6 +16,11 @@ fn line(text: &str, color: &str, enabled: bool, newline: &str) -> String {
     }
 }
 
+/// `text` in SGR `color` when this terminal shows colors, plain otherwise.
+pub(crate) fn paint(text: &str, color: &str) -> String {
+    line(text, color, color_enabled(), "")
+}
+
 pub(crate) fn banner(text: &str, newline: &str) {
     print!(
         "{newline}{}",
