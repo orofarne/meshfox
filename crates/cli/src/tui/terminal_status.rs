@@ -57,9 +57,10 @@ impl Snapshot {
                         .get_or_insert_with(|| service.block.clone());
                 }
                 "starting" | "restarting" | "stopping" => {
-                    snapshot
-                        .active
-                        .insert(key(&service.node_id, &service.block), service.block.clone());
+                    snapshot.active.insert(
+                        key(&service.node_id, &service.block),
+                        key(&service.node_id, &service.block),
+                    );
                 }
                 _ => {}
             }
@@ -71,7 +72,7 @@ impl Snapshot {
             }
             let addr = key(&run.node_id, &run.block);
             if run.status == "running" {
-                snapshot.active.insert(addr, run.block.clone());
+                snapshot.active.insert(addr.clone(), addr);
             } else {
                 snapshot.completed.insert(
                     addr,
@@ -89,7 +90,7 @@ impl Snapshot {
             }
             let addr_key = key(&addr.node_id, &addr.block_name);
             if output.running {
-                snapshot.active.insert(addr_key, addr.block_name.clone());
+                snapshot.active.insert(addr_key.clone(), addr_key);
             } else {
                 // Keep ledger running entries until its next refresh: this
                 // output may belong to the previous invocation of that block.
@@ -109,7 +110,7 @@ impl Snapshot {
             }
             snapshot.active.insert(
                 key(&addr.node_id, &addr.block_name),
-                addr.block_name.clone(),
+                key(&addr.node_id, &addr.block_name),
             );
         }
         if let Some(run) = &app.run {
@@ -470,10 +471,34 @@ mod tests {
         });
         let mut status = CanvasStatus::default();
         assert_eq!(status.observe(Snapshot::from_app(&app)), State::Ready(1));
+        app.service_list[0].status = "starting".into();
+        assert_eq!(
+            CanvasStatus::default().observe(Snapshot::from_app(&app)),
+            State::Running("root/server".into())
+        );
         app.service_list[0].status = "crashed".into();
         assert_eq!(
             status.observe(Snapshot::from_app(&app)),
             State::Failure("server".into())
+        );
+        app.service_list.clear();
+        app.step_output.clear();
+        let addr = meshfox_core::deps::BlockAddr::new("other-node", "run[item=eu]");
+        app.step_output.insert(
+            addr,
+            super::super::app::StepOutput {
+                text: String::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+                output_markdown: false,
+                exit_code: 0,
+                duration_ms: 0,
+                running: true,
+            },
+        );
+        assert_eq!(
+            CanvasStatus::default().observe(Snapshot::from_app(&app)),
+            State::Running("other-node/run[item=eu]".into())
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

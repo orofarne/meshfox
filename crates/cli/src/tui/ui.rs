@@ -4525,14 +4525,14 @@ mod tests {
         }))
         .await;
         status.update(&mut app);
-        assert_eq!(app.activity.state, State::Running("render".into()));
+        assert_eq!(app.activity.state, State::Running("root/render".into()));
         let area = Rect::new(0, 0, 100, 14);
         let screen = render_to_screen(area, |f| {
             render_output(f, Rect::new(0, 0, 100, 12), &mut app);
             render_footer(f, Rect::new(0, 13, 100, 1), &app);
         });
-        assert!(screen.contains("running: render"), "{screen}");
-        assert!(screen.contains("Running: render"), "{screen}");
+        assert!(screen.contains("running: root/render"), "{screen}");
+        assert!(screen.contains("Running: root/render"), "{screen}");
         assert!(screen.contains("install (exit 0"), "{screen}");
         assert!(screen.contains("==> render"), "{screen}");
         app.on_run_event(Some(RunEvent::StepEnd {

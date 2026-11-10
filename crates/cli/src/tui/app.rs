@@ -7238,8 +7238,8 @@ impl App {
         if let Some(addr) = self.foreground_step() {
             self.child_steps
                 .get(addr)
-                .map(|child| format!("{} → {child}", addr.block_name))
-                .unwrap_or_else(|| addr.block_name.clone())
+                .map(|child| format!("{}/{} → {child}", addr.node_id, addr.block_name))
+                .unwrap_or_else(|| format!("{}/{}", addr.node_id, addr.block_name))
         } else if run.chain.is_empty() {
             "preparing".into()
         } else {
@@ -10219,7 +10219,7 @@ mod tests {
         status.update(&mut app);
         assert_eq!(
             app.activity.state,
-            crate::terminal_status::State::Running("dep".into())
+            crate::terminal_status::State::Running("root/dep".into())
         );
         // A lost stream must be a failure, even while the last ledger snapshot
         // still reports both the dependency and reserved target as running.

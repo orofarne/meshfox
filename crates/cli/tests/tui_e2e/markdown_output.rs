@@ -171,13 +171,13 @@ fn quiet_chain_console_and_status_follow_the_same_step() {
         .unwrap();
     session.send_keys("\x1b[B\r");
     session
-        .wait_for("Output (running: render", Duration::from_secs(10))
+        .wait_for("Output (running: root/render", Duration::from_secs(10))
         .unwrap();
     session
-        .wait_for("Running: render", Duration::from_secs(2))
+        .wait_for("Running: root/render", Duration::from_secs(2))
         .unwrap();
     let screen = session.screen_text();
-    let output = &screen[screen.find("Output (running: render").unwrap()..];
+    let output = &screen[screen.find("Output (running: root/render").unwrap()..];
     assert!(output.contains("prep (exit 0"), "{screen}");
     assert!(output.contains("==> render"), "{screen}");
     session
@@ -186,5 +186,5 @@ fn quiet_chain_console_and_status_follow_the_same_step() {
     let screen = session.screen_text();
     let output = &screen[screen.find("Output (done)").expect(&screen)..];
     assert!(output.contains("render (exit 0"), "{screen}");
-    assert!(!output.contains("Running: render"), "{screen}");
+    assert!(!output.contains("Running: root/render"), "{screen}");
 }
