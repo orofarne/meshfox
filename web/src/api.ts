@@ -1213,6 +1213,25 @@ export async function subscribeRun(
   await openEventSocket(wsUrl(`api/run/subscribe?${params}`), onEvent);
 }
 
+export interface RunResult {
+  runId: number;
+  outcome: "exited" | "killed";
+  exitCode: number | null;
+  durationMs: number;
+  text: string;
+  stdout: string;
+  stderr: string;
+}
+
+/** Read a finished result without opening an event subscription. */
+export async function fetchRunResult(nodeId: string, block: string, runId?: number): Promise<RunResult> {
+  const params = new URLSearchParams({ nodeId, block });
+  if (runId !== undefined) params.set("runId", String(runId));
+  const res = await fetch(`api/run/result?${params}`);
+  if (!res.ok) throw new Error(`GET /api/run/result: ${res.status}`);
+  return res.json();
+}
+
 /** One finished run of a block, as `GET /api/run/history` lists it (see
  * `crates/server/src/run_ledger.rs`'s `RunSummary`). `stale` means it no
  * longer describes the document — the block, something it depends on, or a

@@ -1677,6 +1677,36 @@ pub async fn run_history(
     res.json().await.map_err(|e| e.to_string())
 }
 
+pub type RunResult = meshfox_server::RunResult;
+
+/// Fetch the settled output in one response, without replaying events.
+pub async fn finished_run_result(
+    port: u16,
+    node_id: &str,
+    block: &str,
+    run_id: Option<i64>,
+) -> Result<RunResult, String> {
+    let mut url = reqwest::Url::parse_with_params(
+        &format!("{}/api/run/result", base_url(port)),
+        &[("nodeId", node_id), ("block", block)],
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(id) = run_id {
+        url.query_pairs_mut().append_pair("runId", &id.to_string());
+    }
+    client()
+        .get(url)
+        .timeout(time_limit(QUICK))
+        .send()
+        .await
+        .map_err(|e| describe(&e))?
+        .error_for_status()
+        .map_err(|e| describe(&e))?
+        .json()
+        .await
+        .map_err(|e| describe(&e))
+}
+
 /// The stored output of one historical run — `/api/run/subscribe` with a
 /// `runId`, read to its end. A finished run replays its lines and closes, so
 /// this simply collects them; a run the worker no longer has (rotated out

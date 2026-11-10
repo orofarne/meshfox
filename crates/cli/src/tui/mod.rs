@@ -396,6 +396,11 @@ enum ExternalMsg {
     ImagesChanged,
     /// An incremental update for a run this session never started.
     Run(ExternalRunUpdate),
+    RunResult {
+        node_id: String,
+        block: String,
+        result: crate::worker_client::RunResult,
+    },
     /// Some run started or ended somewhere (another frontend, a terminal
     /// session): the worker's `GET /api/runs` has changed, refetch it.
     RunsChanged,
@@ -491,7 +496,27 @@ async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<Exter
         // `get_active_runs`); for a running one it's the time so far, which
         // the live stream's own terminal event will measure itself.
         let known = (run.status != "running").then_some(run.uptime_ms);
-        spawn_run_subscriber(port, run.node_id, run.block, known, tx.clone());
+        if known.is_some() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Ok(result) = crate::worker_client::finished_run_result(
+                    port,
+                    &run.node_id,
+                    &run.block,
+                    run.history_id,
+                )
+                .await
+                {
+                    let _ = tx.send(ExternalMsg::RunResult {
+                        node_id: run.node_id,
+                        block: run.block,
+                        result,
+                    });
+                }
+            });
+        } else {
+            spawn_run_subscriber(port, run.node_id, run.block, None, tx.clone());
+        }
     }
 }
 
@@ -624,6 +649,9 @@ async fn main_loop(
                 app.on_slow_background_msg(msg).await;
             }
             Some(msg) = external_run_rx.recv() => match msg {
+                ExternalMsg::RunResult { node_id, block, result } => {
+                    app.on_finished_run_result(BlockAddr::new(node_id, block), result);
+                }
                 ExternalMsg::Run(update) => app.on_subscribed_run_event(
                     update.subscription_id,
                     BlockAddr::new(update.node_id, update.block),

@@ -2,6 +2,24 @@ import { test, expect } from "@playwright/test";
 
 const taskSelector = '[id="mesh-block-root::long-task"]';
 
+test("reload restores a finished result without replay subscriptions", async ({ page }) => {
+  await page.goto("/");
+  const task = page.locator(taskSelector);
+  await task.getByRole("button", { name: "run long-task", exact: true }).click();
+  await expect(task.locator(".mesh-code-output")).toContainText("done", { timeout: 12_000 });
+  await expect(task.getByRole("button", { name: "run long-task", exact: true })).toBeEnabled();
+  const subscriptions: string[] = [];
+  page.on("websocket", socket => {
+    if (socket.url().includes("/api/run/subscribe")) subscriptions.push(socket.url());
+  });
+  const snapshot = page.waitForResponse(response => response.url().includes("/api/run/result?") && response.ok());
+  await page.reload();
+  const result = await (await snapshot).json();
+  expect(result.text).toContain("done");
+  await expect(task.locator(".mesh-code-output")).toContainText("done");
+  expect(subscriptions).toEqual([]);
+});
+
 test("run acknowledges the click while arguments are being prepared", async ({ page }) => {
   await page.goto("/");
   const task = page.locator(taskSelector);

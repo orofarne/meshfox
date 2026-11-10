@@ -55,6 +55,7 @@ import {
   forceRun,
   fetchActiveRuns,
   subscribeRun,
+  fetchRunResult,
   submitForm,
   type RunEvent,
   type NodePatch,
@@ -1828,7 +1829,7 @@ export default function App() {
       // leftover output instead of (or mixed with) the real current
       // one.
       const isCurrent = beginAddressWatch(`${run.nodeId}::${run.block}`);
-      let replay: LiveBlockState = {
+      const replay: LiveBlockState = {
         status: run.status === "killed" ? "killed" : run.status === "exited" ? "done" : "running",
         text: "",
         stdoutText: undefined,
@@ -1846,16 +1847,25 @@ export default function App() {
       // Reconciliation can discover the history id after this tab already
       // displayed the result. Keep that result until its complete replay is
       // ready; clearing it first makes text and Markdown images disappear.
-      if (!finished) patchLiveBlock(run.nodeId, run.block, replay);
+      if (finished) {
+        void fetchRunResult(run.nodeId, run.block, run.historyId).then((result) => {
+          if (!isCurrent()) return;
+          patchLiveBlock(run.nodeId, run.block, {
+            ...replay,
+            status: result.outcome === "killed" ? "killed" : "done",
+            text: result.text, stdoutText: result.stdout, stderrText: result.stderr,
+            exitCode: result.exitCode ?? undefined, historyId: result.runId,
+            durationMs: result.durationMs,
+          });
+        }).catch(() => {});
+        return;
+      }
+      patchLiveBlock(run.nodeId, run.block, replay);
       let sawDone = false;
       subscribeRun(run.nodeId, run.block, 0, (event) => {
         if (!isCurrent()) return;
         switch (event.type) {
           case "line":
-            if (finished) {
-              replay = appendOutputLine(replay, event);
-              break;
-            }
             // The console is a transcript of what this tab saw happen. A
             // run that already finished when it was adopted is only being
             // replayed into the block's own output — often it is this
@@ -1878,7 +1888,6 @@ export default function App() {
           case "done":
             sawDone = true;
             patchLiveBlock(run.nodeId, run.block, {
-              ...(finished ? replay : {}),
               status: event.outcome === "killed" ? "killed" : "done",
               exitCode: event.exitCode,
               runId: undefined,

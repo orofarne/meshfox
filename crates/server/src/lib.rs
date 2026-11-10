@@ -10347,11 +10347,13 @@ async fn subscribe_run(
 /// reset is never shown as the block's latest result. `404` if there is
 /// none. `finished` is the address's in-memory handle, if any, consulted
 /// only when nothing was stored for the run (output storing turned off).
-fn serve_stored_run(
+type StoredRunLine = (u64, stream_exec::OutputStream, String, Option<u64>);
+
+fn stored_run_data(
     state: &AppState,
     query: &SubscribeRunQuery,
     finished: Option<Arc<run_registry::RunHandle>>,
-) -> Result<Response, ApiError> {
+) -> Result<(run_ledger::RunSummary, Vec<StoredRunLine>), ApiError> {
     let not_found = || {
         ApiError(
             StatusCode::NOT_FOUND,
@@ -10392,6 +10394,63 @@ fn serve_stored_run(
             None => Vec::new(),
         },
     };
+    Ok((run, lines))
+}
+
+/// A finished result is a snapshot, without per-line replay events or a live socket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunResult {
+    pub run_id: i64,
+    pub outcome: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub text: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+async fn get_run_result(
+    State(state): State<Arc<AppState>>,
+    Query(mut query): Query<SubscribeRunQuery>,
+) -> Result<Json<RunResult>, ApiError> {
+    let addr = canonical_run_address(&state, &query.node_id, &query.block);
+    query.block = addr.block_name;
+    let finished = state
+        .runs_registry
+        .lock()
+        .unwrap()
+        .get(&(query.node_id.clone(), query.block.clone()))
+        .cloned();
+    let (run, lines) = stored_run_data(&state, &query, finished)?;
+    let mut result = RunResult {
+        run_id: run.id,
+        outcome: run.outcome,
+        exit_code: run.exit_code,
+        duration_ms: run.duration_ms.unwrap_or(0),
+        text: String::new(),
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    for (_, stream, text, _) in lines {
+        result.text.push_str(&text);
+        result.text.push('\n');
+        let output = match stream {
+            stream_exec::OutputStream::Stdout => &mut result.stdout,
+            stream_exec::OutputStream::Stderr => &mut result.stderr,
+        };
+        output.push_str(&text);
+        output.push('\n');
+    }
+    Ok(Json(result))
+}
+
+fn serve_stored_run(
+    state: &AppState,
+    query: &SubscribeRunQuery,
+    finished: Option<Arc<run_registry::RunHandle>>,
+) -> Result<Response, ApiError> {
+    let (run, lines) = stored_run_data(state, query, finished)?;
     let done = match run.outcome.as_str() {
         "killed" => SubscribeEvent::Done {
             outcome: "killed",
@@ -11223,6 +11282,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/api/form/cancel", post(cancel_form))
         .route("/api/form/reset", post(reset_form))
         .route("/api/run/subscribe", get(subscribe_run))
+        .route("/api/run/result", get(get_run_result))
         .route("/api/run/history", get(get_run_history))
         .route("/api/run/tty", get(run_block_tty))
         .route("/api/run/tty/attach", get(attach_tty))
@@ -22911,6 +22971,53 @@ mod run_lock_tests {
             "exit_code leaked through in snake_case: {done_event:?}"
         );
 
+        cleanup(&canvas_path);
+    }
+
+    #[tokio::test]
+    async fn finished_result_returns_a_snapshot_without_replaying_events() {
+        let canvas_path = write_test_canvas("<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n```bash name=bulk\nfor ((i=0;i<1000;i++)); do echo \"line $i\"; done\necho warning >&2\nexit 3\n```\n");
+        let addr = spawn_test_server(canvas_path.clone()).await;
+        run_ws_events(addr, "block=bulk").await;
+        let (status, body) = get(addr, "/api/run/result?nodeId=root&block=bulk").await;
+        assert_eq!(status, 200, "{body}");
+        let result: RunResult = serde_json::from_str(&body).unwrap();
+        assert_eq!(result.outcome, "exited");
+        assert_eq!(result.exit_code, Some(3));
+        assert_eq!(result.stdout.lines().count(), 1_000);
+        assert!(result.stdout.starts_with("line 0\n"));
+        assert!(result.stdout.ends_with("line 999\n"));
+        assert_eq!(result.stderr, "warning\n");
+        assert_eq!(result.text.lines().count(), 1_001);
+        // Snapshot and subscription expose exactly the same ordered output.
+        let events = subscribe_ws_events(addr, "/api/run/subscribe?nodeId=root&block=bulk").await;
+        let mut text = String::new();
+        for event in events.iter().filter(|e| e["type"] == "line") {
+            text.push_str(event["text"].as_str().unwrap());
+            text.push('\n');
+        }
+        assert_eq!(result.text, text);
+        post_json(addr, "/api/session/reset", "{}").await;
+        assert_eq!(
+            get(addr, "/api/run/result?nodeId=root&block=bulk").await.0,
+            404
+        );
+        let (status, body) = get(
+            addr,
+            &format!(
+                "/api/run/result?nodeId=root&block=bulk&runId={}",
+                result.run_id
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "historical snapshot remains accessible: {body}"
+        );
+        assert_eq!(
+            serde_json::from_str::<RunResult>(&body).unwrap().text,
+            result.text
+        );
         cleanup(&canvas_path);
     }
 

@@ -6761,6 +6761,39 @@ impl App {
         }
     }
 
+    pub fn on_finished_run_result(
+        &mut self,
+        addr: BlockAddr,
+        result: crate::worker_client::RunResult,
+    ) {
+        // A foreground run may have started while the snapshot was in flight.
+        if self.run.as_ref().is_some_and(|r| r.chain.contains(&addr))
+            || self.external_running.contains_key(&addr)
+            || self.step_output.contains_key(&addr)
+        {
+            return;
+        }
+        let output = StepOutput {
+            text: result.text,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            output_markdown: self.block_output_markdown(&addr),
+            exit_code: result.exit_code.unwrap_or(-1),
+            duration_ms: result.duration_ms,
+            running: false,
+        };
+        self.displayed_invocations
+            .insert(definition_addr(&addr), addr.clone());
+        self.step_output.insert(addr.clone(), output);
+        if self
+            .rows
+            .get(self.selected)
+            .is_some_and(|row| row.node_id == addr.node_id)
+        {
+            self.render_current_document();
+        }
+    }
+
     /// [`Self::on_external_run_event`] for a run found at startup
     /// (`mod.rs`'s `reconcile_runs`) rather than announced by
     /// `WatchEvent::RunStarted`: the worker already knows how long a finished
@@ -12557,34 +12590,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_found_at_startup_shows_its_output_exit_code_and_known_duration() {
-        use crate::worker_client::SubscribeEvent;
         let mut app = app_with_blocks("reconcile", "```bash name=\"a\"\necho a\n```\n").await;
         let addr = BlockAddr::new("root", "a");
-        let out = meshfox_server::stream_exec::OutputStream::Stdout;
-        let err = meshfox_server::stream_exec::OutputStream::Stderr;
-        app.on_reconciled_run_event(
+        app.on_finished_run_result(
             addr.clone(),
-            SubscribeEvent::Line {
-                stream: out,
-                text: "hello".into(),
-                time_ms: None,
+            crate::worker_client::RunResult {
+                run_id: 42,
+                outcome: "exited".into(),
+                exit_code: Some(3),
+                duration_ms: 1234,
+                text: "hello\noops\n".into(),
+                stdout: "hello\n".into(),
+                stderr: "oops\n".into(),
             },
-            Some(1234),
-        );
-        assert!(app.step_output[&addr].running, "still replaying");
-        app.on_reconciled_run_event(
-            addr.clone(),
-            SubscribeEvent::Line {
-                stream: err,
-                text: "oops".into(),
-                time_ms: None,
-            },
-            Some(1234),
-        );
-        app.on_reconciled_run_event(
-            addr.clone(),
-            SubscribeEvent::Done { exit_code: Some(3) },
-            Some(1234),
         );
         let entry = &app.step_output[&addr];
         assert_eq!(
@@ -12600,6 +12618,19 @@ mod tests {
             !app.external_running.contains_key(&addr),
             "no longer counted as running"
         );
+        app.on_finished_run_result(
+            addr.clone(),
+            crate::worker_client::RunResult {
+                run_id: 1,
+                outcome: "exited".into(),
+                exit_code: Some(0),
+                duration_ms: 1,
+                text: "late stale snapshot\n".into(),
+                stdout: "late stale snapshot\n".into(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(app.step_output[&addr].text, "hello\noops\n");
     }
 
     #[tokio::test]
