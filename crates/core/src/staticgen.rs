@@ -622,7 +622,7 @@ fn build_node_view(
                     canvas_links,
                 )
             } else {
-                resolve_link_url(t, ctx)
+                resolve_link_url(t, &base_dir, ctx)
             }
         });
         let first_link_override = (node.node_type == NodeType::File && ctx.copy_files)
@@ -1195,7 +1195,7 @@ fn render_markdown(
             }) => {
                 let new_url = first_link_override.take().unwrap_or_else(|| {
                     resolve_canvas_page_link(&dest_url, base_dir, ctx, canvas_links)
-                        .unwrap_or_else(|| resolve_link_url(&dest_url, ctx))
+                        .unwrap_or_else(|| resolve_link_url(&dest_url, base_dir, ctx))
                 });
                 events.push(Event::Start(Tag::Link {
                     link_type,
@@ -1546,7 +1546,7 @@ fn resolve_image_url(
 /// left untouched unless it's relative and `links_base_url` is set, in which case
 /// it's prefixed with it. Never copies anything — see the module doc
 /// comment for why plain links get this lighter treatment than images.
-fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
+fn resolve_link_url(url: &str, base_dir: &Path, ctx: &RenderCtx) -> String {
     if !url_allowed(url, false) {
         return String::new();
     }
@@ -1557,10 +1557,57 @@ fn resolve_link_url(url: &str, ctx: &RenderCtx) -> String {
         Some(base) => format!(
             "{}/{}",
             base.trim_end_matches('/'),
-            url.trim_start_matches("./")
+            root_relative_link(url, base_dir, ctx)
         ),
         None => url.to_string(),
     }
+}
+
+/// `url`, written relative to the directory it appears in (`base_dir`), as a
+/// path relative to the *root* canvas's directory — what `links_base_url`
+/// (the root of the sources) is joined with. A canvas rendered from a
+/// subdirectory (`examples/x.canvas.md`) links `helper.py` meaning
+/// `examples/helper.py`, and `../x.canvas.md` meaning `x.canvas.md`. Left as
+/// written (minus a leading `./`) for the root canvas, for a directory
+/// outside the root's, and for a link that climbs out of the root.
+fn root_relative_link(url: &str, base_dir: &Path, ctx: &RenderCtx) -> String {
+    let plain = url.trim_start_matches("./");
+    // Only a recursive export renders canvases from other directories;
+    // otherwise `root_canvas_path` is not even a canvas file (see `build`).
+    if !ctx.recursive {
+        return plain.to_string();
+    }
+    let Some(root_dir) = ctx.root_canvas_path.parent() else {
+        return plain.to_string();
+    };
+    let base = base_dir
+        .canonicalize()
+        .unwrap_or_else(|_| base_dir.to_path_buf());
+    let Ok(rel) = base.strip_prefix(root_dir) else {
+        return plain.to_string();
+    };
+    let mut parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.is_empty() {
+        return plain.to_string();
+    }
+    let split = plain.find(['?', '#']).unwrap_or(plain.len());
+    let (path, suffix) = plain.split_at(split);
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return plain.to_string();
+                }
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+    let trailing = if path.ends_with('/') { "/" } else { "" };
+    format!("{}{trailing}{suffix}", parts.join("/"))
 }
 
 /// Whether `path` is a canvas (`mdcanvas::is_canvas`: a `*.canvas.md`, or a
@@ -1752,7 +1799,7 @@ fn resolve_file_target_for_copy(
     canvas_links: &mut Vec<CanvasLinkTarget>,
 ) -> String {
     if is_external_or_absolute(url) {
-        return resolve_link_url(url, ctx);
+        return resolve_link_url(url, base_dir, ctx);
     }
     match resolve_canvas_relative(url, base_dir, ctx.access) {
         Some(resolved) if is_canvas_file(&resolved) => {
@@ -1765,7 +1812,7 @@ fn resolve_file_target_for_copy(
                 // `build_for_static_export` before this ever reaches a
                 // template — what's returned here doesn't matter for
                 // correctness, only for not panicking on the way there.
-                return resolve_link_url(url, ctx);
+                return resolve_link_url(url, base_dir, ctx);
             }
             canvas_page_href(url, resolved, ctx, canvas_links)
         }
@@ -1799,7 +1846,7 @@ fn resolve_file_target_for_copy(
             });
             dest_rel
         }
-        None => resolve_link_url(url, ctx),
+        None => resolve_link_url(url, base_dir, ctx),
     }
 }
 
@@ -3034,6 +3081,48 @@ mod tests {
         );
         assert!(assets.is_empty(), "{assets:?}");
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn links_base_url_is_joined_with_the_path_from_the_root_canvas_directory() {
+        let dir = temp_dir("links-nested");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        write(&dir, "doc.canvas.md", b"unused: `c` is given directly");
+        let c = canvas(concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "[a](helper.py) [b](../top.md#x) [c](./dir/) [d](../../out.md)\n",
+        ));
+        let links = "https://github.com/me/repo/blob/main/";
+        let root_path = dir.join("doc.canvas.md");
+
+        // Rendered as a page of its own, one directory below the root canvas.
+        let (nested, ..) =
+            build_for_static_export(&c, &sub, &root_path, "sub", Some(links), None, true, true)
+                .unwrap();
+        let body = &nested.root.html_body;
+        for want in [
+            "href=\"https://github.com/me/repo/blob/main/sub/helper.py\"",
+            "href=\"https://github.com/me/repo/blob/main/top.md#x\"",
+            "href=\"https://github.com/me/repo/blob/main/sub/dir/\"",
+            // Climbing out of the root is left as written.
+            "href=\"https://github.com/me/repo/blob/main/../../out.md\"",
+        ] {
+            assert!(body.contains(want), "{want} missing from {body}");
+        }
+
+        // The root canvas itself: as written.
+        let (top, ..) =
+            build_for_static_export(&c, &dir, &root_path, "", Some(links), None, true, true)
+                .unwrap();
+        assert!(
+            top.root
+                .html_body
+                .contains("href=\"https://github.com/me/repo/blob/main/helper.py\""),
+            "{}",
+            top.root.html_body
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
