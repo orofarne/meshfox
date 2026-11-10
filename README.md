@@ -52,6 +52,17 @@ docker run --user "$(id -u):$(id -g)" -p 127.0.0.1:4590:4590 \
   -e MESHFOX_TOKEN=change-me -v "$PWD":/work ghcr.io/orofarne/meshfox:full
 ```
 
+Or on Windows, through WSL2 (no native build; see "Windows (WSL2)" below). This
+PowerShell snippet downloads [`scripts/meshfox-wsl.ps1`](./scripts/meshfox-wsl.ps1)
+into the current directory and runs it: it installs the WSL distribution if needed, installs or updates
+meshfox and the DuckDB CLI inside it, and serves the canvases in `-CanvasDir`
+(a Windows folder) at `http://localhost:4590/`:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/orofarne/meshfox/main/scripts/meshfox-wsl.ps1 -OutFile meshfox-wsl.ps1
+powershell -ExecutionPolicy Bypass -File .\meshfox-wsl.ps1 -CanvasDir "$env:USERPROFILE\meshfox"
+```
+
 Package maintainers can disable self-updating without rebuilding the binary:
 install a marker at `<prefix>/share/meshfox/install-method` alongside
 `<prefix>/bin/meshfox`. Its contents may be `homebrew`, `deb`, `pacman` or `docker` for
@@ -81,14 +92,6 @@ Meshfox pulls together several documentation patterns that are usually spread ac
 Status: **beta**.
 
 This document is itself a valid meshfox canvas — every `##` section here is a node, nested under this root. See [SPEC.md](./SPEC.md) for more details.
-
-## v1.0.0
-<!-- meshfox:node id="v1-0-0" -->
-
-Rough checklist for what's needed before a 1.0.0 release:
-
-- [ ] Windows support (the CLI, TUI and web UI natively, and the Windows Credential Manager for stored secrets)
-- [ ] Rewrite docs
 
 ## Concept
 <!-- meshfox:node id="concept" -->
@@ -566,6 +569,28 @@ Open `http://localhost:4590/` and sign in with the token. Without `MESHFOX_TOKEN
 - **Updating** means pulling a newer image and recreating the container: `meshfox check-updates` says so instead of replacing the binary.
 
 The image wraps the binary from the GitHub release of the same tag. To build one yourself: `docker build -f docker/Dockerfile --build-arg MESHFOX_VERSION=0.27.0 --target slim -t meshfox:slim docker/` (or `--target full`); `docker/smoke.sh <image> slim|full <version>` runs the checks CI runs before it pushes. The Debian base has to be at least as new as the release runners' glibc (2.39), which is why it is 13 (trixie) and not 12. `.github/workflows/docker.yml` builds both variants natively on both architectures and publishes the multi-arch manifests after a release; run it by hand with `push` off for a dry run.
+
+### Windows (WSL2)
+<!-- meshfox:node id="windows-wsl2" -->
+
+There is no native Windows build; meshfox runs on Windows inside WSL2, as the Linux binary. [`scripts/meshfox-wsl.ps1`](./scripts/meshfox-wsl.ps1) does the setup and starts `meshfox serve --http` (see "Serving canvases over HTTP") for you. In PowerShell:
+
+```powershell
+.\scripts\meshfox-wsl.ps1 -CanvasDir D:\notes
+```
+
+On every run it:
+
+1. checks that WSL and the distribution (`-Distro`, default `Ubuntu-24.04`) are installed, and installs the distribution if not (finish its first-run setup, then run the script again);
+2. installs meshfox into `~/.local/bin` inside the distribution with `scripts/install.sh`, or runs `meshfox check-updates -y` if it is already there (`-SkipUpdate` skips the check);
+3. installs the DuckDB CLI (for `display="table"`) with its official installer, which always puts it in `~/.duckdb/cli/<version>/`, and passes that path to meshfox as `MESHFOX_DUCKDB`; `-DuckDbVersion 2.0.0` pins a version instead of the latest stable;
+4. creates an access token once and keeps it in `%LOCALAPPDATA%\meshfox\token`, so the sign-in does not change between runs;
+5. runs `meshfox serve --http 127.0.0.1:4590 --root <canvas dir>` in the foreground and opens `http://localhost:4590/` in the Windows browser (`-Port` changes the port, `-NoBrowser` skips opening it). Ctrl+C stops it; while the window is open WSL does not shut the distribution down.
+
+- **Distribution.** The release binary needs glibc 2.39 or newer: Ubuntu 24.04 or Debian 13, not Ubuntu 22.04 or Debian 12. It is the same binary as on any Linux, so nothing is rebuilt for WSL.
+- **Canvases on the Windows drive.** `-CanvasDir` is a Windows path, reached as `/mnt/c/...` (or `/mnt/d/...`) from WSL, so the files can be opened from Windows tools too. That filesystem is much slower for tree walks than the distribution's own (see "Serving canvases over HTTP"; add a `.meshfoxignore` for big trees), and file-change events from Windows-side edits may not reach the watchers. For many files, keep the canvases inside the distribution and open them from Windows as `\\wsl$\<distro>\...` instead.
+- **Socket.** The coordinator's socket is `~/.meshfox/serve.sock` inside the distribution, not on `/mnt/c`, where unix sockets and mode `0600` are unreliable. To drive it from a WSL shell (`meshfox tui`, `cores ls`, `run`), set `MESHFOX_SERVER_SOCKET=$HOME/.meshfox/serve.sock` there.
+- **Not available.** There is no systemd in this setup (the script runs `serve` itself), the macOS menu-bar app is macOS only, and `secret_store = "keychain"` needs a Secret Service (`gnome-keyring`, `dbus-user-session`) running in the distribution; without one, keep the default `plaintext`.
 
 ### Terminal UI
 <!-- meshfox:node id="usage-tui" -->
