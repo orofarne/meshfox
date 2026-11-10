@@ -23,6 +23,60 @@ fn session(body: &str) -> TuiSession {
 
 #[test]
 #[ignore = "pty-based e2e"]
+fn successful_block_rerun_replaces_failed_footer_with_green_completion() {
+    let (mut session, canvas) = fixture(
+        "```sh name=build\nif [ ! -f fixed ]; then exit 7; fi\nprintf 'repaired-%s\\n' 42\n```\n",
+    );
+    // Click the document's block control, rather than the tree's run badge.
+    let click_run = |session: &mut TuiSession| {
+        let screen = session.screen_text();
+        let (row, col) = screen
+            .lines()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                line.rfind("[run]")
+                    .map(|byte| (row as u16, line[..byte].chars().count() as u16))
+            })
+            .last()
+            .expect("document block run control");
+        session.send_mouse_click(row, col + 1);
+    };
+    session
+        .wait_for("[history]", Duration::from_secs(5))
+        .unwrap();
+    click_run(&mut session);
+    session.wait_for("exit 7", Duration::from_secs(10)).unwrap();
+    session
+        .wait_for("✗ Failed: build", Duration::from_secs(5))
+        .unwrap();
+    let (row, col) = session.find("✗ Failed: build").unwrap();
+    assert_eq!(row, 29, "failure must appear in the bottom status row");
+    let failed_color = session.fgcolor_at(row, col);
+
+    // Repair the same block's input without restarting the TUI or worker.
+    std::fs::write(canvas.parent().unwrap().join("fixed"), "").unwrap();
+    click_run(&mut session);
+    session
+        .wait_for("repaired-42", Duration::from_secs(10))
+        .unwrap();
+    session.wait_for("exit 0", Duration::from_secs(5)).unwrap();
+    session
+        .wait_for("✓ Completed: build", Duration::from_secs(5))
+        .unwrap();
+    let (row, col) = session.find("✓ Completed: build").unwrap();
+    assert_eq!(row, 29, "completion must appear in the bottom status row");
+    assert_eq!(
+        session.fgcolor_at(row, col),
+        Some(vt100::Color::Rgb(0x6f, 0xcf, 0x97))
+    );
+    assert_ne!(session.fgcolor_at(row, col), failed_color);
+    assert!(!session.screen_text().contains("✗ Failed:"));
+    session.send_keys("q");
+    assert!(session.wait_for_exit(Duration::from_secs(5)));
+}
+
+#[test]
+#[ignore = "pty-based e2e"]
 fn terminal_status_tracks_run_and_clears_on_quit() {
     let mut session = session("```bash name=build\nsleep 0.3; echo done\n```\n");
     session.clear_raw();

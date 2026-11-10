@@ -123,9 +123,11 @@ impl Snapshot {
                 // The chain stream also spans preparation and finalization.
                 // Clear stale ledger entries before publishing its actual phase.
                 for addr in run.chain.iter().chain(app.run_target.iter()) {
-                    snapshot
-                        .active
-                        .remove(&key(&addr.node_id, &addr.block_name));
+                    let key = key(&addr.node_id, &addr.block_name);
+                    snapshot.active.remove(&key);
+                    // The ledger/output can still describe the previous run.
+                    // Do not count its failure as a completion in this batch.
+                    snapshot.completed.remove(&key);
                 }
                 let label = app.foreground_run_label();
                 if let Some(addr) = app.foreground_step() {
