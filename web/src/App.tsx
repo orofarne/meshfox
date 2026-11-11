@@ -102,6 +102,40 @@ const NO_EXEC_MESSAGE = "This core was started with --no-exec: running blocks is
 
 const nodeTypes = { mesh: MeshNode };
 
+/**
+ * Blocks whose live state says "running"/"queued" but that no activity of this
+ * tab owns: runs started elsewhere, shown as activities of their own.
+ */
+function discoverRunningBlocks(
+  nodes: readonly Node<MeshNodeData>[],
+  activities: readonly RunActivity[],
+  owned: ReadonlySet<string>,
+  ttyKeys: ReadonlySet<string>,
+): RunActivity[] {
+  const discovered: RunActivity[] = [];
+  for (const n of nodes) {
+    for (const [block, value] of Object.entries(n.data.liveBlocks)) {
+      const key = `${n.id}::${block}`;
+      if (owned.has(key) || ttyKeys.has(key) || (value.status !== "running" && value.status !== "queued")) continue;
+      // This tab's own run can settle (its Done event) a render before the
+      // block's own live state stops saying "running" (the stream's
+      // cleanup patches it afterwards). That leftover must not be adopted
+      // as a foreign run: its later "result" would carry no exit code and
+      // replace the real outcome of the run this tab started.
+      if (settledByOwnActivity(activities, key, value.startedAt)) continue;
+      discovered.push({ key, target: { nodeId: n.id, block }, current: { nodeId: n.id, block },
+        phase: value.status === "queued" ? "preparing" : "running", runId: value.runId,
+        startedAt: value.startedAt ?? Date.now(), stepStartedAt: value.startedAt, addresses: [key] });
+    }
+  }
+  return discovered;
+}
+
+function settledByOwnActivity(activities: readonly RunActivity[], key: string, startedAt: number | undefined): boolean {
+  return activities.some(a => a.endedAt !== undefined && a.addresses.includes(key)
+    && (startedAt === undefined || startedAt <= a.endedAt));
+}
+
 /** Refresh ports together after visible nodes mount or their handles move. */
 function NodeHandleRefresh({ nodes }: Readonly<{ nodes: Node<MeshNodeData>[] }>) {
   const updateNodeInternals = useUpdateNodeInternals();
@@ -4156,22 +4190,7 @@ export default function App() {
     const owned = new Set(activities.filter(activityIsLive).flatMap(a => a.addresses));
     const discovered: RunActivity[] = [];
     const ttyKeys = new Set(liveTtySessions.map(a => `${a.nodeId}::${a.block}`));
-    for (const n of nodes) {
-      for (const [block, value] of Object.entries(n.data.liveBlocks)) {
-        const key = `${n.id}::${block}`;
-        if (owned.has(key) || ttyKeys.has(key) || (value.status !== "running" && value.status !== "queued")) continue;
-        // This tab's own run can settle (its Done event) a render before the
-        // block's own live state stops saying "running" (the stream's
-        // cleanup patches it afterwards). That leftover must not be adopted
-        // as a foreign run: its later "result" would carry no exit code and
-        // replace the real outcome of the run this tab started.
-        if (activities.some(a => a.endedAt !== undefined && a.addresses.includes(key)
-          && (value.startedAt === undefined || value.startedAt <= a.endedAt))) continue;
-        discovered.push({ key, target: { nodeId: n.id, block }, current: { nodeId: n.id, block },
-          phase: value.status === "queued" ? "preparing" : "running", runId: value.runId,
-          startedAt: value.startedAt ?? Date.now(), stepStartedAt: value.startedAt, addresses: [key] });
-      }
-    }
+    discovered.push(...discoverRunningBlocks(nodes, activities, owned, ttyKeys));
     for (const tty of liveTtySessions) {
       const key = `${tty.nodeId}::${tty.block}`;
       // A delayed /api/runs snapshot must not resurrect a tty whose
