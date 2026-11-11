@@ -8,6 +8,51 @@ const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 32;
 const SIXEL_CACHE_ENTRIES: usize = 128;
 
+/// Bitmap interiors are skipped by ratatui's diff. If a popup withdraws from
+/// those cells, the unchanged image anchor would otherwise leave its text on
+/// screen indefinitely. Remember coverage, not popup types, so every overlay
+/// (including one that shrinks while filtering) follows the same rule.
+#[derive(Default)]
+pub(super) struct ImageRedrawState {
+    previous: Option<(ratatui::layout::Rect, Vec<bool>)>,
+}
+
+impl ImageRedrawState {
+    fn update(&mut self, buffer: &ratatui::buffer::Buffer) -> bool {
+        use ratatui::buffer::CellDiffOption;
+        let skipped: Vec<_> = buffer
+            .content
+            .iter()
+            .map(|cell| cell.diff_option == CellDiffOption::Skip)
+            .collect();
+        let restore = self.previous.as_ref().is_some_and(|(area, previous)| {
+            *area == buffer.area
+                && previous
+                    .iter()
+                    .zip(&skipped)
+                    .any(|(&was, &now)| !was && now)
+        });
+        self.previous = Some((buffer.area, skipped));
+        restore
+    }
+
+    pub fn draw<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<B>,
+        mut render: impl FnMut(&mut ratatui::Frame),
+    ) -> Result<(), B::Error> {
+        let frame = terminal.draw(&mut render)?;
+        let area = frame.area;
+        if self.update(frame.buffer) {
+            // resize to the same geometry clears both the physical viewport
+            // and the diff baseline, without querying the terminal cursor.
+            terminal.resize(area)?;
+            terminal.draw(render)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct DocumentImage {
     size: Size,
     pub sliced: Option<SlicedProtocol>,
@@ -117,6 +162,41 @@ fn protocol_bytes(protocol: &Protocol) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_is_reissued_when_a_popup_shrinks_or_closes() {
+        use ratatui::{backend::TestBackend, layout::Rect, widgets::Clear, Terminal};
+        let image = image(12);
+        let mut terminal = Terminal::new(TestBackend::new(8, 14)).unwrap();
+        let mut redraw = ImageRedrawState::default();
+        let mut draws = 0;
+        // The image anchor stays outside the popup. Filtering shrinks it,
+        // exposing cells whose image data has not changed.
+        for (popup, expected_draws) in [
+            (Some(Rect::new(1, 2, 5, 9)), 1),
+            (Some(Rect::new(1, 2, 5, 9)), 2),
+            (Some(Rect::new(1, 5, 5, 3)), 4),
+            (None, 6),
+            (None, 7),
+        ] {
+            redraw
+                .draw(&mut terminal, |frame| {
+                    draws += 1;
+                    super::super::ui::render_document_image(
+                        &image,
+                        0,
+                        Rect::new(0, 1, 2, 12),
+                        frame.buffer_mut(),
+                    );
+                    if let Some(popup) = popup {
+                        frame.render_widget(Clear, popup);
+                        frame.render_widget(ratatui::widgets::Paragraph::new("choice"), popup);
+                    }
+                })
+                .unwrap();
+            assert_eq!(draws, expected_draws);
+        }
+    }
     fn image(rows: u16) -> DocumentImage {
         let pixels = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
             16,

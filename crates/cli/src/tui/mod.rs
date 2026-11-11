@@ -541,9 +541,10 @@ async fn main_loop(
     // never refresh after its first fetch.
     let mut service_log_tick = tokio::time::interval(Duration::from_secs(1));
     service_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut image_redraw = image_render::ImageRedrawState::default();
     loop {
         status.update(app);
-        terminal.draw(|f| ui::render(f, app))?;
+        image_redraw.draw(terminal, |f| ui::render(f, app))?;
         if app.should_quit {
             return Ok(());
         }
