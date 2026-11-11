@@ -269,9 +269,13 @@ fn compact_live_output_header(line: &mut Line<'static>, width: usize) {
     let Some(rest) = first.content.strip_prefix("┌─ output: ") else {
         return;
     };
-    let Some((name, suffix)) = rest.rsplit_once(" · live") else {
+    let name = rest
+        .strip_suffix(" · markdown · ")
+        .or_else(|| rest.strip_suffix(" · "));
+    let Some(name) = name else {
         return;
     };
+    let suffix = &rest[name.len()..];
     let name_width = Span::raw(name).width();
     let budget = name_width.saturating_sub(overflow);
     if budget >= name_width {
@@ -288,7 +292,7 @@ fn compact_live_output_header(line: &mut Line<'static>, width: usize) {
         used += w;
     }
     shortened.push('…');
-    line.spans[0].content = format!("┌─ output: {shortened} · live{suffix}").into();
+    line.spans[0].content = format!("┌─ output: {shortened}{suffix}").into();
 }
 
 /// Wrap each cell independently, preserving grapheme widths and inline styles.
@@ -449,7 +453,7 @@ mod tests {
     fn narrow_live_header_keeps_outcome_duration_and_style() {
         let status_style = Style::default().fg(super::super::theme::fail());
         let original = Line::from(vec![
-            Span::raw("┌─ output: 長い名前のビルド-task · live · "),
+            Span::raw("┌─ output: 長い名前のビルド-task · "),
             Span::styled("exit 127", status_style),
             Span::raw(" · 1.1s ──"),
         ]);
@@ -460,7 +464,7 @@ mod tests {
         assert_eq!(narrow.rows(), 1);
         let line = &narrow.lines[0];
         assert!(line.width() <= 48);
-        assert!(line.to_string().contains("… · live · exit 127 · 1.1s"));
+        assert!(line.to_string().contains("… · exit 127 · 1.1s"));
         assert_eq!(line.spans[1].style, status_style);
         let wide = LayoutContext::new(Size::new(120, 10))
             .text(&segment)

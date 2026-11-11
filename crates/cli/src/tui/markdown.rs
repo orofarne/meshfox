@@ -35,6 +35,8 @@ pub enum Segment {
     },
     TablePreview(Box<super::table::TableData>),
     Image {
+        /// Frame columns kept outside the image raster.
+        prefix: Vec<Span<'static>>,
         path: PathBuf,
         alt: String,
         /// `{width=NN%}`/`{height=NN%}` right after the image (see
@@ -981,10 +983,8 @@ impl<'a> Renderer<'a> {
     /// Renders `block_name`'s own live output (`App::step_output`, the most
     /// recent run's already-finished result for this exact block) right
     /// under the fence it belongs to — same framed-box convention the
-    /// on-disk `OutputRegion` splice uses for *cached* output, distinguished
-    /// by a "· live" marker in the header, since the two can legitimately
-    /// coexist (a fresh live run of a block whose last `cache`d result is
-    /// still sitting in the document). An `output="markdown"` block's stdout
+    /// on-disk `OutputRegion` splice uses for *cached* output. The "live"
+    /// marker is shown only while the run is active. An `output="markdown"` block's stdout
     /// is plain text while the run is still going and re-rendered as real
     /// Markdown once it's done — same "raw while running, rendered once
     /// done" the web UI's `LiveRunOutput` and the Output pane
@@ -1024,10 +1024,7 @@ impl<'a> Renderer<'a> {
                 super::theme::fail()
             };
             Line::from(vec![
-                Span::styled(
-                    format!("┌─ output: {block_name} · live{kind} · "),
-                    header_style,
-                ),
+                Span::styled(format!("┌─ output: {block_name}{kind} · "), header_style),
                 Span::styled(status, header_style.fg(color).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!(
@@ -1129,11 +1126,27 @@ impl<'a> Renderer<'a> {
                         prefix.insert(0, Span::styled("│ ", border));
                         self.segments.push(Segment::Table { table, prefix });
                     }
-                    // A widget can't sit inside a text border: close off the
-                    // lines so far, let the image through as-is, continue.
-                    image @ (Segment::Image { .. }
-                    | Segment::TablePreview(_)
-                    | Segment::Button { .. }) => {
+                    Segment::Image {
+                        path,
+                        alt,
+                        mut prefix,
+                        width_percent,
+                        height_percent,
+                        bg,
+                    } => {
+                        flush(self, std::mem::take(&mut framed));
+                        prefix.insert(0, Span::styled("│ ", border));
+                        self.segments.push(Segment::Image {
+                            path,
+                            alt,
+                            prefix,
+                            width_percent,
+                            height_percent,
+                            bg,
+                        });
+                    }
+                    // These widgets keep their own layout outside the text frame.
+                    image @ (Segment::TablePreview(_) | Segment::Button { .. }) => {
                         flush(self, std::mem::take(&mut framed));
                         self.segments.push(image);
                     }
@@ -1179,7 +1192,25 @@ impl<'a> Renderer<'a> {
                 prefix.insert(0, Span::styled("│ ", self.output_border()));
                 Segment::Table { table, prefix }
             }
-            other => other, // Segment::Image — no border to draw around a widget.
+            Segment::Image {
+                path,
+                alt,
+                mut prefix,
+                width_percent,
+                height_percent,
+                bg,
+            } => {
+                prefix.insert(0, Span::styled("│ ", self.output_border()));
+                Segment::Image {
+                    path,
+                    alt,
+                    prefix,
+                    width_percent,
+                    height_percent,
+                    bg,
+                }
+            }
+            other => other,
         }
     }
 
@@ -1540,6 +1571,7 @@ impl<'a> Renderer<'a> {
                     // link_preview_image_path`'s synthetic path).
                     let path = std::path::PathBuf::from(dest_url.as_ref());
                     self.push_segment(Segment::Image {
+                        prefix: Vec::new(),
                         path,
                         alt,
                         width_percent: None,
@@ -1549,6 +1581,7 @@ impl<'a> Renderer<'a> {
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
                     self.push_segment(Segment::Image {
+                        prefix: Vec::new(),
                         path,
                         alt,
                         width_percent: None,
@@ -2919,7 +2952,11 @@ mod tests {
             live.stdout.clear();
             live.stderr.clear();
             let text = live_doc_text(live);
-            assert!(text.contains(&format!("live · {status} · 5ms")), "{text}");
+            assert!(
+                text.contains(&format!("output: t · {status} · 5ms")),
+                "{text}"
+            );
+            assert!(!text.contains(" · live"), "{text}");
             assert!(text.contains("(no output)"), "{text}");
             assert!(!text.contains("exit -1"), "{text}");
         }
@@ -2939,7 +2976,7 @@ mod tests {
             "raw table syntax should be rendered, not literal:\n{text}"
         );
         assert!(
-            text.contains("output: t · live · markdown · exit 0"),
+            text.contains("output: t · markdown · exit 0"),
             "frame header:\n{text}"
         );
         let table_line = text.lines().find(|l| l.contains("ZMARKERZ")).unwrap();
@@ -3190,6 +3227,11 @@ mod tests {
             images,
             vec![PathBuf::from("data:image/png;base64,iVBORw0KGgo=")]
         );
+        let prefix = segments.iter().find_map(|s| match s {
+            Segment::Image { prefix, .. } => Some(Line::from(prefix.clone()).to_string()),
+            _ => None,
+        });
+        assert_eq!(prefix.as_deref(), Some("│ "));
         let last_text = segments.iter().rev().find_map(|s| match s {
             Segment::Text(lines) => Some(lines.clone()),
             _ => None,

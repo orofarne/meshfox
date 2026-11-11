@@ -1595,13 +1595,22 @@ impl App {
                                 true,
                             ));
                         }
-                    } else if let super::markdown::Segment::Image { path, .. } = segment {
+                    } else if let super::markdown::Segment::Image { path, prefix, .. } = segment {
                         let image = self.doc_images.get(path).and_then(|p| p.as_ref());
                         let height = image.map(|p| p.size().height as usize).unwrap_or(1);
                         if let Some(image) = image {
-                            images.push((rows.len(), Arc::clone(image)));
+                            images.push((
+                                rows.len(),
+                                Line::from(prefix.clone()).width() as u16,
+                                Arc::clone(image),
+                            ));
                         }
-                        rows.extend(std::iter::repeat_with(selection::Row::blank).take(height));
+                        rows.extend(selection::rows(
+                            &vec![Line::from(prefix.clone()); height],
+                            area.width,
+                            false,
+                            true,
+                        ));
                     }
                 }
                 (rows, area, usize::from(self.doc_scroll), 0)
@@ -5754,24 +5763,31 @@ impl App {
     }
 
     fn prepare_document_images(&mut self, base_dir: &Path, asset_base: Option<String>) {
-        let images: Vec<(PathBuf, Option<u32>, Option<u32>, Option<Background>)> = self
+        let images: Vec<(PathBuf, u16, Option<u32>, Option<u32>, Option<Background>)> = self
             .doc_segments
             .iter()
             .filter_map(|s| match s {
                 Segment::Image {
                     path,
+                    prefix,
                     width_percent,
                     height_percent,
                     bg,
                     ..
-                } => Some((path.clone(), *width_percent, *height_percent, *bg)),
+                } => Some((
+                    path.clone(),
+                    Line::from(prefix.clone()).width() as u16,
+                    *width_percent,
+                    *height_percent,
+                    *bg,
+                )),
                 Segment::Text(_)
                 | Segment::Button { .. }
                 | Segment::Table { .. }
                 | Segment::TablePreview(_) => None,
             })
             .collect();
-        for (path, width_percent, height_percent, bg) in images {
+        for (path, inset, width_percent, height_percent, bg) in images {
             if path
                 .to_str()
                 .is_some_and(|p| p.starts_with("meshfox-link-preview:"))
@@ -5795,7 +5811,7 @@ impl App {
             }
             // The document title and its following blank row occupy two rows.
             let budget = super::document_layout::LayoutContext::new(self.document_viewport)
-                .inset(0, 2)
+                .inset(inset, 2)
                 .image_budget(width_percent, height_percent);
             // Rasterizing (SVG parse + text layout, Lanczos resize, protocol
             // encoding) is far too slow to repeat on every selection change,
@@ -5868,6 +5884,7 @@ impl App {
                 let path = link_preview_image_path(image_url);
                 self.doc_images.insert(path.clone(), Some(protocol));
                 self.doc_segments.push(Segment::Image {
+                    prefix: Vec::new(),
                     path,
                     alt: "preview image".to_string(),
                     width_percent: None,
@@ -7411,7 +7428,7 @@ impl App {
     }
 
     /// Shows each `tty` block's latest finished run under it in the Document
-    /// pane — the same `output: <block> · live · exit N|failed · <time>` frame a
+    /// pane — the same `output: <block> · exit N|failed · <time>` frame a
     /// plain block gets, just with no output (a terminal session's isn't
     /// stored). Plain blocks get theirs by replaying their stored run
     /// (`mod.rs`'s `reconcile_runs` / `on_external_run_event`); a `tty` block
@@ -11715,17 +11732,14 @@ mod tests {
                 .join("\n")
         };
         let text = drawn(&app);
-        assert!(
-            text.contains("output: term · live · exit 0 · 2.8s"),
-            "{text}"
-        );
+        assert!(text.contains("output: term · exit 0 · 2.8s"), "{text}");
 
         // A newer failing run replaces it.
         app.block_runs = Some(vec![run("term", "tty", "exited", Some(3))]);
         app.sync_tty_results();
         assert_eq!(app.step_output[&addr].exit_code, 3);
         assert!(
-            drawn(&app).contains("output: term · live · exit 3"),
+            drawn(&app).contains("output: term · exit 3"),
             "{}",
             drawn(&app)
         );

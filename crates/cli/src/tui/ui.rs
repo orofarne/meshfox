@@ -1568,7 +1568,9 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 
                 y += layout.height;
             }
-            Segment::Image { path, alt, .. } => {
+            Segment::Image {
+                path, alt, prefix, ..
+            } => {
                 let protocol = app.doc_images.get(path).and_then(|o| o.as_ref());
                 let rows = protocol.map(|p| p.size().height).unwrap_or(1);
                 let Some(layout) = wrapped_text_layout(rows, skip, bottom - y) else {
@@ -1576,11 +1578,20 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     continue;
                 };
                 let height = layout.height;
+                let prefix = Line::from(prefix.clone());
+                let inset = (prefix.width() as u16).min(inner.width);
+                for row in y..y + height {
+                    f.render_widget(
+                        Paragraph::new(prefix.clone()),
+                        Rect::new(inner.x, row, inset, 1),
+                    );
+                }
                 let rect = Rect {
-                    x: inner.x,
+                    x: inner.x + inset,
                     y,
                     width: inner
                         .width
+                        .saturating_sub(inset)
                         .min(protocol.map(|p| p.size().width).unwrap_or(inner.width)),
                     height,
                 };
@@ -4747,6 +4758,7 @@ mod tests {
                 .unwrap();
                 selection.images.push((
                     0,
+                    0,
                     Arc::new(
                         prepared_image(
                             &picker,
@@ -4942,6 +4954,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_output_border_survives_scrolling_and_selection() {
+        let mut app = test_app().await;
+        let area = Rect::new(0, 0, 12, 8);
+        app.set_document_viewport(10, 6);
+        let path = app.canvas_path.parent().unwrap().join("framed.png");
+        app.doc_segments = vec![Segment::Image {
+            prefix: vec![Span::styled("│ ", Style::default().fg(Color::Magenta))],
+            path: path.clone(),
+            alt: "framed".into(),
+            width_percent: None,
+            height_percent: None,
+            bg: None,
+        }];
+        app.doc_images.insert(
+            path,
+            Some(Arc::new(
+                super::super::app::prepared_image(
+                    &ratatui_image::picker::Picker::halfblocks(),
+                    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                        16,
+                        80,
+                        image::Rgb([255, 0, 0]),
+                    )),
+                    ratatui::layout::Size::new(2, 10),
+                )
+                .unwrap(),
+            )),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 8)).unwrap();
+        for scroll in [0, 2] {
+            app.doc_scroll = scroll;
+            terminal
+                .draw(|f| render_document(f, area, &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(1, 1)].symbol(), "│");
+            assert_eq!(buffer[(1, 1)].fg, Color::Magenta);
+            assert_eq!(buffer[(3, 1)].bg, Color::Rgb(255, 0, 0));
+        }
+        app.focus = Focus::Document;
+        app.begin_text_selection();
+        let selection = app.text_selection.as_ref().expect("selection");
+        terminal.draw(|f| selection.render(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].symbol(), "│");
+        assert_eq!(buffer[(3, 1)].bg, Color::Rgb(255, 0, 0));
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn document_image_loading_is_not_reported_as_failure() {
         use super::super::app::BackgroundMsg;
         for result in [Ok(true), Ok(false), Err("not found")] {
@@ -4953,6 +5016,7 @@ mod tests {
             .unwrap();
             let path = app.canvas_path.parent().unwrap().join("sensor.png");
             app.doc_segments = vec![Segment::Image {
+                prefix: Vec::new(),
                 path: path.clone(),
                 alt: "sensor".into(),
                 width_percent: None,

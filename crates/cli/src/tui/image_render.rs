@@ -8,31 +8,47 @@ const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 32;
 const SIXEL_CACHE_ENTRIES: usize = 128;
 
-/// Bitmap interiors are skipped by ratatui's diff. If a popup withdraws from
-/// those cells, the unchanged image anchor would otherwise leave its text on
-/// screen indefinitely. Remember coverage, not popup types, so every overlay
-/// (including one that shrinks while filtering) follows the same rule.
+/// Restore withdrawn overlays only when ratatui would otherwise leave the
+/// bitmap anchor unchanged. Moving or cropping an image already reissues it.
 #[derive(Default)]
 pub(super) struct ImageRedrawState {
-    previous: Option<(ratatui::layout::Rect, Vec<bool>)>,
+    previous: Option<ImageCoverage>,
+}
+
+struct ImageCoverage {
+    area: ratatui::layout::Rect,
+    skipped: Vec<bool>,
+    anchors: std::collections::HashMap<usize, u64>,
 }
 
 impl ImageRedrawState {
     fn update(&mut self, buffer: &ratatui::buffer::Buffer) -> bool {
         use ratatui::buffer::CellDiffOption;
-        let skipped: Vec<_> = buffer
-            .content
-            .iter()
-            .map(|cell| cell.diff_option == CellDiffOption::Skip)
-            .collect();
-        let restore = self.previous.as_ref().is_some_and(|(area, previous)| {
-            *area == buffer.area
-                && previous
-                    .iter()
-                    .zip(&skipped)
-                    .any(|(&was, &now)| !was && now)
-        });
-        self.previous = Some((buffer.area, skipped));
+        use std::hash::{Hash, Hasher};
+        let previous = self.previous.as_ref().filter(|p| p.area == buffer.area);
+        let mut coverage = ImageCoverage {
+            area: buffer.area,
+            skipped: Vec::with_capacity(buffer.content.len()),
+            anchors: std::collections::HashMap::new(),
+        };
+        let mut unchanged_anchor = false;
+        let mut restore = false;
+        for (index, cell) in buffer.content.iter().enumerate() {
+            let skipped = cell.diff_option == CellDiffOption::Skip;
+            coverage.skipped.push(skipped);
+            if matches!(cell.diff_option, CellDiffOption::ForcedWidth(_)) {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                cell.hash(&mut hash);
+                let hash = hash.finish();
+                unchanged_anchor = previous
+                    .and_then(|p| p.anchors.get(&index))
+                    .is_some_and(|&old| old == hash);
+                coverage.anchors.insert(index, hash);
+            } else if skipped && unchanged_anchor {
+                restore |= previous.is_some_and(|p| !p.skipped[index]);
+            }
+        }
+        self.previous = Some(coverage);
         restore
     }
 
@@ -195,6 +211,37 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(draws, expected_draws);
+        }
+    }
+
+    #[test]
+    fn scrolling_bitmaps_never_requests_an_extra_draw() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        for sixel in [false, true] {
+            let mut image = image(12);
+            image.fragment.as_mut().unwrap().sixel = sixel;
+            let mut terminal = Terminal::new(TestBackend::new(8, 14)).unwrap();
+            let mut redraw = ImageRedrawState::default();
+            let mut draws = 0;
+            // Moving down, clipping at the bottom, then cropping at the top;
+            // all transitions expose Skip cells, but the anchor already changes.
+            for (step, (y, skip)) in [(1, 0), (2, 0), (3, 0), (1, 1), (1, 2), (1, 1), (1, 0)]
+                .into_iter()
+                .enumerate()
+            {
+                redraw
+                    .draw(&mut terminal, |frame| {
+                        draws += 1;
+                        super::super::ui::render_document_image(
+                            &image,
+                            skip,
+                            Rect::new(0, y, 2, 14 - y),
+                            frame.buffer_mut(),
+                        );
+                    })
+                    .unwrap();
+                assert_eq!(draws, step + 1, "sixel={sixel}, y={y}, skip={skip}");
+            }
         }
     }
     fn image(rows: u16) -> DocumentImage {

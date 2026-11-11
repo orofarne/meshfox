@@ -165,7 +165,7 @@ pub struct Point {
 }
 
 pub struct Selection {
-    pub(super) images: Vec<(usize, Arc<super::image_render::DocumentImage>)>,
+    pub(super) images: Vec<(usize, u16, Arc<super::image_render::DocumentImage>)>,
     pub pane: Focus,
     pub rows: Vec<Row>,
     pub area: Rect,
@@ -473,7 +473,7 @@ impl Selection {
         }
         // Images share the frozen document's row coordinates. Clip against the
         // selection viewport, which can scroll independently of the live pane.
-        for (start, image) in &self.images {
+        for (start, inset, image) in &self.images {
             let end = start + usize::from(image.size().height);
             let visible_start = (*start).max(self.top);
             let visible_end = end.min(self.top + usize::from(self.area.height));
@@ -482,9 +482,12 @@ impl Selection {
                     image,
                     (visible_start - start) as u16,
                     Rect::new(
-                        self.area.x,
+                        self.area.x + (*inset).min(self.area.width),
                         self.area.y + (visible_start - self.top) as u16,
-                        self.area.width.min(image.size().width),
+                        self.area
+                            .width
+                            .saturating_sub(*inset)
+                            .min(image.size().width),
                         (visible_end - visible_start) as u16,
                     ),
                     f.buffer_mut(),
