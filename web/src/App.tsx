@@ -4160,6 +4160,13 @@ export default function App() {
       for (const [block, value] of Object.entries(n.data.liveBlocks)) {
         const key = `${n.id}::${block}`;
         if (owned.has(key) || ttyKeys.has(key) || (value.status !== "running" && value.status !== "queued")) continue;
+        // This tab's own run can settle (its Done event) a render before the
+        // block's own live state stops saying "running" (the stream's
+        // cleanup patches it afterwards). That leftover must not be adopted
+        // as a foreign run: its later "result" would carry no exit code and
+        // replace the real outcome of the run this tab started.
+        if (activities.some(a => a.endedAt !== undefined && a.addresses.includes(key)
+          && (value.startedAt === undefined || value.startedAt <= a.endedAt))) continue;
         discovered.push({ key, target: { nodeId: n.id, block }, current: { nodeId: n.id, block },
           phase: value.status === "queued" ? "preparing" : "running", runId: value.runId,
           startedAt: value.startedAt ?? Date.now(), stepStartedAt: value.startedAt, addresses: [key] });
