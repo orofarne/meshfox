@@ -535,6 +535,12 @@ async fn main_loop(
     app.refresh_block_runs().await;
     let mut worker_tick = tokio::time::interval(Duration::from_secs(3));
     worker_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // A persistent interval, not a `sleep` built per loop pass: any other
+    // wakeup (the 120ms spinner tick while a service is running) would reset
+    // a fresh sleep before it ever fired, and the services view's log would
+    // never refresh after its first fetch.
+    let mut service_log_tick = tokio::time::interval(Duration::from_secs(1));
+    service_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         status.update(app);
         terminal.draw(|f| ui::render(f, app))?;
@@ -684,7 +690,7 @@ async fn main_loop(
                 app.poll_tables();
                 app.request_worker_refresh();
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if services_view_open_on_worker => {
+            _ = service_log_tick.tick(), if services_view_open_on_worker => {
                 if let Some(view) = &app.services_view {
                     let keys = app.sorted_service_keys();
                     if let Some((node_id, block)) = keys.get(view.selected.min(keys.len().saturating_sub(1))).cloned() {

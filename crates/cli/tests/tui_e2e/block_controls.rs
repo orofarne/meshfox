@@ -114,6 +114,9 @@ fn mouse_controls_work_on_wrapped_header_and_keep_run_access_when_folded() {
         .wait_for("printf MOUSE_RESULT", Duration::from_secs(5))
         .unwrap();
     session
-        .wait_for("output: build", Duration::from_secs(5))
+        // The narrow pane shortens the block name in the header
+        // (`output: bui… · live · exit 0 · 9ms`) to keep the outcome visible,
+        // so match the part that is always there.
+        .wait_for("live · exit 0", Duration::from_secs(5))
         .unwrap();
 }
