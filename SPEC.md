@@ -3925,9 +3925,10 @@ Remote URLs and inline `data:` images are not filesystem watch targets.
 The same asset confinement rules apply to watching and serving images.
 
 In the TUI, Markdown image percentage dimensions refer to the current document
-pane, preserving aspect ratio and fitting within its available area. For
-example, `{width=100%}` uses the full pane width when height permits; an omitted
-height does not impose the default thumbnail height. Images without percentage
+pane, preserving aspect ratio. For example, `{width=100%}` uses the full pane
+width; when height is omitted, the image can extend beyond the visible pane
+and its remaining rows are reached by scrolling. An explicit percentage height
+limits the image to that fraction of the pane height. Images without percentage
 attributes keep a 56-column by 24-row maximum, limited by the pane size.
 Resizing or entering fullscreen recalculates these dimensions from cached bytes.
 

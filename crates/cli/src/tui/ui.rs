@@ -4937,11 +4937,11 @@ mod tests {
             path: path.clone(),
             result: Ok(svg.to_vec()),
         });
-        for width in [82, 122, 62] {
+        for (width, height) in [(82, 60), (122, 12), (122, 30), (62, 10)] {
             let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 60)).unwrap();
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|f| render_document(f, Rect::new(0, 0, width, 60), &mut app))
+                .draw(|f| render_document(f, Rect::new(0, 0, width, height), &mut app))
                 .unwrap();
             assert_eq!(
                 app.doc_images[&path].as_ref().unwrap().size().width,
@@ -4949,6 +4949,18 @@ mod tests {
             );
             let buffer = terminal.backend().buffer();
             assert_eq!(buffer[(width - 2, 3)].bg, Color::Rgb(255, 0, 0));
+            if height <= 30 {
+                assert!(app.doc_images[&path].as_ref().unwrap().size().height > height - 4);
+                app.doc_scroll = 5;
+                terminal
+                    .draw(|f| render_document(f, Rect::new(0, 0, width, height), &mut app))
+                    .unwrap();
+                assert_eq!(
+                    terminal.backend().buffer()[(width - 2, 1)].bg,
+                    Color::Rgb(255, 0, 0)
+                );
+                app.doc_scroll = 0;
+            }
         }
         let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }

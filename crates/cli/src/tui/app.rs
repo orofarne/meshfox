@@ -11101,11 +11101,11 @@ mod tests {
         use ratatui::layout::Size;
         assert_eq!(
             image_size_budget_for_viewport(Size::new(120, 60), Some(100), None),
-            Size::new(120, 60)
+            Size::new(120, u16::MAX)
         );
         assert_eq!(
             image_size_budget_for_viewport(Size::new(120, 60), Some(50), None),
-            Size::new(60, 60)
+            Size::new(60, u16::MAX)
         );
         assert_eq!(
             image_size_budget_for_viewport(Size::new(120, 60), None, Some(50)),

@@ -169,7 +169,14 @@ impl LayoutContext {
             (u64::from(available) * u64::from(percent.unwrap_or(100)) / 100)
                 .clamp(1, u64::from(available)) as u16
         };
-        ratatui::layout::Size::new(scale(width, width_percent), scale(height, height_percent))
+        // A width-only image belongs to the scrollable document, so its
+        // natural height must not be constrained by the visible viewport.
+        let height = if width_percent.is_some() && height_percent.is_none() {
+            u16::MAX
+        } else {
+            scale(height, height_percent)
+        };
+        ratatui::layout::Size::new(scale(width, width_percent), height)
     }
 }
 
