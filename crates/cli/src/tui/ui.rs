@@ -1640,14 +1640,8 @@ fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
         // A 1-row strip (see `compute_layout`) — no border (there's no room
         // for one plus content), just the same title text a click here
         // expands back into the full pane.
-        // A status message ("saved — merged with changes made elsewhere",
-        // "reloaded — file changed on disk") would otherwise be invisible
-        // here: it is drawn in the pane body, which this strip hides.
-        let text = if app.status.is_empty() {
-            format!("▸{}", title.trim())
-        } else {
-            format!("▸{} — {}", title.trim(), app.status)
-        };
+        // General status messages belong to the persistent footer.
+        let text = format!("▸{}", title.trim());
         let line = Line::styled(text, pane_border(app.focus == Focus::Output));
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -1728,11 +1722,6 @@ fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
         app.copy_output_lines = lines.clone();
         app.copy_output_top = start;
         Text::from(lines[start..end].to_vec())
-    } else if !app.status.is_empty() {
-        Text::from(Line::from(Span::styled(
-            app.status.as_str(),
-            Style::default().fg(super::theme::accent()),
-        )))
     } else {
         Text::from(Line::from(Span::styled(
             "select a node and press r to run its block (R to run without deps)",
@@ -3327,7 +3316,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         "the tree/document panes, or between them and Output, to resize",
         "",
         "running a `tty` block hands the real terminal over to it,",
-        "same as `meshfox run` — this UI reappears once it exits",
+        "Ctrl-] returns here while the process keeps running;",
+        "t then enter reconnects. The UI also reappears once it exits",
     ]);
 
     // A handful of these lines run past 60 columns (the old fixed-62-wide
@@ -4575,6 +4565,23 @@ mod tests {
         });
         assert!(screen.contains("Output (done)"), "{screen}");
         assert!(screen.contains("Completed: ready"), "{screen}");
+        std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn general_status_appears_only_in_the_footer() {
+        let mut app = test_app().await;
+        app.status = "reloaded — file changed on disk".into();
+        for collapsed in [false, true] {
+            app.console_collapsed = collapsed;
+            let area = Rect::new(0, 0, 90, 25);
+            let screen = render_to_screen(area, |f| render_screen(f, &mut app));
+            assert_eq!(screen.matches(&app.status).count(), 1, "{screen}");
+            assert!(
+                screen.lines().last().unwrap().contains(&app.status),
+                "{screen}"
+            );
+        }
         std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
     }
 

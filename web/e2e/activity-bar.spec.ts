@@ -138,6 +138,39 @@ test("a real terminal run can be stopped from the strip after minimizing", async
   await expect(bar(page).getByRole("button", { name: "■ Stop", exact: true })).toHaveCount(0);
 });
 
+test("an auto-opened chain console closes during a subsequent live terminal", async ({ page }) => {
+  await launch(page);
+  const consolePanel = page.locator(".console-panel");
+  await expect(consolePanel).toHaveAttribute("aria-hidden", "true");
+  await node(page, "chained").locator(".mesh-node-quick-run-icon").click();
+  await expect(consolePanel).toHaveAttribute("aria-hidden", "false");
+  await expect(bar(page)).toContainText("Completed: chained/chained");
+  // Both nodes really executed; no mocked run stream or cached dependency.
+  await expect(consolePanel).toContainText("dep-ran");
+  await expect(consolePanel).toContainText("chained-ran");
+  await node(page, "monitor").locator(".mesh-node-quick-run-icon").click();
+  const terminal = page.locator(".mesh-tty-panel");
+  try {
+    await expect(terminal.locator(".mesh-tty-head-status")).toHaveText("interactive");
+    await expect(consolePanel).toHaveAttribute("aria-hidden", "false");
+    // Keep the real PTY alive past the console's ten-second grace period.
+    await expect(consolePanel).toHaveAttribute("aria-hidden", "true", { timeout: 13_000 });
+    await expect(terminal.locator(".mesh-tty-head-status")).toHaveText("interactive");
+    await terminal.getByTitle("Minimize — session keeps running", { exact: true }).click();
+    // An explicit user open, unlike the automatic one, must stay pinned.
+    await bar(page).getByRole("button", { name: "Console", exact: true }).click();
+    await page.clock.install();
+    await page.clock.runFor(11_000);
+    await expect(consolePanel).toHaveAttribute("aria-hidden", "false");
+  } finally {
+    if (await terminal.isVisible()) {
+      await terminal.getByTitle("Minimize — session keeps running", { exact: true }).click();
+    }
+    await bar(page).getByRole("button", { name: "■ Stop", exact: true }).click();
+    await expect(bar(page)).toContainText("Killed: monitor/monitor");
+  }
+});
+
 test("checks, terminals and services live only in the bottom strip", async ({ page }, testInfo) => {
   await page.route("**/api/canvas", async route => {
     const response = await route.fetch();

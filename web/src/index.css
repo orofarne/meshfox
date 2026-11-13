@@ -1872,8 +1872,8 @@ button > .mesh-node-running-spinner {
 .mesh-tty-panel {
   display: flex;
   flex-direction: column;
-  width: min(900px, 92vw);
-  height: min(560px, 82vh);
+  width: 95vw;
+  height: 90vh;
   background: #0d0e10;
   border: 1px solid var(--node-border);
   border-radius: 8px;
@@ -1960,8 +1960,8 @@ button > .mesh-node-running-spinner {
 .mesh-expand-panel {
   display: flex;
   flex-direction: column;
-  width: min(900px, 92vw);
-  height: min(720px, 85vh);
+  width: 95vw;
+  height: 90vh;
   background: var(--node-bg);
   border: 1px solid var(--node-border);
   border-radius: 8px;
@@ -2009,14 +2009,6 @@ button > .mesh-node-running-spinner {
   flex: 1;
   min-height: 0;
   overflow: auto;
-}
-
-/* A group's mini sub-canvas (see NodeExpandPanel.tsx) gets a roomier panel
- * than a plain node body — canvas content benefits from more space than a
- * single node's markdown does. */
-.mesh-expand-panel-group {
-  width: min(1200px, 95vw);
-  height: min(800px, 90vh);
 }
 
 /* React Flow needs a definite pixel height from its container — `flex: 1`

@@ -273,14 +273,16 @@ const SHORT_BODY_MAX_LINES = 2;
 const SHORT_BODY_MAX_CHARS = 120;
 
 /** A childless text/file/link node whose body is one or two short plain
- * lines (no fenced block): folding it saves next to nothing, so it's never
- * foldable. Mirrors `is_short_body_node` in `crates/core/src/staticgen.rs`. */
+ * lines (no fenced block or image): folding it saves next to nothing, so
+ * it's never foldable. An image's short source can render a tall body. */
 function isShortBodyNode(n: CanvasNode): boolean {
   const type = n.type ?? "text";
   if (type !== "text" && type !== "file" && type !== "link") return false;
   // A `display="code"`/`"table"` file node's one-line body is just the
   // link; what it renders is the whole target's content.
   if (n.display === "code" || n.display === "table") return false;
+  // Includes inline and reference-style Markdown images, with empty alt too.
+  if (/!\[/.test(n.text)) return false;
   const lines = n.text.split("\n").filter((l) => l.trim() !== "");
   const chars = lines.reduce((sum, l) => sum + l.trim().length, 0);
   return (
@@ -847,6 +849,7 @@ export default function App() {
   // convention) — `TtyPanel` owns its own WebSocket for its whole
   // lifetime, so this is just the address it was opened for.
   const [ttySession, setTtySession] = useState<{
+    panelId: number;
     path: string[];
     blockName: string;
     withDeps: boolean;
@@ -860,6 +863,8 @@ export default function App() {
      * `TtyPanel`'s own `attachTo` prop. */
     attachTo?: { nodeId: string; block: string };
   } | null>(null);
+  // Each opening owns a fresh terminal/socket, even for the same address.
+  const ttyPanelId = useRef(0);
   // Which node's settings modal (title/type/color/target/edges) is open,
   // if any — see NodeSettings.tsx. Opened only via a node's own gear
   // button (or the text editor's, see NodeTextEditor's own header) — no
@@ -1089,9 +1094,8 @@ export default function App() {
     },
     [],
   );
-  // Any block actively running right now, across the whole canvas — drives
-  // both "expand immediately" and the auto-collapse timer's own guard,
-  // mirroring the TUI's `console_tick`'s own `proc.is_some()` check.
+  // Any active block, including terminals — used to preserve concurrent
+  // runs' transcripts when another run starts.
   const anyBlockRunning = nodes.some((n) =>
     Object.values(n.data.liveBlocks).some((b) => b.status === "running" || b.status === "queued"),
   );
@@ -1099,6 +1103,21 @@ export default function App() {
   useEffect(() => {
     anyBlockRunningRef.current = anyBlockRunning;
   }, [anyBlockRunning]);
+  // Terminal output has its own panel. A live TTY must not hold an
+  // automatically opened transcript console open after its chain finishes.
+  const ttyBlockKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const node of canvas?.nodes ?? []) {
+      for (const segment of parseBody(node.text, node.id)) {
+        if (segment.type === "code" && segment.tty) keys.add(`${node.id}::${segment.name}`);
+      }
+    }
+    return keys;
+  }, [canvas]);
+  const anyConsoleBlockRunning = nodes.some(n =>
+    Object.entries(n.data.liveBlocks).some(([block, state]) =>
+      (state.status === "running" || state.status === "queued") && !ttyBlockKeys.has(`${n.id}::${block}`)),
+  );
   // Opening is *not* driven from here — only a run whose own chain has 2+
   // blocks should auto-expand the console (see `executeRun`'s own
   // `previewChain.length >= 2` check, mirroring the TUI's
@@ -1106,7 +1125,7 @@ export default function App() {
   // canvas space over. This effect only ever *closes* it again, once
   // everything has been idle for a while, unless the user opened it manually.
   useEffect(() => {
-    if (anyBlockRunning || consoleCollapsed || consolePinned) return;
+    if (anyConsoleBlockRunning || consoleCollapsed || consolePinned) return;
     // Give the completed transcript a full grace period, even if the process
     // spent its final seconds working silently.
     consoleLastActivityRef.current = Date.now();
@@ -1114,12 +1133,12 @@ export default function App() {
     // same "true no-op once there's nothing left to check" reasoning the
     // TUI's own guarded tick has.
     const id = setInterval(() => {
-      if (!anyBlockRunningRef.current && Date.now() - consoleLastActivityRef.current >= CONSOLE_COLLAPSE_GRACE_MS) {
+      if (Date.now() - consoleLastActivityRef.current >= CONSOLE_COLLAPSE_GRACE_MS) {
         setConsoleCollapsed(true);
       }
     }, 500);
     return () => clearInterval(id);
-  }, [anyBlockRunning, consoleCollapsed, consolePinned]);
+  }, [anyConsoleBlockRunning, consoleCollapsed, consolePinned]);
 
   // Folds the polled `services` list into every node's own `data.services`
   // (matched by `nodeId`) — the service-equivalent of `liveBlocks`' own
@@ -1507,6 +1526,7 @@ export default function App() {
       (nodeId, block) => {
         if (ttySessionRef.current !== null || selfInitiatedRuns.current.has(`${nodeId}::${block}`)) return;
         setTtySession({
+          panelId: ++ttyPanelId.current,
           path: [],
           blockName: block,
           withDeps: false,
@@ -1691,7 +1711,7 @@ export default function App() {
               ownRunIds.current.add(event.runId);
               break;
             case "tty-start":
-              setTtySession({ path: [], blockName: event.block, withDeps: false,
+              setTtySession({ panelId: ++ttyPanelId.current, path: [], blockName: event.block, withDeps: false,
                 autoclose: isBlockAutoclose(canvas, { nodeId: event.nodeId, blockName: event.block }),
                 attachTo: { nodeId: event.nodeId, block: event.block } });
               break;
@@ -3694,7 +3714,7 @@ export default function App() {
     for (const n of nodes) {
       const blocks = Object.values(n.data.liveBlocks);
       if (blocks.some((lb) => lb.status === "running")) mark(running, n.id);
-      if (blocks.some((lb) => lb.status === "killed" || (lb.status === "done" && lb.exitCode !== 0))) {
+      if (blocks.some((lb) => lb.status === "done" && lb.exitCode !== 0)) {
         mark(failed, n.id);
       }
     }
@@ -4389,11 +4409,7 @@ export default function App() {
       )}
       {ttySession && (
         <TtyPanel
-          key={
-            ttySession.attachTo
-              ? `attach:${ttySession.attachTo.nodeId}/${ttySession.attachTo.block}`
-              : `${ttySession.path.join("/")}/${ttySession.blockName}`
-          }
+          key={ttySession.panelId}
           path={ttySession.path}
           blockName={ttySession.blockName}
           withDeps={ttySession.withDeps}
@@ -4441,7 +4457,7 @@ export default function App() {
           onClose={() => setTtySessionsPanelOpen(false)}
           onReopen={(nodeId, block) => {
             setTtySessionsPanelOpen(false);
-            setTtySession({ path: [], blockName: block, withDeps: false, autoclose: false, attachTo: { nodeId, block } });
+            setTtySession({ panelId: ++ttyPanelId.current, path: [], blockName: block, withDeps: false, autoclose: false, attachTo: { nodeId, block } });
           }}
           onKill={(nodeId, block) => {
             killRun({ nodeId, block })

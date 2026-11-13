@@ -1651,6 +1651,10 @@ terminal to hand over.
   command could do. Earlier steps in the same `deps=` chain still run
   captured/streamed exactly as usual; only the `tty` step(s) themselves
   take over the terminal, handing it back once each one exits.
+- **TUI** — `Ctrl-]` leaves an attached terminal and returns immediately
+  to the canvas without stopping its process or chain. Press `t`, select
+  the session, then Enter to reconnect. This also works for a terminal
+  started by another client. The attach banner and `?` help show the key.
 - **Web UI** — `meshfox view` gives the block a real pseudo-terminal
   (not just piped stdout/stderr, which can't do cursor movement, raw
   input mode, or terminal-size queries) and streams it to an in-browser

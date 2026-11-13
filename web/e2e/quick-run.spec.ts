@@ -28,6 +28,26 @@ test("quick-run on a tty default block opens a terminal, not an error", async ({
   await page.locator(".mesh-tty-head-actions button", { hasText: "✕" }).click();
 });
 
+test("starting a tty block again opens its previously minimized terminal", async ({ page }) => {
+  const run = node(page, "monitor").getByTitle("Opens an interactive terminal for this block", { exact: true });
+  const panel = page.locator(".mesh-tty-panel");
+  const status = page.getByLabel("Current activity", { exact: true });
+  await run.click();
+  await expect(panel).toBeVisible();
+  await expect(panel.locator(".mesh-tty-head-status")).toHaveText("interactive");
+  await panel.getByTitle("Minimize — session keeps running", { exact: true }).click();
+  await status.getByRole("button", { name: "■ Stop", exact: true }).click();
+  await expect(status).toContainText("Killed: monitor/monitor");
+  await expect(run).toBeEnabled();
+  await run.click();
+  await expect(panel).toBeVisible();
+  await expect(panel.locator(".mesh-tty-head-status")).toHaveText("interactive");
+  await panel.locator(".xterm-helper-textarea").fill("echo tty-restarted; exit");
+  await panel.locator(".xterm-helper-textarea").press("Enter");
+  await expect(panel).toContainText("tty-restarted");
+  await expect(panel.locator(".mesh-tty-head-status")).toHaveText("✓ Completed · exit 0");
+});
+
 test("quick-run on a plain (non-tty) default block still streams output the normal way", async ({ page }) => {
   await node(page, "plain").locator(".mesh-node-quick-run-icon").click();
 

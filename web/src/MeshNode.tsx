@@ -1010,7 +1010,7 @@ function RunningSpinner() {
 
 /** Shown in a node's title bar whenever any of its own blocks' most recent
  * run (see `RunningSpinner`'s doc comment for the same `liveBlocks` lookup)
- * ended badly — killed, or `"done"` with a non-zero exit code — so a failure
+ * failed — `"done"` with a non-zero or missing exit code — so a failure
  * stays visible even for a folded or scrolled-out-of-view node, the same way
  * `RunningSpinner` keeps a busy one visible. Cleared the same way the live
  * state itself is: a fresh run of that block, or the next canvas reload. */
@@ -3345,7 +3345,7 @@ export function MeshNode({ id, data, selected }: NodeProps & { data: MeshNodeDat
   const nodeFailed =
     !!data.descendantFailed ||
     Object.values(data.liveBlocks).some(
-      (lb) => lb.status === "killed" || (lb.status === "done" && lb.exitCode !== 0),
+      (lb) => lb.status === "done" && lb.exitCode !== 0,
     );
   // Clicking the title text toggles fold both ways in read-only mode
   // (alongside `FoldToggle` itself), but the title text is also meant to

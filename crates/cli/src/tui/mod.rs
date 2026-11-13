@@ -864,13 +864,16 @@ async fn run_http_tty_attach_handoff(
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
-    crate::run_output::banner(&format!("attached to {block_name}"), "\r\n");
+    crate::run_output::banner(
+        &format!("attached to {block_name} · Ctrl-] to return to canvas (keeps running)"),
+        "\r\n",
+    );
     io::stdout().flush()?;
 
     let outcome = bridge_http_tty_attach(&mut socket).await;
     let _ = futures_util::SinkExt::close(&mut socket).await;
 
-    if !autoclose || !matches!(outcome, TtyEnd::Exited(_)) {
+    if outcome != TtyEnd::Detached && (!autoclose || !matches!(outcome, TtyEnd::Exited(_))) {
         print!(
             "\r\n({} — press any key to return to the canvas)\r\n",
             outcome.label()
@@ -886,7 +889,10 @@ async fn run_http_tty_attach_handoff(
         EnterAlternateScreen,
         EnableMouseCapture
     )?;
-    terminal.clear()?;
+    // Restore the canvas without querying the cursor position: a detached
+    // terminal may leave modes that make that query fail or time out.
+    let size = terminal.size()?;
+    terminal.resize(ratatui::layout::Rect::from(size))?;
 
     input_paused.store(false, Ordering::Release);
     Ok(())
@@ -1024,6 +1030,7 @@ fn spawn_raw_stdin_reader(
 pub(crate) enum TtyEnd {
     Exited(i32),
     Killed,
+    Detached,
     Disconnected,
     Error,
 }
@@ -1041,6 +1048,7 @@ impl TtyEnd {
             Self::Exited(0) => "Completed · exit 0".into(),
             Self::Exited(code) => format!("Failed · exit {code}"),
             Self::Killed => "Killed".into(),
+            Self::Detached => "Detached · session keeps running".into(),
             Self::Disconnected => "Connection lost · result unknown".into(),
             Self::Error => "Run failed · see error above".into(),
         }
@@ -1184,7 +1192,7 @@ pub(crate) async fn bridge_http_tty_with_chain_id(
         }
     }
 
-    bridge_tty_pty_phase(socket).await
+    bridge_tty_pty_phase(socket, false).await
 }
 
 /// The actual interactive byte relay, shared by `bridge_http_tty_with_chain_id` (once its
@@ -1201,7 +1209,10 @@ pub(crate) async fn bridge_http_tty_with_chain_id(
 /// that only ever changes on an explicit user resize) and sends a
 /// `{"cols":..,"rows":..}` text frame whenever it changes — the only thing
 /// a text frame ever means client-to-server on either kind of connection.
-async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
+async fn bridge_tty_pty_phase(
+    socket: &mut crate::worker_client::TtySocket,
+    allow_detach: bool,
+) -> TtyEnd {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1241,8 +1252,15 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
         tokio::select! {
             input = stdin_rx.recv() => {
                 let Some(bytes) = input else { break TtyEnd::Disconnected };
-                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                // Ctrl-] is reserved by the TUI viewer. Forward preceding
+                // input, but neither the escape nor trailing buffered keys.
+                let detach_at = allow_detach.then(|| bytes.iter().position(|&b| b == 0x1d)).flatten();
+                let input = &bytes[..detach_at.unwrap_or(bytes.len())];
+                if !input.is_empty() && socket.send(Message::Binary(input.to_vec().into())).await.is_err() {
                     break TtyEnd::Disconnected;
+                }
+                if detach_at.is_some() {
+                    break TtyEnd::Detached;
                 }
             }
             msg = socket.next() => {
@@ -1316,7 +1334,7 @@ async fn bridge_tty_pty_phase(socket: &mut crate::worker_client::TtySocket) -> T
 /// this goes straight to the same interactive byte relay `bridge_http_tty_with_chain_id`
 /// itself hands off to once its own prelude reaches `TtyStart`.
 async fn bridge_http_tty_attach(socket: &mut crate::worker_client::TtySocket) -> TtyEnd {
-    bridge_tty_pty_phase(socket).await
+    bridge_tty_pty_phase(socket, true).await
 }
 
 #[cfg(test)]

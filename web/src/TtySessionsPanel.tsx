@@ -24,7 +24,7 @@ interface TtySessionsPanelProps {
  * find a `service` block's own status/log across page reloads. Reuses
  * `ServicePanel`'s own card/header chrome (`.service-panel*` classes) but a
  * flat single-column list — there's no per-session detail to show besides
- * "reopen"/"kill".
+ * "Open"/"kill".
  */
 export function TtySessionsPanel({ sessions, onClose, onReopen, onKill }: TtySessionsPanelProps) {
   return (
@@ -46,7 +46,7 @@ export function TtySessionsPanel({ sessions, onClose, onReopen, onKill }: TtySes
                 <span className="service-panel-row-node">{s.nodeId}</span>
                 <span className="tty-sessions-row-actions">
                   <button type="button" onClick={() => onReopen(s.nodeId, s.block)}>
-                    reopen
+                    Open
                   </button>
                   <button type="button" onClick={() => onKill(s.nodeId, s.block)}>
                     kill
