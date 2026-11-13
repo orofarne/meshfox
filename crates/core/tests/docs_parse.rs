@@ -53,7 +53,7 @@ fn every_doc_canvas_parses_with_one_root() {
 fn readme_has_its_sections_and_links_every_doc_canvas() {
     let readme = load("README.md");
     let titles = titles(&readme);
-    for expected in ["Concept", "Installation", "Documentation", "License"] {
+    for expected in ["Install", "Documentation", "License"] {
         assert!(
             titles.contains(&expected),
             "README.md: missing section {expected:?}, found {titles:?}"

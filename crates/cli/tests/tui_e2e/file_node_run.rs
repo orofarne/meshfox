@@ -54,7 +54,7 @@ fn a_file_node_is_drawn_and_run_like_a_fence() {
     // The output shows before the run is over; a key pressed while it still
     // is would only be told a run is already in progress.
     session
-        .wait_for("run finished", Duration::from_secs(10))
+        .wait_for("output: script · exit 0", Duration::from_secs(10))
         .unwrap_or_else(|e| panic!("the run never finished: {e}\n{}", session.screen_text()));
 
     // `r` runs the chain, dependency first.

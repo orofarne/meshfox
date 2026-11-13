@@ -5359,7 +5359,7 @@ mod tests {
         let area = Rect::new(0, 0, 100, 10);
         let unscrolled = render_to_screen(area, |f| render_help(f, area, &app));
         assert!(
-            !unscrolled.contains("this UI reappears once it exits"),
+            !unscrolled.contains("UI also reappears once it exits"),
             "the last help line shouldn't already be visible on such a short terminal:\n{unscrolled}"
         );
 
@@ -5371,7 +5371,7 @@ mod tests {
         app.help_scroll = u16::MAX;
         let scrolled = render_to_screen(area, |f| render_help(f, area, &app));
         assert!(
-            scrolled.contains("this UI reappears once it exits"),
+            scrolled.contains("UI also reappears once it exits"),
             "scrolling down should eventually reach the last help line:\n{scrolled}"
         );
     }

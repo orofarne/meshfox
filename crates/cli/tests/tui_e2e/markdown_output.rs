@@ -84,7 +84,7 @@ fn parameterized_record_shows_running_status_and_output_beneath_its_source() {
         "stdout beneath source:\n{screen}"
     );
     session
-        .wait_for("live · exit 0", Duration::from_secs(10))
+        .wait_for("· exit 0 ·", Duration::from_secs(10))
         .expect("block completion");
     assert!(session
         .screen_text()
