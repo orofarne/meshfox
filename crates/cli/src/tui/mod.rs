@@ -11,6 +11,7 @@
 
 mod ansi;
 mod app;
+mod backend;
 mod clipboard;
 mod date_picker;
 mod document_layout;
@@ -45,12 +46,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use backend::PositionedBackend;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use app::{App, BackgroundMsg};
@@ -71,7 +72,7 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     svg_raster::warm_up_fonts();
-    let backend = CrosstermBackend::new(stdout);
+    let backend = PositionedBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let (background_tx, mut background_rx) =
@@ -521,7 +522,7 @@ async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<Exter
 }
 
 async fn main_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     app: &mut App,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     input_paused: &Arc<AtomicBool>,
@@ -712,7 +713,7 @@ async fn main_loop(
 /// Enter a nested API client using the worker selected by the open API.
 /// The parent App and its subscriptions remain alive for return with `q`.
 async fn run_child_canvas_handoff(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     pending: app::PendingChildCanvas,
@@ -750,7 +751,7 @@ async fn run_child_canvas_handoff(
 /// Print to the terminal's ordinary screen/scrollback with mouse reporting
 /// disabled, then suspend until Enter/Esc. No redraw can disturb selection.
 async fn show_copy_text(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     text: &str,
 ) -> io::Result<()> {
@@ -800,7 +801,7 @@ async fn show_copy_text(
 /// is left too — unlike the tty relays below, the editor sets up its own.
 /// `input_paused` keeps the crossterm reader thread off stdin meanwhile.
 async fn run_external_editor_handoff(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     request: external_editor::Request,
 ) -> io::Result<external_editor::Outcome> {
@@ -811,7 +812,7 @@ async fn run_external_editor_handoff(
 /// which owns the terminal meanwhile, then takes everything back. The common
 /// part of the editor and `[tui.open]` handoffs.
 async fn hand_terminal_over<T>(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     program: impl std::future::Future<Output = T>,
 ) -> io::Result<T> {
@@ -847,7 +848,7 @@ async fn hand_terminal_over<T>(
 /// Joins an existing tty session, then displays its actual final outcome.
 /// The step’s own autoclose flag controls the pause before returning.
 async fn run_http_tty_attach_handoff(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     input_paused: &Arc<AtomicBool>,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     mut socket: crate::worker_client::TtySocket,
