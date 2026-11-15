@@ -484,7 +484,7 @@ impl AppState {
         // A structural edit (including deletion/reordering) can affect a
         // view anywhere in the document. Keep the precise history event,
         // but tell clients to fetch all freshly computed presentation data.
-        let event = if resolved_canvas(raw, &self.canvas_path).is_ok_and(|c| {
+        let event = if resolved_canvas_in(Some(self), raw, &self.canvas_path).is_ok_and(|c| {
             c.nodes
                 .iter()
                 .any(|n| !meshfox_core::fence::scan_render_blocks(&n.text).is_empty())
@@ -1666,7 +1666,7 @@ struct RunFingerprintCtx {
 impl RunFingerprintCtx {
     fn load(state: &AppState) -> Option<Self> {
         let raw = state.raw.lock().unwrap().clone();
-        let mut canvas = resolved_canvas(&raw, &state.canvas_path).ok()?;
+        let mut canvas = resolved_canvas_live(state, &raw).ok()?;
         seed_artifact_paths(
             state,
             &mut canvas,
@@ -2326,6 +2326,10 @@ struct WatchPlan {
     images: Vec<(PathBuf, PathBuf, String)>,
     /// Confines `file_targets` and `images`; built only when there are any.
     access: Option<meshfox_core::FileAccess>,
+    /// The include-resolved document, kept only when something in it reads
+    /// variable values (a Starlark fence or an `include`): what
+    /// [`WatchPlan::vars_fingerprint`] resolves them against.
+    evaluated: Option<Canvas>,
 }
 
 impl WatchPlan {
@@ -2368,7 +2372,22 @@ impl WatchPlan {
             }
         }
         let access = (!file_targets.is_empty() || !images.is_empty()).then(|| file_access(state));
+        let evaluated = resolved
+            .filter(|c| {
+                c.nodes.iter().any(|n| {
+                    n.node_type == NodeType::Include
+                        || !meshfox_core::fence::scan_constraint_blocks(&n.text).is_empty()
+                        || !meshfox_core::fence::scan_render_blocks(&n.text).is_empty()
+                })
+            })
+            .or_else(|| {
+                canvas
+                    .as_ref()
+                    .filter(|c| c.nodes.iter().any(|n| n.node_type == NodeType::Include))
+                    .cloned()
+            });
         WatchPlan {
+            evaluated,
             raw,
             built: std::time::Instant::now(),
             canvas,
@@ -2377,6 +2396,18 @@ impl WatchPlan {
             images,
             access,
         }
+    }
+
+    /// The variable values the document's Starlark fences and `include`s read
+    /// right now, as one comparable string -- `None` while the document reads
+    /// none, or while the state's locks are busy (the caller keeps its last
+    /// answer). A change means what the document shows may differ, though
+    /// nothing on disk did: a `configure` answer, a form's Send, a run's
+    /// output, a `--set` from another process.
+    fn vars_fingerprint(&self, state: &AppState) -> Option<String> {
+        let canvas = self.evaluated.as_ref()?;
+        let vars = live_script_vars(state, canvas)?;
+        Some(format!("{vars:?}"))
     }
 
     /// Whether the plan no longer matches the document, or is old enough
@@ -2493,10 +2524,19 @@ fn spawn_file_watcher(state: Arc<AppState>) {
         let mut last_includes = plan.include_stamps(&state);
         let mut last_files = plan.file_stamps(&state);
         let mut last_images = plan.image_stamps();
+        let mut last_vars = plan.vars_fingerprint(&state);
         loop {
             std::thread::sleep(Duration::from_millis(500));
             if plan.is_stale(&state) {
                 plan = WatchPlan::build(&state);
+            }
+            // A variable answered, changed or reset leaves every file as it
+            // was, yet a `vars`-reading view or a `$VAR` include differs.
+            if let Some(now) = plan.vars_fingerprint(&state) {
+                if last_vars.as_ref().is_some_and(|last| *last != now) {
+                    state.canvas_events.push(ServerEvent::Changed);
+                }
+                last_vars = Some(now);
             }
             let images = plan.image_stamps();
             if images != last_images {
@@ -2568,7 +2608,7 @@ async fn persist_run_outputs(state: &AppState, pending: &[PendingOutput]) -> Res
         let Ok(located) = locate_node(&content, &output.node_id) else {
             continue;
         };
-        let Ok(canvas) = resolved_canvas(&located.raw, &state.canvas_path) else {
+        let Ok(canvas) = resolved_canvas_live(state, &located.raw) else {
             continue;
         };
         let Some(node) = canvas.node(&output.node_id) else {
@@ -2923,7 +2963,7 @@ fn steps_needing_a_lock(
     forced_reruns: &std::collections::HashSet<meshfox_core::BlockAddr>,
 ) -> Vec<(meshfox_core::BlockAddr, run_ledger::RunKind)> {
     let mut out = Vec::new();
-    let Ok(canvas) = resolved_canvas(raw_snapshot, &state.canvas_path) else {
+    let Ok(canvas) = resolved_canvas_live(state, raw_snapshot) else {
         return out;
     };
     let mut candidates: Vec<_> = forced_reruns.iter().collect();
@@ -3242,7 +3282,7 @@ async fn prepare_arguments(
         .0;
     if let Some(block) = &response.prepared.block {
         let raw = state.raw.lock().unwrap().clone();
-        let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+        let mut canvas = resolved_canvas_live(&state, &raw)?;
         let path: Vec<_> = response.path.iter().map(String::as_str).collect();
         let chain = prepare_run_plan(
             &state,
@@ -3308,7 +3348,7 @@ async fn prepare_arguments_local(
     Json(request): Json<ArgumentsRequest>,
 ) -> Result<Json<ArgumentsResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let mut canvas = resolved_canvas_live(&state, &raw)?;
     seed_artifact_paths(
         &state,
         &mut canvas,
@@ -3496,7 +3536,7 @@ async fn get_vars_with_plan(
     // Include-resolved (not just `parse_or_error`) so `path`/`block` below
     // can address a node spliced in from an `include`, same as `run_block`
     // — see `resolved_canvas`'s own doc comment.
-    let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let mut canvas = resolved_canvas_live(&state, &raw)?;
     let path: Vec<&str> = if query.path.is_empty() {
         Vec::new()
     } else {
@@ -3870,7 +3910,7 @@ async fn get_configure_vars(
     let raw = state.raw.lock().unwrap().clone();
     // Include-resolved so a `meshfox:var` declared inside an `include` is
     // offered here too, same reasoning as `get_vars`.
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     // Same reasoning as `get_vars`: a `from`-declared variable is computed,
@@ -3974,7 +4014,7 @@ async fn post_configure_vars(
     let raw = state.raw.lock().unwrap().clone();
     // Include-resolved so a `meshfox:var` declared inside an `include` can
     // be saved here too, same reasoning as `get_vars`.
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw)?;
     let decls = meshfox_core::declared_vars(&canvas)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     let (secret_decls, configurable): (Vec<_>, Vec<_>) = decls
@@ -4792,7 +4832,23 @@ fn parse_or_error(raw: &str) -> Result<Canvas, ApiError> {
 /// now. Shared by `canvas_response` and `get_include_asset` (the latter
 /// needs the resolved tree's `asset_base`s, not the JSON response itself).
 fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
-    let mut resolved = resolved_canvas_structure(raw, canvas_path)?;
+    resolved_canvas_in(None, raw, canvas_path)
+}
+
+/// [`resolved_canvas`] with the worker's live variable answers (see
+/// [`with_live_inputs`]): an `include` whose target is `$VAR` follows a
+/// `session` answer, a form's answer or a run's output, not only what is on
+/// disk.
+fn resolved_canvas_live(state: &AppState, raw: &str) -> Result<Canvas, ApiError> {
+    resolved_canvas_in(Some(state), raw, &state.canvas_path)
+}
+
+fn resolved_canvas_in(
+    state: Option<&AppState>,
+    raw: &str,
+    canvas_path: &std::path::Path,
+) -> Result<Canvas, ApiError> {
+    let mut resolved = resolved_canvas_structure_in(state, raw, canvas_path)?;
     // A runnable file node's block fingerprint covers its target's content.
     meshfox_core::hydrate_target_digests(&mut resolved, canvas_path);
     Ok(resolved)
@@ -4802,9 +4858,20 @@ fn resolved_canvas(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, A
 /// callers that only look at the document's structure and run on a timer
 /// (the file watcher), where hashing files twice a second would be waste.
 fn resolved_canvas_structure(raw: &str, canvas_path: &std::path::Path) -> Result<Canvas, ApiError> {
+    resolved_canvas_structure_in(None, raw, canvas_path)
+}
+
+fn resolved_canvas_structure_in(
+    state: Option<&AppState>,
+    raw: &str,
+    canvas_path: &std::path::Path,
+) -> Result<Canvas, ApiError> {
     let canvas = parse_or_error(raw)?;
-    meshfox_core::include::resolve(&canvas, canvas_path)
-        .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
+    let resolved = match state.and_then(|s| live_file_access(s, &canvas)) {
+        Some(access) => meshfox_core::include::resolve_with_access(&canvas, canvas_path, &access),
+        None => meshfox_core::include::resolve(&canvas, canvas_path),
+    };
+    resolved.map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))
 }
 
 #[derive(Debug, Serialize)]
@@ -4835,7 +4902,7 @@ impl AppState {
     /// Includes and derived statuses participate in the snapshot as well.
     fn canvas_snapshot(&self) -> Result<Json<VersionedCanvas>, ApiError> {
         let raw = self.raw.lock().unwrap();
-        let Json(canvas) = canvas_response(&raw, &self.canvas_path)?;
+        let Json(canvas) = canvas_response_in(Some(self), &raw, &self.canvas_path)?;
         // Retain only a digest, rather than a second full copy of the
         // response (which can include large, transient computed views).
         let fingerprint = meshfox_core::body_rev(
@@ -4856,15 +4923,23 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
 fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canvas>, ApiError> {
-    let mut canvas = resolved_canvas(raw, canvas_path)?;
+    canvas_response_in(None, raw, canvas_path)
+}
+
+fn canvas_response_in(
+    state: Option<&AppState>,
+    raw: &str,
+    canvas_path: &std::path::Path,
+) -> Result<Json<Canvas>, ApiError> {
+    let mut canvas = resolved_canvas_in(state, raw, canvas_path)?;
     // The annotation passes (constraint badges, computed views, options,
     // tag colors, body revisions) are the model's own — the same ones a
     // browser embedding runs through `meshfox_core::render::render_canvas`.
     // Only the file access differs: here it is the full one (trusted `dir`
     // variables, `@tmp`), built from the include-resolved document.
-    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
-    let vars = meshfox_core::script_vars_for_canvas_path(&canvas, canvas_path);
+    let (access, vars) = evaluation_inputs(state, &canvas, canvas_path);
     meshfox_core::render::annotate_resolved(
         &mut canvas,
         canvas_root_dir(canvas_path),
@@ -5052,12 +5127,21 @@ fn commit_located(
 /// this id before reaching here) or if resolution fails, rather than
 /// panicking over what would only ever be a broadcast-payload oddity, not
 /// a request failure the client already got its own `200` response for.
+#[cfg(test)]
 fn node_upserted_event(raw: &str, canvas_path: &std::path::Path, local_id: &str) -> ServerEvent {
-    let Ok(mut canvas) = resolved_canvas(raw, canvas_path) else {
+    node_upserted_event_in(None, raw, canvas_path, local_id)
+}
+
+fn node_upserted_event_in(
+    state: Option<&AppState>,
+    raw: &str,
+    canvas_path: &std::path::Path,
+    local_id: &str,
+) -> ServerEvent {
+    let Ok(mut canvas) = resolved_canvas_in(state, raw, canvas_path) else {
         return ServerEvent::Changed;
     };
-    let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
-    let vars = meshfox_core::script_vars_for_canvas_path(&canvas, canvas_path);
+    let (access, vars) = evaluation_inputs(state, &canvas, canvas_path);
     meshfox_core::constraint::annotate_status_with_access(
         &mut canvas,
         Some(canvas_root_dir(canvas_path)),
@@ -5512,7 +5596,12 @@ async fn clear_node_layout(
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
     let updated = clear_node_layout_in_document(&located.raw, &located.local_id)?;
-    let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
+    let op = node_upserted_event_in(
+        Some(&state),
+        &updated,
+        &state.canvas_path,
+        &located.local_id,
+    );
     commit_located(&state, &located, &updated, op)?;
     state.canvas_snapshot()
 }
@@ -5590,7 +5679,7 @@ async fn create_node(
         req.title_slug_id,
         req.body.as_deref(),
     )?;
-    let op = node_upserted_event(&updated, &state.canvas_path, &new_id);
+    let op = node_upserted_event_in(Some(&state), &updated, &state.canvas_path, &new_id);
     commit_located(&state, &located, &updated, op)?;
     let Json(canvas) = state.canvas_snapshot()?;
     Ok(Json(CreateNodeResponse { new_id, canvas }))
@@ -5732,7 +5821,7 @@ async fn update_node(
             })
     })?;
 
-    let op = node_upserted_event(&raw, &state.canvas_path, &local_id);
+    let op = node_upserted_event_in(Some(&state), &raw, &state.canvas_path, &local_id);
     commit_located(&state, &located, &raw, op)?;
     let Json(mut snapshot) = state.canvas_snapshot()?;
     if merged {
@@ -5752,7 +5841,7 @@ async fn append_node_body(
     let primary_raw = state.raw.lock().unwrap().clone();
     let located = locate_node(&primary_raw, &id)?;
     let raw = append_node_body_in_document(&located.raw, &located.local_id, &body)?;
-    let op = node_upserted_event(&raw, &state.canvas_path, &located.local_id);
+    let op = node_upserted_event_in(Some(&state), &raw, &state.canvas_path, &located.local_id);
     commit_located(&state, &located, &raw, op)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -5783,7 +5872,12 @@ async fn update_block_attrs(
         &req,
         &|canvas| meshfox_core::deps::validate(canvas).map_err(|e| e.to_string()),
     )?;
-    let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
+    let op = node_upserted_event_in(
+        Some(&state),
+        &updated,
+        &state.canvas_path,
+        &located.local_id,
+    );
     commit_located(&state, &located, &updated, op)?;
     state.canvas_snapshot()
 }
@@ -5829,6 +5923,82 @@ fn resolve_confined_target(state: &AppState, target: &str) -> Result<std::path::
     file_access(state)
         .confine(canvas_dir, target)
         .map_err(confine_api_error(target))
+}
+
+/// Runs `f` with the worker's live variable inputs: stored answers
+/// (`session_vars`, remembered session paths), values produced by this
+/// session's runs, the answer cache and shared config. `None` when one of the
+/// locks is busy -- including when the calling thread itself holds it -- so a
+/// caller deep inside another operation falls back to the on-disk view
+/// instead of deadlocking. Never touches `state.raw`.
+fn with_live_inputs<R>(
+    state: &AppState,
+    f: impl FnOnce(
+        &HashMap<String, String>,
+        &HashMap<String, String>,
+        &meshfox_core::varcache::VarCache,
+        &meshfox_core::shared_env::SharedEnv,
+    ) -> R,
+) -> Option<R> {
+    let session_paths = state.session_paths.try_lock().ok()?;
+    let session_vars = state.session_vars.try_lock().ok()?;
+    let session_runs = state.session_runs.try_lock().ok()?;
+    let cache = state.vars_cache.try_lock().ok()?;
+    let mut overrides = session_paths.clone();
+    overrides.extend(session_vars.clone());
+    let computed: HashMap<String, String> = session_runs
+        .values()
+        .flat_map(|run| run.produced_vars.clone())
+        .collect();
+    let shared = meshfox_core::load_shared_env(canvas_root_dir(&state.canvas_path));
+    Some(f(&overrides, &computed, &cache, &shared))
+}
+
+/// [`FileAccess::resolve`](meshfox_core::FileAccess::resolve) on the live
+/// inputs of [`with_live_inputs`], for `canvas` (as parsed or include-resolved).
+fn live_file_access(state: &AppState, canvas: &Canvas) -> Option<meshfox_core::FileAccess> {
+    with_live_inputs(state, |overrides, computed, cache, shared| {
+        meshfox_core::FileAccess::resolve(
+            canvas,
+            &state.canvas_path,
+            overrides,
+            cache,
+            computed,
+            shared,
+        )
+    })
+}
+
+/// What a document's Starlark fences read as `vars` right now (see
+/// [`with_live_inputs`]).
+fn live_script_vars(
+    state: &AppState,
+    canvas: &Canvas,
+) -> Option<meshfox_core::script_vars::ScriptVars> {
+    with_live_inputs(state, |overrides, computed, cache, shared| {
+        meshfox_core::script_vars_with(canvas, overrides, cache, computed, shared)
+    })
+}
+
+/// The file access and `vars` the annotation passes of `canvas` run with: the
+/// worker's live ones when `state` is given and its locks are free, otherwise
+/// what is on disk (environment, answer cache, shared config).
+fn evaluation_inputs(
+    state: Option<&AppState>,
+    canvas: &Canvas,
+    canvas_path: &std::path::Path,
+) -> (
+    meshfox_core::FileAccess,
+    meshfox_core::script_vars::ScriptVars,
+) {
+    let live =
+        state.and_then(|s| Some((live_file_access(s, canvas)?, live_script_vars(s, canvas)?)));
+    live.unwrap_or_else(|| {
+        (
+            meshfox_core::FileAccess::for_canvas_path(canvas, canvas_path),
+            meshfox_core::script_vars_for_canvas_path(canvas, canvas_path),
+        )
+    })
 }
 
 /// What the canvas may read beyond its own directory right now: the
@@ -6167,7 +6337,7 @@ async fn run_file_node(
 /// (`persist` off), as before.
 async fn run_file_node_impl(state: Arc<AppState>, id: String) -> Result<Response, ApiError> {
     let primary_raw = state.raw.lock().unwrap().clone();
-    let canvas = resolved_canvas(&primary_raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &primary_raw)?;
     let node = canvas
         .node(&id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {id:?}")))?;
@@ -6563,7 +6733,12 @@ async fn reparent_node(
     // applies equally before and after a move that never leaves this file.
     let updated =
         reparent_node_in_document(&located.raw, &located.local_id, &located_parent.local_id)?;
-    let op = node_upserted_event(&updated, &state.canvas_path, &located.local_id);
+    let op = node_upserted_event_in(
+        Some(&state),
+        &updated,
+        &state.canvas_path,
+        &located.local_id,
+    );
     commit_located(&state, &located, &updated, op)?;
     state.canvas_snapshot()
 }
@@ -6959,7 +7134,7 @@ async fn force_run(
                 &query.save_secrets,
             )?;
             let raw = state.raw.lock().unwrap().clone();
-            let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+            let mut canvas = resolved_canvas_live(&state, &raw)?;
             let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
             let chain = prepare_run_plan(
                 &state,
@@ -7056,7 +7231,7 @@ async fn run_block_impl_sized(
     // resolved tree is namespaced (`{include_id}/{original_id}`), same as
     // what `GET /api/canvas` already sends the browser, so a path/block
     // the UI read off that response resolves the same way here.
-    let mut canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    let mut canvas = resolved_canvas_live(&state, &raw_snapshot)?;
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
     let overrides = effective_overrides(&state, &req.vars);
     let plan = prepare_run_plan(
@@ -7420,7 +7595,7 @@ async fn run_block_impl_sized(
             // `Node::cwd`) so an earlier step's freshly-patched cache
             // (above) is visible before this one runs — same reasoning
             // `meshfox run`'s CLI loop already has.
-            let Ok(step_canvas) = resolved_canvas(&located.raw, &state.canvas_path) else {
+            let Ok(step_canvas) = resolved_canvas_live(&state, &located.raw) else {
                 yield Ok(ndjson_line(&RunEvent::Error {
                     message: format!("node {:?} not found", addr.node_id),
                 }));
@@ -8371,7 +8546,7 @@ const AUTORUN_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 async fn trigger_autorun(state: Arc<AppState>, addr: meshfox_core::BlockAddr) {
     let raw = state.raw.lock().unwrap().clone();
-    let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+    let Ok(canvas) = resolved_canvas_live(&state, &raw) else {
         return;
     };
     let Some(path) = canvas.id_path_to(&addr.node_id) else {
@@ -8552,7 +8727,7 @@ async fn get_form_fields(
     Query(query): Query<FormFieldsQuery>,
 ) -> Result<Json<FormFieldsResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw)?;
     let node = canvas.node(&query.node_id).ok_or_else(|| {
         ApiError(
             StatusCode::NOT_FOUND,
@@ -8672,7 +8847,7 @@ async fn submit_form(
     Json(req): Json<SubmitFormRequest>,
 ) -> Result<Json<SubmitFormResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw)?;
     let node = canvas
         .node(&req.node_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
@@ -8913,7 +9088,7 @@ async fn reset_form(
     Json(req): Json<ResetFormRequest>,
 ) -> Result<Json<ResetFormResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw)?;
     let node = canvas
         .node(&req.node_id)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no node {:?}", req.node_id)))?;
@@ -9157,7 +9332,7 @@ async fn run_block_tty(
     // first so an unconfirmed request never kills anything.
     if let (Some(force_node_id), Some(force_block)) = (query.force_node_id, query.force_block) {
         let raw = state.raw.lock().unwrap().clone();
-        let mut canvas = resolved_canvas(&raw, &state.canvas_path)?;
+        let mut canvas = resolved_canvas_live(&state, &raw)?;
         let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
         let chain = prepare_run_plan(
             &state,
@@ -9754,7 +9929,7 @@ async fn restart_service(
     Json(req): Json<ServiceKeyRequest>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     let raw = state.raw.lock().unwrap().clone();
-    let canvas = resolved_canvas(&raw, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw)?;
     require_run_allowed(
         &state,
         &canvas,
@@ -9811,7 +9986,7 @@ async fn force_start_service(
     Json(req): Json<ForceStartServiceRequest>,
 ) -> Result<Json<ServiceActionResponse>, ApiError> {
     let raw_snapshot = state.raw.lock().unwrap().clone();
-    let canvas = resolved_canvas(&raw_snapshot, &state.canvas_path)?;
+    let canvas = resolved_canvas_live(&state, &raw_snapshot)?;
     let path: Vec<&str> = req.path.iter().map(String::as_str).collect();
     let chain = meshfox_core::resolve_run_chain(&canvas, &path, &req.block, false)?;
     require_run_allowed(&state, &canvas, &chain, req.confirm)?;
@@ -9861,7 +10036,7 @@ async fn force_start_service(
 
     remember_session_paths(&state, &relevant_decls, &resolved_vars)?;
     let located = locate_node(&raw_snapshot, &target.node_id)?;
-    let step_canvas = resolved_canvas(&located.raw, &state.canvas_path)?;
+    let step_canvas = resolved_canvas_live(&state, &located.raw)?;
     let step_node = step_canvas.node(&target.node_id).ok_or_else(|| {
         ApiError(
             StatusCode::NOT_FOUND,
@@ -10956,7 +11131,7 @@ async fn get_include_asset(
 ) -> Response {
     let base = if let Some(dir) = q.dir.as_deref() {
         let raw = state.raw.lock().unwrap().clone();
-        let Ok(canvas) = resolved_canvas(&raw, &state.canvas_path) else {
+        let Ok(canvas) = resolved_canvas_live(&state, &raw) else {
             return StatusCode::NOT_FOUND.into_response();
         };
         let is_main = std::path::Path::new(dir).canonicalize().ok()
@@ -11870,6 +12045,135 @@ mod node_op_broadcast_tests {
             )
             .unwrap();
         assert!(matches!(recv_event(&mut rx), ServerEvent::Changed));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    const VARS_RENDER: &str = concat!(
+        "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"MFX_LIVE_X\" default=\"from default\" -->\n\n",
+        "```starlark render name=\"show\"\nprint(vars[\"MFX_LIVE_X\"])\n```\n",
+    );
+
+    fn render_text(canvas: &Canvas) -> String {
+        canvas.node("root").unwrap().render_results[0]
+            .markdown
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn starlark_vars_follow_the_workers_live_answers() {
+        let path = write_test_canvas(VARS_RENDER);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let shown = |state: Option<&AppState>| {
+            render_text(&canvas_response_in(state, VARS_RENDER, &path).unwrap().0)
+        };
+        assert_eq!(shown(Some(&state)), "from default");
+        // A form's Send / a session answer lives only in the worker's memory.
+        state
+            .session_vars
+            .lock()
+            .unwrap()
+            .insert("MFX_LIVE_X".into(), "answered".into());
+        assert_eq!(shown(Some(&state)), "answered");
+        // The on-disk view (no worker state) still sees only the default.
+        assert_eq!(shown(None), "from default");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_include_by_variable_follows_a_session_path() {
+        let data = std::env::temp_dir().join(format!(
+            "mfx-live-include-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&data).unwrap();
+        let data = data.canonicalize().unwrap();
+        std::fs::write(
+            data.join("child.canvas.md"),
+            "<!-- meshfox:canvas -->\n# Child\n<!-- meshfox:node id=\"root\" -->\n\nlive include marker\n",
+        )
+        .unwrap();
+        let raw = concat!(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+            "<!-- meshfox:var name=\"MFX_LIVE_DIR\" type=\"dir\" session -->\n\n",
+            "## Child\n<!-- meshfox:node id=\"child\" type=\"include\" -->\n\n",
+            "[child]($MFX_LIVE_DIR/child.canvas.md)\n",
+        );
+        let path = write_test_canvas(raw);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        assert!(resolved_canvas_live(&state, raw).is_err());
+        state
+            .session_paths
+            .lock()
+            .unwrap()
+            .insert("MFX_LIVE_DIR".into(), data.to_string_lossy().into_owned());
+        let resolved = resolved_canvas_live(&state, raw).unwrap();
+        assert!(resolved
+            .node("child")
+            .unwrap()
+            .text
+            .contains("live include marker"));
+        // Without worker state the same document cannot resolve it.
+        assert!(resolved_canvas(raw, &path).is_err());
+        std::fs::remove_file(path).unwrap();
+        let _ = std::fs::remove_dir_all(data);
+    }
+
+    #[tokio::test]
+    async fn the_file_watcher_announces_a_changed_variable_answer() {
+        let path = write_test_canvas(VARS_RENDER);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let (_, mut rx, _) = state.canvas_events.subscribe_from(u64::MAX);
+        spawn_file_watcher(state.clone());
+        // Let the watcher take its baseline before the answer changes.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        state
+            .session_vars
+            .lock()
+            .unwrap()
+            .insert("MFX_LIVE_X".into(), "answered".into());
+        let mut seen = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            while let Ok(event) = rx.try_recv() {
+                seen |= matches!(event.item, ServerEvent::Changed);
+            }
+            if seen {
+                break;
+            }
+        }
+        assert!(seen, "no Changed event after the answer changed");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_changed_variable_changes_the_watch_fingerprint_only_when_the_document_reads_vars() {
+        let path = write_test_canvas(VARS_RENDER);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        let plan = WatchPlan::build(&state);
+        let before = plan.vars_fingerprint(&state).expect("document reads vars");
+        assert_eq!(
+            plan.vars_fingerprint(&state).as_deref(),
+            Some(before.as_str())
+        );
+        state
+            .session_vars
+            .lock()
+            .unwrap()
+            .insert("MFX_LIVE_X".into(), "other".into());
+        assert_ne!(plan.vars_fingerprint(&state).unwrap(), before);
+        std::fs::remove_file(path).unwrap();
+
+        // A document with no Starlark fence and no include has nothing to watch.
+        let plain = "# Root\n<!-- meshfox:node id=\"root\" -->\n\n<!-- meshfox:var name=\"MFX_LIVE_Y\" default=\"d\" -->\n";
+        let path = write_test_canvas(plain);
+        let state = build_state(path.clone(), false, None).await.unwrap();
+        assert!(WatchPlan::build(&state).vars_fingerprint(&state).is_none());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -24279,8 +24583,7 @@ mod capability_tests {
         let state = build_state_with(canvas_path, false, None, Capabilities::NO_EXEC)
             .await
             .unwrap();
-        let canvas =
-            resolved_canvas(&state.raw.lock().unwrap().clone(), &state.canvas_path).unwrap();
+        let canvas = resolved_canvas_live(&state, &state.raw.lock().unwrap().clone()).unwrap();
         let error = require_run_allowed(&state, &canvas, &[addr_of("a", "go")], true).unwrap_err();
         assert_eq!(error.0, StatusCode::FORBIDDEN);
         std::fs::remove_dir_all(&dir).ok();
@@ -24292,8 +24595,7 @@ mod capability_tests {
         let state = build_state_with(canvas_path, false, None, Capabilities::READ_ONLY)
             .await
             .unwrap();
-        let canvas =
-            resolved_canvas(&state.raw.lock().unwrap().clone(), &state.canvas_path).unwrap();
+        let canvas = resolved_canvas_live(&state, &state.raw.lock().unwrap().clone()).unwrap();
         require_run_allowed(&state, &canvas, &[addr_of("a", "go")], true)
             .expect("a plain block runs");
         let error = require_run_allowed(
@@ -24314,8 +24616,7 @@ mod capability_tests {
         let state = build_state_with(canvas_path, false, None, Capabilities::UNRESTRICTED)
             .await
             .unwrap();
-        let canvas =
-            resolved_canvas(&state.raw.lock().unwrap().clone(), &state.canvas_path).unwrap();
+        let canvas = resolved_canvas_live(&state, &state.raw.lock().unwrap().clone()).unwrap();
         require_run_allowed(
             &state,
             &canvas,

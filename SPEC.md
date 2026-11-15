@@ -1585,8 +1585,13 @@ Every `starlark constraint` and `starlark render` fence has a read-only global
 - **Where values come from.** The process environment, the on-disk answer
   cache, shared config and defaults — the same sources `$VAR` in a `file`/
   `include` target uses, so `meshfox check` and `meshfox render` see exactly
-  that. Static and PDF export give `vars` no values at all, so a published
-  page never carries variable values.
+  that. A running worker (web, TUI, MCP) also sees what it only holds in
+  memory: a form's answer, a `session` variable's answer, a value a `from=`
+  source produced this session. The same values decide `$VAR` in `include`
+  targets. When one of them changes, the worker tells its clients to refetch
+  the document, so a view that reads `vars` is recomputed. Static and PDF
+  export give `vars` no values at all, so a published page never carries
+  variable values.
 - **Not an input.** Reading a variable never prompts, never runs a `from=`
   source and never makes a fence depend on anything.
 
