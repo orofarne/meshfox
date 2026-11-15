@@ -26,6 +26,12 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// busy build log, say), small enough to never be a real memory concern.
 const BYTE_CAPACITY: usize = 262_144; // 256 KiB
 
+/// How long a killed session gets to end on its own before `SIGKILL`: the
+/// time for a program to run its cleanup (Claude Code, for one, records on
+/// exit that its fullscreen start was healthy and counts a hard kill within
+/// the first seconds as a failed start).
+pub const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunOutcome {
     Running,
@@ -182,6 +188,54 @@ impl TtySessionHandle {
     }
 }
 
+impl TtySessionHandle {
+    /// Appends `bytes` to the log and hands them to every attached viewer. No
+    /// viewer attached right now is normal and common: the bytes are already
+    /// in the ring buffer for whoever attaches next.
+    fn publish(&self, bytes: Vec<u8>) {
+        self.log.lock().unwrap().push(&bytes);
+        let _ = self
+            .tx
+            .send(TtyEvent::Bytes(Arc::from(bytes.into_boxed_slice())));
+    }
+}
+
+/// Ends the session the way closing its terminal would, with `SIGKILL` only
+/// as the fallback (the same shape as a service's stop): `SIGHUP` at once,
+/// `SIGTERM` if it is still there halfway through `grace`, `SIGKILL` once
+/// `grace` is over. Output keeps flowing to the viewers meanwhile, so the
+/// program's last words are not lost. Returns when the session is gone.
+async fn stop_gracefully(
+    pty: &mut PtyProcess,
+    handle: &TtySessionHandle,
+    grace: std::time::Duration,
+) {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    let _ = pty.hangup();
+    let mut terminated = false;
+    while started.elapsed() < grace {
+        tokio::select! {
+            chunk = pty.output_rx.recv() => match chunk {
+                Some(bytes) => handle.publish(bytes),
+                // Every holder of the terminal is gone: the session ended.
+                None => {
+                    let _ = pty.wait().await;
+                    return;
+                }
+            },
+            _ = tokio::time::sleep(TICK) => {
+                if !terminated && started.elapsed() >= grace / 2 && pty.group_alive() {
+                    terminated = true;
+                    let _ = pty.terminate();
+                }
+            }
+        }
+    }
+    let _ = pty.kill();
+    let _ = pty.wait().await;
+}
+
 /// Registers an already-spawned pty session and hands back a handle whose
 /// log/outcome stay live in the background regardless of how many viewers
 /// (if any) are currently attached. The caller is expected to insert the
@@ -198,8 +252,19 @@ impl TtySessionHandle {
 pub fn track(
     node_id: String,
     block_name: String,
+    pty: PtyProcess,
+    ledger_row: Option<(crate::run_ledger::RunLedger, i64)>,
+) -> Arc<TtySessionHandle> {
+    track_with_grace(node_id, block_name, pty, ledger_row, STOP_GRACE)
+}
+
+/// [`track`] with an explicit stop grace period (tests use a short one).
+fn track_with_grace(
+    node_id: String,
+    block_name: String,
     mut pty: PtyProcess,
     ledger_row: Option<(crate::run_ledger::RunLedger, i64)>,
+    grace: std::time::Duration,
 ) -> Arc<TtySessionHandle> {
     let (tx, _) = broadcast::channel(1024);
     let (kill_tx, mut kill_rx) = oneshot::channel();
@@ -222,22 +287,14 @@ pub fn track(
         let outcome = loop {
             tokio::select! {
                 chunk = pty.output_rx.recv() => match chunk {
-                    Some(bytes) => {
-                        task_handle.log.lock().unwrap().push(&bytes);
-                        // No viewers attached right now is a normal, common
-                        // case — nothing to do about it, the bytes are
-                        // already durably in the ring buffer for whoever
-                        // attaches next.
-                        let _ = task_handle.tx.send(TtyEvent::Bytes(Arc::from(bytes.into_boxed_slice())));
-                    }
+                    Some(bytes) => task_handle.publish(bytes),
                     None => {
                         let exit_code = pty.wait().await;
                         break RunOutcome::Exited { exit_code };
                     }
                 },
                 _ = &mut kill_rx => {
-                    let _ = pty.kill();
-                    let _ = pty.wait().await;
+                    stop_gracefully(&mut pty, &task_handle, grace).await;
                     break RunOutcome::Killed;
                 }
             }
@@ -333,6 +390,85 @@ mod tests {
         assert!(handle.viewer_sizes.lock().unwrap().contains_key(&a));
 
         handle.kill();
+    }
+
+    /// Polls until the session's log contains `needle`.
+    async fn wait_for_output(handle: &TtySessionHandle, needle: &str) {
+        for _ in 0..200 {
+            let (backlog, _) = handle.attach();
+            if String::from_utf8_lossy(&backlog).contains(needle) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("never saw {needle:?} in the session output");
+    }
+
+    /// Polls until the session has an outcome and returns how long that took.
+    async fn wait_for_end(handle: &TtySessionHandle) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        while matches!(handle.outcome(), RunOutcome::Running) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "the session never ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn a_killed_session_gets_to_clean_up_before_any_sigkill() {
+        let marker = std::env::temp_dir().join(format!(
+            "mfx-tty-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let code = format!(
+            "trap 'echo bye; echo cleaned > {}; exit 0' HUP TERM\necho ready\nwhile :; do sleep 0.1; done",
+            marker.display()
+        );
+        let pty = pty_exec::spawn(&code, None, None, no_envs(), None, None, (80, 24)).unwrap();
+        let handle = track("root".to_string(), "shell".to_string(), pty, None);
+        wait_for_output(&handle, "ready").await;
+
+        assert!(handle.kill());
+        let took = wait_for_end(&handle).await;
+
+        assert!(matches!(handle.outcome(), RunOutcome::Killed));
+        assert!(marker.exists(), "the cleanup handler never ran");
+        // Far less than the grace period: it ended as soon as it was asked.
+        assert!(took < STOP_GRACE, "took {took:?}");
+        // What it printed while stopping reached the log.
+        let (backlog, _) = handle.attach();
+        assert!(String::from_utf8_lossy(&backlog).contains("bye"));
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ignores_hangup_and_terminate_is_killed_after_the_grace() {
+        let code = "trap '' HUP TERM\necho ready\nwhile :; do sleep 0.1; done";
+        let pty = pty_exec::spawn(code, None, None, no_envs(), None, None, (80, 24)).unwrap();
+        let pid = pty.pid();
+        let grace = std::time::Duration::from_millis(1000);
+        let handle = track_with_grace("root".to_string(), "shell".to_string(), pty, None, grace);
+        wait_for_output(&handle, "ready").await;
+
+        assert!(handle.kill());
+        let took = wait_for_end(&handle).await;
+
+        assert!(matches!(handle.outcome(), RunOutcome::Killed));
+        assert!(
+            took >= grace,
+            "SIGKILL came before the grace ran out: {took:?}"
+        );
+        assert!(took < grace * 4, "took {took:?}");
+        // SAFETY: signal 0 only checks that the group exists.
+        let alive = unsafe { libc::kill(-pid, 0) } == 0;
+        assert!(!alive, "the session's process group is still alive");
     }
 
     #[tokio::test]

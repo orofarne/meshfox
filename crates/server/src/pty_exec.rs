@@ -98,6 +98,34 @@ impl PtyProcess {
         Ok(())
     }
 
+    /// Sends `signal` to the whole pty session (see `kill` for why the whole
+    /// group). `ESRCH` -- already gone -- is not an error.
+    fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
+        // SAFETY: as in `kill`: `pid` is this session's own group leader.
+        let ret = unsafe { libc::kill(-(self.pid as libc::pid_t), signal) };
+        if ret != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// `SIGHUP` to the session: what the kernel sends when a terminal goes
+    /// away, so a shell exits and a program with a cleanup handler runs it.
+    pub fn hangup(&self) -> io::Result<()> {
+        self.signal_group(libc::SIGHUP)
+    }
+
+    /// `SIGTERM` to the session: the ordinary "please stop".
+    pub fn terminate(&self) -> io::Result<()> {
+        self.signal_group(libc::SIGTERM)
+    }
+
+    /// Whether any process of the session is still alive.
+    pub fn group_alive(&self) -> bool {
+        // SAFETY: signal 0 only checks that the group exists.
+        unsafe { libc::kill(-(self.pid as libc::pid_t), 0) == 0 }
+    }
+
     /// Waits for the child to exit, returning its exit code (`-1` if it
     /// couldn't be determined, e.g. killed by a signal). Only meaningful to
     /// call once — later calls return `-1` immediately.

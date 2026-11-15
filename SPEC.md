@@ -1713,6 +1713,15 @@ timeout); it shows up as a running `tty` run, and stopping it ends the
 chain like any other kill. A `tty` session's terminal is as large as the
 smallest attached client's, and before any client attaches it is 80×24.
 
+Stopping a `tty` session (the kill action, killing the chain, or the worker
+shutting down) ends it the way closing its terminal would, and only forces it
+as a last resort: `SIGHUP` goes to the whole session at once, `SIGTERM` if
+something is still alive after 2.5 s, and `SIGKILL` once 5 s have passed.
+Output printed while it stops still reaches the viewers. A program that
+cleans up on exit (an editor, a coding agent recording that it ended
+normally) gets the chance to; one that ignores both signals is killed after
+the 5 s. The worker waits for this before it exits.
+
 By default, once a `tty` block's process exits, its exit code (and
 whatever it last printed) stays visible until a deliberate action returns
 to the canvas — a keypress in `meshfox tui`, closing the panel by hand in

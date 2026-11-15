@@ -11754,8 +11754,19 @@ fn spawn_shutdown_signal_handler(state: Arc<AppState>) {
             .drain()
             .map(|(_, h)| h)
             .collect();
-        for handle in tty_handles {
+        for handle in &tty_handles {
             handle.kill();
+        }
+        // A tty session is stopped gracefully (see `tty_registry::stop_gracefully`),
+        // which takes a moment: wait for it rather than exiting under it.
+        let tty_deadline =
+            std::time::Instant::now() + tty_registry::STOP_GRACE + Duration::from_secs(2);
+        while std::time::Instant::now() < tty_deadline
+            && tty_handles
+                .iter()
+                .any(|h| matches!(h.outcome(), tty_registry::RunOutcome::Running))
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let results = futures_util::future::join_all(
             service_handles.iter().map(|handle| handle.stop_automatic()),
