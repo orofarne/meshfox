@@ -70,7 +70,11 @@ fn tab_skips_console_and_ctrl_w_focuses_it_and_returns() {
     }
     session.send_keys("\x17");
     focused(&session, "Output");
-    assert!(!session.screen_text().contains("▸Output"));
+    // The focus colour lands before the collapsed marker is redrawn away, so
+    // wait for the marker to go instead of reading one snapshot.
+    session
+        .wait_absent("▸Output", Duration::from_secs(5))
+        .unwrap();
     session.send_keys("\x17");
     focused(&session, "canvas.canvas.md");
     session.wait_for("▸Output", Duration::from_secs(5)).unwrap();
