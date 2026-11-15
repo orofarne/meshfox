@@ -2624,13 +2624,14 @@ impl CheckReport {
 /// caller (CLI `check` below, or the MCP `check` tool) decides what to do
 /// with per-fence failures.
 fn check_canvas(raw: &str, canvas_path: &Path) -> Result<CheckReport, String> {
-    let (mut canvas, access) = resolved_for_evaluation(raw, canvas_path)?;
+    let (mut canvas, access, vars) = resolved_for_evaluation(raw, canvas_path)?;
     let constraints = meshfox_core::constraint::evaluate_with_access(
         &canvas,
         Some(canvas_root_dir(canvas_path)),
         &access,
+        &vars,
     );
-    let renders = render_outcomes(&mut canvas, canvas_path, &access);
+    let renders = render_outcomes(&mut canvas, canvas_path, &access, &vars);
     Ok(CheckReport {
         constraints,
         renders,
@@ -2638,15 +2639,24 @@ fn check_canvas(raw: &str, canvas_path: &Path) -> Result<CheckReport, String> {
 }
 
 /// Parses `raw` and resolves its includes, the tree every Starlark fence is
-/// evaluated against, plus the file access its `file`-node reads go through.
+/// evaluated against, plus the file access its `file`-node reads go through
+/// and the variable values its fences read as `vars`.
 fn resolved_for_evaluation(
     raw: &str,
     canvas_path: &Path,
-) -> Result<(Canvas, meshfox_core::FileAccess), String> {
+) -> Result<
+    (
+        Canvas,
+        meshfox_core::FileAccess,
+        meshfox_core::script_vars::ScriptVars,
+    ),
+    String,
+> {
     let canvas = Canvas::from_markdown(raw).map_err(|e| e.to_string())?;
     let canvas = meshfox_core::include::resolve(&canvas, canvas_path).map_err(|e| e.to_string())?;
     let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
-    Ok((canvas, access))
+    let vars = meshfox_core::script_vars_for_canvas_path(&canvas, canvas_path);
+    Ok((canvas, access, vars))
 }
 
 /// Evaluates every `starlark render` fence of `canvas`, in document order.
@@ -2654,8 +2664,14 @@ fn render_outcomes(
     canvas: &mut Canvas,
     canvas_path: &Path,
     access: &meshfox_core::FileAccess,
+    vars: &meshfox_core::script_vars::ScriptVars,
 ) -> Vec<RenderOutcome> {
-    meshfox_core::starlark_render::annotate(canvas, Some(canvas_root_dir(canvas_path)), access);
+    meshfox_core::starlark_render::annotate(
+        canvas,
+        Some(canvas_root_dir(canvas_path)),
+        access,
+        vars,
+    );
     canvas
         .nodes
         .iter()
@@ -2754,7 +2770,7 @@ fn check(canvas_path: &Path) {
 fn render_cmd(canvas_path: &Path, node: Option<&str>, name: Option<&str>) {
     let raw = read_raw_or_exit(canvas_path);
     let outcomes = resolved_for_evaluation(&raw, canvas_path)
-        .map(|(mut canvas, access)| render_outcomes(&mut canvas, canvas_path, &access))
+        .map(|(mut canvas, access, vars)| render_outcomes(&mut canvas, canvas_path, &access, &vars))
         .unwrap_or_else(|e| {
             eprintln!("meshfox render: {}: {e}", canvas_path.display());
             std::process::exit(1);

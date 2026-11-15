@@ -4864,7 +4864,13 @@ fn canvas_response(raw: &str, canvas_path: &std::path::Path) -> Result<Json<Canv
     // Only the file access differs: here it is the full one (trusted `dir`
     // variables, `@tmp`), built from the include-resolved document.
     let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
-    meshfox_core::render::annotate_resolved(&mut canvas, canvas_root_dir(canvas_path), &access);
+    let vars = meshfox_core::script_vars_for_canvas_path(&canvas, canvas_path);
+    meshfox_core::render::annotate_resolved(
+        &mut canvas,
+        canvas_root_dir(canvas_path),
+        &access,
+        &vars,
+    );
     Ok(Json(canvas))
 }
 
@@ -5051,10 +5057,12 @@ fn node_upserted_event(raw: &str, canvas_path: &std::path::Path, local_id: &str)
         return ServerEvent::Changed;
     };
     let access = meshfox_core::FileAccess::for_canvas_path(&canvas, canvas_path);
+    let vars = meshfox_core::script_vars_for_canvas_path(&canvas, canvas_path);
     meshfox_core::constraint::annotate_status_with_access(
         &mut canvas,
         Some(canvas_root_dir(canvas_path)),
         &access,
+        &vars,
     );
     meshfox_core::annotate_effective_colors(&mut canvas);
     meshfox_core::annotate_body_revs(&mut canvas);

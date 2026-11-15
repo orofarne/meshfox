@@ -1563,6 +1563,33 @@ validate`: `validate` asks whether the file *parses* as a well-formed
 canvas; `check` asks whether the document, once parsed, actually satisfies
 whatever rules its own constraint fences declare.
 
+### Variables in Starlark (`vars`)
+
+Every `starlark constraint` and `starlark render` fence has a read-only global
+`vars`, a dict from variable name to value:
+
+    ```starlark render name="query-size"
+    print("query has", len(vars["QUERY"].split("\n")), "lines; limit", vars["LIMIT"])
+    ```
+
+- **Typed.** `int` is an integer, `bool` a boolean, `list` a list of its items
+  (typed by `of=`); `string`, `select`, `dir`, `file`, `date` and `datetime`
+  are strings.
+- **Only values that exist without asking.** A variable that is unanswered,
+  `required` and unconfirmed, or `from=`-computed and not yet computed is
+  absent from `vars` (`"X" in vars` is false, `vars.get("X")` is `None`), never
+  an empty string. A `secret` variable is never in `vars`. A `content=`
+  variable is always there.
+- **Scoped.** A node-scoped variable is visible only to fences in its own
+  node's subtree, like everywhere else.
+- **Where values come from.** The process environment, the on-disk answer
+  cache, shared config and defaults — the same sources `$VAR` in a `file`/
+  `include` target uses, so `meshfox check` and `meshfox render` see exactly
+  that. Static and PDF export give `vars` no values at all, so a published
+  page never carries variable values.
+- **Not an input.** Reading a variable never prompts, never runs a `from=`
+  source and never makes a fence depend on anything.
+
 ## Computed Starlark views
 
 A `starlark render` fence computes a Markdown view of the document using the

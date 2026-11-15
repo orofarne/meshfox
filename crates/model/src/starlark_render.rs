@@ -29,7 +29,12 @@ impl starlark::PrintHandler for Output {
     }
 }
 
-pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &dyn FileSource) {
+pub fn annotate(
+    canvas: &mut Canvas,
+    base_dir: Option<&Path>,
+    access: &dyn FileSource,
+    vars: &crate::script_vars::ScriptVars,
+) {
     if !canvas
         .nodes
         .iter()
@@ -45,7 +50,13 @@ pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &dyn FileS
         GlobalsBuilder::extended_by(&[LibraryExtension::StructType, LibraryExtension::Print]);
     globals.namespace("md", crate::markdown_fragment::markdown_globals);
     let globals = globals.with(crate::constraint::sequence_globals).build();
-    for node in &mut canvas.nodes {
+    // Per node, computed up front: the loop below borrows the nodes mutably.
+    let var_preludes: Vec<String> = canvas
+        .nodes
+        .iter()
+        .map(|n| vars.prelude_for(canvas, &n.id))
+        .collect();
+    for (node, vars_prelude) in canvas.nodes.iter_mut().zip(var_preludes) {
         node.render_results = crate::fence::scan_render_blocks(&node.text)
             .into_iter()
             .enumerate()
@@ -60,7 +71,8 @@ pub fn annotate(canvas: &mut Canvas, base_dir: Option<&Path>, access: &dyn FileS
                 );
                 let output = Output::default();
                 let setup = format!(
-                    "{prelude}self = doc.node({})\n",
+                    "{prelude}{}self = doc.node({})\n",
+                    vars_prelude,
                     serde_json::to_string(&node.id).unwrap()
                 );
                 let error = block.error.or_else(|| {
@@ -100,9 +112,25 @@ mod tests {
     }
     fn render(code: &str) -> RenderResult {
         let mut c = canvas(code);
-        annotate(&mut c, None, &DiskFiles);
+        annotate(&mut c, None, &DiskFiles, &Default::default());
         c.nodes[0].render_results.remove(0)
     }
+    #[test]
+    fn render_blocks_read_vars() {
+        let mut c = canvas("print(vars['GREETING'], vars['N'] + 1)");
+        let mut vars = crate::script_vars::ScriptVars::new();
+        vars.insert(
+            "GREETING",
+            "root",
+            crate::script_vars::ScriptValue::Str("hi".into()),
+        );
+        vars.insert("N", "root", crate::script_vars::ScriptValue::Int(41));
+        annotate(&mut c, None, &DiskFiles, &vars);
+        let result = c.nodes[0].render_results.remove(0);
+        assert_eq!(result.error, None);
+        assert_eq!(result.markdown.trim(), "hi 42");
+    }
+
     #[test]
     fn sum_adds_numbers_and_honors_start() {
         let result =
@@ -179,12 +207,12 @@ for n in [doc] + doc.descendants():
 print(md.table(headers=["Tag", "Nodes"], rows=[[tag, counts[tag]] for tag in sorted(counts)]))"#,
         );
         let text = c.nodes[0].text.clone();
-        annotate(&mut c, None, &DiskFiles);
+        annotate(&mut c, None, &DiskFiles, &Default::default());
         assert!(c.nodes[0].render_results[0]
             .markdown
             .contains("| todo | 1 |"));
         c.nodes[1].tags = vec!["done".into()];
-        annotate(&mut c, None, &DiskFiles);
+        annotate(&mut c, None, &DiskFiles, &Default::default());
         assert!(c.nodes[0].render_results[0]
             .markdown
             .contains("| done | 1 |"));
@@ -224,9 +252,12 @@ print(md.table(headers=["Tag", "Nodes"], rows=[[tag, counts[tag]] for tag in sor
     #[test]
     fn plain_starlark_is_inert_and_modes_are_validated() {
         let mut c = Canvas::from_markdown("# Root\n```starlark\nnot_valid()\n```\n```starlark constraint render\nprint(1)\n```\n```starlark render output=\"text\"\nprint(2)\n```").unwrap();
-        annotate(&mut c, None, &DiskFiles);
+        annotate(&mut c, None, &DiskFiles, &Default::default());
         assert_eq!(c.nodes[0].render_results.len(), 2);
         assert!(c.nodes[0].render_results.iter().all(|r| r.error.is_some()));
-        assert!(crate::constraint::evaluate_with_access(&c, None, &DiskFiles).is_empty());
+        assert!(
+            crate::constraint::evaluate_with_access(&c, None, &DiskFiles, &Default::default())
+                .is_empty()
+        );
     }
 }

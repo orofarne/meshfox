@@ -1776,9 +1776,9 @@ impl CanvasCtx {
     /// Evaluates the `starlark render` fences and returns the Markdown each computes — the view the web UI and TUI show under its `starlark · name` header. `node` and `name` narrow it. A block that fails comes back with `ok: false` and its Starlark `error` (and makes the overall `ok` false); naming a node or block with no render fence is a tool error.
     async fn render(&self, params: RenderParams) -> Result<CallToolResult, ErrorData> {
         let raw = self.read_raw().await?;
-        let (mut canvas, access) =
+        let (mut canvas, access, vars) =
             crate::resolved_for_evaluation(&raw, &self.canvas_path).map_err(invalid_params)?;
-        let outcomes = crate::render_outcomes(&mut canvas, &self.canvas_path, &access);
+        let outcomes = crate::render_outcomes(&mut canvas, &self.canvas_path, &access, &vars);
         let total = outcomes.len();
         let selected: Vec<_> = outcomes
             .iter()

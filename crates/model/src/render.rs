@@ -64,14 +64,24 @@ pub fn render_canvas_lenient(
 fn finish(mut canvas: Canvas, canvas_path: &Path, files: &dyn FileSource) -> Canvas {
     // A runnable file node's block fingerprint covers its target's content.
     canvas.hydrate_target_digests_with(canvas_path, files);
-    annotate_resolved(&mut canvas, canvas_root_dir(canvas_path), files);
+    annotate_resolved(
+        &mut canvas,
+        canvas_root_dir(canvas_path),
+        files,
+        &crate::script_vars::ScriptVars::default(),
+    );
     canvas
 }
 
 /// The annotation passes over an already include-resolved canvas, in order:
 /// constraint pass/fail badges, computed Starlark views, declared options,
 /// tag-derived colors, body revisions.
-pub fn annotate_resolved(canvas: &mut Canvas, base_dir: &Path, files: &dyn FileSource) {
+pub fn annotate_resolved(
+    canvas: &mut Canvas,
+    base_dir: &Path,
+    files: &dyn FileSource,
+    vars: &crate::script_vars::ScriptVars,
+) {
     // Every embedded constraint fence's script itself is cheap and pure
     // (tick/heap/callstack-bounded — see `constraint::evaluate`); the only
     // I/O it can trigger is a `file`-type node's own already-declared
@@ -79,8 +89,8 @@ pub fn annotate_resolved(canvas: &mut Canvas, base_dir: &Path, files: &dyn FileS
     // `display="code"` preview is. Running every constraint on every fetch
     // keeps a viewer's pass/fail badges current without a separate
     // endpoint or a stale cache to invalidate.
-    crate::constraint::annotate_status_with_access(canvas, Some(base_dir), files);
-    crate::starlark_render::annotate(canvas, Some(base_dir), files);
+    crate::constraint::annotate_status_with_access(canvas, Some(base_dir), files, vars);
+    crate::starlark_render::annotate(canvas, Some(base_dir), files, vars);
     // Best-effort: a malformed `meshfox:option` declaration shouldn't break
     // *viewing* the canvas (falls back to no options declared, same as if
     // there were none at all) — validation is what surfaces that loudly,

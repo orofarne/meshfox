@@ -331,13 +331,7 @@ impl FileAccess {
     /// and `@tmp` can grant anything. A `from=`-computed `dir` variable
     /// needs a run's output and grants nothing here.
     pub fn for_canvas_path(canvas: &Canvas, canvas_path: &Path) -> FileAccess {
-        let cache = crate::varcache::VarCache::load_read_only(canvas_path)
-            .unwrap_or_else(|_| crate::varcache::VarCache::in_memory());
-        let root = match canvas_path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        let shared = crate::shared_env::load(root);
+        let (cache, shared) = read_only_var_state(canvas_path);
         FileAccess::resolve(
             canvas,
             canvas_path,
@@ -409,6 +403,20 @@ impl FileAccess {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(fallback)
     }
+}
+
+/// The answer cache and shared config as a caller with no live session state
+/// sees them: read from disk, never written.
+pub(crate) fn read_only_var_state(
+    canvas_path: &Path,
+) -> (crate::varcache::VarCache, crate::shared_env::SharedEnv) {
+    let cache = crate::varcache::VarCache::load_read_only(canvas_path)
+        .unwrap_or_else(|_| crate::varcache::VarCache::in_memory());
+    let root = match canvas_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    (cache, crate::shared_env::load(root))
 }
 
 /// [`Canvas::hydrate_target_digests_with`] against the real disk, with the

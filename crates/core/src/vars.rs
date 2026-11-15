@@ -816,6 +816,77 @@ pub fn declared_vars(canvas: &Canvas) -> Result<Vec<VarDecl>, VarsError> {
     Ok(scanned.into_iter().map(|s| s.decl).collect())
 }
 
+/// The value of `decl` as a Starlark fence sees it: typed by the declaration
+/// (`int` an integer, `bool` a boolean, `list` a list of its typed items),
+/// otherwise the string. `None` for a value that doesn't fit the type, which
+/// `resolve` has already reported as invalid anyway.
+fn script_value(
+    value: &str,
+    var_type: VarType,
+    of: Option<VarType>,
+) -> Option<meshfox_model::script_vars::ScriptValue> {
+    use meshfox_model::script_vars::ScriptValue;
+    Some(match var_type {
+        VarType::Int => ScriptValue::Int(value.trim().parse().ok()?),
+        VarType::Bool => ScriptValue::Bool(match value {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        }),
+        VarType::List => ScriptValue::List(
+            crate::listvars::parse_list(value)
+                .ok()?
+                .into_iter()
+                .map(|item| script_value(&item, of.unwrap_or(VarType::String), None))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => ScriptValue::Str(value.to_string()),
+    })
+}
+
+/// What a Starlark fence reads as `vars` (SPEC.md, "Variables in Starlark"):
+/// every declared, non-secret variable that has a value without asking
+/// anyone -- from `overrides`, the environment, `cache`, `shared`, its
+/// default, a `content=` fence or `computed` -- typed by its declaration. A
+/// variable with no such value is simply absent; a secret never appears.
+pub fn script_vars_with(
+    canvas: &Canvas,
+    overrides: &HashMap<String, String>,
+    cache: &crate::varcache::VarCache,
+    computed: &HashMap<String, String>,
+    shared: &crate::shared_env::SharedEnv,
+) -> meshfox_model::script_vars::ScriptVars {
+    let scanned = scan_all_var_decls(canvas).unwrap_or_default();
+    let decls: Vec<VarDecl> = scanned
+        .iter()
+        .filter(|s| !s.decl.secret)
+        .map(|s| s.decl.clone())
+        .collect();
+    let resolved = preview_with_shared(&decls, overrides, cache, computed, shared);
+    let mut out = meshfox_model::script_vars::ScriptVars::new();
+    for s in scanned.iter().filter(|s| !s.decl.secret) {
+        let Some(value) = resolved.values.get(&s.decl.name) else {
+            continue;
+        };
+        if let Some(value) = script_value(value, s.decl.var_type, s.decl.of) {
+            out.insert(&s.decl.name, &s.owner_node, value);
+        }
+    }
+    out
+}
+
+/// [`script_vars_with`] for a caller with no live session state (`meshfox
+/// check`, a plain page load): the process environment, the on-disk answer
+/// cache, shared config and defaults only. A `from=`-computed variable needs
+/// a run's output and is absent.
+pub fn script_vars_for_canvas_path(
+    canvas: &Canvas,
+    canvas_path: &std::path::Path,
+) -> meshfox_model::script_vars::ScriptVars {
+    let (cache, shared) = crate::dirvars::read_only_var_state(canvas_path);
+    script_vars_with(canvas, &HashMap::new(), &cache, &HashMap::new(), &shared)
+}
+
 /// True if `node_id` is `ancestor_id` itself or a (transitive) descendant of
 /// it, by document nesting (`Node::parent`) — same walk-up-the-parent-chain
 /// shape `Canvas::resolve_absolute_position` already uses for group offsets,
@@ -2000,6 +2071,50 @@ mod tests {
         );
         let decls = declared_vars(&canvas(doc)).unwrap();
         assert!(decls[0].session);
+    }
+
+    #[test]
+    fn script_vars_are_typed_skip_secrets_and_missing_values_and_keep_scope() {
+        use meshfox_model::script_vars::ScriptValue;
+        let doc = concat!(
+            "# Root\n\n",
+            "<!-- meshfox:var name=\"MFX_SV_S\" default=\"text\" -->\n",
+            "<!-- meshfox:var name=\"MFX_SV_N\" type=\"int\" default=\"7\" -->\n",
+            "<!-- meshfox:var name=\"MFX_SV_B\" type=\"bool\" default=\"true\" -->\n",
+            "<!-- meshfox:var name=\"MFX_SV_L\" type=\"list\" of=\"int\" default=\"[1,2]\" -->\n",
+            "<!-- meshfox:var name=\"MFX_SV_SECRET\" secret default=\"hunter2\" -->\n",
+            "<!-- meshfox:var name=\"MFX_SV_NOVALUE\" -->\n",
+            "<!-- meshfox:var name=\"MFX_SV_Q\" content=\"queries/get-users\" -->\n\n",
+            "## Queries\n<!-- meshfox:node id=\"queries\" -->\n\n",
+            "<!-- meshfox:var name=\"MFX_SV_LOCAL\" default=\"l\" -->\n",
+            "```sql name=\"get-users\"\nSELECT 1\n```\n",
+        );
+        let c = canvas(doc);
+        let vars = script_vars_with(
+            &c,
+            &HashMap::new(),
+            &crate::varcache::VarCache::in_memory(),
+            &HashMap::new(),
+            &crate::shared_env::SharedEnv::new(),
+        );
+        assert_eq!(vars.get("MFX_SV_S"), Some(&ScriptValue::Str("text".into())));
+        assert_eq!(vars.get("MFX_SV_N"), Some(&ScriptValue::Int(7)));
+        assert_eq!(vars.get("MFX_SV_B"), Some(&ScriptValue::Bool(true)));
+        assert_eq!(
+            vars.get("MFX_SV_L"),
+            Some(&ScriptValue::List(vec![
+                ScriptValue::Int(1),
+                ScriptValue::Int(2)
+            ]))
+        );
+        assert_eq!(
+            vars.get("MFX_SV_Q"),
+            Some(&ScriptValue::Str("SELECT 1".into()))
+        );
+        assert!(vars.get("MFX_SV_SECRET").is_none());
+        assert!(vars.get("MFX_SV_NOVALUE").is_none());
+        // Node-scoped: present, but only offered to its own subtree.
+        assert!(vars.get("MFX_SV_LOCAL").is_some());
     }
 
     fn content_doc(var: &str) -> String {

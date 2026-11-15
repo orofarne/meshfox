@@ -18,7 +18,12 @@ use std::path::Path;
 /// want constraints touching disk at all), which makes every one of those
 /// calls return `None` rather than erroring.
 pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResult> {
-    evaluate_with_access(canvas, base_dir, &crate::dirvars::FileAccess::none())
+    evaluate_with_access(
+        canvas,
+        base_dir,
+        &crate::dirvars::FileAccess::none(),
+        &Default::default(),
+    )
 }
 
 /// Runs every embedded constraint fence's script and writes each node's
@@ -27,7 +32,12 @@ pub fn evaluate(canvas: &Canvas, base_dir: Option<&Path>) -> Vec<ConstraintResul
 /// server, before serving `GET /api/canvas`), populated by a consumer
 /// rather than by parsing. `base_dir` is forwarded to `evaluate` as-is.
 pub fn annotate_status(canvas: &mut Canvas, base_dir: Option<&Path>) {
-    annotate_status_with_access(canvas, base_dir, &crate::dirvars::FileAccess::none())
+    annotate_status_with_access(
+        canvas,
+        base_dir,
+        &crate::dirvars::FileAccess::none(),
+        &Default::default(),
+    )
 }
 
 #[cfg(test)]
@@ -84,7 +94,8 @@ mod tests {
         let canvas = Canvas::from_markdown(&raw).unwrap();
         let resolved = crate::include::resolve(&canvas, &path).unwrap();
         let access = crate::FileAccess::for_canvas_path(&resolved, &path);
-        let results = evaluate_with_access(&resolved, Some(&canvas_dir), &access);
+        let results =
+            evaluate_with_access(&resolved, Some(&canvas_dir), &access, &Default::default());
         std::env::remove_var(var);
 
         assert_eq!(results.len(), 1);

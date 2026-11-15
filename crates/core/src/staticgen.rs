@@ -2072,7 +2072,12 @@ mod tests {
     #[test]
     fn computed_starlark_export_has_collapsible_source_and_a_real_table() {
         let mut c = canvas("# Root\n```starlark render name=\"counts\"\nprint(md.table(headers=[\"Tag\", \"Count\"], rows=[[md.link(\"todo\", \"https://example.com\"), 2]]))\n```\n");
-        crate::starlark_render::annotate(&mut c, None, &crate::FileAccess::none());
+        crate::starlark_render::annotate(
+            &mut c,
+            None,
+            &crate::FileAccess::none(),
+            &Default::default(),
+        );
         let site = build_site(&c);
         let html = &site.root.html_body;
         assert!(

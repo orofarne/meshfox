@@ -8590,7 +8590,12 @@ fn resolve_includes(canvas: &Canvas, canvas_path: &Path) -> Canvas {
     let canvas_dir = canvas_path.parent().filter(|p| !p.as_os_str().is_empty());
     let canvas_dir = Some(canvas_dir.unwrap_or(Path::new(".")));
     let access = meshfox_core::FileAccess::for_canvas_path(&resolved, canvas_path);
-    meshfox_core::constraint::annotate_status_with_access(&mut resolved, canvas_dir, &access);
+    meshfox_core::constraint::annotate_status_with_access(
+        &mut resolved,
+        canvas_dir,
+        &access,
+        &Default::default(),
+    );
     // Same "populate before flatten reads it" idiom as `constraint_results`
     // right above, for `meshfox:tag-color` (TODO.canvas.md: "Node colour by
     // tag") — best-effort, a malformed declaration just means no node

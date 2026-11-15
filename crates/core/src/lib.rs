@@ -61,6 +61,7 @@ pub mod service;
 pub mod service_lock;
 pub mod shared_env;
 pub mod slug;
+pub use meshfox_model::script_vars;
 pub use meshfox_model::starlark_render;
 pub mod staticgen;
 pub use meshfox_model::subsup;
@@ -128,9 +129,10 @@ pub use varout::{
 pub use vars::{
     close_over_var_refs, declared_vars, filter_choices, invalid_vars_error, map_block_env,
     pending_choices_source, preview_with_shared, resolve as resolve_vars, resolve_block_env,
-    resolve_block_env_with_shared, resolve_with_shared, validate_env_refs, validate_value,
-    validate_var_refs, validate_var_scope, BlockEnvResolution, ChoicesPending, FileMode,
-    InvalidVar, ResolvedVars, ValueSource, VarDecl, VarType, VarsError,
+    resolve_block_env_with_shared, resolve_with_shared, script_vars_for_canvas_path,
+    script_vars_with, validate_env_refs, validate_value, validate_var_refs, validate_var_scope,
+    BlockEnvResolution, ChoicesPending, FileMode, InvalidVar, ResolvedVars, ValueSource, VarDecl,
+    VarType, VarsError,
 };
 
 pub use attrs::UnknownAttrError;

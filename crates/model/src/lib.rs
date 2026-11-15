@@ -31,6 +31,7 @@ pub mod options;
 pub mod output;
 pub mod pack;
 pub mod render;
+pub mod script_vars;
 pub mod slug;
 pub mod starlark_render;
 pub mod subsup;

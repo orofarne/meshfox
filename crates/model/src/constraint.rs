@@ -186,6 +186,7 @@ pub fn evaluate_with_access(
     canvas: &Canvas,
     base_dir: Option<&Path>,
     access: &dyn crate::file_source::FileSource,
+    vars: &crate::script_vars::ScriptVars,
 ) -> Vec<ConstraintResult> {
     let prelude = build_prelude(canvas, base_dir, access);
     let globals = globals();
@@ -194,6 +195,7 @@ pub fn evaluate_with_access(
         let blocks = crate::fence::scan_constraint_blocks(&node.text);
         let total = blocks.len();
         for (i, block) in blocks.into_iter().enumerate() {
+            let prelude = format!("{prelude}{}", vars.prelude_for(canvas, &node.id));
             results.push(evaluate_one(&prelude, &globals, node, block, i + 1, total));
         }
     }
@@ -206,10 +208,11 @@ pub fn annotate_status_with_access(
     canvas: &mut Canvas,
     base_dir: Option<&Path>,
     access: &dyn crate::file_source::FileSource,
+    vars: &crate::script_vars::ScriptVars,
 ) {
     let mut by_node: std::collections::HashMap<String, Vec<ConstraintStatus>> =
         std::collections::HashMap::new();
-    for result in evaluate_with_access(canvas, base_dir, access) {
+    for result in evaluate_with_access(canvas, base_dir, access, vars) {
         by_node
             .entry(result.node_id.clone())
             .or_default()
@@ -525,7 +528,7 @@ fn parse_csv(content: &str) -> Option<serde_json::Value> {
 /// A Starlark double-quoted string literal for `s` — same escaping rules
 /// as Python's, which is all a node id/title/tag should ever need since
 /// they're arbitrary user text (a heading can contain a `"` or a newline).
-fn star_str(s: &str) -> String {
+pub(crate) fn star_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -550,11 +553,11 @@ mod tests {
     use crate::test_disk::DiskFiles;
 
     fn evaluate(c: &crate::canvas::Canvas, base: Option<&Path>) -> Vec<ConstraintResult> {
-        evaluate_with_access(c, base, &DiskFiles)
+        evaluate_with_access(c, base, &DiskFiles, &Default::default())
     }
 
     fn annotate_status(c: &mut crate::canvas::Canvas, base: Option<&Path>) {
-        annotate_status_with_access(c, base, &DiskFiles)
+        annotate_status_with_access(c, base, &DiskFiles, &Default::default())
     }
 
     use super::*;
@@ -890,6 +893,57 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meshfox-constraint-test-{tag}-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn evaluate_with_vars(
+        c: &crate::canvas::Canvas,
+        vars: &crate::script_vars::ScriptVars,
+    ) -> Vec<ConstraintResult> {
+        evaluate_with_access(c, None, &DiskFiles, vars)
+    }
+
+    #[test]
+    fn vars_are_typed_and_scoped_to_the_declaring_subtree() {
+        use crate::script_vars::{ScriptValue, ScriptVars};
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ```starlark constraint name=\"global\"\n\
+             if vars[\"NAME\"] != \"x\" or vars[\"N\"] != 3 or vars[\"ON\"] != True:\n\x20   fail(\"wrong values: \" + str(vars))\n\
+             if vars[\"TAGS\"] != [\"a\", \"b\"]:\n\x20   fail(\"wrong list\")\n\
+             if \"LOCAL\" in vars or vars.get(\"MISSING\") != None:\n\x20   fail(\"out of scope or missing leaked\")\n\
+             ```\n\n\
+             ## Inner\n<!-- meshfox:node id=\"inner\" -->\n\n\
+             ```starlark constraint name=\"local\"\n\
+             if vars[\"LOCAL\"] != \"here\" or vars[\"NAME\"] != \"x\":\n\x20   fail(\"inner scope lost a value\")\n\
+             ```\n",
+        );
+        let mut vars = ScriptVars::new();
+        vars.insert("NAME", "root", ScriptValue::Str("x".into()));
+        vars.insert("N", "root", ScriptValue::Int(3));
+        vars.insert("ON", "root", ScriptValue::Bool(true));
+        vars.insert(
+            "TAGS",
+            "root",
+            ScriptValue::List(vec![
+                ScriptValue::Str("a".into()),
+                ScriptValue::Str("b".into()),
+            ]),
+        );
+        vars.insert("LOCAL", "inner", ScriptValue::Str("here".into()));
+        let results = evaluate_with_vars(&c, &vars);
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(r.ok, "{}: {:?}", r.label, r.messages);
+        }
+    }
+
+    #[test]
+    fn vars_is_an_empty_dict_when_nothing_is_offered() {
+        let c = canvas(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n\
+             ```starlark constraint\nif len(vars) != 0:\n\x20   fail(\"not empty\")\n```\n",
+        );
+        assert!(evaluate(&c, None)[0].ok);
     }
 
     #[test]
