@@ -4536,6 +4536,7 @@ async fn preflight_worker_vars(
 /// defaults, since none of them change `ask`'s own prompting behavior.
 fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
     VarDecl {
+        content: None,
         of: None,
         name: status.name.clone(),
         var_type: VarType::parse(&status.var_type).unwrap_or(VarType::String),
@@ -8730,6 +8731,7 @@ mod set_override_tests {
 
     fn decl(name: &str, var_type: meshfox_core::VarType, choices: &[&str]) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type,

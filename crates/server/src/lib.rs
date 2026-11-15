@@ -3527,7 +3527,12 @@ async fn get_vars_with_plan(
     let form_fields = chain_form_fields(&canvas, &chain);
     let relevant: Vec<_> = decls
         .iter()
-        .filter(|d| needed.contains(&d.name) && d.from.is_none() && !form_fields.contains(&d.name))
+        .filter(|d| {
+            needed.contains(&d.name)
+                && d.from.is_none()
+                && d.content.is_none()
+                && !form_fields.contains(&d.name)
+        })
         .cloned()
         .collect();
 
@@ -3875,7 +3880,9 @@ async fn get_configure_vars(
         == meshfox_core::secret_store::SecretStoreKind::Keychain;
     let configurable: Vec<_> = decls
         .iter()
-        .filter(|d| (keychain || !d.secret) && !d.session && d.from.is_none())
+        .filter(|d| {
+            (keychain || !d.secret) && !d.session && d.from.is_none() && d.content.is_none()
+        })
         .cloned()
         .collect();
 
@@ -19038,6 +19045,7 @@ mod var_status_tests {
         secret: bool,
     ) -> meshfox_core::VarDecl {
         meshfox_core::VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type: meshfox_core::VarType::String,

@@ -279,6 +279,7 @@ mod tests {
 
     fn list_decl(choices: &[&str], of: Option<VarType>) -> VarDecl {
         VarDecl {
+            content: None,
             of,
             name: "REGIONS".into(),
             var_type: VarType::List,
@@ -378,6 +379,7 @@ mod tests {
     #[test]
     fn a_select_with_pending_choices_keeps_its_value_or_errors() {
         let mut decl = VarDecl {
+            content: None,
             of: None,
             name: "FONT".into(),
             var_type: VarType::Select,

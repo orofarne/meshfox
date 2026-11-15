@@ -635,6 +635,23 @@ pub fn scan_code_blocks(markdown: &str) -> Vec<CodeBlock> {
         .collect()
 }
 
+/// The raw text of the backtick fence named `name` (`name="..."` in its info
+/// string) in `markdown`: exactly the lines between the delimiters, with no
+/// trailing newline. Unlike `scan_code_blocks` any language qualifies, since
+/// a fence read only as text (`meshfox:var content=`) never has to be
+/// runnable; a fence inside a cached-output region never counts. The first
+/// match wins.
+pub fn named_fence_text(markdown: &str, name: &str) -> Option<String> {
+    let output_ranges = crate::output::output_byte_ranges(markdown);
+    scan_raw_fences(markdown).into_iter().find_map(|f| {
+        if f.delim_char != '`' || in_output_region(&output_ranges, f.span.start) {
+            return None;
+        }
+        let (_, attrs) = parse_info_string(&f.info);
+        (attrs.get("name").map(String::as_str) == Some(name)).then_some(f.code)
+    })
+}
+
 /// Same as `scan_code_blocks`, but a node may have *one* fence with no
 /// `name` at all — it's runnable too, implicitly named after `node_id`
 /// (see SPEC.md's "Runnable code fences": this is what lets `meshfox

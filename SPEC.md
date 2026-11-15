@@ -2466,6 +2466,47 @@ Attributes:
   never cached, defaulted, or prompted for. `type`/`choices` still apply,
   validated against whatever the source block actually produced.
 
+### Fence text as a value (`content=`)
+
+`content="node-id/block-name"` makes the value of a variable the **text of a
+fence** — the lines between its delimiters, with no trailing newline and no
+delimiters. A bare `content="block-name"` names a fence in the node the
+variable is declared in, like `from=` and `deps=`:
+
+    <!-- meshfox:var name="QUERY" content="queries/get-users" -->
+
+    ```sql name="get-users"
+    SELECT * FROM users WHERE active
+    ```
+
+    ```bash name="run" env="QUERY"
+    psql -c "$QUERY"
+    ```
+
+- The fence is only read: it is never run, and there is no dependency edge.
+  Any language qualifies (`sql`, `json`, ...), the fence only needs a
+  `name=`. A fence inside a cached-output region never counts.
+- The value is read from the canvas each time, so editing the fence changes
+  the value, and a block whose `env=` references it counts as changed for
+  freshness (like any variable whose resolved value changed).
+- Never user-suppliable, like `from=`: `--set`, a submitted form, the
+  environment, the cache and shared config are all ignored, `configure` and
+  the pre-run form never offer it, and a `form` field can't target it.
+- Combining `content=` with `from`, `default`, `default_var`, `required`,
+  `secret`, `session`, `choices`, `choices_var` or a `type` other than
+  `string` is an error. A `?` condition is not allowed either.
+- A reference to a fence that doesn't exist fails the run, naming the
+  variable and the node (`meshfox validate` reports it too).
+- The value travels in the process environment, which the OS limits (about
+  128 KiB per variable on Linux, about 1 MiB in total on macOS). When the OS
+  refuses to start the process, the run fails naming the largest variables.
+
+- `content` — `content="node-id/block-name"`: the value is that fence's
+  text, see "Fence text as a value (`content=`)" below. Mutually exclusive
+  with every other source of a value (`from`, `default`, `default_var`,
+  `required`, `secret`, `session`, `choices`, `choices_var`, non-`string`
+  `type`).
+
 ### Named environment builtins
 
 `@python_venv` and `@node_env` accept optional whitespace-separated
@@ -3665,7 +3706,7 @@ unrecognized key, for forward/backward compatibility across format versions
                      | 'arrowEnd' | 'tags' | 'sourceSide' | 'targetSide' | 'via'
     var-attr       ::= 'name' | 'type' | 'prompt' | 'default' | 'default_var'
                      | 'choices' | 'choices_var' | 'secret' | 'required'
-                     | 'session' | 'from'
+                     | 'session' | 'from' | 'content'
     option-attr    ::= 'name'
     tag-color-attr ::= 'tag' | 'color'
     output-attr    ::= 'name'

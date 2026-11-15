@@ -5,6 +5,41 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
+/// Turns the OS refusing to start a process because its environment is too big
+/// (`E2BIG`, "Argument list too long" -- 7 on Linux, macOS and the BSDs) into an
+/// error that names the variables to blame. Any other error passes through
+/// unchanged. The limit is the OS's own (about 128 KiB for one variable on
+/// Linux, about 1 MiB for the whole environment on macOS), so it is learned
+/// from the refusal rather than guessed.
+pub fn explain_env_too_large(
+    error: std::io::Error,
+    envs: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> std::io::Error {
+    const E2BIG: i32 = 7;
+    if error.raw_os_error() != Some(E2BIG) {
+        return error;
+    }
+    let mut sizes: Vec<(String, usize)> = envs
+        .iter()
+        .filter(|(k, _)| !is_run_context(k))
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.len()))
+        .collect();
+    sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    let largest: Vec<String> = sizes
+        .iter()
+        .take(3)
+        .map(|(name, len)| format!("{name} ({:.1} KiB)", *len as f64 / 1024.0))
+        .collect();
+    std::io::Error::other(format!(
+        "the environment for this block is too large for the operating system to start it \
+         (Argument list too long); largest variables: {}. A variable's value, including a \
+         `content=` fence's text, is passed in the process environment, which the OS limits \
+         (about 128 KiB per variable on Linux, about 1 MiB in total on macOS) -- use a smaller \
+         value",
+        largest.join(", ")
+    ))
+}
+
 pub fn is_run_context(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     matches!(

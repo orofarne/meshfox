@@ -462,6 +462,27 @@ where
     K: AsRef<std::ffi::OsStr>,
     V: AsRef<std::ffi::OsStr>,
 {
+    // A variable's value travels in the process environment, which the OS
+    // bounds; say which variable is to blame instead of a bare E2BIG.
+    let envs: Vec<(std::ffi::OsString, std::ffi::OsString)> = envs
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_os_string(), v.as_ref().to_os_string()))
+        .collect();
+    spawn_block_with(block, envs.iter().map(|(k, v)| (k, v)), cwd, canvas_path)
+        .map_err(|e| meshfox_core::process_env::explain_env_too_large(e, &envs))
+}
+
+fn spawn_block_with<I, K, V>(
+    block: &meshfox_core::CodeBlock,
+    envs: I,
+    cwd: Option<&Path>,
+    canvas_path: Option<&Path>,
+) -> io::Result<SpawnedProcess>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
     if meshfox_core::is_button(&block.lang) {
         // A `button` fence has no real code of its own — its whole point is
         // its `deps=` chain, already run before this by the same caller

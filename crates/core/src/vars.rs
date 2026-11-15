@@ -174,6 +174,21 @@ pub struct VarDecl {
     /// `of="int"` — the item type of a `type="list"` variable (`None` means
     /// plain strings). Only `Some` for a list.
     pub of: Option<VarType>,
+    /// `content="node-id/block-name"` -- the value is the text of that
+    /// fence (see [`VarContent`]). Never prompted for, defaulted, cached or
+    /// supplied from outside, and the block is never run.
+    pub content: Option<VarContent>,
+}
+
+/// The `content=` source of a variable: which fence, and its text as of the
+/// canvas the declaration was read from (`declared_vars` fills it in, so an
+/// edit to the fence is a new value on the next read).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarContent {
+    /// Always fully qualified (`node_id` is `Some`) once it leaves `declared_vars`.
+    pub block: crate::fence::BlockRef,
+    /// `None` when no fence of that name exists in the node.
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -216,6 +231,16 @@ pub enum VarsError {
         "meshfox:var {0:?} combines from= with {1}=, which isn't allowed for a computed variable"
     )]
     FromConflict(String, &'static str),
+    #[error("meshfox:var {0:?} has an empty content= target")]
+    EmptyContent(String),
+    #[error("meshfox:var {0:?} has a `?` condition in content=, which only deps= supports")]
+    ContentCondition(String),
+    #[error("meshfox:var {0:?} combines content= with {1}=, which isn't allowed for a variable whose value is a block's text")]
+    ContentConflict(String, &'static str),
+    #[error("node {0:?} form {1:?} has a `field var=\"{2}\"`, but {2:?} is content=-bound — a form field can't target it, its value is always the block's own text")]
+    FormFieldTargetsContentVar(String, String, String),
+    #[error("meshfox:var {0:?} has content=\"{1}/{2}\", but node {1:?} has no fence named {2:?}")]
+    ContentBlockNotFound(String, String, String),
     #[error("meshfox:var {0:?} combines default= with default_var=, only one may be given")]
     DefaultConflict(String),
     #[error("meshfox:var {0:?} combines choices= with choices_var=, only one may be given")]
@@ -296,6 +321,7 @@ const VAR_ATTRS: &[&str] = &[
     "default",
     "default_var",
     "from",
+    "content",
     "mode",
     "ext",
     "of",
@@ -408,7 +434,37 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
             return Err(VarsError::FromConflict(name, "choices_var"));
         }
     }
+    let content = match attrs.get("content") {
+        None => None,
+        Some(s) if s.trim().is_empty() => return Err(VarsError::EmptyContent(name)),
+        Some(s) => {
+            let block = crate::fence::parse_block_ref(s.trim());
+            if block.condition.is_some() {
+                return Err(VarsError::ContentCondition(name));
+            }
+            Some(VarContent { block, text: None })
+        }
+    };
+    if content.is_some() {
+        let conflict = [
+            (from.is_some(), "from"),
+            (default.is_some(), "default"),
+            (default_var.is_some(), "default_var"),
+            (required, "required"),
+            (secret, "secret"),
+            (session, "session"),
+            (choices_var.is_some(), "choices_var"),
+            (!choices.is_empty(), "choices"),
+            (var_type != VarType::String, "type"),
+        ]
+        .into_iter()
+        .find_map(|(set, what)| set.then_some(what));
+        if let Some(what) = conflict {
+            return Err(VarsError::ContentConflict(name, what));
+        }
+    }
     Ok(VarDecl {
+        content,
         of,
         name,
         var_type,
@@ -521,6 +577,7 @@ fn validate_list_value(decl: &VarDecl, value: &str) -> Result<(), String> {
     let items = crate::listvars::parse_list(value)
         .map_err(|e| format!("{:?} {e}, got {value:?}", decl.name))?;
     let item_decl = VarDecl {
+        content: None,
         var_type: decl.of.unwrap_or(VarType::String),
         of: None,
         choices: Vec::new(),
@@ -715,10 +772,25 @@ fn scan_all_var_decls(canvas: &Canvas) -> Result<Vec<ScannedVar>, VarsError> {
                     from.node_id = Some(node.id.clone());
                 }
             }
+            if let Some(content) = &mut decl.content {
+                if content.block.node_id.is_none() {
+                    content.block.node_id = Some(node.id.clone());
+                }
+            }
             out.push(ScannedVar {
                 owner_node: node.id.clone(),
                 decl,
             });
+        }
+    }
+    for scanned in &mut out {
+        if let Some(content) = &mut scanned.decl.content {
+            content.text = content
+                .block
+                .node_id
+                .as_deref()
+                .and_then(|id| canvas.node(id))
+                .and_then(|n| crate::fence::named_fence_text(&n.text, &content.block.block_name));
         }
     }
     Ok(out)
@@ -917,6 +989,13 @@ pub fn validate_var_scope(canvas: &Canvas) -> Result<(), VarsError> {
                     if let Some(decl) = decls_by_name.get(var_name.as_str()) {
                         if decl.from.is_some() {
                             return Err(VarsError::FormFieldTargetsComputedVar(
+                                node.id.clone(),
+                                block.name.clone().unwrap_or_default(),
+                                var_name,
+                            ));
+                        }
+                        if decl.content.is_some() {
+                            return Err(VarsError::FormFieldTargetsContentVar(
                                 node.id.clone(),
                                 block.name.clone().unwrap_or_default(),
                                 var_name,
@@ -1184,6 +1263,8 @@ pub enum ValueSource {
     Environment,
     Cache,
     Shared,
+    /// The `content=` fence of the declaration itself.
+    Content,
 }
 
 impl ValueSource {
@@ -1193,6 +1274,7 @@ impl ValueSource {
             ValueSource::Environment => "the process environment",
             ValueSource::Cache => "the variable cache",
             ValueSource::Shared => "shared config",
+            ValueSource::Content => "its content= block",
         }
     }
 }
@@ -1219,6 +1301,7 @@ pub fn invalid_vars_error(invalid: &[InvalidVar]) -> String {
                 ValueSource::Environment => " — fix or unset it in the environment",
                 ValueSource::Shared => " — fix it in the shared config",
                 ValueSource::Override => "",
+                ValueSource::Content => " — fix the content= reference or add the fence",
             };
             format!("{} (from {}){fix}", i.message, i.source.describe())
         })
@@ -1334,6 +1417,28 @@ pub fn resolve_with_shared(
     let mut secret_errors = HashMap::new();
     let mut invalid = Vec::new();
     for decl in topo_order(decls) {
+        // A `content=` variable is the text of a fence: nothing outside the
+        // canvas (not `--set`, the environment, the cache, shared config)
+        // can supply it, and it is never missing -- a dangling reference is
+        // reported as invalid instead, so the run fails with the reason.
+        if let Some(content) = &decl.content {
+            match &content.text {
+                Some(text) => {
+                    values.insert(decl.name.clone(), text.clone());
+                }
+                None => invalid.push(InvalidVar {
+                    name: decl.name.clone(),
+                    source: ValueSource::Content,
+                    message: format!(
+                        "{}: node {:?} has no fence named {:?}",
+                        decl.name,
+                        content.block.node_id.as_deref().unwrap_or_default(),
+                        content.block.block_name
+                    ),
+                }),
+            }
+            continue;
+        }
         if decl.from.is_some() {
             match computed.get(&decl.name) {
                 Some(v) => {
@@ -1897,6 +2002,120 @@ mod tests {
         assert!(decls[0].session);
     }
 
+    fn content_doc(var: &str) -> String {
+        format!(
+            concat!(
+                "# Root\n\n{}\n\n",
+                "## Queries\n<!-- meshfox:node id=\"queries\" -->\n\n",
+                "```sql name=\"get-users\"\nSELECT *\n  FROM users\n```\n",
+            ),
+            var
+        )
+    }
+
+    #[test]
+    fn a_content_var_resolves_to_the_fence_text_and_normalizes_a_bare_node() {
+        let doc = content_doc("<!-- meshfox:var name=\"QUERY\" content=\"queries/get-users\" -->");
+        let decls = declared_vars(&canvas(&doc)).unwrap();
+        let content = decls[0].content.as_ref().unwrap();
+        assert_eq!(content.block.node_id.as_deref(), Some("queries"));
+        assert_eq!(content.text.as_deref(), Some("SELECT *\n  FROM users"));
+        let r = resolve(
+            &decls,
+            &HashMap::new(),
+            &crate::varcache::VarCache::default(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.values["QUERY"], "SELECT *\n  FROM users");
+        assert!(r.missing.is_empty() && r.invalid.is_empty());
+    }
+
+    #[test]
+    fn a_bare_content_target_means_a_fence_in_the_declaring_node() {
+        let doc = concat!(
+            "# Root\n\n## Q\n<!-- meshfox:node id=\"q\" -->\n\n",
+            "<!-- meshfox:var name=\"QUERY\" content=\"get\" -->\n",
+            "```sql name=\"get\"\nSELECT 1\n```\n",
+        );
+        let decls = declared_vars(&canvas(doc)).unwrap();
+        assert_eq!(
+            decls[0].content.as_ref().unwrap().text.as_deref(),
+            Some("SELECT 1")
+        );
+    }
+
+    #[test]
+    fn nothing_outside_the_canvas_can_supply_a_content_var() {
+        let doc = content_doc(
+            "<!-- meshfox:var name=\"MESHFOX_TEST_CONTENT_ENV\" content=\"queries/get-users\" -->",
+        );
+        let decls = declared_vars(&canvas(&doc)).unwrap();
+        std::env::set_var("MESHFOX_TEST_CONTENT_ENV", "from the environment");
+        let overrides = HashMap::from([("MESHFOX_TEST_CONTENT_ENV".to_string(), "x".to_string())]);
+        let r = resolve(
+            &decls,
+            &overrides,
+            &crate::varcache::VarCache::default(),
+            &HashMap::new(),
+        );
+        std::env::remove_var("MESHFOX_TEST_CONTENT_ENV");
+        assert_eq!(
+            r.values["MESHFOX_TEST_CONTENT_ENV"],
+            "SELECT *\n  FROM users"
+        );
+    }
+
+    #[test]
+    fn a_content_var_pointing_at_a_missing_fence_is_invalid_with_a_reason() {
+        let doc = content_doc("<!-- meshfox:var name=\"QUERY\" content=\"queries/nope\" -->");
+        let decls = declared_vars(&canvas(&doc)).unwrap();
+        let r = resolve(
+            &decls,
+            &HashMap::new(),
+            &crate::varcache::VarCache::default(),
+            &HashMap::new(),
+        );
+        assert!(r.values.is_empty() && r.missing.is_empty());
+        let text = invalid_vars_error(&r.invalid);
+        assert!(
+            text.contains("QUERY") && text.contains("no fence named \"nope\""),
+            "{text}"
+        );
+        assert!(crate::deps::validate(&canvas(&doc)).is_err());
+    }
+
+    #[test]
+    fn content_conflicts_with_every_other_source_of_a_value() {
+        for (extra, what) in [
+            ("default=\"x\"", "default"),
+            ("required", "required"),
+            ("secret", "secret"),
+            ("session", "session"),
+            ("from=\"queries/get-users\"", "from"),
+            ("default_var=\"Y\"", "default_var"),
+            ("type=\"int\"", "type"),
+        ] {
+            let attrs = parse_var_comment(&format!(
+                "<!-- meshfox:var name=\"X\" content=\"a/b\" {extra} -->"
+            ))
+            .unwrap();
+            assert_eq!(
+                build_var_decl(attrs).unwrap_err(),
+                VarsError::ContentConflict("X".to_string(), what)
+            );
+        }
+        let attrs = parse_var_comment("<!-- meshfox:var name=\"X\" content=\" \" -->").unwrap();
+        assert_eq!(
+            build_var_decl(attrs).unwrap_err(),
+            VarsError::EmptyContent("X".to_string())
+        );
+        let attrs = parse_var_comment("<!-- meshfox:var name=\"X\" content=\"a/b?Y\" -->").unwrap();
+        assert_eq!(
+            build_var_decl(attrs).unwrap_err(),
+            VarsError::ContentCondition("X".to_string())
+        );
+    }
+
     #[test]
     fn a_root_declaration_stays_non_session_by_default() {
         let doc = "# Root\n\n<!-- meshfox:var name=\"X\" default=\"1\" -->\n";
@@ -2119,6 +2338,7 @@ mod tests {
 
     fn required_decl(name: &str, default: Option<&str>, secret: bool, required: bool) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type: VarType::String,
@@ -2317,6 +2537,7 @@ mod tests {
 
     fn typed_decl(name: &str, var_type: VarType, choices: &[&str]) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type,
@@ -2336,6 +2557,7 @@ mod tests {
 
     fn from_decl(name: &str, from: crate::fence::BlockRef) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type: VarType::String,
@@ -3118,6 +3340,7 @@ mod tests {
 
     fn session_decl(name: &str, required: bool) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type: VarType::String,
@@ -3267,6 +3490,7 @@ mod tests {
 
     fn default_var_decl(name: &str, default_var: &str) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type: VarType::String,
@@ -3286,6 +3510,7 @@ mod tests {
 
     fn choices_var_decl(name: &str, choices_var: &str) -> VarDecl {
         VarDecl {
+            content: None,
             of: None,
             name: name.to_string(),
             var_type: VarType::Select,

@@ -1155,6 +1155,7 @@ fn normalize_date_inputs(decls: &[VarDecl], inputs: &mut [String]) {
 fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
     let var_type = VarType::parse(&status.var_type).unwrap_or(VarType::String);
     VarDecl {
+        content: None,
         of: None,
         name: status.name.clone(),
         var_type,
@@ -8543,9 +8544,9 @@ impl App {
     /// them).
     pub fn has_configurable_vars(&self) -> bool {
         let keychain = self.secret_keychain;
-        self.decls
-            .iter()
-            .any(|d| (keychain || !d.secret) && !d.session && d.from.is_none())
+        self.decls.iter().any(|d| {
+            (keychain || !d.secret) && !d.session && d.from.is_none() && d.content.is_none()
+        })
     }
 
     fn cancel_var_form(&mut self) {
@@ -12207,6 +12208,7 @@ mod tests {
     #[test]
     fn typed_dates_are_normalized_before_validation() {
         let decl = |name: &str, var_type| VarDecl {
+            content: None,
             of: None,
             name: name.into(),
             var_type,
@@ -12247,6 +12249,7 @@ mod tests {
     #[test]
     fn list_fields_are_typed_as_text_and_stored_as_json() {
         let decl = VarDecl {
+            content: None,
             of: None,
             name: "REGIONS".into(),
             var_type: VarType::List,

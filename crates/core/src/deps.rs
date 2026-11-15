@@ -1150,6 +1150,19 @@ pub fn validate(canvas: &Canvas) -> Result<(), DepsError> {
             }
         }
     }
+    // Likewise a `content=` reference to a fence that no longer exists.
+    for decl in &decls {
+        if let Some(content) = &decl.content {
+            if content.text.is_none() {
+                return Err(crate::vars::VarsError::ContentBlockNotFound(
+                    decl.name.clone(),
+                    content.block.node_id.clone().unwrap_or_default(),
+                    content.block.block_name.clone(),
+                )
+                .into());
+            }
+        }
+    }
     for node in &canvas.nodes {
         for block in crate::fence::scan_render_blocks(&node.text) {
             if let Some(error) = block.error {
