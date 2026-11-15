@@ -633,7 +633,11 @@ async fn main_loop(
         // enough to run for however long a run takes.
         let spinner_active = app.spinner_active();
         let copy_flash_until = app.text_selection.as_ref().and_then(|s| s.copy_flash_until);
+        let status_deadline = app.status_deadline();
         tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(status_deadline.unwrap_or_else(std::time::Instant::now))), if status_deadline.is_some() => {
+                app.expire_status();
+            }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(copy_flash_until.unwrap_or_else(std::time::Instant::now))), if copy_flash_until.is_some() => {
                 if let Some(selection)=&mut app.text_selection {selection.copy_flash_until=None;}
             }

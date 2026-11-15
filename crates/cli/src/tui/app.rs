@@ -805,6 +805,7 @@ pub struct App {
     /// set by palette commands that create a node.
     select_after_reload: Option<String>,
     pub status: String,
+    status_expiry: Option<(std::time::Instant, String)>,
     pub(super) activity: super::terminal_status::PanelStatus,
     pub show_help: bool,
     /// How far the `?` help modal's own content is scrolled down — counts
@@ -1503,6 +1504,7 @@ impl App {
             palette: None,
             select_after_reload: None,
             activity: super::terminal_status::PanelStatus::default(),
+            status_expiry: None,
             status: if let Some(warning) = theme_warning {
                 format!("theme: {warning}")
             } else if read_only {
@@ -7320,6 +7322,27 @@ impl App {
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
     }
 
+    fn service_notice(&mut self, message: String) {
+        self.status = message.clone();
+        self.status_expiry = Some((
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            message,
+        ));
+    }
+
+    pub fn status_deadline(&self) -> Option<std::time::Instant> {
+        self.status_expiry.as_ref().map(|(deadline, _)| *deadline)
+    }
+
+    pub fn expire_status(&mut self) {
+        if let Some((_, message)) = self.status_expiry.take() {
+            // A newer error or other status must survive this notice's timer.
+            if self.status == message {
+                self.status.clear();
+            }
+        }
+    }
+
     /// How long the console stays expanded after the last run/step
     /// activity (`console_last_activity`) before `console_tick` collapses
     /// it again — only actually applies once nothing is running, since
@@ -7663,7 +7686,7 @@ impl App {
             KeyCode::Char('K') => {
                 let (node_id, block) = keys[selected].clone();
                 match crate::worker_client::stop_service(port, &node_id, &block).await {
-                    Ok(()) => self.status = format!("stopped {block}"),
+                    Ok(()) => self.service_notice(format!("Service {block} stopped")),
                     Err(e) => self.status = format!("failed to stop {block}: {e}"),
                 }
                 self.refresh_services().await;
@@ -7700,7 +7723,9 @@ impl App {
                     }
                 }
                 match crate::worker_client::restart_service(port, &node_id, &block, false).await {
-                    Ok(pid) => self.status = format!("restarted {block} (pid {pid})"),
+                    Ok(pid) => {
+                        self.service_notice(format!("Service {block} restarted (pid {pid})"))
+                    }
                     Err(e) => self.status = format!("failed to restart {block}: {e}"),
                 }
                 self.refresh_services().await;
@@ -10230,6 +10255,24 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn service_notice_expires_without_erasing_a_newer_status() {
+        let mut app = app_with_blocks("service-notice", "").await;
+        let before = std::time::Instant::now();
+        app.service_notice("Service run stopped".into());
+        assert_eq!(app.status, "Service run stopped");
+        assert!(app.status_deadline().unwrap() >= before + std::time::Duration::from_secs(5));
+        app.expire_status();
+        assert!(app.status.is_empty());
+        assert!(app.status_deadline().is_none());
+
+        app.service_notice("Service run stopped".into());
+        app.status = "failed to restart run: disconnected".into();
+        app.expire_status();
+        assert_eq!(app.status, "failed to restart run: disconnected");
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }
 
     #[tokio::test]
