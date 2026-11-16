@@ -342,6 +342,12 @@ process.env.MESHFOX_E2E_MCP_LIVE_FIREFOX_DIR = MCP_LIVE_DIRS.firefox;
 // over a top-level `use.viewport`), not just once at the top level.
 const VIEWPORT = { width: 1280, height: 1600 };
 
+// search.spec.ts needs `long-body-node` to overflow its own body, and
+// autolayout.ts caps a depth-≥ 2 node at 60% of the viewport height — at
+// VIEWPORT's 1600px that's 960px, taller than the fixture's content, so
+// nothing would scroll. 800px gives the 480px cap the fixture was written for.
+const SEARCH_VIEWPORT = { width: 1280, height: 800 };
+
 export default defineConfig({
   testDir: "./e2e",
   timeout: 30_000,
@@ -505,7 +511,7 @@ export default defineConfig({
     {
       name: `${browser}-search`,
       testMatch: /(^|\/)search\.spec\.ts$/,
-      use: { ...device, viewport: VIEWPORT, baseURL: `http://127.0.0.1:${SEARCH_PORT}` },
+      use: { ...device, viewport: SEARCH_VIEWPORT, baseURL: `http://127.0.0.1:${SEARCH_PORT}` },
     },
     {
       name: `${browser}-search-pan`,
