@@ -822,6 +822,12 @@ fn complete_snippet(text: &str, row: usize, chars: &[char], col: usize) -> Optio
             "<!-- meshfox:edge from=\"$1\" -->$0".to_string(),
             "an extra edge to this node",
         ),
+        (
+            "meshfox:var",
+            "<!-- meshfox:var",
+            "<!-- meshfox:var name=\"${1:NAME}\" -->$0".to_string(),
+            "a declared variable",
+        ),
     ];
     let items: Vec<Item> = candidates
         .into_iter()
@@ -972,6 +978,10 @@ mod tests {
         // `<!-- meshfox:n` narrows it to the node marker.
         let c = at("# Root\n<!-- meshfox:n|\n").unwrap();
         assert_eq!(labels(&c), ["meshfox:node"]);
+        // `<!-- meshfox:v` narrows it to the variable declaration.
+        let c = at("# Root\n<!-- meshfox:v|\n").unwrap();
+        assert_eq!(labels(&c), ["meshfox:var"]);
+        assert_eq!(c.items[0].insert, "<!-- meshfox:var name=\"${1:NAME}\" -->$0");
     }
 
     #[test]
