@@ -26,7 +26,7 @@ It grew by exactly 1 more once `meshfox-core` gained a line-based three-way merg
 
 The TUI Unicode palette adds `unicode_names2` 3.1.0 ((MIT OR Apache-2.0) AND Unicode-DFS-2016), with `unicode_names2_generator` (MIT OR Apache-2.0) used at build time. Unicode data attribution is covered by the crate's bundled Unicode license. The macOS normal-edge shipped dependency count was refreshed to 627 using Cargo metadata; no new copyleft obligations were found.
 
-Computed Starlark views add a direct use of `allocative` (Apache-2.0) in `meshfox-core` for heap accounting of the native `MarkdownFragment` value. It was already a normal dependency of `starlark`, so this adds no packages to the shipped dependency graph. Refreshed with `cargo metadata --filter-platform aarch64-apple-darwin`: 629 normal-edge third-party crates, with no additional copyleft requirement beyond the exceptions above.
+Computed Starlark views add a direct use of `allocative` (Apache-2.0) in `meshfox-core` for heap accounting of the native `MarkdownFragment` value. It was already a normal dependency of `starlark`, so this adds no packages to the shipped dependency graph. The `re` namespace of those views (`regex`, `MIT OR Apache-2.0`, linear-time matching with a compiled-size cap) became a direct `meshfox-model` dependency; it was already in the tree via `syntect`, so no new packages. Refreshed with `cargo metadata --filter-platform aarch64-apple-darwin`: 629 normal-edge third-party crates, with no additional copyleft requirement beyond the exceptions above.
 
 Inline color spans unify `meshfox-core` and the CLI on `pulldown-cmark` 0.13.4 (MIT, already used by the CLI). This removes the separate 0.12.2 package. Refreshed via `cargo metadata --filter-platform aarch64-apple-darwin`: 628 normal-edge third-party crates, 790 total non-workspace packages across all targets and dependency kinds. The only package removed is MIT-licensed; no new licenses or copyleft obligations are introduced.
 
@@ -71,6 +71,7 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | pulldown-cmark | MIT |
 | ratatui | MIT |
 | ratatui-image | MIT |
+| regex | MIT OR Apache-2.0 |
 | reqwest | MIT OR Apache-2.0 |
 | resvg | Apache-2.0 OR MIT |
 | rmcp | Apache-2.0 |

@@ -1663,6 +1663,7 @@ The built-in `md` namespace returns native `MarkdownFragment` values:
 | `md.link(label, url)` | A link with an escaped label and encoded URL delimiters. |
 | `md.code(text, lang="")` | A fenced code block with a safe delimiter length. |
 | `md.table(headers, rows)` | A GFM table from lists; every row must match the nonempty header width. |
+| `md.image(alt, source, attrs="")` | An inline image. `source` that is an SVG document becomes a `data:image/svg+xml;base64` URL (the same line `output="image"` writes, so it follows the UI theme and needs no file); any other `source` is a URL or path. `attrs` is the image-attribute grammar without braces (`"width=50% bg=#fff"`); an invalid value is an error. |
 
 Builders distinguish ordinary strings/numbers (data to escape) from fragments
 (already-constructed markup). Inline fragments can be placed in links and
@@ -1673,6 +1674,29 @@ emits its Markdown; `str(fragment)` explicitly loses the type information, so
 passing that string to another builder treats it as literal text. Fragment size
 is limited to 1 MiB. No color syntax is introduced here; future helpers can
 return the same fragment type.
+
+Besides `md`, render and constraint fences have four pure, deterministic
+namespaces (no clock, randomness or I/O):
+
+- **`json`** — Starlark's own `json.encode(x)`, `json.decode(s)` and
+  `json.indent(s)`.
+- **`re`** — regular expressions with the Rust `regex` crate's linear-time
+  syntax (no backreferences or look-around; a pattern whose compiled form is
+  over 1 MiB is an error). A match is a list `[whole, group1, ...]` with
+  `None` for a group that did not take part. `re.search(pattern, text)` and
+  `re.fullmatch(pattern, text)` return a match or `None`;
+  `re.findall(pattern, text)` a list of matches; `re.sub(pattern, repl, text,
+  count=0)` replaces all matches (or the first `count`), `repl` using `$1` /
+  `${name}` and `$$` for a literal dollar; `re.split(pattern, text)` a list
+  of strings.
+- **`math`** — `pi`, `e`, `floor`, `ceil`, `round` (these three return an
+  `int`; a result outside 32 bits is an error), `sqrt`, `pow`, `sin`, `cos`,
+  `tan`, `atan2`, `radians`, `degrees`, all taking ints or floats.
+- **`fmt`** — number and text formatting that Starlark's `%` lacks (`"%.1f"`
+  is an error there): `fmt.float(x, precision=2)` is a fixed number of
+  decimals (0–20), `fmt.compact(x, precision=2)` the same with trailing zeros
+  removed (`fmt.compact(4.0)` is `"4"`), `fmt.pad_left(text, width, fill=" ")`
+  and `fmt.pad_right(...)` pad to a width in characters.
 
 ## Interactive (`tty`) blocks
 

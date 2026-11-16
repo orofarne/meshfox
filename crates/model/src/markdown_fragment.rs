@@ -86,6 +86,19 @@ fn colored(value: Value<'_>, key: &str, color: &str) -> anyhow::Result<MarkdownF
     )
 }
 
+fn encode_url(url: &str) -> String {
+    url.replace(' ', "%20")
+        .replace('(', "%28")
+        .replace(')', "%29")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+        .replace('"', "%22")
+        .replace('\\', "%5C")
+        .replace('|', "%7C")
+        .replace('\n', "%0A")
+        .replace('\r', "%0D")
+}
+
 #[starlark::starlark_module]
 pub fn markdown_globals(builder: &mut GlobalsBuilder) {
     fn text(value: Value<'_>) -> anyhow::Result<MarkdownFragment> {
@@ -103,18 +116,44 @@ pub fn markdown_globals(builder: &mut GlobalsBuilder) {
             url.len() <= crate::starlark_render::MAX_OUTPUT_BYTES,
             "MarkdownFragment exceeds 1 MiB"
         );
-        let url = url
-            .replace(' ', "%20")
-            .replace('(', "%28")
-            .replace(')', "%29")
-            .replace('<', "%3C")
-            .replace('>', "%3E")
-            .replace('"', "%22")
-            .replace('\\', "%5C")
-            .replace('|', "%7C")
-            .replace('\n', "%0A")
-            .replace('\r', "%0D");
+        let url = encode_url(url);
         fragment(format!("[{}](<{}>)", inline(label)?, url), false)
+    }
+    /// An inline image. `source` is either an SVG document (inlined as a
+    /// `data:image/svg+xml;base64` URL, so it follows the UI theme and needs
+    /// no file on disk) or a URL/path. `attrs` is the image-attribute grammar
+    /// inside the braces, e.g. `"width=50% bg=#fff"`.
+    fn image(
+        alt: &str,
+        source: &str,
+        #[starlark(default = "")] attrs: &str,
+    ) -> anyhow::Result<MarkdownFragment> {
+        anyhow::ensure!(
+            source.len() <= crate::starlark_render::MAX_OUTPUT_BYTES,
+            "MarkdownFragment exceeds 1 MiB"
+        );
+        let attrs = (!attrs.trim().is_empty()).then_some(attrs);
+        if let Some(attrs) = attrs {
+            anyhow::ensure!(
+                crate::image_attrs::parse_inner(attrs).is_some(),
+                "invalid image attributes: {attrs:?}"
+            );
+        }
+        if let Some(image) = crate::output::image_output_markdown(alt, source, 0, attrs) {
+            return fragment(image, false);
+        }
+        let alt: String = alt
+            .chars()
+            .filter(|c| !matches!(c, '[' | ']' | '\\' | '\n' | '\r'))
+            .collect();
+        let braces = attrs
+            .and_then(crate::image_attrs::parse_inner)
+            .map(|a| a.to_braces())
+            .unwrap_or_default();
+        fragment(
+            format!("![{alt}](<{}>){braces}", encode_url(source.trim())),
+            false,
+        )
     }
     /// Set a foreground color on escaped text or an existing inline fragment.
     fn color(value: Value<'_>, color: &str) -> anyhow::Result<MarkdownFragment> {

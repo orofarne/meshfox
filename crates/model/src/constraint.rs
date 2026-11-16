@@ -174,7 +174,10 @@ pub(crate) fn sequence_globals(builder: &mut GlobalsBuilder) {
 }
 
 fn globals() -> Globals {
-    GlobalsBuilder::extended_by(&[LibraryExtension::StructType])
+    let mut builder =
+        GlobalsBuilder::extended_by(&[LibraryExtension::StructType, LibraryExtension::Json]);
+    crate::starlark_lib::register(&mut builder);
+    builder
         .with(constraint_globals)
         .with(sequence_globals)
         .build()

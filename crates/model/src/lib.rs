@@ -33,6 +33,7 @@ pub mod pack;
 pub mod render;
 pub mod script_vars;
 pub mod slug;
+mod starlark_lib;
 pub mod starlark_render;
 pub mod subsup;
 pub mod suggest;

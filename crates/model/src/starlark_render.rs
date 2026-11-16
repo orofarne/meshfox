@@ -46,9 +46,13 @@ pub fn annotate(
         return;
     }
     let prelude = crate::constraint::build_prelude(canvas, base_dir, access);
-    let mut globals =
-        GlobalsBuilder::extended_by(&[LibraryExtension::StructType, LibraryExtension::Print]);
+    let mut globals = GlobalsBuilder::extended_by(&[
+        LibraryExtension::StructType,
+        LibraryExtension::Print,
+        LibraryExtension::Json,
+    ]);
     globals.namespace("md", crate::markdown_fragment::markdown_globals);
+    crate::starlark_lib::register(&mut globals);
     let globals = globals.with(crate::constraint::sequence_globals).build();
     // Per node, computed up front: the loop below borrows the nodes mutably.
     let var_preludes: Vec<String> = canvas
@@ -129,6 +133,84 @@ mod tests {
         let result = c.nodes[0].render_results.remove(0);
         assert_eq!(result.error, None);
         assert_eq!(result.markdown.trim(), "hi 42");
+    }
+
+    #[test]
+    fn re_namespace_matches_replaces_and_splits() {
+        let r = render(
+            r#"
+m = re.search("LSFT\\(KC_(\\w+)\\)", "x LSFT(KC_GRAVE) y")
+print(m[0], m[1], re.search("z", "abc"))
+print(re.fullmatch("MO\\((\\d)\\)", "MO(2)")[1], re.fullmatch("a", "ab"))
+print(re.findall("(\\d)(x)?", "1x2"))
+print(re.sub("(\\w+)@", "<$1>", "a@b c@d"), re.sub("a", "-", "aaa", 2))
+print(re.split(",\\s*", "a, b,c"))
+"#,
+        );
+        assert_eq!(r.error, None);
+        assert_eq!(
+            r.markdown,
+            "LSFT(KC_GRAVE) GRAVE None\n2 None\n[[\"1x\", \"1\", \"x\"], [\"2\", \"2\", None]]\n<a>b <c>d --a\n[\"a\", \"b\", \"c\"]\n"
+        );
+        assert!(render(r#"re.search("(", "x")"#).error.is_some());
+        assert!(render(r#"re.search("(a)\\1", "aa")"#).error.is_some());
+    }
+
+    #[test]
+    fn math_and_fmt_namespaces() {
+        let r = render(
+            r#"
+print(math.floor(2.7), math.ceil(2.1), math.round(2.5), math.sqrt(16), math.pow(2, 10))
+print(fmt.float(math.pi, 3), fmt.float(2), fmt.compact(2.50, 3), fmt.compact(4.0), fmt.compact(-0.001))
+print(fmt.float(math.sin(math.radians(90)), 1), fmt.float(math.degrees(math.atan2(1, 1)), 0))
+print(fmt.pad_left("7", 3, "0"), fmt.pad_right("ab", 4, "."), fmt.float(1e6, 0))
+"#,
+        );
+        assert_eq!(r.error, None);
+        assert_eq!(
+            r.markdown,
+            "2 3 3 4.0 1024.0\n3.142 2.00 2.5 4 0\n1.0 45\n007 ab.. 1000000\n"
+        );
+        assert!(render("math.sqrt(-1)").error.is_some());
+        assert!(render("fmt.float(1.0, 99)").error.is_some());
+        assert!(render("math.floor(1e300)").error.is_some());
+    }
+
+    #[test]
+    fn json_encodes_and_decodes() {
+        let r = render(
+            r#"
+print(json.encode({"a": [1, "x"]}), json.decode("[1, {\"k\": true}]")[1]["k"])
+"#,
+        );
+        assert_eq!(r.error, None);
+        assert_eq!(r.markdown.trim(), "{\"a\":[1,\"x\"]} True");
+    }
+
+    #[test]
+    fn md_image_inlines_svg_and_validates_attrs() {
+        let r = render(
+            r#"
+print(md.image("k [1]", "<svg xmlns='http://www.w3.org/2000/svg'/>", "width=50%"))
+print(md.image("p", "dir/a b.png"))
+"#,
+        );
+        assert_eq!(r.error, None);
+        let lines: Vec<&str> = r.markdown.lines().collect();
+        assert!(
+            lines[0].starts_with("![k 1](data:image/svg+xml;base64,"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("){width=50%}"), "{}", lines[0]);
+        assert_eq!(lines[1], "![p](<dir/a%20b.png>)");
+        assert!(render(r#"md.image("a", "<svg/>", "width=bogus")"#)
+            .error
+            .is_some());
+        // An inline fragment fits a table cell like any other.
+        let t = render(r#"print(md.table(["i"], [[md.image("a", "x.png")]]))"#);
+        assert_eq!(t.error, None);
+        assert!(t.markdown.contains("![a](<x.png>)"), "{}", t.markdown);
     }
 
     #[test]
