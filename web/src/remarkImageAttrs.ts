@@ -138,7 +138,10 @@ function applyImageAttrs(image: Image, next: Text, siblings: RootContent[], imag
   if (parsed.height) hProperties.height = parsed.height;
   // Mirrors `image_attrs::html_attrs`: a bare number is CSS pixels.
   const style: string[] = [];
-  if (parsed.maxWidth) style.push(`max-width:${/^\d+$/.test(parsed.maxWidth) ? `${parsed.maxWidth}px` : parsed.maxWidth}`);
+  if (parsed.maxWidth) {
+    const maxWidth = /^\d+$/.test(parsed.maxWidth) ? `${parsed.maxWidth}px` : parsed.maxWidth;
+    style.push(`max-width:${maxWidth}`);
+  }
   if (parsed.bg) style.push(`background:${parsed.bg}`);
   if (style.length > 0) hProperties.style = style.join(";");
   image.data = { ...image.data, hProperties };
