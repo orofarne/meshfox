@@ -714,9 +714,9 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
             // (so it does not make a sibling unnamed fence ambiguous either).
             !attrs.get("norun").is_some_and(|v| v != "false")
                 && !(lang == "starlark"
-                && ["render", "constraint"]
-                    .iter()
-                    .any(|key| attrs.get(*key).is_some_and(|v| v != "false")))
+                    && ["render", "constraint"]
+                        .iter()
+                        .any(|key| attrs.get(*key).is_some_and(|v| v != "false")))
                 && (crate::block_refs::is_supported_lang(lang)
                     || attrs.contains_key("interpreter")
                     // takes its interpreter from the block it extends

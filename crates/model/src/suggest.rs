@@ -982,7 +982,10 @@ mod tests {
         // `<!-- meshfox:v` narrows it to the variable declaration.
         let c = at("# Root\n<!-- meshfox:v|\n").unwrap();
         assert_eq!(labels(&c), ["meshfox:var"]);
-        assert_eq!(c.items[0].insert, "<!-- meshfox:var name=\"${1:NAME}\" -->$0");
+        assert_eq!(
+            c.items[0].insert,
+            "<!-- meshfox:var name=\"${1:NAME}\" -->$0"
+        );
     }
 
     #[test]
