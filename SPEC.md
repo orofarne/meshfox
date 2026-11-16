@@ -513,6 +513,14 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   trailing block-name argument that would just repeat the node's own id —
   see "CLI" below — and applies the same way to a fence whose *explicit*
   `name` happens to already match its node's `id`.
+- `norun` — optional flag (`norun` or `norun=true`; `norun=false` disables
+  it): the fence is shown but never runs. It is not a block at all — no
+  run control, not addressable by `run` or `deps=`, and not counted as an
+  unnamed sibling, so it does not stop another fence in the node from being
+  its implicit block. For an example of a `bash` fence that must stay
+  verbatim documentation; without `name=` and the like it is already
+  non-runnable, but `norun` says so explicitly and keeps it that way when
+  the node's other fences change.
 - `confirm` — optional flag (`confirm` or `confirm=true`; `confirm=false`
   disables it), for potentially destructive operations. Before any step starts,
   all marked blocks in the resolved chain (including implicit variable/file

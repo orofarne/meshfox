@@ -710,7 +710,10 @@ pub(crate) fn candidate_fences(markdown: &str) -> Vec<(RawFence, String, HashMap
             (f, lang, attrs)
         })
         .filter(|(_, lang, attrs)| {
-            !(lang == "starlark"
+            // `norun`: an example to show, never to run — not a block at all
+            // (so it does not make a sibling unnamed fence ambiguous either).
+            !attrs.get("norun").is_some_and(|v| v != "false")
+                && !(lang == "starlark"
                 && ["render", "constraint"]
                     .iter()
                     .any(|key| attrs.get(*key).is_some_and(|v| v != "false")))
@@ -772,6 +775,7 @@ const FENCE_ATTRS: &[&str] = &[
     "output-attrs",
     "autorun",
     "confirm",
+    "norun",
     "render",
     "send",
     "cancel",
@@ -1382,6 +1386,22 @@ mod tests {
         let blocks = scan_code_blocks(md);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].code, "  echo hi");
+    }
+
+    #[test]
+    fn norun_keeps_a_fence_from_being_a_block_and_from_making_siblings_ambiguous() {
+        let md = "```bash name=\"x\" norun\necho a\n```\n";
+        assert!(scan_code_blocks(md).is_empty());
+        assert!(scan_runnable_blocks("n", md).is_empty());
+        // `norun=false` is the same as not writing it.
+        let md = "```bash name=\"x\" norun=false\necho a\n```\n";
+        assert_eq!(scan_code_blocks(md).len(), 1);
+        // An example next to the one real unnamed fence leaves it implicit.
+        let md = "```bash norun\nexample\n```\n\n```bash\nreal\n```\n";
+        let blocks = scan_runnable_blocks("n", md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name.as_deref(), Some("n"));
+        assert_eq!(blocks[0].code, "real");
     }
 
     #[test]

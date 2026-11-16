@@ -51,6 +51,7 @@ pub const FENCE_FLAG_ATTRS: &[&str] = &[
     "always",
     "default",
     "confirm",
+    "norun",
     "autorun",
     "reset",
     "fold",
