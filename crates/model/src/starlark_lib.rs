@@ -13,12 +13,35 @@ use starlark::values::float::UnpackFloat;
 /// catastrophic backtracking to bound.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
+/// Compiled patterns kept per thread: a script that classifies hundreds of
+/// strings calls `re.fullmatch` with the same literal pattern each time, and
+/// compiling dominated its run time. Pure memoization (a pattern always
+/// compiles to the same program), so scripts cannot observe it; a `Regex`
+/// clone is a cheap reference-count bump.
+const REGEX_CACHE_ENTRIES: usize = 64;
+
+thread_local! {
+    static REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, Regex>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 fn compile(pattern: &str) -> anyhow::Result<Regex> {
-    RegexBuilder::new(pattern)
+    if let Some(re) = REGEX_CACHE.with(|c| c.borrow().get(pattern).cloned()) {
+        return Ok(re);
+    }
+    let re = RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .map_err(|e| anyhow::anyhow!("invalid regular expression: {e}"))
+        .map_err(|e| anyhow::anyhow!("invalid regular expression: {e}"))?;
+    REGEX_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= REGEX_CACHE_ENTRIES {
+            c.clear();
+        }
+        c.insert(pattern.to_owned(), re.clone());
+    });
+    Ok(re)
 }
 
 /// A match as a list: the whole match first, then each capture group (`None`
