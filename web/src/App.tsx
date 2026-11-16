@@ -702,10 +702,20 @@ export default function App() {
     window.addEventListener("meshfox:canvas-opened", onOpened);
     return () => window.removeEventListener("meshfox:canvas-opened", onOpened);
   }, []);
-  // Snapshot, not live-tracked: the 60%/40% viewport-relative widths
+  // Snapshot, not live-tracked: the 60%/55% viewport-relative widths
   // `autolayout.ts` computes are read once per app load, not recomputed on
   // window resize (deliberate — see autolayout.ts's module doc comment).
   const viewportWidthRef = useRef(window.innerWidth);
+  const [viewportHeight, setViewportHeight] = useState(window.innerHeight);
+  const viewportHeightRef = useRef(viewportHeight);
+  useEffect(() => {
+    const onResize = () => {
+      viewportHeightRef.current = window.innerHeight;
+      setViewportHeight(window.innerHeight);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
   // Every auto-placed node's last known *real, rendered* height (React
   // Flow's own `measured.height`), keyed by node id — persists across a
   // canvas reload (unlike `nodes` state, which the canvas-load effect below
@@ -744,6 +754,7 @@ export default function App() {
       const boxes = computeAutoLayout({
         canvas,
         viewportWidth: viewportWidthRef.current,
+        viewportHeight: viewportHeightRef.current,
         measuredHeight: (nodeId) => measuredHeightsRef.current.get(nodeId),
         foldedNodeIds: nextFolded,
       });
@@ -2629,6 +2640,7 @@ export default function App() {
     const boxes = computeAutoLayout({
       canvas,
       viewportWidth: viewportWidthRef.current,
+      viewportHeight: viewportHeightRef.current,
       measuredHeight: (id) => measuredHeightsRef.current.get(id),
       foldedNodeIds,
     });
@@ -3120,6 +3132,7 @@ export default function App() {
     const boxes = computeAutoLayout({
       canvas,
       viewportWidth: viewportWidthRef.current,
+      viewportHeight: viewportHeightRef.current,
       measuredHeight: (id) => measuredHeightsRef.current.get(id),
       foldedNodeIds,
     });
@@ -3212,7 +3225,7 @@ export default function App() {
       }),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [canvas, varDecls, measuredSignature, foldedNodeIds]);
+  }, [canvas, varDecls, measuredSignature, foldedNodeIds, viewportHeight]);
 
   // Anchors the very first view on the root node's own top-left corner, a
   // fixed padding in from the canvas area's, at a fixed readable zoom (see
@@ -3899,6 +3912,7 @@ export default function App() {
     const layoutBoxes = computeAutoLayout({
       canvas,
       viewportWidth: viewportWidthRef.current,
+      viewportHeight: viewportHeightRef.current,
       measuredHeight: (id) => measuredHeightsRef.current.get(id),
       foldedNodeIds,
     });

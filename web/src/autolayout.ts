@@ -34,7 +34,7 @@
 // to the file on its own (see App.tsx's `touchedNodeIds`/`handleSaveLayout`).
 
 import type { CanvasDoc, CanvasNode } from "./types";
-import { findRoot, subtreeIds, visibleNodeIds } from "./tree";
+import { findRoot, subtreeIds, visibleNodeIds } from "./tree.ts";
 
 const H_GAP = 80;
 const V_GAP = 25;
@@ -59,8 +59,8 @@ const WIDTH_RATIO_SHALLOW = 0.6;
  * regardless of how much deeper. */
 const WIDTH_RATIO_DEEP = 0.55;
 /** A depth-≥2 node's content-driven height is capped here (see the module
- * doc comment) — root/depth-1 nodes are never capped. */
-const MAX_HEIGHT_DEEP = 480;
+ * doc comment), as a fraction of viewport height — root/depth-1 nodes are never capped. */
+const MAX_HEIGHT_RATIO_DEEP = 0.6;
 /** Used only for a node that hasn't been measured yet (its very first
  * render) — self-corrects the moment a real `measured.height` lands. */
 const UNMEASURED_PLACEHOLDER_HEIGHT = 100;
@@ -85,6 +85,8 @@ export interface AutoLayoutInput {
   /** Typically `window.innerWidth`, read once per canvas load — see
    * App.tsx; this module has no opinion on when the caller re-invokes it. */
   viewportWidth: number;
+  /** Current browser viewport height; deep nodes grow up to 60% of it. */
+  viewportHeight: number;
   /** React Flow's own `node.measured.height` for a node that's been
    * rendered at least once, if any. */
   measuredHeight: (nodeId: string) => number | undefined;
@@ -111,6 +113,7 @@ function widthForDepth(depth: number, viewportWidth: number): number {
 export function computeAutoLayout({
   canvas,
   viewportWidth,
+  viewportHeight,
   measuredHeight,
   foldedNodeIds,
 }: AutoLayoutInput): Map<string, LayoutBox> {
@@ -138,7 +141,8 @@ export function computeAutoLayout({
     if (depth < 2) {
       return { width, height: measured };
     }
-    return { width, height: Math.min(measured, MAX_HEIGHT_DEEP), maxHeight: MAX_HEIGHT_DEEP };
+    const maxHeight = viewportHeight * MAX_HEIGHT_RATIO_DEEP;
+    return { width, height: Math.min(measured, maxHeight), maxHeight };
   }
 
   const rootSize = sizeFor(root, 0);
