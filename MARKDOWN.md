@@ -67,7 +67,7 @@ any single flavor's full feature set wholesale, since every one of them
 needs an independent implementation on both the Rust side and the web
 side (`pulldown-cmark` and `remark` share nothing with each other).
 
-### Image size and background (`{width=..}`/`{height=..}`/`{bg=..}`)
+### Image size and background (`{width=..}`/`{height=..}`/`{max-width=..}`/`{bg=..}`)
 
 GitLab/Pandoc-style, written with no space directly after an image's
 closing `)`:
@@ -78,9 +78,12 @@ closing `)`:
 ![alt](pic.png){width=300 height=50%}
 ![alt](diagram.svg){bg=#fff}
 ![alt](diagram.svg){width=50% bg=transparent}
+![alt](wide.svg){width=100% max-width=800}
+![alt](wide.svg){max-width=none}
 ```
 
-Only `width=`/`height=` (each a bare integer — pixels — or integer+`%`) and
+Only `width=`/`height=` (each a bare integer — pixels — or integer+`%`),
+`max-width=` (a bare integer, integer+`%`, or `none`) and
 `bg=` (`#rgb`, `#rrggbb` or `transparent`, any case), each at most once —
 not Pandoc's full `{.class #id ...}` attribute grammar, and never free-form
 CSS. Anything that doesn't match this exact shape is left alone as ordinary
@@ -93,8 +96,18 @@ on a dark theme. There is deliberately no global rule: you choose per image.
 
 | | web | static/PDF | TUI |
 |---|---|---|---|
-| `width`/`height` | full — real `width`/`height` on the rendered `<img>` | full, same as web | `%` only, scales the terminal image protocol's fixed size budget; a literal pixel value is parsed but has no effect (no pixel grid to map it onto) |
+| `width`/`height` | full — real `width`/`height` on the rendered `<img>` | full, same as web | pixels are CSS pixels, converted to cells by the terminal's cell size; `%` is a fraction of the document pane — for SVG and PNG/JPEG alike |
+| `max-width` | `max-width` in the `<img>`'s `style` (a bare number is pixels) | same | bounds the displayed width; `none` lifts the pane-width clamp (see below) |
 | `bg` | `style="background:#rrggbb"` on the `<img>` | same | painted behind the SVG when it is rasterized; only SVGs are rasterized by meshfox, so it has no effect on a PNG/JPEG (those carry their own pixels) |
+
+**Image size in the TUI.** An image without `%` sizing shows at its own size
+(an SVG's `width`/`height`, else `viewBox`; a PNG/JPEG's pixel dimensions —
+both taken as CSS pixels), clamped to the
+document pane's width like a browser's `max-width:100%`. An explicit pixel
+`width`/`height`, or `max-width=none`, lifts that clamp on purpose: an image
+wider than the pane is scrolled sideways (horizontal wheel or Shift+wheel over
+it, Shift+←/→ in the document, or clicking/dragging the thin scrollbar drawn
+under it). `max-width=N`/`N%` caps the width explicitly (`N%` of the pane).
 
 Shared parser: `crates/core/src/image_attrs.rs` (Rust) /
 `web/src/remarkImageAttrs.ts` (web).

@@ -29,6 +29,24 @@ impl fmt::Display for Size {
     }
 }
 
+/// A `max-width=` value: an upper bound on an image's displayed width — a
+/// bare integer, integer+`%`, or `none` (no bound at all: a deliberately wide
+/// image may extend past its container and be scrolled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxSize {
+    None,
+    Size(Size),
+}
+
+impl fmt::Display for MaxSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MaxSize::None => write!(f, "none"),
+            MaxSize::Size(size) => size.fmt(f),
+        }
+    }
+}
+
 /// A `bg=` value: a fixed backing color painted behind an image (so a
 /// transparent SVG drawn for a light page stays legible on a dark theme),
 /// or an explicit `transparent` (no backing at all). Only hex colors —
@@ -78,12 +96,16 @@ impl fmt::Display for Background {
 pub struct ImageAttrs {
     pub width: Option<Size>,
     pub height: Option<Size>,
+    pub max_width: Option<MaxSize>,
     pub bg: Option<Background>,
 }
 
 impl ImageAttrs {
     pub fn is_empty(&self) -> bool {
-        self.width.is_none() && self.height.is_none() && self.bg.is_none()
+        self.width.is_none()
+            && self.height.is_none()
+            && self.max_width.is_none()
+            && self.bg.is_none()
     }
 
     /// The canonical `{width=.. height=.. bg=..}` spelling (`parse`
@@ -95,6 +117,9 @@ impl ImageAttrs {
         }
         if let Some(h) = self.height {
             parts.push(format!("height={h}"));
+        }
+        if let Some(m) = self.max_width {
+            parts.push(format!("max-width={m}"));
         }
         if let Some(bg) = self.bg {
             parts.push(format!("bg={bg}"));
@@ -131,6 +156,13 @@ pub fn parse_inner(inner: &str) -> Option<ImageAttrs> {
         match key {
             "width" if attrs.width.is_none() => attrs.width = Some(parse_size(val)?),
             "height" if attrs.height.is_none() => attrs.height = Some(parse_size(val)?),
+            "max-width" if attrs.max_width.is_none() => {
+                attrs.max_width = Some(if val == "none" {
+                    MaxSize::None
+                } else {
+                    MaxSize::Size(parse_size(val)?)
+                })
+            }
             "bg" if attrs.bg.is_none() => attrs.bg = Some(Background::parse(val)?),
             _ => return None,
         }
@@ -166,8 +198,22 @@ pub fn html_attrs(attrs: &ImageAttrs) -> String {
     if let Some(h) = attrs.height {
         out.push_str(&format!(" height=\"{h}\""));
     }
+    let mut style = String::new();
+    if let Some(m) = attrs.max_width {
+        // CSS needs a unit: a bare number is pixels, like `width="300"`.
+        match m {
+            MaxSize::Size(Size {
+                value,
+                percent: false,
+            }) => style.push_str(&format!("max-width:{value}px;")),
+            m => style.push_str(&format!("max-width:{m};")),
+        }
+    }
     if let Some(bg) = attrs.bg {
-        out.push_str(&format!(" style=\"background:{bg}\""));
+        style.push_str(&format!("background:{bg};"));
+    }
+    if !style.is_empty() {
+        out.push_str(&format!(" style=\"{}\"", style.trim_end_matches(';')));
     }
     out
 }
@@ -252,9 +298,41 @@ mod tests {
                 value: 50,
                 percent: true,
             }),
+            max_width: None,
             bg: None,
         };
         assert_eq!(html_attrs(&attrs), r#" width="300" height="50%""#);
+    }
+
+    #[test]
+    fn parses_max_width_in_every_form() {
+        let size = |value, percent| MaxSize::Size(Size { value, percent });
+        for (text, want) in [
+            ("{max-width=800}", size(800, false)),
+            ("{max-width=60%}", size(60, true)),
+            ("{max-width=none}", MaxSize::None),
+        ] {
+            let (attrs, len) = parse(text).unwrap();
+            assert_eq!(attrs.max_width, Some(want), "{text}");
+            assert_eq!(len, text.len());
+        }
+        assert_eq!(parse("{max-width=wide}"), None);
+        assert_eq!(parse("{max-width=1 max-width=2}"), None);
+        // The underscore spelling is not an alias.
+        assert_eq!(parse("{max_width=1}"), None);
+    }
+
+    #[test]
+    fn max_width_round_trips_and_shares_the_style_attribute_with_bg() {
+        let (attrs, _) = parse("{width=100% max-width=none bg=#fff}").unwrap();
+        assert_eq!(attrs.to_braces(), "{width=100% max-width=none bg=#ffffff}");
+        assert_eq!(parse(&attrs.to_braces()).unwrap().0, attrs);
+        assert_eq!(
+            html_attrs(&attrs),
+            r#" width="100%" style="max-width:none;background:#ffffff""#
+        );
+        let (only, _) = parse("{max-width=640}").unwrap();
+        assert_eq!(html_attrs(&only), r#" style="max-width:640px""#);
     }
 
     #[test]

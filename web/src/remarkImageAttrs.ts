@@ -1,5 +1,5 @@
 // Client-side mirror of crates/core/src/image_attrs.rs — the narrow
-// Pandoc/GitLab-style `{width=..}`/`{height=..}`/`{bg=..}` syntax right
+// Pandoc/GitLab-style `{width=..}`/`{height=..}`/`{max-width=..}`/`{bg=..}` syntax right
 // after an image, with no space (see SPEC.md's "Formal grammar" / TODO.canvas.md's
 // `image-attrs` task). Deliberately hand-rolled rather than pulling in
 // `remark-attr` (the same reasoning TODO.canvas.md records for the Rust
@@ -19,6 +19,8 @@ import type { Image, Root, RootContent, Text } from "mdast";
 interface ParsedImageAttrs {
   width?: string;
   height?: string;
+  /** `max-width=`: an integer, integer+`%`, or `none`. */
+  maxWidth?: string;
   /** Canonical CSS spelling (`#rrggbb` lowercase, or `transparent`) —
    * the same normalisation `image_attrs::Background`'s `Display` does. */
   bg?: string;
@@ -40,6 +42,7 @@ export function parseBackground(value: string): string | null {
 export interface ImageAttrValues {
   width?: string;
   height?: string;
+  maxWidth?: string;
   bg?: string;
 }
 
@@ -63,6 +66,12 @@ export function parseImageAttrsInner(inner: string): ImageAttrValues | null {
       result.bg = bg;
       continue;
     }
+    if (key === "max-width") {
+      if (result.maxWidth !== undefined) return null;
+      if (value !== "none" && !/^\d+%?$/.test(value)) return null;
+      result.maxWidth = value;
+      continue;
+    }
     if (!/^\d+%?$/.test(value)) return null;
     if (key === "width") {
       if (result.width !== undefined) return null;
@@ -83,6 +92,7 @@ export function imageAttrsToBraces(attrs: ImageAttrValues): string {
   const parts: string[] = [];
   if (attrs.width !== undefined) parts.push(`width=${attrs.width}`);
   if (attrs.height !== undefined) parts.push(`height=${attrs.height}`);
+  if (attrs.maxWidth !== undefined) parts.push(`max-width=${attrs.maxWidth}`);
   if (attrs.bg !== undefined) parts.push(`bg=${attrs.bg}`);
   return parts.length === 0 ? "" : `{${parts.join(" ")}}`;
 }
@@ -126,7 +136,11 @@ function applyImageAttrs(image: Image, next: Text, siblings: RootContent[], imag
   };
   if (parsed.width) hProperties.width = parsed.width;
   if (parsed.height) hProperties.height = parsed.height;
-  if (parsed.bg) hProperties.style = `background:${parsed.bg}`;
+  // Mirrors `image_attrs::html_attrs`: a bare number is CSS pixels.
+  const style: string[] = [];
+  if (parsed.maxWidth) style.push(`max-width:${/^\d+$/.test(parsed.maxWidth) ? `${parsed.maxWidth}px` : parsed.maxWidth}`);
+  if (parsed.bg) style.push(`background:${parsed.bg}`);
+  if (style.length > 0) hProperties.style = style.join(";");
   image.data = { ...image.data, hProperties };
   const rest = next.value.slice(parsed.consumed);
   if (rest.length === 0) {

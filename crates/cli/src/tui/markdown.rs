@@ -39,21 +39,14 @@ pub enum Segment {
         prefix: Vec<Span<'static>>,
         path: PathBuf,
         alt: String,
-        /// `{width=NN%}`/`{height=NN%}` right after the image (see
-        /// `meshfox_core::image_attrs`) — a terminal has no pixel grid to
-        /// map an absolute `width=300` onto, so only the `%` form is
-        /// honored here: it scales `app::load_image_protocol`'s own fixed
-        /// size budget. A literal `width=300` (no `%`) is parsed but has
-        /// no effect in the TUI — same "narrow support, no crash" fallback
-        /// the rest of this syntax uses elsewhere.
-        width_percent: Option<u32>,
-        height_percent: Option<u32>,
-        /// `{bg=#rrggbb}` — painted behind an SVG when it's rasterized
-        /// (`svg_raster::rasterize`), so a transparent diagram drawn for a
-        /// light page stays legible on the terminal's dark background.
-        /// Only SVGs are rasterized by us, so it has no effect on a PNG/
-        /// JPEG (those already carry their own pixels).
-        bg: Option<meshfox_core::image_attrs::Background>,
+        /// `{width=.. height=.. max-width=.. bg=..}` right after the image
+        /// (see `meshfox_core::image_attrs`). `width`/`height` in pixels and
+        /// `max-width` set the displayed size from the image's own pixel
+        /// size (see `LayoutContext::intrinsic_budget`), `%` scales the pane,
+        /// and `bg` is painted behind an SVG when it is rasterized so a
+        /// transparent diagram drawn for a light page stays legible on a dark
+        /// terminal (a PNG/JPEG carries its own pixels, so `bg` is ignored).
+        attrs: meshfox_core::image_attrs::ImageAttrs,
     },
 }
 
@@ -1130,9 +1123,7 @@ impl<'a> Renderer<'a> {
                         path,
                         alt,
                         mut prefix,
-                        width_percent,
-                        height_percent,
-                        bg,
+                        attrs,
                     } => {
                         flush(self, std::mem::take(&mut framed));
                         prefix.insert(0, Span::styled("│ ", border));
@@ -1140,9 +1131,7 @@ impl<'a> Renderer<'a> {
                             path,
                             alt,
                             prefix,
-                            width_percent,
-                            height_percent,
-                            bg,
+                            attrs,
                         });
                     }
                     // These widgets keep their own layout outside the text frame.
@@ -1196,18 +1185,14 @@ impl<'a> Renderer<'a> {
                 path,
                 alt,
                 mut prefix,
-                width_percent,
-                height_percent,
-                bg,
+                attrs,
             } => {
                 prefix.insert(0, Span::styled("│ ", self.output_border()));
                 Segment::Image {
                     path,
                     alt,
                     prefix,
-                    width_percent,
-                    height_percent,
-                    bg,
+                    attrs,
                 }
             }
             other => other,
@@ -1264,32 +1249,15 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    /// Applies a `{width=NN%}`/`{height=NN%}` marker (see
-    /// `pending_image_attrs`) to the `Segment::Image` just pushed —
-    /// always the last segment at this point, since nothing else can run
-    /// between pushing it and the very next event being checked. Only the
-    /// `%` form has any effect (see `Segment::Image`'s own doc comment).
-    fn apply_pending_image_attrs(&mut self, attrs: &meshfox_core::image_attrs::ImageAttrs) {
-        let Some(Segment::Image {
-            width_percent,
-            height_percent,
-            bg,
-            ..
-        }) = self.segments.last_mut()
-        else {
-            return;
-        };
-        if let Some(w) = attrs.width {
-            if w.percent {
-                *width_percent = Some(w.value);
-            }
+    /// Hands a `{width=.. max-width=.. ..}` marker (see `pending_image_attrs`)
+    /// to the `Segment::Image` just pushed — always the last segment at this
+    /// point, since nothing else can run between pushing it and the very next
+    /// event being checked. What each attribute means for a given image kind
+    /// is decided at load time (see `Segment::Image`'s own doc comment).
+    fn apply_pending_image_attrs(&mut self, parsed: &meshfox_core::image_attrs::ImageAttrs) {
+        if let Some(Segment::Image { attrs, .. }) = self.segments.last_mut() {
+            *attrs = *parsed;
         }
-        if let Some(h) = attrs.height {
-            if h.percent {
-                *height_percent = Some(h.value);
-            }
-        }
-        *bg = attrs.bg;
     }
 
     fn event(&mut self, ev: Event, span_start: usize) {
@@ -1574,9 +1542,7 @@ impl<'a> Renderer<'a> {
                         prefix: Vec::new(),
                         path,
                         alt,
-                        width_percent: None,
-                        height_percent: None,
-                        bg: None,
+                        attrs: Default::default(),
                     });
                 } else {
                     let path = self.base_dir.join(dest_url.as_ref());
@@ -1584,9 +1550,7 @@ impl<'a> Renderer<'a> {
                         prefix: Vec::new(),
                         path,
                         alt,
-                        width_percent: None,
-                        height_percent: None,
-                        bg: None,
+                        attrs: Default::default(),
                     });
                 }
             }
@@ -3040,7 +3004,7 @@ mod tests {
     fn finished_image_live_output_becomes_an_image_segment_with_its_bg() {
         let segments = image_live_segments(LIVE_SVG, 0, false);
         let image = segments.iter().find_map(|s| match s {
-            Segment::Image { path, bg, .. } => Some((path.clone(), *bg)),
+            Segment::Image { path, attrs, .. } => Some((path.clone(), attrs.bg)),
             _ => None,
         });
         let (path, bg) = image.expect("an image segment for the SVG");
@@ -3076,12 +3040,9 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         let image = segments.iter().find_map(|s| match s {
-            Segment::Image {
-                path,
-                width_percent,
-                bg,
-                ..
-            } => Some((path.clone(), *width_percent, *bg)),
+            Segment::Image { path, attrs, .. } => {
+                Some((path.clone(), attrs.width.map(|w| w.value), attrs.bg))
+            }
             _ => None,
         });
         let (path, width, bg) = image.expect("the cached region's image");
@@ -3418,8 +3379,7 @@ mod tests {
     // TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
     // "Атрибуты картинок в markdown" — `{width=NN%}`/`{height=NN%}` right
     // after an image becomes a sizing hint on the resulting
-    // `Segment::Image`; only the `%` form has any effect in the TUI (see
-    // `app::image_size_budget`).
+    // `Segment::Image` (see `LayoutContext::intrinsic_budget`/`image_budget`).
     #[test]
     fn image_percent_attrs_become_a_sizing_hint() {
         let hl = Highlighter::new();
@@ -3434,25 +3394,22 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
         );
-        let Segment::Image {
-            width_percent,
-            height_percent,
-            ..
-        } = segments
+        let Segment::Image { attrs, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
             .unwrap()
         else {
             unreachable!()
         };
-        assert_eq!(width_percent, Some(50));
-        assert_eq!(height_percent, Some(25));
+        assert_eq!(attrs.width.map(|w| (w.value, w.percent)), Some((50, true)));
+        assert_eq!(attrs.height.map(|h| (h.value, h.percent)), Some((25, true)));
     }
 
     #[test]
-    fn image_absolute_attrs_are_parsed_but_have_no_tui_effect() {
+    fn image_absolute_and_max_width_attrs_are_kept_for_load_time_sizing() {
+        use meshfox_core::image_attrs::MaxSize;
         let hl = Highlighter::new();
-        let md = "![alt](pic.png){width=300}\n";
+        let md = "![alt](pic.svg){width=300 max-width=none}\n";
         let (segments, _clicks) = render(
             md,
             Path::new("/nonexistent-base-dir"),
@@ -3463,14 +3420,18 @@ mod tests {
             None,
             &std::collections::HashMap::new(),
         );
-        let Segment::Image { width_percent, .. } = segments
+        let Segment::Image { attrs, .. } = segments
             .into_iter()
             .find(|s| matches!(s, Segment::Image { .. }))
             .unwrap()
         else {
             unreachable!()
         };
-        assert_eq!(width_percent, None);
+        assert_eq!(
+            attrs.width.map(|w| (w.value, w.percent)),
+            Some((300, false))
+        );
+        assert_eq!(attrs.max_width, Some(MaxSize::None));
     }
 
     #[test]

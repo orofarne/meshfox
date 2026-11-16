@@ -24,6 +24,8 @@ use std::sync::{Arc, OnceLock};
 const MIN_LONG_SIDE: f32 = 800.0;
 const MAX_LONG_SIDE: f32 = 2000.0;
 const MAX_UPSCALE: f32 = 8.0;
+/// Longest side (pixels) a display-resolution raster may have.
+const MAX_RASTER_SIDE: u32 = 4096;
 
 /// Loaded once: scanning the system's font directories takes long enough
 /// to notice, and every SVG in a document would otherwise redo it.
@@ -49,29 +51,37 @@ pub fn warm_up_fonts() {
 /// a color — `None`/`Transparent` leave the pixels transparent. `None` if
 /// the SVG doesn't parse or has no drawable size.
 pub fn rasterize(svg_text: &str, bg: Option<Background>) -> Option<image::DynamicImage> {
-    rasterize_impl(svg_text, bg, None)
+    rasterize_impl(svg_text, bg, |_, _| None)
 }
 
 /// Render vectors directly at their display resolution, avoiding a second
 /// raster resize that loses fine lines and small text. Bound allocations even
 /// when image attributes or terminal metrics are unusually large.
+#[cfg(test)]
 pub fn rasterize_to_fit(
     svg_text: &str,
     bg: Option<Background>,
     max_width: u32,
     max_height: u32,
 ) -> Option<image::DynamicImage> {
-    rasterize_impl(
-        svg_text,
-        bg,
-        Some((max_width.min(4096), max_height.min(4096))),
-    )
+    rasterize_impl(svg_text, bg, |_, _| Some((max_width, max_height)))
+}
+
+/// Like `rasterize_to_fit`, but the pixel budget is chosen from the SVG's own
+/// size (`width`/`height`, else `viewBox`, in CSS pixels) — which is only
+/// known after parsing, so the caller hands in how to turn it into a budget.
+pub fn rasterize_sized(
+    svg_text: &str,
+    bg: Option<Background>,
+    budget: impl FnOnce(f32, f32) -> Option<(u32, u32)>,
+) -> Option<image::DynamicImage> {
+    rasterize_impl(svg_text, bg, budget)
 }
 
 fn rasterize_impl(
     svg_text: &str,
     bg: Option<Background>,
-    target: Option<(u32, u32)>,
+    target: impl FnOnce(f32, f32) -> Option<(u32, u32)>,
 ) -> Option<image::DynamicImage> {
     let theme = super::theme::svg();
     let themed = resolve_root_vars(&svg::resolve_vars(
@@ -87,10 +97,12 @@ fn rasterize_impl(
     if !(long.is_finite() && long > 0.0) {
         return None;
     }
-    let scale = if let Some((width, height)) = target {
+    let scale = if let Some((width, height)) = target(size.width(), size.height()) {
         if width == 0 || height == 0 {
             return None;
         }
+        // Bound allocations even for absurd attributes or terminal metrics.
+        let (width, height) = (width.min(MAX_RASTER_SIDE), height.min(MAX_RASTER_SIDE));
         (width as f32 / size.width()).min(height as f32 / size.height())
     } else if long < MIN_LONG_SIDE {
         (MIN_LONG_SIDE / long).min(MAX_UPSCALE)

@@ -15,7 +15,7 @@ use super::image_render::DocumentImage;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use meshfox_core::deps::BlockAddr;
 use meshfox_core::fence;
-use meshfox_core::image_attrs::Background;
+use meshfox_core::image_attrs::{Background, ImageAttrs};
 use meshfox_core::mdcanvas;
 use meshfox_core::vars::{declared_vars, VarDecl, VarType};
 use meshfox_core::{Canvas, FileDisplay, NodeType};
@@ -583,6 +583,13 @@ pub struct App {
     /// `ui::compute_layout`'s own pane rects), so a click always hit-tests
     /// against exactly what's currently on screen, scroll/wrap included.
     pub doc_click_targets: Vec<(Rect, ClickTarget)>,
+    /// Images wider than the document pane as drawn by the most recent frame
+    /// (like `doc_click_targets`): where a horizontal scroll or a click on
+    /// the thin scrollbar under them lands.
+    pub doc_image_hscroll_targets: Vec<ImageHScroll>,
+    /// How far each such image is scrolled right, in cells — kept per image
+    /// path so it survives re-layout; clamped to the image at draw time.
+    pub doc_hscroll: HashMap<PathBuf, u16>,
     pub(super) doc_images: HashMap<PathBuf, Option<Arc<DocumentImage>>>,
     /// Prepared images that survive `render_current_document`'s rebuild of
     /// `doc_images`; see `prepare_document_images`.
@@ -673,6 +680,9 @@ pub struct App {
     /// resize gesture. Set by `resize_handle_at`, consumed by
     /// `on_resize_drag`, cleared on the matching `Up(Left)`.
     resize_drag: Option<ResizeDrag>,
+    /// The wide image whose scrollbar is being dragged (`Down(Left)` on the
+    /// bar until the matching `Up(Left)`).
+    hscroll_drag: Option<PathBuf>,
     pub highlighter: Highlighter,
     pub picker: Picker,
     /// The canvas worker's port. Production startup requires `Some`;
@@ -1440,6 +1450,8 @@ impl App {
             reveal_selected_block: false,
             doc_click_regions: Vec::new(),
             doc_click_targets: Vec::new(),
+            doc_image_hscroll_targets: Vec::new(),
+            doc_hscroll: HashMap::new(),
             doc_images: HashMap::new(),
             doc_image_cache: HashMap::new(),
             document_viewport: ratatui::layout::Size::new(56, 24),
@@ -1460,6 +1472,7 @@ impl App {
             auto_expanded_pane: None,
             output_height_pct,
             resize_drag: None,
+            hscroll_drag: None,
             highlighter: Highlighter::with_extra_syntaxes(&syntax_root),
             picker,
             worker_port,
@@ -1600,13 +1613,17 @@ impl App {
                         }
                     } else if let super::markdown::Segment::Image { path, prefix, .. } = segment {
                         let image = self.doc_images.get(path).and_then(|p| p.as_ref());
-                        let height = image.map(|p| p.size().height as usize).unwrap_or(1);
+                        let inset = Line::from(prefix.clone()).width() as u16;
+                        let avail = area.width.saturating_sub(inset);
+                        let height = image.map(|p| p.rows_in(avail) as usize).unwrap_or(1);
                         if let Some(image) = image {
-                            images.push((
-                                rows.len(),
-                                Line::from(prefix.clone()).width() as u16,
-                                Arc::clone(image),
-                            ));
+                            let offset = self
+                                .doc_hscroll
+                                .get(path)
+                                .copied()
+                                .unwrap_or(0)
+                                .min(image.max_hscroll(avail));
+                            images.push((rows.len(), inset, Arc::clone(image), offset));
                         }
                         rows.extend(selection::rows(
                             &vec![Line::from(prefix.clone()); height],
@@ -1998,6 +2015,16 @@ impl App {
             KeyCode::Char('?') => {
                 self.show_help = true;
                 self.help_scroll = 0;
+            }
+            // Sideways through the first (topmost) image wider than the pane.
+            KeyCode::Left | KeyCode::Right
+                if self.focus == Focus::Document
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !self.doc_image_hscroll_targets.is_empty() =>
+            {
+                let step = if key.code == KeyCode::Right { 8 } else { -8 };
+                let hit = self.doc_image_hscroll_targets[0].clone();
+                self.scroll_image_h(&hit, step);
             }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 Focus::Tree => self.move_selection(-1),
@@ -3401,6 +3428,16 @@ impl App {
                         &mouse,
                         is_double_click,
                     );
+                    let bar = self
+                        .doc_image_hscroll_targets
+                        .iter()
+                        .find(|t| t.bar.is_some_and(|b| point_in(b, mouse.column, mouse.row)))
+                        .cloned();
+                    if let Some(hit) = bar {
+                        self.drag_image_hscrollbar(&hit, mouse.column);
+                        self.hscroll_drag = Some(hit.path);
+                        return;
+                    }
                     let target = self
                         .doc_click_targets
                         .iter()
@@ -3438,6 +3475,25 @@ impl App {
                     }
                 }
             }
+            // A horizontal wheel, or Shift+wheel, over a wide image scrolls it.
+            MouseEventKind::ScrollRight
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollUp
+                if (matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft
+                ) || mouse.modifiers.contains(KeyModifiers::SHIFT))
+                    && self.image_hscroll_at(mouse.column, mouse.row).is_some() =>
+            {
+                let step = match mouse.kind {
+                    MouseEventKind::ScrollRight | MouseEventKind::ScrollDown => 5,
+                    _ => -5,
+                };
+                if let Some(hit) = self.image_hscroll_at(mouse.column, mouse.row) {
+                    self.scroll_image_h(&hit, step);
+                }
+            }
             MouseEventKind::ScrollDown => {
                 if point_in(layout.tree, mouse.column, mouse.row) {
                     self.move_selection(1);
@@ -3462,11 +3518,22 @@ impl App {
             MouseEventKind::ScrollLeft if point_in(layout.output, mouse.column, mouse.row) => {
                 self.scroll_output_h(-5);
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.hscroll_drag.is_some() => {
+                let hit = self
+                    .doc_image_hscroll_targets
+                    .iter()
+                    .find(|t| Some(&t.path) == self.hscroll_drag.as_ref())
+                    .cloned();
+                if let Some(hit) = hit {
+                    self.drag_image_hscrollbar(&hit, mouse.column);
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.on_resize_drag(area, mouse.column, mouse.row);
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.resize_drag = None;
+                self.hscroll_drag = None;
             }
             _ => {}
         }
@@ -4609,6 +4676,40 @@ impl App {
         self.rebuild_rows();
         self.jump_to_node(&group_id);
         true
+    }
+
+    /// The wide image (or its scrollbar row) under screen cell (`col`, `row`).
+    pub(super) fn image_hscroll_at(&self, col: u16, row: u16) -> Option<ImageHScroll> {
+        self.doc_image_hscroll_targets
+            .iter()
+            .find(|t| point_in(t.area, col, row))
+            .cloned()
+    }
+
+    /// Scrolls a wide image `delta` cells sideways, within its own width.
+    pub(super) fn scroll_image_h(&mut self, hit: &ImageHScroll, delta: i32) {
+        let current = i32::from(self.doc_hscroll.get(&hit.path).copied().unwrap_or(0));
+        let next = (current + delta).clamp(0, i32::from(hit.max)) as u16;
+        self.doc_hscroll.insert(hit.path.clone(), next);
+    }
+
+    /// Puts the scrollbar thumb's centre under screen column `col` (a click on
+    /// the thin bar, or a drag along it) and scrolls the image to match.
+    pub(super) fn drag_image_hscrollbar(&mut self, hit: &ImageHScroll, col: u16) {
+        let Some(bar) = hit.bar else { return };
+        let track = u32::from(bar.width);
+        let thumb = (track * track / u32::from(hit.total.max(1))).clamp(1, track.max(1));
+        let room = track.saturating_sub(thumb);
+        let pos = u32::from(col.saturating_sub(bar.x))
+            .saturating_sub(thumb / 2)
+            .min(room);
+        let offset = if room == 0 {
+            0
+        } else {
+            (pos * u32::from(hit.max) + room / 2) / room
+        };
+        self.doc_hscroll
+            .insert(hit.path.clone(), offset.min(u32::from(hit.max)) as u16);
     }
 
     fn scroll_document(&mut self, delta: i32) {
@@ -5766,23 +5867,19 @@ impl App {
     }
 
     fn prepare_document_images(&mut self, base_dir: &Path, asset_base: Option<String>) {
-        let images: Vec<(PathBuf, u16, Option<u32>, Option<u32>, Option<Background>)> = self
+        let images: Vec<(PathBuf, u16, ImageAttrs)> = self
             .doc_segments
             .iter()
             .filter_map(|s| match s {
                 Segment::Image {
                     path,
                     prefix,
-                    width_percent,
-                    height_percent,
-                    bg,
+                    attrs,
                     ..
                 } => Some((
                     path.clone(),
                     Line::from(prefix.clone()).width() as u16,
-                    *width_percent,
-                    *height_percent,
-                    *bg,
+                    *attrs,
                 )),
                 Segment::Text(_)
                 | Segment::Button { .. }
@@ -5790,7 +5887,7 @@ impl App {
                 | Segment::TablePreview(_) => None,
             })
             .collect();
-        for (path, inset, width_percent, height_percent, bg) in images {
+        for (path, inset, attrs) in images {
             if path
                 .to_str()
                 .is_some_and(|p| p.starts_with("meshfox-link-preview:"))
@@ -5813,9 +5910,8 @@ impl App {
                 continue;
             }
             // The document title and its following blank row occupy two rows.
-            let budget = super::document_layout::LayoutContext::new(self.document_viewport)
-                .inset(inset, 2)
-                .image_budget(width_percent, height_percent);
+            let layout =
+                super::document_layout::LayoutContext::new(self.document_viewport).inset(inset, 2);
             // Rasterizing (SVG parse + text layout, Lanczos resize, protocol
             // encoding) is far too slow to repeat on every selection change,
             // so reuse the result while nothing it depends on has changed.
@@ -5827,15 +5923,15 @@ impl App {
                     std::hash::Hash::hash(b, &mut hasher);
                     std::hash::Hasher::finish(&hasher)
                 }),
-                budget,
-                bg,
+                pane: layout.size,
+                attrs,
                 font: (font.width, font.height),
                 protocol: self.picker.protocol_type(),
             };
             let protocol = match self.doc_image_cache.get(&path) {
                 Some((cached, image)) if *cached == key => image.clone(),
                 _ => {
-                    let image = load_document_image(&self.picker, &path, bytes, bg, budget);
+                    let image = load_document_image(&self.picker, &path, bytes, &attrs, layout);
                     if self.doc_image_cache.len() >= DOC_IMAGE_CACHE_ENTRIES {
                         self.doc_image_cache.clear();
                     }
@@ -5890,9 +5986,7 @@ impl App {
                     prefix: Vec::new(),
                     path,
                     alt: "preview image".to_string(),
-                    width_percent: None,
-                    height_percent: None,
-                    bg: None,
+                    attrs: Default::default(),
                 });
             }
         }
@@ -8817,12 +8911,26 @@ fn request_image(
     });
 }
 
+/// An image wider than the document pane, as laid out on screen.
+#[derive(Clone)]
+pub struct ImageHScroll {
+    pub path: PathBuf,
+    /// The visible part of the image and its scrollbar row.
+    pub area: Rect,
+    /// The scrollbar row, when it is on screen.
+    pub bar: Option<Rect>,
+    /// The furthest the image can be scrolled right, in cells.
+    pub max: u16,
+    /// The image's full width in cells.
+    pub total: u16,
+}
+
 /// Everything `load_document_image`'s output depends on besides the path.
 #[derive(PartialEq)]
 struct DocImageKey {
     content: Option<u64>,
-    budget: ratatui::layout::Size,
-    bg: Option<Background>,
+    pane: ratatui::layout::Size,
+    attrs: ImageAttrs,
     font: (u16, u16),
     protocol: ProtocolType,
 }
@@ -8840,8 +8948,8 @@ fn load_document_image(
     picker: &Picker,
     path: &Path,
     bytes: Option<&[u8]>,
-    bg: Option<Background>,
-    budget: ratatui::layout::Size,
+    attrs: &ImageAttrs,
+    layout: super::document_layout::LayoutContext,
 ) -> Option<Arc<DocumentImage>> {
     let embedded_svg = path.to_str().and_then(|url| {
         let (meta, payload) = url.strip_prefix("data:")?.split_once(',')?;
@@ -8854,25 +8962,62 @@ fn load_document_image(
     let svg = embedded_svg
         .as_deref()
         .or_else(|| is_svg_path(path).then_some(bytes).flatten());
-    let image = if let Some(svg) = svg {
-        let density = if picker.protocol_type() == ProtocolType::Iterm2 {
-            2
-        } else {
-            1
-        };
-        super::svg_raster::rasterize_to_fit(
-            std::str::from_utf8(svg).ok()?,
-            bg,
-            u32::from(budget.width) * u32::from(picker.font_size().width) * density,
-            u32::from(budget.height) * u32::from(picker.font_size().height) * density,
-        )?
+    let bg = attrs.bg;
+    let (image, budget) = if let Some(svg) = svg {
+        let density = image_density(picker);
+        let font = picker.font_size();
+        let cell = css_px_per_cell(picker);
+        let budget = std::cell::Cell::new(layout.image_budget(None, None));
+        let image =
+            super::svg_raster::rasterize_sized(std::str::from_utf8(svg).ok()?, bg, |w, h| {
+                let chosen = layout.intrinsic_budget(attrs, (w, h), cell);
+                budget.set(chosen);
+                Some((
+                    u32::from(chosen.width) * u32::from(font.width) * density,
+                    u32::from(chosen.height) * u32::from(font.height) * density,
+                ))
+            })?;
+        (image, budget.get())
     } else {
-        match path.to_str().filter(|s| s.starts_with("data:")) {
+        let image = match path.to_str().filter(|s| s.starts_with("data:")) {
             Some(url) => decode_data_url_image(url, bg)?,
             None => image::load_from_memory(bytes?).ok()?,
-        }
+        };
+        // A raster image is sized like an SVG, from its pixel dimensions
+        // taken as CSS pixels.
+        let budget = layout.intrinsic_budget(
+            attrs,
+            (image.width() as f32, image.height() as f32),
+            css_px_per_cell(picker),
+        );
+        (image, budget)
     };
     prepared_image(picker, image, budget).map(Arc::new)
+}
+
+/// Pixels per font-size unit: iTerm2 reports points, drawn at twice the density.
+fn image_density(picker: &Picker) -> u32 {
+    if picker.protocol_type() == ProtocolType::Iterm2 {
+        2
+    } else {
+        1
+    }
+}
+
+/// CSS pixels one terminal cell covers, to place an SVG's own `width`/`height`.
+/// iTerm2-protocol metrics are already points (≈ CSS pixels); Sixel/others are
+/// physical pixels, divided by the display scale iTerm2 reported (1 otherwise).
+fn css_px_per_cell(picker: &Picker) -> (f32, f32) {
+    let font = picker.font_size();
+    let scale = if picker.protocol_type() == ProtocolType::Iterm2 {
+        1.0
+    } else {
+        super::image_metrics::display_scale()
+    };
+    (
+        f32::from(font.width) / scale,
+        f32::from(font.height) / scale,
+    )
 }
 
 pub(super) fn prepared_image(
@@ -8915,16 +9060,20 @@ pub(super) fn prepared_image(
             Some(DocumentImage::fragment(
                 size,
                 pixels,
+                cell_width,
                 cell_height,
                 tmux,
                 sixel,
             ))
         }
-        _ => {
-            SlicedProtocol::new_with_resize(picker, pixels, size, ratatui_image::Resize::Fit(None))
-                .ok()
-                .map(DocumentImage::sliced)
-        }
+        _ => SlicedProtocol::new_with_resize(
+            picker,
+            pixels.clone(),
+            size,
+            ratatui_image::Resize::Fit(None),
+        )
+        .ok()
+        .map(|sliced| DocumentImage::sliced(sliced, pixels, picker.clone(), cell_width)),
     }
 }
 

@@ -84,6 +84,17 @@ import { fingerprint, parseBody } from "../src/fence.ts";
 const PLAIN_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>';
 
+test("max-width mirrors the Rust grammar: number, percent or none, once, hyphenated", () => {
+  for (const v of ["800", "60%", "none"]) {
+    assert.equal(parseImageAttrsInner(`max-width=${v}`)?.maxWidth, v);
+  }
+  for (const bad of ["max-width=wide", "max-width=1 max-width=2", "max_width=1", "max-width="]) {
+    assert.equal(parseImageAttrsInner(bad), null, bad);
+  }
+  const attrs = parseImageAttrsInner("width=100% max-width=none bg=#FFF");
+  assert.equal(imageAttrsToBraces(attrs), "{width=100% max-width=none bg=#ffffff}");
+});
+
 test("looksLikeSvg agrees with the Rust sniff", () => {
   assert.ok(looksLikeSvg(PLAIN_SVG));
   assert.ok(looksLikeSvg("\n  <svg>"));

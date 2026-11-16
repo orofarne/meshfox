@@ -1293,6 +1293,17 @@ fn render_tree(f: &mut Frame, area: Rect, app: &mut App) {
         ));
         y += height;
     }
+    // Row-based thumb: items may wrap onto several rows.
+    let first = app.list_state.offset().min(heights.len());
+    paint_vthumb(
+        f,
+        x_of(area),
+        area.y + 1,
+        usize::from(area.height.saturating_sub(2)),
+        heights.iter().sum(),
+        heights[..first].iter().sum(),
+        app.focus == Focus::Tree,
+    );
 }
 
 #[cfg(test)]
@@ -1311,18 +1322,65 @@ fn reveal_header_scroll(scroll: u16, height: u16, header: u16) -> u16 {
 }
 
 /// Bitmap protocols render one cached crop; Kitty/Halfblocks use native slicing.
+#[cfg(test)]
 pub(super) fn render_document_image(
     image: &super::image_render::DocumentImage,
     skip: u16,
     area: Rect,
     buffer: &mut ratatui::buffer::Buffer,
 ) {
+    render_document_image_at(image, skip, 0, area, buffer);
+}
+
+/// `render_document_image` for an image scrolled `skip_col` cells to the left.
+pub(super) fn render_document_image_at(
+    image: &super::image_render::DocumentImage,
+    skip: u16,
+    skip_col: u16,
+    area: Rect,
+    buffer: &mut ratatui::buffer::Buffer,
+) {
     use ratatui::widgets::Widget;
-    if let Some(fragment) = image.visible_fragment(skip, area.height) {
+    if let Some(fragment) = image.visible_fragment_at(skip, area.height, skip_col, area.width) {
         Image::new(fragment.as_ref()).render(area, buffer);
     } else if let Some(sliced) = &image.sliced {
-        SlicedImage::new(sliced, SignedPosition::from((0, -(skip as i16)))).render(area, buffer);
+        // Kitty/Halfblocks can only skip rows: a sideways window is its own
+        // (cropped and re-encoded) protocol, cached per window.
+        let window = image.sliced_window(skip_col, area.width);
+        SlicedImage::new(
+            window.as_deref().unwrap_or(sliced),
+            SignedPosition::from((0, -(skip as i16))),
+        )
+        .render(area, buffer);
     }
+}
+
+/// The thin horizontal scrollbar under an image wider than its pane: a dim
+/// track with a bright thumb sized and placed like the visible window.
+fn render_image_hscrollbar(f: &mut Frame, bar: Rect, total: u16, offset: u16, focused: bool) {
+    if bar.width == 0 || total <= bar.width {
+        return;
+    }
+    let track = u32::from(bar.width);
+    let thumb = (track * track / u32::from(total)).clamp(1, track);
+    let max_offset = u32::from(total - bar.width);
+    let start = u32::from(offset).min(max_offset) * (track - thumb) / max_offset;
+    let dim = Style::default().fg(super::theme::border());
+    let lit = Style::default().fg(if focused {
+        super::theme::accent()
+    } else {
+        super::theme::muted()
+    });
+    let spans: Vec<Span> = (0..track)
+        .map(|i| {
+            if (start..start + thumb).contains(&i) {
+                Span::styled("━", lit)
+            } else {
+                Span::styled("─", dim)
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Line::from(spans)), bar);
 }
 
 fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
@@ -1336,6 +1394,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
     app.copy_document_area = inner;
 
     app.doc_click_targets.clear();
+    app.doc_image_hscroll_targets.clear();
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -1408,12 +1467,15 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                     }
                 }
                 preceding_rows += text.rows();
-            } else if let Segment::Image { path, .. } = segment {
+            } else if let Segment::Image { path, prefix, .. } = segment {
+                let avail = inner
+                    .width
+                    .saturating_sub(Line::from(prefix.clone()).width() as u16);
                 preceding_rows += app
                     .doc_images
                     .get(path)
                     .and_then(|p| p.as_ref())
-                    .map(|p| usize::from(p.size().height))
+                    .map(|p| usize::from(p.rows_in(avail)))
                     .unwrap_or(1);
             }
         }
@@ -1458,12 +1520,16 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                         | Segment::Button { .. }
                         | Segment::Table { .. }
                         | Segment::TablePreview(_) => context.text(seg).unwrap().rows(),
-                        Segment::Image { path, .. } => app
-                            .doc_images
-                            .get(path)
-                            .and_then(|p| p.as_ref())
-                            .map(|p| p.size().height as usize)
-                            .unwrap_or(1),
+                        Segment::Image { path, prefix, .. } => {
+                            let avail = inner
+                                .width
+                                .saturating_sub(Line::from(prefix.clone()).width() as u16);
+                            app.doc_images
+                                .get(path)
+                                .and_then(|p| p.as_ref())
+                                .map(|p| usize::from(p.rows_in(avail)))
+                                .unwrap_or(1)
+                        }
                     })
                     .sum();
                 app.doc_scroll = reveal_header_scroll(
@@ -1572,31 +1638,70 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                 path, alt, prefix, ..
             } => {
                 let protocol = app.doc_images.get(path).and_then(|o| o.as_ref());
-                let rows = protocol.map(|p| p.size().height).unwrap_or(1);
+                let prefix = Line::from(prefix.clone());
+                let inset = (prefix.width() as u16).min(inner.width);
+                let avail = inner.width.saturating_sub(inset);
+                let image_rows = protocol.map(|p| p.size().height).unwrap_or(1);
+                let rows = protocol.map(|p| p.rows_in(avail)).unwrap_or(1);
                 let Some(layout) = wrapped_text_layout(rows, skip, bottom - y) else {
                     skip -= rows;
                     continue;
                 };
                 let height = layout.height;
-                let prefix = Line::from(prefix.clone());
-                let inset = (prefix.width() as u16).min(inner.width);
                 for row in y..y + height {
                     f.render_widget(
                         Paragraph::new(prefix.clone()),
                         Rect::new(inner.x, row, inset, 1),
                     );
                 }
+                // Image rows first, then (for an image wider than the pane) the
+                // scrollbar row; either may be scrolled partly out of view.
+                let image_visible = image_rows.saturating_sub(skip).min(height);
                 let rect = Rect {
                     x: inner.x + inset,
                     y,
-                    width: inner
-                        .width
-                        .saturating_sub(inset)
-                        .min(protocol.map(|p| p.size().width).unwrap_or(inner.width)),
-                    height,
+                    width: avail.min(protocol.map(|p| p.size().width).unwrap_or(avail)),
+                    height: image_visible,
                 };
                 match protocol {
-                    Some(p) => render_document_image(p, skip, rect, f.buffer_mut()),
+                    Some(p) => {
+                        let offset = app
+                            .doc_hscroll
+                            .get(path)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(p.max_hscroll(avail));
+                        if image_visible > 0 {
+                            render_document_image_at(p, skip, offset, rect, f.buffer_mut());
+                        }
+                        if p.overflows(avail) {
+                            let bar_y = y + image_visible;
+                            let bar_visible = skip + height > image_rows;
+                            let bar = Rect::new(inner.x + inset, bar_y, avail, 1);
+                            if bar_visible {
+                                render_image_hscrollbar(
+                                    f,
+                                    bar,
+                                    p.size().width,
+                                    offset,
+                                    app.focus == Focus::Document,
+                                );
+                            }
+                            app.doc_image_hscroll_targets
+                                .push(super::app::ImageHScroll {
+                                    path: path.clone(),
+                                    area: Rect::new(
+                                        rect.x,
+                                        y,
+                                        avail,
+                                        image_visible + u16::from(bar_visible),
+                                    ),
+                                    bar: bar_visible.then_some(bar),
+                                    max: p.max_hscroll(avail),
+                                    total: p.size().width,
+                                });
+                        }
+                    }
                     None if app.image_pending.contains(path) => f.render_widget(
                         Paragraph::new(format!("[image loading: {alt}]"))
                             .style(Style::default().fg(super::theme::muted())),
@@ -1611,6 +1716,133 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                 skip = 0;
                 y += height;
             }
+        }
+    }
+    render_document_vscrollbar(f, area, inner, app, context, y >= bottom);
+}
+
+/// A thin scrollbar for the document pane: a bright `▐` thumb drawn over the
+/// right border (the dimmed border itself is the track), shown only when the document does
+/// not fit. `filled` says the visible rows ran out before the content did,
+/// which spares measuring the whole document when it plainly fits.
+fn render_document_vscrollbar(
+    f: &mut Frame,
+    area: Rect,
+    inner: Rect,
+    app: &App,
+    context: super::document_layout::LayoutContext,
+    filled: bool,
+) {
+    if !filled && app.doc_scroll == 0 {
+        return;
+    }
+    let total: usize = app
+        .doc_segments
+        .iter()
+        .map(|seg| match seg {
+            Segment::Image { path, prefix, .. } => {
+                let avail = inner
+                    .width
+                    .saturating_sub(Line::from(prefix.clone()).width() as u16);
+                app.doc_images
+                    .get(path)
+                    .and_then(|p| p.as_ref())
+                    .map_or(1, |p| usize::from(p.rows_in(avail)))
+            }
+            _ => context.text(seg).map_or(1, |text| text.rows()),
+        })
+        .sum();
+    let view = usize::from(inner.height);
+    if total <= view || view == 0 || area.width == 0 {
+        return;
+    }
+    paint_vthumb(
+        f,
+        x_of(area),
+        inner.y,
+        view,
+        total,
+        usize::from(app.doc_scroll),
+        app.focus == Focus::Document,
+    );
+}
+
+pub(super) fn x_of(area: Rect) -> u16 {
+    area.x + area.width.saturating_sub(1)
+}
+
+/// A thumb for a `total`-row list shown `view` rows at a time from row
+/// `offset`: its `(start, length)` in cells of a `view`-cell track.
+fn thumb_span(view: usize, total: usize, offset: usize) -> (usize, usize) {
+    let thumb = (view * view / total).clamp(1, view);
+    let max_scroll = (total - view).max(1);
+    (offset.min(max_scroll) * (view - thumb) / max_scroll, thumb)
+}
+
+/// The shared thin vertical scrollbar: the border column at `x` is the track
+/// (dimmed so a focused, bright frame does not swallow the thumb) and a bold
+/// `▐` marks the visible window. Nothing is drawn when everything fits.
+pub(super) fn paint_vthumb(
+    f: &mut Frame,
+    x: u16,
+    top: u16,
+    view: usize,
+    total: usize,
+    offset: usize,
+    focused: bool,
+) {
+    if view == 0 || total <= view {
+        return;
+    }
+    let (start, thumb) = thumb_span(view, total, offset);
+    let thumb_style = Style::default()
+        .fg(if focused {
+            super::theme::accent()
+        } else {
+            super::theme::muted()
+        })
+        .add_modifier(Modifier::BOLD);
+    let track_style = Style::default().fg(super::theme::border());
+    for row in 0..view {
+        let cell = &mut f.buffer_mut()[(x, top + row as u16)];
+        if (start..start + thumb).contains(&row) {
+            cell.set_symbol("▐");
+            cell.set_style(thumb_style);
+        } else {
+            cell.set_style(track_style);
+        }
+    }
+}
+
+/// `paint_vthumb`'s sideways twin, drawn over the bottom border row `y`.
+fn paint_hthumb(
+    f: &mut Frame,
+    y: u16,
+    left: u16,
+    view: usize,
+    total: usize,
+    offset: usize,
+    focused: bool,
+) {
+    if view == 0 || total <= view {
+        return;
+    }
+    let (start, thumb) = thumb_span(view, total, offset);
+    let thumb_style = Style::default()
+        .fg(if focused {
+            super::theme::accent()
+        } else {
+            super::theme::muted()
+        })
+        .add_modifier(Modifier::BOLD);
+    let track_style = Style::default().fg(super::theme::border());
+    for col in 0..view {
+        let cell = &mut f.buffer_mut()[(left + col as u16, y)];
+        if (start..start + thumb).contains(&col) {
+            cell.set_symbol("▄");
+            cell.set_style(thumb_style);
+        } else {
+            cell.set_style(track_style);
         }
     }
 }
@@ -1719,6 +1951,15 @@ fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
         let scroll = (app.output_scroll as usize).min(max_scroll);
         let end = lines.len() - scroll;
         let start = end.saturating_sub(take);
+        paint_vthumb(
+            f,
+            x_of(area),
+            inner.y,
+            take,
+            lines.len(),
+            start,
+            app.focus == Focus::Output,
+        );
         app.copy_output_lines = lines.clone();
         app.copy_output_top = start;
         Text::from(lines[start..end].to_vec())
@@ -1744,7 +1985,17 @@ fn render_output(f: &mut Frame, area: Rect, app: &mut App) {
     let max_hscroll = (text.width() as u16).saturating_sub(inner.width);
     let hscroll = app.output_hscroll.min(max_hscroll);
     app.copy_output_left = hscroll;
+    let total_width = text.width();
     f.render_widget(Paragraph::new(text).scroll((0, hscroll)), inner);
+    paint_hthumb(
+        f,
+        area.bottom().saturating_sub(1),
+        inner.x,
+        usize::from(inner.width),
+        total_width,
+        usize::from(hscroll),
+        app.focus == Focus::Output,
+    );
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -3363,6 +3614,15 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
             .scroll((scroll, 0)),
         inner,
     );
+    paint_vthumb(
+        f,
+        x_of(rect),
+        inner.y,
+        usize::from(inner_height),
+        usize::from(total_rows),
+        usize::from(scroll),
+        true,
+    );
 }
 
 /// The editor's syntect theme and the theme set it came from. Unpacking the
@@ -4774,6 +5034,7 @@ mod tests {
                         )
                         .unwrap(),
                     ),
+                    0,
                 ));
                 let mut terminal =
                     ratatui::Terminal::new(ratatui::backend::TestBackend::new(6, 6)).unwrap();
@@ -4914,8 +5175,9 @@ mod tests {
                 .draw(|f| render_document(f, area, &mut app))
                 .unwrap();
             let image = app.doc_images[&path].as_ref().expect("decoded SVG");
+            // Shown at its own size, clamped to the pane width; height follows
+            // the aspect ratio and is reached by scrolling, not fitted to the pane.
             assert!(image.size().width <= width - 2);
-            assert!(image.size().height <= height - 4);
             let buffer = terminal.backend().buffer();
             assert!(
                 buffer
@@ -4973,6 +5235,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_document_pane_shows_a_thin_vertical_scrollbar_only_when_it_overflows() {
+        let mut app = test_app().await;
+        let (width, height) = (22, 12);
+        let draw = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_document(f, Rect::new(0, 0, width, height), app))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let thumb_rows = |buffer: &ratatui::buffer::Buffer| -> Vec<u16> {
+            (0..height)
+                .filter(|y| buffer[(width - 1, *y)].symbol() == "▐")
+                .collect()
+        };
+        let lines = |n: usize| {
+            vec![Segment::Text(
+                (0..n).map(|i| Line::from(format!("line {i}"))).collect(),
+            )]
+        };
+
+        app.doc_segments = lines(5);
+        assert!(
+            thumb_rows(&draw(&mut app)).is_empty(),
+            "a short document needs no bar"
+        );
+
+        // 40 rows in a 10-row pane: a 2-row thumb (10 * 10 / 40) that travels.
+        app.doc_segments = lines(40);
+        app.doc_scroll = 0;
+        assert_eq!(thumb_rows(&draw(&mut app)), vec![1, 2]);
+        app.doc_scroll = 15;
+        let middle = thumb_rows(&draw(&mut app));
+        assert_eq!(middle.len(), 2);
+        assert!(middle[0] > 2 && middle[1] < 9, "{middle:?}");
+        app.doc_scroll = 30;
+        assert_eq!(thumb_rows(&draw(&mut app)), vec![9, 10]);
+        // Scrolling past the end pins the thumb to the bottom, and the
+        // corner of the frame is left alone.
+        app.doc_scroll = 200;
+        let buffer = draw(&mut app);
+        assert_eq!(thumb_rows(&buffer), vec![9, 10]);
+        assert_eq!(buffer[(width - 1, height - 1)].symbol(), "┘");
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_output_pane_shows_thin_scrollbars_on_its_border() {
+        let mut app = test_app().await;
+        let (width, height) = (30, 8);
+        app.console_collapsed = false;
+        app.external_console_lines = (0..50)
+            .map(|i| format!("line {i} {}", "x".repeat(60)))
+            .collect();
+        let draw = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_output(f, Rect::new(0, 0, width, height), app))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let buffer = draw(&mut app);
+        // Output follows the tail, so the vertical thumb sits at the bottom.
+        let thumb: Vec<u16> = (1..height - 1)
+            .filter(|y| buffer[(width - 1, *y)].symbol() == "▐")
+            .collect();
+        assert_eq!(thumb.last(), Some(&(height - 2)), "{thumb:?}");
+        // The lines are wider than the pane, so the bottom border carries a
+        // sideways thumb, starting at the left.
+        assert_eq!(buffer[(1, height - 1)].symbol(), "▄");
+        assert_ne!(buffer[(width - 2, height - 1)].symbol(), "▄");
+        app.output_scroll = u16::MAX;
+        let buffer = draw(&mut app);
+        assert_eq!(buffer[(width - 1, 1)].symbol(), "▐", "scrolled to the top");
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_wide_svg_scrolls_sideways_under_a_thin_scrollbar() {
+        use super::super::app::BackgroundMsg;
+        let mut app = test_app().await;
+        app.picker = ratatui_image::picker::Picker::halfblocks();
+        app.display_canvas = meshfox_core::Canvas::from_markdown(
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![wide](wide.svg){max-width=none}\n",
+        )
+        .unwrap();
+        let path = app.canvas_path.parent().unwrap().join("wide.svg");
+        // 1000x100 CSS px: red on the left half, blue on the right.
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="100"><rect width="500" height="100" fill="#ff0000"/><rect x="500" width="500" height="100" fill="#0000ff"/></svg>"##;
+        app.on_background_msg(BackgroundMsg::ImageBytes {
+            generation: app.image_generation,
+            path: path.clone(),
+            result: Ok(svg.to_vec()),
+        });
+        let (width, height) = (42, 12);
+        let draw = |app: &mut App| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| render_document(f, Rect::new(0, 0, width, height), app))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let shows = |buffer: &ratatui::buffer::Buffer, rgb: (u8, u8, u8)| {
+            let color = Color::Rgb(rgb.0, rgb.1, rgb.2);
+            (1..width - 1).any(|x| {
+                (0..height).any(|y| {
+                    let cell = &buffer[(x, y)];
+                    cell.fg == color || cell.bg == color
+                })
+            })
+        };
+
+        let buffer = draw(&mut app);
+        let image_width = app.doc_images[&path].as_ref().unwrap().size().width;
+        let inner = width - 2;
+        assert!(
+            image_width > inner,
+            "declared size is not clamped to the pane"
+        );
+        let hit = app
+            .doc_image_hscroll_targets
+            .first()
+            .cloned()
+            .expect("wide image");
+        assert_eq!((hit.total, hit.max), (image_width, image_width - inner));
+        let bar = hit.bar.expect("scrollbar row on screen");
+        assert_eq!(bar.height, 1);
+        assert!(
+            (bar.x..bar.x + bar.width).all(|x| matches!(buffer[(x, bar.y)].symbol(), "━" | "─"))
+        );
+        assert_eq!(
+            buffer[(bar.x, bar.y)].symbol(),
+            "━",
+            "thumb starts at the left"
+        );
+        assert!(shows(&buffer, (255, 0, 0)) && !shows(&buffer, (0, 0, 255)));
+
+        // Scrolling to the far end reveals the other half and moves the thumb.
+        app.scroll_image_h(&hit, i32::MAX / 2);
+        let buffer = draw(&mut app);
+        assert!(shows(&buffer, (0, 0, 255)) && !shows(&buffer, (255, 0, 0)));
+        assert_eq!(buffer[(bar.x + bar.width - 1, bar.y)].symbol(), "━");
+        assert_eq!(buffer[(bar.x, bar.y)].symbol(), "─");
+
+        // A click on the bar maps its column to an offset; the ends clamp.
+        app.drag_image_hscrollbar(&hit, bar.x);
+        assert_eq!(app.doc_hscroll[&path], 0);
+        app.drag_image_hscrollbar(&hit, bar.x + bar.width - 1);
+        assert_eq!(app.doc_hscroll[&path], hit.max);
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
     async fn image_output_border_survives_scrolling_and_selection() {
         let mut app = test_app().await;
         let area = Rect::new(0, 0, 12, 8);
@@ -4982,9 +5400,7 @@ mod tests {
             prefix: vec![Span::styled("│ ", Style::default().fg(Color::Magenta))],
             path: path.clone(),
             alt: "framed".into(),
-            width_percent: None,
-            height_percent: None,
-            bg: None,
+            attrs: Default::default(),
         }];
         app.doc_images.insert(
             path,
@@ -5038,9 +5454,7 @@ mod tests {
                 prefix: Vec::new(),
                 path: path.clone(),
                 alt: "sensor".into(),
-                width_percent: None,
-                height_percent: None,
-                bg: None,
+                attrs: Default::default(),
             }];
             app.image_pending.insert(path.clone());
             let area = Rect::new(0, 0, 80, 15);

@@ -2,6 +2,16 @@
 //! https://iterm2.com/documentation-escape-codes.html (Report Cell Size).
 
 use ratatui_image::FontSize;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Display backing scale reported by iTerm2 (`ReportCellSize`), times 100.
+/// Sixel cell metrics are physical pixels there, so converting them to CSS
+/// pixels (for an SVG's own `width`/`height`) needs this. 100 when unknown.
+static DISPLAY_SCALE_X100: AtomicU32 = AtomicU32::new(100);
+
+pub(super) fn display_scale() -> f32 {
+    DISPLAY_SCALE_X100.load(Ordering::Relaxed) as f32 / 100.0
+}
 
 /// Called only during initial construction, before the input reader starts.
 /// Nested canvases inherit the resulting Picker instead of querying again.
@@ -39,7 +49,9 @@ pub(super) fn query_iterm_cell_pixels() -> Option<FontSize> {
             break;
         }
     }
-    parse_iterm_cell_pixels(&response)
+    let (metrics, scale) = parse_iterm_cell_report(&response)?;
+    DISPLAY_SCALE_X100.store((scale * 100.0).round().max(1.0) as u32, Ordering::Relaxed);
+    Some(metrics)
 }
 
 #[cfg(not(unix))]
@@ -47,7 +59,12 @@ pub(super) fn query_iterm_cell_pixels() -> Option<FontSize> {
     None
 }
 
+#[cfg(test)]
 fn parse_iterm_cell_pixels(response: &[u8]) -> Option<FontSize> {
+    parse_iterm_cell_report(response).map(|(size, _)| size)
+}
+
+fn parse_iterm_cell_report(response: &[u8]) -> Option<(FontSize, f64)> {
     let response = std::str::from_utf8(response).ok()?;
     let (_, fields) = response.split_once("\x1b]1337;ReportCellSize=")?;
     let end = fields.find('\x07').or_else(|| fields.find("\x1b\\"))?;
@@ -68,7 +85,7 @@ fn parse_iterm_cell_pixels(response: &[u8]) -> Option<FontSize> {
         let pixels = (points * scale).round();
         (pixels >= 1.0 && pixels <= u16::MAX as f64).then_some(pixels as u16)
     };
-    Some(FontSize::new(physical(width)?, physical(height)?))
+    Some((FontSize::new(physical(width)?, physical(height)?), scale))
 }
 
 #[cfg(test)]

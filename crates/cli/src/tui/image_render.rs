@@ -72,19 +72,34 @@ impl ImageRedrawState {
 pub(super) struct DocumentImage {
     size: Size,
     pub sliced: Option<SlicedProtocol>,
+    /// What a horizontally scrolled sliced image is re-encoded from: the
+    /// library's sliced widget can only skip rows, never columns.
+    window_source: Option<WindowSource>,
     fragment: Option<FragmentImage>,
+}
+
+const SLICED_WINDOWS: usize = 4;
+
+struct WindowSource {
+    pixels: DynamicImage,
+    picker: ratatui_image::picker::Picker,
+    cell_width: u32,
+    /// Most recent first, keyed by (first column, columns).
+    windows: RefCell<VecDeque<((u16, u16), Arc<SlicedProtocol>)>>,
 }
 struct FragmentImage {
     pixels: DynamicImage,
+    cell_width: u32,
     cell_height: u32,
     is_tmux: bool,
     sixel: bool,
-    cache: RefCell<VecDeque<((u16, u16), Arc<Protocol>)>>,
+    cache: RefCell<VecDeque<((u16, u16, u16, u16), Arc<Protocol>)>>,
 }
 impl DocumentImage {
     pub fn fragment(
         size: Size,
         pixels: DynamicImage,
+        cell_width: u32,
         cell_height: u32,
         is_tmux: bool,
         sixel: bool,
@@ -92,8 +107,10 @@ impl DocumentImage {
         Self {
             size,
             sliced: None,
+            window_source: None,
             fragment: Some(FragmentImage {
                 pixels,
+                cell_width,
                 cell_height,
                 is_tmux,
                 sixel,
@@ -101,26 +118,110 @@ impl DocumentImage {
             }),
         }
     }
-    pub fn sliced(sliced: SlicedProtocol) -> Self {
+    /// A natively sliced (Kitty/Halfblocks) image; `pixels` are what it was
+    /// encoded from, kept to re-encode the window of a sideways scroll.
+    pub fn sliced(
+        sliced: SlicedProtocol,
+        pixels: DynamicImage,
+        picker: ratatui_image::picker::Picker,
+        cell_width: u32,
+    ) -> Self {
         Self {
             size: sliced.size(),
             sliced: Some(sliced),
+            window_source: Some(WindowSource {
+                pixels,
+                picker,
+                cell_width,
+                windows: RefCell::new(VecDeque::new()),
+            }),
             fragment: None,
         }
+    }
+
+    /// The `width`-column window of a sliced image starting at `skip_col`, or
+    /// `None` when the whole image is shown (or this is not a sliced image).
+    pub fn sliced_window(&self, skip_col: u16, width: u16) -> Option<Arc<SlicedProtocol>> {
+        let source = self.window_source.as_ref()?;
+        let width = width.min(self.size.width.saturating_sub(skip_col));
+        if width == 0 || (skip_col == 0 && width >= self.size.width) {
+            return None;
+        }
+        let key = (skip_col, width);
+        let mut windows = source.windows.borrow_mut();
+        if let Some(index) = windows.iter().position(|(k, _)| *k == key) {
+            let hit = windows.remove(index)?;
+            let window = hit.1.clone();
+            windows.push_front(hit);
+            return Some(window);
+        }
+        let x = u32::from(skip_col) * source.cell_width;
+        let cropped = source.pixels.crop_imm(
+            x,
+            0,
+            (u32::from(width) * source.cell_width).min(source.pixels.width().checked_sub(x)?),
+            source.pixels.height(),
+        );
+        let window = Arc::new(
+            SlicedProtocol::new_with_resize(
+                &source.picker,
+                cropped,
+                Size::new(width, self.size.height),
+                ratatui_image::Resize::Fit(None),
+            )
+            .ok()?,
+        );
+        windows.truncate(SLICED_WINDOWS - 1);
+        windows.push_front((key, window.clone()));
+        Some(window)
     }
     pub fn size(&self) -> Size {
         self.size
     }
 
-    /// Cache keys are source row and visible row count; pane resize/file changes
-    /// replace the whole DocumentImage, so stale pixels cannot survive them.
+    /// Whether the image is wider than the `avail` columns it is shown in, so
+    /// it scrolls sideways and gets a scrollbar row under it.
+    pub fn overflows(&self, avail: u16) -> bool {
+        self.size.width > avail
+    }
+
+    /// Document rows the image takes up in `avail` columns: its own height
+    /// plus one row for the horizontal scrollbar when it overflows.
+    pub fn rows_in(&self, avail: u16) -> u16 {
+        self.size
+            .height
+            .saturating_add(u16::from(self.overflows(avail)))
+    }
+
+    /// The furthest a `avail`-column window can be scrolled right.
+    pub fn max_hscroll(&self, avail: u16) -> u16 {
+        self.size.width.saturating_sub(avail)
+    }
+
+    /// Cache keys are the source row/column and the visible rows/columns;
+    /// pane resize/file changes replace the whole DocumentImage, so stale
+    /// pixels cannot survive them.
+    #[cfg(test)]
     pub fn visible_fragment(&self, skip: u16, height: u16) -> Option<Arc<Protocol>> {
+        self.visible_fragment_at(skip, height, 0, self.size().width)
+    }
+
+    /// The `width`×`height`-cell window of this image whose top-left cell is
+    /// (`skip_col`, `skip`) — what a horizontally scrolled image shows.
+    pub fn visible_fragment_at(
+        &self,
+        skip: u16,
+        height: u16,
+        skip_col: u16,
+        width: u16,
+    ) -> Option<Arc<Protocol>> {
         let source = self.fragment.as_ref()?;
         let height = height.min(self.size().height.saturating_sub(skip));
-        if height == 0 {
+        let width = width.min(self.size().width.saturating_sub(skip_col));
+        if height == 0 || width == 0 {
             return None;
         }
-        let key = (skip, height);
+        let key = (skip, height, skip_col, width);
         let mut cache = source.cache.borrow_mut();
         if let Some(index) = cache.iter().position(|(cached, _)| *cached == key) {
             let hit = cache.remove(index)?;
@@ -128,18 +229,19 @@ impl DocumentImage {
             cache.push_front(hit);
             return Some(protocol);
         }
+        let x = u32::from(skip_col) * source.cell_width;
         let y = u32::from(skip) * source.cell_height;
         let pixels = source.pixels.crop_imm(
-            0,
+            x,
             y,
-            source.pixels.width(),
+            (u32::from(width) * source.cell_width).min(source.pixels.width().checked_sub(x)?),
             (u32::from(height) * source.cell_height).min(source.pixels.height().checked_sub(y)?),
         );
         // Sixel bands carry raster dimensions, palette and six-pixel row state.
         // Cropping their strings leaves the full opaque raster behind and cannot
         // represent cell boundaries not divisible by six. Encode the exact
         // cropped pixels, then reuse the resulting sequence on repeat visits.
-        let size = Size::new(self.size().width, height);
+        let size = Size::new(width, height);
         let encoded = if source.sixel {
             Protocol::Sixel(
                 ratatui_image::protocol::sixel::Sixel::new(pixels, size, source.is_tmux).ok()?,
@@ -256,7 +358,7 @@ mod tests {
                 }
             },
         ));
-        DocumentImage::fragment(Size::new(2, rows), pixels, 8, false, false)
+        DocumentImage::fragment(Size::new(2, rows), pixels, 8, 8, false, false)
     }
     #[test]
     fn cached_fragment_preserves_visible_pixels_and_cell_placement() {
@@ -321,6 +423,7 @@ mod tests {
                 let image = DocumentImage::fragment(
                     Size::new(4, 4),
                     pixels.clone(),
+                    12,
                     u32::from(cell_height),
                     tmux,
                     true,
@@ -361,5 +464,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn a_horizontal_window_crops_columns_and_is_cached_per_window() {
+        // 4 cells wide, 8 px each: the left half red, the right half blue.
+        let pixels = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(32, 16, |x, _| {
+            if x < 16 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        }));
+        let image = DocumentImage::fragment(Size::new(4, 2), pixels, 8, 8, false, false);
+        let right = image.visible_fragment_at(0, 2, 2, 2).unwrap();
+        assert_eq!(right.size(), Size::new(2, 2));
+        assert!(Arc::ptr_eq(
+            &right,
+            &image.visible_fragment_at(0, 2, 2, 2).unwrap()
+        ));
+        let left = image.visible_fragment_at(0, 2, 0, 2).unwrap();
+        assert!(!Arc::ptr_eq(&left, &right));
+        // The window never extends past the image, and an empty one is None.
+        assert_eq!(
+            image.visible_fragment_at(0, 2, 3, 9).unwrap().size(),
+            Size::new(1, 2)
+        );
+        assert!(image.visible_fragment_at(0, 2, 4, 2).is_none());
     }
 }

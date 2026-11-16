@@ -158,6 +158,64 @@ impl LayoutContext {
         })
     }
 
+    /// Display budget (cells) for an image (SVG or raster) with its own size of
+    /// `intrinsic` CSS pixels, `cell` being the CSS pixels one terminal cell
+    /// covers.
+    ///
+    /// Without `%` sizing the image shows at its declared size, clamped to the
+    /// pane width the way a browser's `max-width:100%` would — unless the
+    /// author gave an explicit pixel `width`/`height` or `max-width=none`, in
+    /// which case it may be wider than the pane (and is scrolled). Height is
+    /// never bound by the viewport: the document scrolls vertically.
+    pub fn intrinsic_budget(
+        self,
+        attrs: &meshfox_core::image_attrs::ImageAttrs,
+        intrinsic: (f32, f32),
+        cell: (f32, f32),
+    ) -> Size {
+        use meshfox_core::image_attrs::{MaxSize, Size as AttrSize};
+        let pane = self.size.width.max(1);
+        // `Some(None)`: `max-width=none`; `None`: no `max-width` given.
+        let explicit_cap: Option<Option<u16>> = attrs.max_width.map(|m| match m {
+            MaxSize::None => None,
+            MaxSize::Size(m) if m.percent => Some(
+                (u64::from(pane) * u64::from(m.value) / 100).clamp(1, u64::from(u16::MAX)) as u16,
+            ),
+            MaxSize::Size(m) => Some(cells(m.value as f32, cell.0)),
+        });
+        let is_percent = |s: Option<AttrSize>| s.is_some_and(|s| s.percent);
+        let valid = |v: f32| v.is_finite() && v > 0.0;
+        if is_percent(attrs.width)
+            || is_percent(attrs.height)
+            || !(valid(intrinsic.0) && valid(intrinsic.1) && valid(cell.0) && valid(cell.1))
+        {
+            let mut budget = self.image_budget(
+                attrs.width.filter(|s| s.percent).map(|s| s.value),
+                attrs.height.filter(|s| s.percent).map(|s| s.value),
+            );
+            if let Some(Some(cap)) = explicit_cap {
+                budget.width = budget.width.min(cap);
+            }
+            return budget;
+        }
+        let natural = (cells(intrinsic.0, cell.0), cells(intrinsic.1, cell.1));
+        let explicit_w = attrs.width.map(|s| cells(s.value as f32, cell.0));
+        let explicit_h = attrs.height.map(|s| cells(s.value as f32, cell.1));
+        let width = explicit_w.unwrap_or_else(|| match explicit_h {
+            // Keep the aspect ratio when only the height is given.
+            Some(h) => (f32::from(h) * f32::from(natural.0) / f32::from(natural.1))
+                .round()
+                .clamp(1.0, f32::from(u16::MAX)) as u16,
+            None => natural.0,
+        });
+        let explicit = attrs.width.is_some() || attrs.height.is_some();
+        let cap = explicit_cap.unwrap_or((!explicit).then_some(pane));
+        Size::new(
+            cap.map_or(width, |cap| width.min(cap)),
+            explicit_h.unwrap_or(u16::MAX),
+        )
+    }
+
     pub fn image_budget(self, width_percent: Option<u32>, height_percent: Option<u32>) -> Size {
         let viewport = self.size;
         let width = viewport.width.max(1);
@@ -178,6 +236,11 @@ impl LayoutContext {
         };
         ratatui::layout::Size::new(scale(width, width_percent), height)
     }
+}
+
+/// `css_px` CSS pixels in whole cells of `per_cell` CSS pixels (at least one).
+fn cells(css_px: f32, per_cell: f32) -> u16 {
+    (css_px / per_cell).round().clamp(1.0, f32::from(u16::MAX)) as u16
 }
 
 fn button_lines(caption: &str, selected: bool, available: u16) -> Vec<Line<'static>> {
@@ -634,5 +697,56 @@ mod tests {
                 .iter()
                 .any(|s| s.style.fg == Some(Color::Yellow)));
         }
+    }
+
+    #[test]
+    fn intrinsic_budget_uses_the_declared_size_clamped_to_the_pane() {
+        use meshfox_core::image_attrs::parse;
+        let attrs = |t: &str| parse(t).map(|(a, _)| a).unwrap_or_default();
+        let ctx = LayoutContext::new(Size::new(100, 40));
+        // 1280x520 CSS px at 8x16 px per cell: 160x33 cells — wider than the pane.
+        let (intrinsic, cell) = ((1280.0, 520.0), (8.0, 16.0));
+        let none = attrs("");
+        assert_eq!(
+            ctx.intrinsic_budget(&none, intrinsic, cell),
+            Size::new(100, u16::MAX)
+        );
+        // A small SVG keeps its own size rather than being blown up.
+        assert_eq!(
+            ctx.intrinsic_budget(&none, (160.0, 64.0), cell),
+            Size::new(20, u16::MAX)
+        );
+        // `max-width` replaces the default clamp.
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{max-width=none}"), intrinsic, cell),
+            Size::new(160, u16::MAX)
+        );
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{max-width=400}"), intrinsic, cell),
+            Size::new(50, u16::MAX)
+        );
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{max-width=50%}"), intrinsic, cell),
+            Size::new(50, u16::MAX)
+        );
+        // An explicit pixel size is a deliberate choice, so it may overflow.
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{width=1600}"), intrinsic, cell),
+            Size::new(200, u16::MAX)
+        );
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{width=1600 max-width=800}"), intrinsic, cell),
+            Size::new(100, u16::MAX)
+        );
+        // Percentages keep their pane-relative meaning.
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{width=50%}"), intrinsic, cell),
+            Size::new(50, u16::MAX)
+        );
+        // Height alone preserves the aspect ratio in cells.
+        assert_eq!(
+            ctx.intrinsic_budget(&attrs("{height=320}"), intrinsic, cell),
+            Size::new(97, 20)
+        );
     }
 }

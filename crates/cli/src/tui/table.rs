@@ -819,6 +819,15 @@ pub fn render_overlay(f: &mut Frame, area: Rect, data: &TableData, tm: &TableMod
         )));
     }
     f.render_widget(Paragraph::new(body), body_area);
+    super::ui::paint_vthumb(
+        f,
+        super::ui::x_of(area),
+        body_area.y,
+        usize::from(body_area.height),
+        rows,
+        tm.top_row,
+        true,
+    );
 
     // The line under the grid: the prompt being typed, an error, or the
     // cursor cell's value.

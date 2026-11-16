@@ -824,7 +824,7 @@ Lives inside a node's Markdown text, as fence-info-string attributes:
   rendering.
 - `output-attrs="..."` — optional; only with `output="image"` (`meshfox
   validate` rejects it otherwise). Image attributes — the same narrow
-  grammar as `{width=..}`/`{bg=..}` after a Markdown image (see
+  grammar as `{width=..}`/`{max-width=..}`/`{bg=..}` after a Markdown image (see
   MARKDOWN.md's "Image size and background") without the braces, e.g.
   `output-attrs="width=50% bg=#fff"` — forwarded onto the generated image.
   `meshfox validate` also rejects a value outside that grammar. Part of
@@ -4046,8 +4046,19 @@ In the TUI, Markdown image percentage dimensions refer to the current document
 pane, preserving aspect ratio. For example, `{width=100%}` uses the full pane
 width; when height is omitted, the image can extend beyond the visible pane
 and its remaining rows are reached by scrolling. An explicit percentage height
-limits the image to that fraction of the pane height. Images without percentage
-attributes keep a 56-column by 24-row maximum, limited by the pane size.
+limits the image to that fraction of the pane height.
+
+An image without percentage attributes — SVG or raster alike — is shown at its
+own size (an SVG's `width`/`height`, else `viewBox`; a raster's pixel
+dimensions; in CSS pixels, converted to cells with the terminal's cell size
+and, on iTerm2 Sixel, its reported display scale), clamped
+to the pane width. A pixel `width`/`height` is honored the same way, and an
+explicit pixel size or `max-width=none` removes the clamp; `max-width=N` or
+`N%` bounds the width. An image wider than the pane scrolls sideways: the
+horizontal wheel or Shift+wheel over it, Shift+Left/Right in the document, or a
+click or drag on the thin scrollbar row drawn under it. Its offset is kept per
+image path and clamped to the image width. Sliced (Kitty/Halfblocks) images
+re-encode the visible window; iTerm2 and Sixel crop the cached bitmap.
 Resizing or entering fullscreen recalculates these dimensions from cached bytes.
 
 TUI document images render their visible rows when scrolled partially above or
