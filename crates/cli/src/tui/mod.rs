@@ -18,6 +18,7 @@ mod document_layout;
 mod external_editor;
 mod image_metrics;
 mod image_render;
+mod image_scroll;
 mod markdown;
 mod open_file;
 mod palette;
@@ -522,6 +523,33 @@ async fn reconcile_runs(port: u16, tx: &tokio::sync::mpsc::UnboundedSender<Exter
     }
 }
 
+/// Input that only moves a scroll position, so a burst of it can be applied
+/// together and drawn once: wheel events and a held Up/Down/PageUp/PageDown.
+fn is_wheel(ev: &Event) -> bool {
+    use crossterm::event::MouseEventKind::{ScrollDown, ScrollLeft, ScrollRight, ScrollUp};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match ev {
+        Event::Mouse(m) => matches!(m.kind, ScrollUp | ScrollDown | ScrollLeft | ScrollRight),
+        Event::Key(k) => {
+            k.kind == KeyEventKind::Press
+                && k.modifiers == KeyModifiers::NONE
+                && matches!(
+                    k.code,
+                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                )
+        }
+        _ => false,
+    }
+}
+
+async fn handle_input(app: &mut App, ev: Event) {
+    match ev {
+        Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key).await,
+        Event::Mouse(mouse) => app.on_mouse(mouse).await,
+        _ => {}
+    }
+}
+
 async fn main_loop(
     terminal: &mut Terminal<PositionedBackend<io::Stdout>>,
     app: &mut App,
@@ -544,6 +572,9 @@ async fn main_loop(
     let mut service_log_tick = tokio::time::interval(Duration::from_secs(1));
     service_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut image_redraw = image_render::ImageRedrawState::default();
+    // The first non-scroll event met while coalescing wheel events: handled
+    // on the next pass, after the frame that shows the scrolling.
+    let mut stashed: Option<Event> = None;
     loop {
         status.update(app);
         image_redraw.draw(terminal, |f| ui::render(f, app))?;
@@ -640,7 +671,20 @@ async fn main_loop(
         let spinner_active = app.spinner_active();
         let copy_flash_until = app.text_selection.as_ref().and_then(|s| s.copy_flash_until);
         let status_deadline = app.status_deadline();
+        if let Some(ev) = stashed.take() {
+            handle_input(app, ev).await;
+            continue;
+        }
+        let now = std::time::Instant::now();
+        let settle_deadline = app.scroll_images.settle_deadline().filter(|t| *t > now);
+        let warm_pending = app.scroll_images.warm_pending();
         tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(settle_deadline.unwrap_or(now))), if settle_deadline.is_some() => {
+                app.scroll_images.settle(std::time::Instant::now());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(1)), if warm_pending => {
+                app.warm_scroll_images();
+            }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(status_deadline.unwrap_or_else(std::time::Instant::now))), if status_deadline.is_some() => {
                 app.expire_status();
             }
@@ -648,11 +692,21 @@ async fn main_loop(
                 if let Some(selection)=&mut app.text_selection {selection.copy_flash_until=None;}
             }
             maybe_ev = input_rx.recv() => {
-                match maybe_ev {
-                    Some(Event::Key(key)) if key.kind == KeyEventKind::Press => app.on_key(key).await,
-                    Some(Event::Mouse(mouse)) => app.on_mouse(mouse).await,
-                    Some(_) => {}
-                    None => return Ok(()),
+                let Some(ev) = maybe_ev else { return Ok(()) };
+                let scrolled = is_wheel(&ev);
+                handle_input(app, ev).await;
+                // A burst of wheel events is applied together and drawn once:
+                // drawing between them only to throw the frame away is what
+                // made scrolling over images lag behind the wheel.
+                while scrolled {
+                    match input_rx.try_recv() {
+                        Ok(next) if is_wheel(&next) => handle_input(app, next).await,
+                        Ok(next) => {
+                            stashed = Some(next);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             event = async {

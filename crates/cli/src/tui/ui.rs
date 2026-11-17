@@ -1329,7 +1329,7 @@ pub(super) fn render_document_image(
     area: Rect,
     buffer: &mut ratatui::buffer::Buffer,
 ) {
-    render_document_image_at(image, skip, 0, area, buffer);
+    render_document_image_at(image, skip, 0, false, area, buffer);
 }
 
 /// `render_document_image` for an image scrolled `skip_col` cells to the left.
@@ -1337,12 +1337,21 @@ pub(super) fn render_document_image_at(
     image: &super::image_render::DocumentImage,
     skip: u16,
     skip_col: u16,
+    defer: bool,
     area: Rect,
     buffer: &mut ratatui::buffer::Buffer,
 ) {
     use ratatui::widgets::Widget;
-    if let Some(fragment) = image.visible_fragment_at(skip, area.height, skip_col, area.width) {
+    let fragment = if defer {
+        image.cached_fragment_at(skip, area.height, skip_col, area.width)
+    } else {
+        image.visible_fragment_at(skip, area.height, skip_col, area.width)
+    };
+    if let Some(fragment) = fragment {
         Image::new(fragment.as_ref()).render(area, buffer);
+    } else if defer && image.is_fragmented() {
+        // Mid-scroll and not encoded yet: a placeholder until the wheel stops.
+        paint_image_placeholder(area, buffer);
     } else if let Some(sliced) = &image.sliced {
         // Kitty/Halfblocks can only skip rows: a sideways window is its own
         // (cropped and re-encoded) protocol, cached per window.
@@ -1352,6 +1361,18 @@ pub(super) fn render_document_image_at(
             SignedPosition::from((0, -(skip as i16))),
         )
         .render(area, buffer);
+    }
+}
+
+/// What a bitmap image looks like while the wheel is spinning too fast to encode it.
+fn paint_image_placeholder(area: Rect, buffer: &mut ratatui::buffer::Buffer) {
+    let style = Style::default().fg(super::theme::border());
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_symbol("░").set_style(style);
+            }
+        }
     }
 }
 
@@ -1395,6 +1416,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 
     app.doc_click_targets.clear();
     app.doc_image_hscroll_targets.clear();
+    app.scroll_images.begin_frame();
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -1672,7 +1694,41 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
                             .unwrap_or(0)
                             .min(p.max_hscroll(avail));
                         if image_visible > 0 {
-                            render_document_image_at(p, skip, offset, rect, f.buffer_mut());
+                            let scrolling =
+                                app.scroll_images.is_scrolling(std::time::Instant::now());
+                            // An image that showed a placeholder in this fast
+                            // scroll keeps it until the scroll settles, instead
+                            // of flipping with every cache hit and miss.
+                            if scrolling
+                                && p.is_fragmented()
+                                && !app.scroll_images.is_deferred(path)
+                                && p.cached_fragment_at(skip, rect.height, offset, rect.width)
+                                    .is_none()
+                            {
+                                app.scroll_images.defer(path);
+                            }
+                            if scrolling && app.scroll_images.is_deferred(path) {
+                                paint_image_placeholder(rect, f.buffer_mut());
+                            } else {
+                                render_document_image_at(
+                                    p,
+                                    skip,
+                                    offset,
+                                    scrolling,
+                                    rect,
+                                    f.buffer_mut(),
+                                );
+                            }
+                            if p.is_fragmented() {
+                                app.scroll_images.record(super::image_scroll::ImageWindow {
+                                    path: path.clone(),
+                                    top: i32::from(y - inner.y) - i32::from(skip),
+                                    pane_height: bottom - inner.y,
+                                    rows: image_rows,
+                                    skip_col: offset,
+                                    width: rect.width,
+                                });
+                            }
                         }
                         if p.overflows(avail) {
                             let bar_y = y + image_visible;
@@ -1718,6 +1774,7 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
             }
         }
     }
+    app.scroll_images.end_frame();
     render_document_vscrollbar(f, area, inner, app, context, y >= bottom);
 }
 
@@ -4975,6 +5032,40 @@ mod tests {
         assert!(sequence.contains("q\"1;1;48;21"), "{sequence:?}");
         assert!(!sequence.contains("q\"1;1;48;28"));
         let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_fragment_that_is_not_cached_is_a_placeholder_only_while_scrolling_fast() {
+        use ratatui::buffer::Buffer;
+        let pixels = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            16,
+            48,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let image = super::super::image_render::DocumentImage::fragment(
+            ratatui::layout::Size::new(2, 6),
+            pixels,
+            8,
+            8,
+            false,
+            false,
+        );
+        let area = Rect::new(0, 0, 2, 3);
+        let mut buffer = Buffer::empty(area);
+        render_document_image_at(&image, 1, 0, true, area, &mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "░");
+        assert!(
+            image.cached_fragment_at(1, 3, 0, 2).is_none(),
+            "nothing was encoded"
+        );
+        let mut buffer = Buffer::empty(area);
+        render_document_image_at(&image, 1, 0, false, area, &mut buffer);
+        assert_ne!(buffer[(0, 0)].symbol(), "░");
+        assert!(image.cached_fragment_at(1, 3, 0, 2).is_some());
+        // Once cached, a fast scroll draws the real image too.
+        let mut buffer = Buffer::empty(area);
+        render_document_image_at(&image, 1, 0, true, area, &mut buffer);
+        assert_ne!(buffer[(0, 0)].symbol(), "░");
     }
 
     #[test]

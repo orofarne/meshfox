@@ -5,7 +5,7 @@ use ratatui_image::{protocol::Protocol, sliced::SlicedProtocol};
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
-const CACHE_ENTRIES: usize = 32;
+const CACHE_ENTRIES: usize = 64;
 const SIXEL_CACHE_ENTRIES: usize = 128;
 
 /// Restore withdrawn overlays only when ratatui would otherwise leave the
@@ -215,6 +215,55 @@ impl DocumentImage {
         skip_col: u16,
         width: u16,
     ) -> Option<Arc<Protocol>> {
+        self.fragment_at(skip, height, skip_col, width, true)
+    }
+
+    /// Like `visible_fragment_at`, but only ever answers from the cache: `None`
+    /// on a miss instead of encoding. A frame drawn mid-scroll uses it so
+    /// that a clipped image costs nothing until the wheel stops.
+    pub fn cached_fragment_at(
+        &self,
+        skip: u16,
+        height: u16,
+        skip_col: u16,
+        width: u16,
+    ) -> Option<Arc<Protocol>> {
+        self.fragment_at(skip, height, skip_col, width, false)
+    }
+
+    /// Whether this image is drawn from cached bitmap fragments (iTerm2 and
+    /// Sixel), the only kind whose per-scroll-step cost can be warmed.
+    pub fn is_fragmented(&self) -> bool {
+        self.fragment.is_some()
+    }
+
+    /// Encode the window now (when not cached yet) without drawing it.
+    /// Returns whether it actually had to encode.
+    pub fn warm_fragment(&self, skip: u16, height: u16, skip_col: u16, width: u16) -> bool {
+        let Some(source) = self.fragment.as_ref() else {
+            return false;
+        };
+        let height = height.min(self.size().height.saturating_sub(skip));
+        let width = width.min(self.size().width.saturating_sub(skip_col));
+        if height == 0 || width == 0 {
+            return false;
+        }
+        let key = (skip, height, skip_col, width);
+        if source.cache.borrow().iter().any(|(k, _)| *k == key) {
+            return false;
+        }
+        self.fragment_at(skip, height, skip_col, width, true)
+            .is_some()
+    }
+
+    fn fragment_at(
+        &self,
+        skip: u16,
+        height: u16,
+        skip_col: u16,
+        width: u16,
+        encode: bool,
+    ) -> Option<Arc<Protocol>> {
         let source = self.fragment.as_ref()?;
         let height = height.min(self.size().height.saturating_sub(skip));
         let width = width.min(self.size().width.saturating_sub(skip_col));
@@ -228,6 +277,9 @@ impl DocumentImage {
             let protocol = hit.1.clone();
             cache.push_front(hit);
             return Some(protocol);
+        }
+        if !encode {
+            return None;
         }
         let x = u32::from(skip_col) * source.cell_width;
         let y = u32::from(skip) * source.cell_height;
@@ -361,6 +413,20 @@ mod tests {
         DocumentImage::fragment(Size::new(2, rows), pixels, 8, 8, false, false)
     }
     #[test]
+    fn cached_only_lookup_never_encodes_and_warming_fills_the_cache() {
+        let image = image(6);
+        assert!(image.cached_fragment_at(2, 3, 0, 2).is_none());
+        assert!(image.warm_fragment(2, 3, 0, 2), "first warm encodes");
+        assert!(!image.warm_fragment(2, 3, 0, 2), "second warm is a hit");
+        let hit = image.cached_fragment_at(2, 3, 0, 2).unwrap();
+        assert!(Arc::ptr_eq(
+            &hit,
+            &image.visible_fragment_at(2, 3, 0, 2).unwrap()
+        ));
+        assert!(image.is_fragmented());
+    }
+
+    #[test]
     fn cached_fragment_preserves_visible_pixels_and_cell_placement() {
         use base64::Engine;
         let image = image(4);
@@ -393,9 +459,9 @@ mod tests {
     }
     #[test]
     fn fragment_cache_evicts_old_views_and_obeys_limits() {
-        let image = image(64);
+        let image = image(128);
         let first = image.visible_fragment(0, 1).unwrap();
-        for skip in 1..40 {
+        for skip in 1..CACHE_ENTRIES as u16 + 8 {
             image.visible_fragment(skip, 1).unwrap();
         }
         let cache = image.fragment.as_ref().unwrap().cache.borrow();

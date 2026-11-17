@@ -483,6 +483,7 @@ impl Selection {
                     image,
                     (visible_start - start) as u16,
                     *offset,
+                    false,
                     Rect::new(
                         self.area.x + (*inset).min(self.area.width),
                         self.area.y + (visible_start - self.top) as u16,

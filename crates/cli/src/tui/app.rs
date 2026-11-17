@@ -587,6 +587,8 @@ pub struct App {
     /// (like `doc_click_targets`): where a horizontal scroll or a click on
     /// the thin scrollbar under them lands.
     pub doc_image_hscroll_targets: Vec<ImageHScroll>,
+    /// Wheel-speed tracking and idle fragment warming for bitmap images.
+    pub(super) scroll_images: super::image_scroll::ScrollImages,
     /// How far each such image is scrolled right, in cells — kept per image
     /// path so it survives re-layout; clamped to the image at draw time.
     pub doc_hscroll: HashMap<PathBuf, u16>,
@@ -1458,6 +1460,7 @@ impl App {
             doc_click_regions: Vec::new(),
             doc_click_targets: Vec::new(),
             doc_image_hscroll_targets: Vec::new(),
+            scroll_images: Default::default(),
             doc_hscroll: HashMap::new(),
             doc_images: HashMap::new(),
             doc_image_cache: HashMap::new(),
@@ -4889,7 +4892,14 @@ impl App {
             .insert(hit.path.clone(), offset.min(u32::from(hit.max)) as u16);
     }
 
+    /// One idle step of warming the image fragments the next wheel steps need.
+    pub(super) fn warm_scroll_images(&mut self) {
+        self.scroll_images.warm_one(&self.doc_images);
+    }
+
     fn scroll_document(&mut self, delta: i32) {
+        self.scroll_images
+            .note_scroll(delta, std::time::Instant::now());
         self.doc_scroll = (self.doc_scroll as i32 + delta).max(0) as u16;
     }
 
