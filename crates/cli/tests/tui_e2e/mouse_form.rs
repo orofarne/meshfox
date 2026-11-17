@@ -15,6 +15,36 @@ use crate::harness::TuiSession;
 
 #[test]
 #[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn form_autorun_footer_keeps_the_target_and_expires_submission_feedback() {
+    let (canvas_path, dir) = fixtures::write_fixture(concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"CARD_ANIMAL\" session -->\n\n",
+        "```form name=\"card-form\"\nfield var=\"CARD_ANIMAL\" label=\"Animal\"\n```\n\n",
+        "## Card\n<!-- meshfox:node id=\"a\" -->\n\n",
+        "```bash name=\"card\" env=\"$CARD_ANIMAL\" autorun deps=\"z/animals-csv\"\n",
+        "echo \"card is $CARD_ANIMAL\"\n```\n\n",
+        "## Animals\n<!-- meshfox:node id=\"z\" -->\n\n",
+        "```bash name=\"animals-csv\"\nsleep 0.1; echo animals-ready\n```\n",
+    ));
+    let mut session = TuiSession::spawn(&canvas_path, dir, 30, 160);
+    let timeout = Duration::from_secs(10);
+    session.wait_for("Animal:", timeout).unwrap();
+    let (row, col) = session.find("Animal:").unwrap();
+    session.send_mouse_click(row, col);
+    session.send_keys("Cat");
+    let (row, col) = session.find("[Send]").unwrap();
+    session.send_mouse_click(row, col);
+    session.wait_for("Completed: card", timeout).unwrap();
+    session.wait_for("form submitted", timeout).unwrap();
+    session
+        .wait_absent("form submitted", Duration::from_secs(7))
+        .unwrap();
+    assert!(session.screen_text().contains("Completed: card"));
+    assert!(!session.screen_text().contains("Completed: animals-csv"));
+}
+
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
 fn filling_in_a_form_field_and_clicking_send_autoruns_the_dependent_block() {
     let (canvas_path, dir) = fixtures::write_fixture(fixtures::FORM_AUTORUN);
     let mut session = TuiSession::spawn(&canvas_path, dir, 30, 100);

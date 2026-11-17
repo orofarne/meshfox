@@ -2,8 +2,86 @@
 //! each nested main loop retains its own history while another canvas is open.
 use super::app::App;
 use crate::terminal_status::State;
+use meshfox_core::{deps::BlockAddr, Canvas};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+
+/// A form submission starts chains in the worker, without a foreground RunState.
+/// Keep their requested targets instead of choosing a result from dependency updates.
+pub(super) struct AutorunActivity {
+    pub started: Instant,
+    members: Vec<BlockAddr>,
+    targets: Vec<(BlockAddr, Option<bool>)>,
+    finished: Option<Instant>,
+    run_ids: BTreeMap<String, i64>,
+}
+
+impl AutorunActivity {
+    pub fn new(canvas: &Canvas, targets: Vec<BlockAddr>, started: Instant) -> Self {
+        let members = targets
+            .iter()
+            .flat_map(|target| {
+                meshfox_core::deps::resolve_chain(canvas, target.clone())
+                    .unwrap_or_else(|_| vec![target.clone()])
+            })
+            .collect();
+        Self {
+            started,
+            members,
+            targets: targets.into_iter().map(|target| (target, None)).collect(),
+            finished: None,
+            run_ids: BTreeMap::new(),
+        }
+    }
+
+    pub fn finish(&mut self, target: &BlockAddr, exit_code: Option<i32>) {
+        if let Some((_, result)) = self.targets.iter_mut().find(|(addr, _)| addr == target) {
+            *result = Some(exit_code == Some(0));
+        }
+        if self.targets.iter().all(|(_, result)| result.is_some()) && self.finished.is_none() {
+            self.finished = Some(Instant::now());
+        }
+    }
+
+    pub fn record_runs(&mut self, runs: &[crate::worker_client::ActiveRunDto]) {
+        for run in runs {
+            if let Some(id) = run.history_id {
+                self.run_ids
+                    .insert(format!("{}/{}", run.node_id, run.block), id);
+            }
+        }
+    }
+
+    pub fn superseded_by(&self, runs: &[crate::worker_client::ActiveRunDto]) -> bool {
+        self.finished.is_some()
+            && runs.iter().any(|run| {
+                run.status == "running"
+                    && run.history_id.is_some_and(|id| {
+                        self.run_ids
+                            .get(&format!("{}/{}", run.node_id, run.block))
+                            .is_none_or(|previous| id > *previous)
+                    })
+            })
+    }
+
+    fn label(&self) -> String {
+        if let Some((target, _)) = self
+            .targets
+            .iter()
+            .find(|(_, result)| *result == Some(false))
+        {
+            target.block_name.clone()
+        } else if self.targets.len() == 1 {
+            self.targets[0].0.block_name.clone()
+        } else {
+            self.targets
+                .iter()
+                .map(|(target, _)| target.block_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Revision {
@@ -39,6 +117,8 @@ impl Snapshot {
                     .map(|r| r.block_name.clone())
                     .unwrap_or_else(|| "configuration".into()),
             )
+        } else if let Some((node, block)) = app.awaiting_forms.iter().min() {
+            Some(format!("{node}/{block}"))
         } else {
             None
         };
@@ -113,7 +193,11 @@ impl Snapshot {
                 key(&addr.node_id, &addr.block_name),
             );
         }
-        if let Some(run) = &app.run {
+        if let Some(run) = &app
+            .run
+            .as_ref()
+            .filter(|run| run.is_running() || app.autorun_activity.is_none())
+        {
             let name = run
                 .chain
                 .last()
@@ -163,6 +247,34 @@ impl Snapshot {
                         revision: Revision::Local(run.step_started),
                     },
                 );
+            }
+        }
+        if let Some(activity) = &app.autorun_activity {
+            for member in &activity.members {
+                let addr = key(&member.node_id, &member.block_name);
+                snapshot.completed.remove(&addr);
+                if activity.finished.is_some() {
+                    snapshot.active.remove(&addr);
+                }
+            }
+            if activity.finished.is_some() {
+                snapshot.completed.insert(
+                    "autorun".into(),
+                    Completion {
+                        label: activity.label(),
+                        failed: activity
+                            .targets
+                            .iter()
+                            .any(|(_, result)| *result == Some(false)),
+                        revision: Revision::Local(activity.started),
+                    },
+                );
+            } else if !activity.members.iter().any(|member| {
+                snapshot
+                    .active
+                    .contains_key(&key(&member.node_id, &member.block_name))
+            }) {
+                snapshot.active.insert("autorun".into(), activity.label());
             }
         }
         let handoff = app
@@ -220,6 +332,10 @@ impl CanvasStatus {
         };
         let now = Instant::now();
         let elapsed = self.panel_elapsed(&panel_state, now);
+        let elapsed = if let Some(activity) = &app.autorun_activity.as_ref().filter(|activity|
+            activity.finished.is_none() || matches!(&panel_state, State::Completed(name) | State::Failure(name) if *name == activity.label())) {
+            Some(activity.finished.unwrap_or(now).saturating_duration_since(activity.started))
+        } else { elapsed };
         let elapsed = if matches!(panel_state, State::Running(_))
             && app.run.as_ref().is_some_and(|run| run.is_running())
         {
@@ -230,6 +346,7 @@ impl CanvasStatus {
         } else {
             elapsed
         };
+        app.status_meta.observe_state(&mut app.status, &panel_state);
         app.activity = PanelStatus {
             state: panel_state,
             elapsed,
@@ -275,6 +392,11 @@ impl CanvasStatus {
             // invocation, regardless of the lexical order of step addresses.
             if let Some(completion) = snapshot.completed.get("foreground") {
                 if previous.completed.get("foreground") != Some(completion) {
+                    self.result = Some(State::Completed(completion.label.clone()));
+                }
+            }
+            if let Some(completion) = snapshot.completed.get("autorun") {
+                if previous.completed.get("autorun") != Some(completion) {
                     self.result = Some(State::Completed(completion.label.clone()));
                 }
             }

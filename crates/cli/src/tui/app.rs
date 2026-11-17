@@ -815,8 +815,9 @@ pub struct App {
     /// set by palette commands that create a node.
     select_after_reload: Option<String>,
     pub status: String,
-    status_expiry: Option<(std::time::Instant, String)>,
+    pub(super) status_meta: super::status_message::StatusMessage,
     pub(super) activity: super::terminal_status::PanelStatus,
+    pub(super) autorun_activity: Option<super::terminal_status::AutorunActivity>,
     pub show_help: bool,
     /// How far the `?` help modal's own content is scrolled down — counts
     /// wrapped display rows (post word-wrap), same convention
@@ -1018,6 +1019,12 @@ pub struct InlineFormState {
 /// worker-backed ones below always report, an error included, so the
 /// document can say why instead of staying on "loading…".
 pub enum BackgroundMsg {
+    AutorunFinished {
+        started: std::time::Instant,
+        target: BlockAddr,
+        exit_code: Option<i32>,
+        runs: Vec<crate::worker_client::ActiveRunDto>,
+    },
     Meta {
         url: String,
         meta: PreviewMeta,
@@ -1517,7 +1524,8 @@ impl App {
             palette: None,
             select_after_reload: None,
             activity: super::terminal_status::PanelStatus::default(),
-            status_expiry: None,
+            autorun_activity: None,
+            status_meta: super::status_message::StatusMessage::default(),
             status: if let Some(warning) = theme_warning {
                 format!("theme: {warning}")
             } else if read_only {
@@ -1587,6 +1595,7 @@ impl App {
     }
 
     pub fn begin_text_selection(&mut self) {
+        self.status_meta.retry("clipboard", &mut self.status);
         use super::selection::{self, Selection};
         if !self.selection_allowed() {
             return;
@@ -1651,7 +1660,11 @@ impl App {
                 )
             }
             Focus::Tree => {
-                self.status = "focus Document or Output to select text".into();
+                self.status_meta.notice(
+                    "clipboard",
+                    &mut self.status,
+                    "focus Document or Output to select text".into(),
+                );
                 return;
             }
         };
@@ -1703,18 +1716,27 @@ impl App {
     }
 
     async fn copy_selection(&mut self, method: Option<super::clipboard::Method>) {
+        self.status_meta.retry("clipboard", &mut self.status);
         let Some(selection) = &self.text_selection else {
-            self.status = "select text with v or drag before copying".into();
+            self.status_meta.notice(
+                "clipboard",
+                &mut self.status,
+                "select text with v or drag before copying".into(),
+            );
             return;
         };
         let text = selection.text();
         if text.is_empty() {
-            self.status = if selection.selecting {
-                "selection contains no text"
-            } else {
-                "Space or Shift+arrows to start selecting text"
-            }
-            .into();
+            self.status_meta.notice(
+                "clipboard",
+                &mut self.status,
+                if selection.selecting {
+                    "selection contains no text"
+                } else {
+                    "Space or Shift+arrows to start selecting text"
+                }
+                .into(),
+            );
             if let Some(selection) = &mut self.text_selection {
                 selection.notice = Some(self.status.clone());
             }
@@ -1725,31 +1747,44 @@ impl App {
     }
 
     async fn deliver_copy(&mut self, text: String, method: super::clipboard::Method) {
+        self.status_meta.retry("clipboard", &mut self.status);
         use super::clipboard::{self, Method};
         let mut delivered = false;
         match method {
             Method::Text => {
                 self.pending_copy_text = Some(text);
-                self.status = "plain text copy view".into();
+                self.status_meta.notice(
+                    "clipboard",
+                    &mut self.status,
+                    "plain text copy view".into(),
+                );
             }
-            Method::Terminal => {
-                self.status = match clipboard::terminal(&text) {
+            Method::Terminal => self.status_meta.result(
+                "clipboard",
+                &mut self.status,
+                match clipboard::terminal(&text) {
                     Ok(()) => {
                         delivered = true;
-                        "selection sent to terminal clipboard (OSC 52)".into()
+                        Ok("selection sent to terminal clipboard (OSC 52)".into())
                     }
-                    Err(e) => format!("clipboard: {e}; try Show selection as plain text in Ctrl-p"),
-                }
-            }
-            Method::System => {
-                self.status = match clipboard::system(&text).await {
+                    Err(e) => Err(format!(
+                        "clipboard: {e}; try Show selection as plain text in Ctrl-p"
+                    )),
+                },
+            ),
+            Method::System => self.status_meta.result(
+                "clipboard",
+                &mut self.status,
+                match clipboard::system(&text).await {
                     Ok(()) => {
                         delivered = true;
-                        "copied to system clipboard on this machine".into()
+                        Ok("copied to system clipboard on this machine".into())
                     }
-                    Err(e) => format!("clipboard: {e}; try Show selection as plain text in Ctrl-p"),
-                }
-            }
+                    Err(e) => Err(format!(
+                        "clipboard: {e}; try Show selection as plain text in Ctrl-p"
+                    )),
+                },
+            ),
         }
         if let Some(selection) = &mut self.text_selection {
             selection.notice = Some(self.status.clone());
@@ -1823,11 +1858,16 @@ impl App {
                         )
                         .await
                         {
-                            Ok(pid) => {
-                                self.status =
-                                    format!("restarted {} (pid {pid})", pending.block_name)
-                            }
-                            Err(error) => self.status = format!("failed to restart: {error}"),
+                            Ok(pid) => self.status_meta.notice(
+                                "service",
+                                &mut self.status,
+                                format!("Service {} restarted (pid {pid})", pending.block_name),
+                            ),
+                            Err(error) => self.status_meta.error(
+                                "service",
+                                &mut self.status,
+                                format!("failed to restart: {error}"),
+                            ),
                         }
                         self.refresh_services().await;
                         return;
@@ -1845,7 +1885,8 @@ impl App {
                     .await;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                    self.status = "run cancelled".into();
+                    self.status_meta
+                        .notice("run", &mut self.status, "run cancelled".into());
                 }
                 _ => self.run_confirmation = Some(pending),
             }
@@ -2179,16 +2220,20 @@ impl App {
             return false;
         }
         if decl.choices.is_empty() {
-            self.status = match self.choices_notes.get(&decl.name) {
-                Some(note) => format!("{}: {note}", decl.name),
-                None => match meshfox_core::pending_choices_source(decl) {
-                    Some(source) => format!(
-                        "{}: its choices come from {source}, which has no value yet",
-                        decl.name
-                    ),
-                    None => "no choices available for this field".into(),
+            self.status_meta.notice(
+                "form-submit",
+                &mut self.status,
+                match self.choices_notes.get(&decl.name) {
+                    Some(note) => format!("{}: {note}", decl.name),
+                    None => match meshfox_core::pending_choices_source(decl) {
+                        Some(source) => format!(
+                            "{}: its choices come from {source}, which has no value yet",
+                            decl.name
+                        ),
+                        None => "no choices available for this field".into(),
+                    },
                 },
-            };
+            );
             return true;
         }
         let ticked: Vec<String> = if multi {
@@ -2550,6 +2595,7 @@ impl App {
     /// block" — so this just leaves a status hint; a mouse click on the
     /// specific form's own field/Send still works regardless.
     fn try_enter_inline_form(&mut self) {
+        self.status_meta.retry("form-submit", &mut self.status);
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -2571,13 +2617,21 @@ impl App {
                     self.active_inline_form = Some(form);
                     self.render_current_document();
                 } else {
-                    self.status = "meshfox: this form has no usable fields".into();
+                    self.status_meta.notice(
+                        "form-submit",
+                        &mut self.status,
+                        "meshfox: this form has no usable fields".into(),
+                    );
                 }
                 return;
             }
         }
         match form_blocks.as_slice() {
-            [] => self.status = "no form in this node".into(),
+            [] => self.status_meta.notice(
+                "form-submit",
+                &mut self.status,
+                "no form in this node".into(),
+            ),
             [name] => {
                 let name = name.clone();
                 if let Some(mut form) = self.try_build_inline_form(&node_id, &name) {
@@ -2586,11 +2640,19 @@ impl App {
                     self.active_inline_form = Some(form);
                     self.render_current_document();
                 } else {
-                    self.status = "meshfox: this form has no usable fields".into();
+                    self.status_meta.notice(
+                        "form-submit",
+                        &mut self.status,
+                        "meshfox: this form has no usable fields".into(),
+                    );
                 }
             }
             _ => {
-                self.status = "more than one form in this node — click the one you want".into();
+                self.status_meta.notice(
+                    "form-submit",
+                    &mut self.status,
+                    "more than one form in this node — click the one you want".into(),
+                );
             }
         }
     }
@@ -2829,6 +2891,7 @@ impl App {
     /// them right away — `advance_run`'s own "chain exhausted" hook drains
     /// the rest.
     async fn submit_inline_form(&mut self) {
+        self.status_meta.retry("form-submit", &mut self.status);
         // The worker refuses a Send while a foreground run is in progress
         // (it commits values *and* starts runs); say so here instead of
         // round-tripping, leaving the form open with what was typed.
@@ -2837,7 +2900,7 @@ impl App {
                 .contains(&(f.node_id.clone(), f.block_name.clone()))
         });
         if !answers_a_waiting_run && self.foreground_run_in_progress() {
-            self.status = "meshfox: a run is in progress — wait for it to finish (or stop it) before sending the form".into();
+            self.status_meta.progress("form-submit", &mut self.status, "meshfox: a run is in progress — wait for it to finish (or stop it) before sending the form".into());
             return;
         }
         if let Some(form) = &mut self.active_inline_form {
@@ -2856,7 +2919,8 @@ impl App {
             {
                 let form = self.active_inline_form.as_mut().unwrap();
                 form.selected = i;
-                self.status = format!("meshfox: {e}");
+                self.status_meta
+                    .error("form-submit", &mut self.status, format!("meshfox: {e}"));
                 return;
             }
         }
@@ -2891,18 +2955,24 @@ impl App {
         // a *second* time, against a canvas snapshot that never actually
         // saw the new value.
         if let Some(port) = self.worker_port {
+            let started = std::time::Instant::now();
             match crate::worker_client::submit_form(port, &form_node_id, &form_block_name, values)
                 .await
             {
                 Ok(triggered) => {
-                    self.status = if triggered.is_empty() {
-                        "meshfox: form submitted".into()
-                    } else {
-                        format!(
-                            "meshfox: form submitted — {} autorun block(s) started",
-                            triggered.len()
-                        )
-                    };
+                    self.track_form_autoruns(port, &triggered, started);
+                    self.status_meta.notice(
+                        "form-submit",
+                        &mut self.status,
+                        if triggered.is_empty() {
+                            "meshfox: form submitted".into()
+                        } else {
+                            format!(
+                                "meshfox: form submitted — {} autorun block(s) started",
+                                triggered.len()
+                            )
+                        },
+                    );
                     // Nothing further to do here: `spawn_worker_watcher`/
                     // `on_external_run_event` (already built to show any
                     // passively-discovered run's live output, not just an
@@ -2912,7 +2982,11 @@ impl App {
                     // would rely on.
                 }
                 Err(e) => {
-                    self.status = format!("meshfox: failed to submit form: {e}");
+                    self.status_meta.error(
+                        "form-submit",
+                        &mut self.status,
+                        format!("meshfox: failed to submit form: {e}"),
+                    );
                 }
             }
             return;
@@ -2922,11 +2996,15 @@ impl App {
             meshfox_core::autorun_blocks_for_changed_vars(&self.display_canvas, &changed);
         let count = triggered.len();
         self.pending_autoruns.extend(triggered);
-        self.status = if count == 0 {
-            "meshfox: form submitted".into()
-        } else {
-            format!("meshfox: form submitted — {count} autorun block(s) queued")
-        };
+        self.status_meta.notice(
+            "form-submit",
+            &mut self.status,
+            if count == 0 {
+                "meshfox: form submitted".into()
+            } else {
+                format!("meshfox: form submitted — {count} autorun block(s) queued")
+            },
+        );
         let idle = self.run.as_ref().is_none_or(|r| r.finished);
         if idle {
             if let Some(addr) = self.pending_autoruns.pop_front() {
@@ -2935,13 +3013,67 @@ impl App {
         }
     }
 
+    fn track_form_autoruns(
+        &mut self,
+        port: u16,
+        triggered: &[crate::worker_client::TriggeredRun],
+        started: std::time::Instant,
+    ) {
+        let targets: Vec<_> = triggered
+            .iter()
+            .filter(|run| !run.tty)
+            .map(|run| BlockAddr::new(run.node_id.clone(), run.block.clone()))
+            .collect();
+        self.autorun_activity = (!targets.is_empty()).then(|| {
+            super::terminal_status::AutorunActivity::new(
+                &self.display_canvas,
+                targets.clone(),
+                started,
+            )
+        });
+        for target in targets {
+            let tx = self.background_tx.clone();
+            let mut rx = crate::worker_client::subscribe_run(
+                port,
+                target.node_id.clone(),
+                target.block_name.clone(),
+            );
+            tokio::spawn(async move {
+                let mut exit_code = None;
+                loop {
+                    tokio::select! {
+                        _ = tx.closed() => return,
+                        event = rx.recv() => match event {
+                            Some(crate::worker_client::SubscribeEvent::Done { exit_code: code }) => {
+                                exit_code = code;
+                                break;
+                            }
+                            Some(_) => {},
+                            None => break,
+                        }
+                    }
+                }
+                let runs = crate::worker_client::list_active_runs(port)
+                    .await
+                    .unwrap_or_default();
+                let _ = tx.send(BackgroundMsg::AutorunFinished {
+                    started,
+                    target,
+                    exit_code,
+                    runs,
+                });
+            });
+        }
+    }
+
     /// The `[Reset]` marker / `Ctrl-r`: puts every field of the open form
     /// back to its default. Like Send, refused while a foreground run is in
     /// progress. In worker mode the worker drops the session values (and
     /// announces it — see `on_form_reset`); never starts an `autorun` block.
     async fn reset_inline_form(&mut self) {
+        self.status_meta.retry("form-reset", &mut self.status);
         if self.foreground_run_in_progress() {
-            self.status = "meshfox: a run is in progress — wait for it to finish (or stop it) before resetting the form".into();
+            self.status_meta.progress("form-reset", &mut self.status, "meshfox: a run is in progress — wait for it to finish (or stop it) before resetting the form".into());
             return;
         }
         let Some((node_id, block_name)) = self
@@ -2955,12 +3087,17 @@ impl App {
             if let Err(e) =
                 crate::worker_client::reset_form(port, &node_id, &block_name, false).await
             {
-                self.status = format!("meshfox: failed to reset form: {e}");
+                self.status_meta.error(
+                    "form-reset",
+                    &mut self.status,
+                    format!("meshfox: failed to reset form: {e}"),
+                );
                 return;
             }
         }
         self.on_form_reset(&node_id, &block_name, false);
-        self.status = "meshfox: form reset".into();
+        self.status_meta
+            .notice("form-reset", &mut self.status, "meshfox: form reset".into());
     }
 
     /// The fields of `(node_id, block_name)` went back to their defaults
@@ -2987,13 +3124,14 @@ impl App {
             }
             self.render_current_document();
         }
-        self.status = format!(
+        self.status_meta.progress("form-wait", &mut self.status, format!(
             "meshfox: run waiting for form {node_id}/{block_name} — Enter on [Send] continues it, Ctrl-x cancels the run"
-        );
+        ));
     }
 
     /// The form a run was parked on was sent or cancelled.
     pub fn on_form_resolved(&mut self, node_id: &str, block_name: &str) {
+        self.status_meta.retry("form-wait", &mut self.status);
         self.awaiting_forms
             .remove(&(node_id.to_string(), block_name.to_string()));
     }
@@ -3001,6 +3139,7 @@ impl App {
     /// `Ctrl-x` in an inline form: cancel the run parked on it (it fails
     /// with a "was cancelled" error). Does nothing if no run waits on it.
     async fn cancel_inline_form(&mut self) {
+        self.status_meta.retry("form-cancel", &mut self.status);
         let Some((node_id, block_name)) = self
             .active_inline_form
             .as_ref()
@@ -3012,12 +3151,20 @@ impl App {
             .awaiting_forms
             .contains(&(node_id.clone(), block_name.clone()))
         {
-            self.status = "meshfox: no run is waiting on this form".into();
+            self.status_meta.notice(
+                "form-cancel",
+                &mut self.status,
+                "meshfox: no run is waiting on this form".into(),
+            );
             return;
         }
         let Some(port) = self.worker_port else { return };
         if let Err(e) = crate::worker_client::cancel_form(port, &node_id, &block_name).await {
-            self.status = format!("meshfox: couldn't cancel the form: {e}");
+            self.status_meta.error(
+                "form-cancel",
+                &mut self.status,
+                format!("meshfox: couldn't cancel the form: {e}"),
+            );
         }
     }
 
@@ -3647,7 +3794,11 @@ impl App {
                     || meshfox_core::is_button(&block.lang)
                     || meshfox_core::is_form(&block.lang)
                 {
-                    self.status = "this block keeps no run history".into();
+                    self.status_meta.notice(
+                        "history",
+                        &mut self.status,
+                        "this block keeps no run history".into(),
+                    );
                 } else {
                     self.open_run_history_for(addr.node_id, addr.block_name)
                         .await;
@@ -3683,7 +3834,11 @@ impl App {
                 block_name,
             } => {
                 if self.run.as_ref().is_some_and(|r| !r.finished) {
-                    self.status = "a run is already in progress — press K to kill it first".into();
+                    self.status_meta.progress(
+                        "run",
+                        &mut self.status,
+                        "a run is already in progress — press K to kill it first".into(),
+                    );
                     return;
                 }
                 self.start_run(node_id, block_name, true).await;
@@ -3952,16 +4107,26 @@ impl App {
                 return;
             }
         }
+        self.status_meta.retry("node", &mut self.status);
         let Some(port) = self.worker_port else {
-            self.status = "node commands need a worker — none reachable".into();
+            self.status_meta.error(
+                "node",
+                &mut self.status,
+                "node commands need a worker — none reachable".into(),
+            );
             return;
         };
         let Some(row) = self.rows.get(self.selected) else {
-            self.status = "no node selected".into();
+            self.status_meta
+                .error("node", &mut self.status, "no node selected".into());
             return;
         };
         if row.reference.is_some() {
-            self.status = "this node comes from an included file — edit it there".into();
+            self.status_meta.error(
+                "node",
+                &mut self.status,
+                "this node comes from an included file — edit it there".into(),
+            );
             return;
         }
         let id = row.node_id.clone();
@@ -4042,7 +4207,11 @@ impl App {
             },
             CommandId::MovePosition => {
                 let Some(node) = self.canvas.node(&id) else {
-                    self.status = "selected node no longer exists".into();
+                    self.status_meta.error(
+                        "node",
+                        &mut self.status,
+                        "selected node no longer exists".into(),
+                    );
                     return;
                 };
                 let siblings: Vec<_> = self
@@ -4143,11 +4312,11 @@ impl App {
         let message = match result {
             Ok(message) => {
                 self.refresh_after_node_command(port, &focus).await;
-                message
+                Ok(message)
             }
-            Err(e) => format!("command failed: {e}"),
+            Err(e) => Err(format!("command failed: {e}")),
         };
-        self.status = message;
+        self.status_meta.result("node", &mut self.status, message);
     }
 
     /// Pulls the document the worker now has into the tree and, if the
@@ -4176,8 +4345,13 @@ impl App {
     }
 
     async fn open_stats_view(&mut self, block: Option<(String, String)>) {
+        self.status_meta.retry("stats", &mut self.status);
         let Some(port) = self.worker_port else {
-            self.status = "statistics need a worker — none reachable".into();
+            self.status_meta.error(
+                "stats",
+                &mut self.status,
+                "statistics need a worker — none reachable".into(),
+            );
             return;
         };
         let selector = match block {
@@ -4196,7 +4370,10 @@ impl App {
                     scroll: 0,
                 });
             }
-            Err(e) => self.status = format!("statistics failed: {e}"),
+            Err(e) => {
+                self.status_meta
+                    .error("stats", &mut self.status, format!("statistics failed: {e}"))
+            }
         }
     }
 
@@ -5043,7 +5220,11 @@ impl App {
         }
         if self.source_editor.is_some() {
             self.pending_external_change = Some((content, display));
-            self.status = "file changed on disk — will reload once the editor closes".into();
+            self.status_meta.progress(
+                "reload",
+                &mut self.status,
+                "file changed on disk — will reload once the editor closes".into(),
+            );
             return;
         }
         self.apply_external_reload(content, display);
@@ -5070,10 +5251,18 @@ impl App {
                     }
                 }
                 self.render_current_document();
-                self.status = "reloaded — file changed on disk".into();
+                self.status_meta.notice(
+                    "reload",
+                    &mut self.status,
+                    "reloaded — file changed on disk".into(),
+                );
             }
             Err(e) => {
-                self.status = format!("file changed on disk but failed to parse: {e}");
+                self.status_meta.error(
+                    "reload",
+                    &mut self.status,
+                    format!("file changed on disk but failed to parse: {e}"),
+                );
             }
         }
     }
@@ -5103,6 +5292,7 @@ impl App {
     /// Open via the worker: it owns target resolution, file access and
     /// coordinator requests; the TUI only handles the returned navigation.
     async fn trigger_open_file(&mut self) {
+        self.status_meta.retry("open", &mut self.status);
         let Some(row) = self.rows.get(self.selected) else {
             return;
         };
@@ -5116,7 +5306,8 @@ impl App {
         {
             let links = super::markdown::links(&node.text);
             if links.is_empty() {
-                self.status = "no links in this node".into();
+                self.status_meta
+                    .notice("open", &mut self.status, "no links in this node".into());
             } else {
                 self.link_picker = Some(LinkPickerState {
                     links,
@@ -5128,11 +5319,15 @@ impl App {
             return;
         }
         let Some(port) = self.worker_port else {
-            self.status = "no worker for canvas".into();
+            self.status_meta
+                .error("open", &mut self.status, "no worker for canvas".into());
             return;
         };
         match crate::worker_client::open_node_file(port, &node_id).await {
-            Ok(crate::worker_client::OpenAction::Done) => self.status = "opened".into(),
+            Ok(crate::worker_client::OpenAction::Done) => {
+                self.status_meta
+                    .notice("open", &mut self.status, "opened".into())
+            }
             Ok(crate::worker_client::OpenAction::OpenFile { path }) => {
                 self.open_plain_file(&path).await
             }
@@ -5147,7 +5342,10 @@ impl App {
                     node: fragment,
                 });
             }
-            Err(e) => self.status = format!("failed to open: {e}"),
+            Err(e) => {
+                self.status_meta
+                    .error("open", &mut self.status, format!("failed to open: {e}"))
+            }
         }
     }
 
@@ -5185,20 +5383,29 @@ impl App {
     /// the TUI; a relative or `file` destination is not something to start
     /// an application for.
     async fn open_link_url(&mut self, url: String) {
+        self.status_meta.retry("open", &mut self.status);
         let lower = url.to_ascii_lowercase();
         if !(lower.starts_with("http://")
             || lower.starts_with("https://")
             || lower.starts_with("mailto:"))
         {
-            self.status = format!("not opening non-web link: {url}");
+            self.status_meta.error(
+                "open",
+                &mut self.status,
+                format!("not opening non-web link: {url}"),
+            );
             return;
         }
         let shown = url.clone();
-        self.status = match tokio::task::spawn_blocking(move || open::that(&url)).await {
-            Ok(Ok(())) => format!("opened {shown}"),
-            Ok(Err(e)) => format!("failed to open: {e}"),
-            Err(e) => format!("failed to open: {e}"),
-        };
+        self.status_meta.result(
+            "open",
+            &mut self.status,
+            match tokio::task::spawn_blocking(move || open::that(&url)).await {
+                Ok(Ok(())) => Ok(format!("opened {shown}")),
+                Ok(Err(e)) => Err(format!("failed to open: {e}")),
+                Err(e) => Err(format!("failed to open: {e}")),
+            },
+        );
     }
 
     /// Opens a plain file the way `[tui.open]` says (see
@@ -5206,19 +5413,23 @@ impl App {
     /// core started with `--no-exec` never starts a configured command: the
     /// file goes to the OS application as if nothing were configured.
     async fn open_plain_file(&mut self, path: &Path) {
+        self.status_meta.retry("open", &mut self.status);
         use meshfox_core::open_rules::{Action, Client, Mode};
         let action = match meshfox_core::open_rules::for_file(&self.canvas_root, Client::Tui, path)
         {
             Ok(action) => action,
             Err(e) => {
-                self.status = e;
+                self.status_meta.error("open", &mut self.status, e);
                 return;
             }
         };
         let action = match action {
             Action::Exec { .. } if self.no_exec => {
-                self.status =
-                    "--no-exec: ignoring the [tui.open] command, using the system default".into();
+                self.status_meta.notice(
+                    "open",
+                    &mut self.status,
+                    "--no-exec: ignoring the [tui.open] command, using the system default".into(),
+                );
                 Action::System
             }
             action => action,
@@ -5226,9 +5437,14 @@ impl App {
         match action {
             Action::System => {
                 if let Err(e) = super::open_file::open_with_system(path).await {
-                    self.status = format!("failed to open: {e}");
+                    self.status_meta.error(
+                        "open",
+                        &mut self.status,
+                        format!("failed to open: {e}"),
+                    );
                 } else if !self.status.starts_with("--no-exec") {
-                    self.status = "opened".into();
+                    self.status_meta
+                        .notice("open", &mut self.status, "opened".into());
                 }
             }
             Action::Exec {
@@ -5239,10 +5455,14 @@ impl App {
                 argv,
                 mode: Mode::Detach,
             } => {
-                self.status = match super::open_file::spawn_detached(&argv) {
-                    Ok(()) => format!("opened with {}", argv[0]),
-                    Err(e) => format!("couldn't run {}: {e}", argv[0]),
-                };
+                self.status_meta.result(
+                    "open",
+                    &mut self.status,
+                    match super::open_file::spawn_detached(&argv) {
+                        Ok(()) => Ok(format!("opened with {}", argv[0])),
+                        Err(e) => Err(format!("couldn't run {}: {e}", argv[0])),
+                    },
+                );
             }
         }
     }
@@ -5259,8 +5479,10 @@ impl App {
     /// straight into this node's body, so there's no node-specific cursor
     /// position to jump to; just opens that file at the top.
     async fn open_source_editor(&mut self) {
+        self.status_meta.retry("editor", &mut self.status);
         if self.read_only {
-            self.status = READ_ONLY_STATUS.into();
+            self.status_meta
+                .error("editor", &mut self.status, READ_ONLY_STATUS.into());
             return;
         }
         let Some(row) = self.rows.get(self.selected) else {
@@ -5273,13 +5495,21 @@ impl App {
 
         let plain_include = node.plain_markdown_include;
         let Some(port) = self.worker_port else {
-            self.status = "no worker for this canvas".into();
+            self.status_meta.error(
+                "editor",
+                &mut self.status,
+                "no worker for this canvas".into(),
+            );
             return;
         };
         let files = match self.include_files(port).await {
             Ok(files) => files,
             Err(e) => {
-                self.status = format!("couldn't list this canvas's includes: {e}");
+                self.status_meta.error(
+                    "editor",
+                    &mut self.status,
+                    format!("couldn't list this canvas's includes: {e}"),
+                );
                 return;
             }
         };
@@ -5287,13 +5517,21 @@ impl App {
         let (path, is_canvas, local_id, target_raw): (PathBuf, bool, Option<String>, String) =
             if plain_include {
                 let Some(info) = files.iter().find(|i| i.node_id == node_id) else {
-                    self.status = "couldn't resolve this include's target file".into();
+                    self.status_meta.error(
+                        "editor",
+                        &mut self.status,
+                        "couldn't resolve this include's target file".into(),
+                    );
                     return;
                 };
                 match crate::worker_client::get_include_raw(port, &node_id).await {
                     Ok(raw) => (info.path.clone(), false, None, raw),
                     Err(e) => {
-                        self.status = format!("failed to open source editor: {e}");
+                        self.status_meta.error(
+                            "editor",
+                            &mut self.status,
+                            format!("failed to open source editor: {e}"),
+                        );
                         return;
                     }
                 }
@@ -5350,7 +5588,11 @@ impl App {
                     self.request_external_edit(true);
                 }
             }
-            Err(e) => self.status = format!("failed to open source editor: {e}"),
+            Err(e) => self.status_meta.error(
+                "editor",
+                &mut self.status,
+                format!("failed to open source editor: {e}"),
+            ),
         }
     }
 
@@ -5396,6 +5638,7 @@ impl App {
         close_on_cancel: bool,
     ) {
         use super::external_editor::Outcome;
+        let failed = matches!(&outcome, Outcome::Failed(_));
         let message = match outcome {
             Outcome::Edited(text) => {
                 if let Some(se) = &mut self.source_editor {
@@ -5410,7 +5653,11 @@ impl App {
         };
         if close_on_cancel {
             self.close_source_editor();
-            self.status = message;
+            if failed {
+                self.status_meta.error("editor", &mut self.status, message);
+            } else {
+                self.status_meta.notice("editor", &mut self.status, message);
+            }
         } else if let Some(se) = &mut self.source_editor {
             se.error = Some(message);
         }
@@ -5471,11 +5718,16 @@ impl App {
     /// Canvas-valued include targets are read-only. Plain Markdown includes
     /// save through the parent worker.
     async fn save_source_editor(&mut self) {
+        self.status_meta.retry("editor", &mut self.status);
         let Some(se) = &self.source_editor else {
             return;
         };
         if se.read_only {
-            self.status = "included canvas is read-only; open it separately to edit".into();
+            self.status_meta.error(
+                "editor",
+                &mut self.status,
+                "included canvas is read-only; open it separately to edit".into(),
+            );
             return;
         }
         let mut text = se.editor.lines.to_string();
@@ -5584,11 +5836,15 @@ impl App {
         self.rebuild_display_canvas(display);
         self.rebuild_rows();
         self.render_current_document();
-        self.status = if merged {
-            "saved — merged with changes made elsewhere".into()
-        } else {
-            "saved".into()
-        };
+        self.status_meta.notice(
+            "editor",
+            &mut self.status,
+            if merged {
+                "saved — merged with changes made elsewhere".into()
+            } else {
+                "saved".into()
+            },
+        );
         self.source_editor = None;
     }
 
@@ -6072,6 +6328,20 @@ impl App {
     /// than something that needs special-casing away.
     pub fn on_background_msg(&mut self, msg: BackgroundMsg) {
         match msg {
+            BackgroundMsg::AutorunFinished {
+                started,
+                target,
+                exit_code,
+                runs,
+            } => {
+                if let Some(activity) = &mut self.autorun_activity {
+                    if activity.started == started {
+                        activity.finish(&target, exit_code);
+                        activity.record_runs(&runs);
+                        self.refresh_runs_soon = true;
+                    }
+                }
+            }
             // Handled by `on_slow_background_msg`, which `mod.rs` tries first;
             // here only for completeness.
             BackgroundMsg::ConfigureVars { .. } | BackgroundMsg::RunPreflight { .. } => {}
@@ -6081,6 +6351,13 @@ impl App {
                     self.apply_services(list);
                 }
                 if let Some(runs) = runs {
+                    if self
+                        .autorun_activity
+                        .as_ref()
+                        .is_some_and(|activity| activity.superseded_by(&runs))
+                    {
+                        self.autorun_activity = None;
+                    }
                     self.block_runs = Some(runs);
                     self.sync_tty_results();
                 }
@@ -6190,8 +6467,13 @@ impl App {
     /// picker first when the node has more than one runnable block — there
     /// isn't a single obvious one to default to.
     async fn trigger_run(&mut self, with_deps: bool) {
+        self.status_meta.retry("run", &mut self.status);
         if self.run.as_ref().is_some_and(|r| !r.finished) {
-            self.status = "a run is already in progress — press K to kill it first".into();
+            self.status_meta.progress(
+                "run",
+                &mut self.status,
+                "a run is already in progress — press K to kill it first".into(),
+            );
             return;
         }
         let Some(row) = self.rows.get(self.selected) else {
@@ -6201,8 +6483,11 @@ impl App {
         if self.focus == Focus::Document {
             if let Some(addr) = self.selected_block.clone() {
                 if self.is_form_block(&addr) {
-                    self.status =
-                        "a form isn't run — Enter edits it, its Send button applies it".into();
+                    self.status_meta.notice(
+                        "run",
+                        &mut self.status,
+                        "a form isn't run — Enter edits it, its Send button applies it".into(),
+                    );
                     return;
                 }
                 self.start_run(addr.node_id, addr.block_name, with_deps)
@@ -6220,11 +6505,19 @@ impl App {
             .node(&node_id)
             .map(|n| n.runnable_blocks())
         else {
-            self.status = format!("node {node_id:?} not found");
+            self.status_meta.error(
+                "run",
+                &mut self.status,
+                format!("node {node_id:?} not found"),
+            );
             return;
         };
         if blocks.is_empty() {
-            self.status = "nothing runnable in this node".into();
+            self.status_meta.notice(
+                "run",
+                &mut self.status,
+                "nothing runnable in this node".into(),
+            );
             return;
         }
 
@@ -6347,7 +6640,8 @@ impl App {
         extra_vars: HashMap<String, String>,
     ) {
         if self.no_exec {
-            self.status = NO_EXEC_STATUS.into();
+            self.status_meta
+                .error("run", &mut self.status, NO_EXEC_STATUS.into());
             return;
         }
         let mut node_id = node_id;
@@ -6363,7 +6657,8 @@ impl App {
                     None => return,
                 },
                 Err(e) => {
-                    self.status = format!("meshfox: {e}");
+                    self.status_meta
+                        .error("run", &mut self.status, format!("meshfox: {e}"));
                     return;
                 }
             }
@@ -6418,7 +6713,11 @@ impl App {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    self.status = format!("confirmation check failed: {error}");
+                    self.status_meta.error(
+                        "run",
+                        &mut self.status,
+                        format!("confirmation check failed: {error}"),
+                    );
                     return;
                 }
             }
@@ -6468,9 +6767,9 @@ impl App {
                         owner_pid,
                         owner_desc,
                     }) => {
-                        self.status = format!(
+                        self.status_meta.progress("run", &mut self.status, format!(
                             "meshfox: {conflict_node:?}/{conflict_block:?} is locked by pid {owner_pid} ({owner_desc}) — y to kill and retry, n to cancel"
-                        );
+                        ));
                         self.service_conflict = Some(ServiceConflictState {
                             block_name: conflict_block.clone(),
                             owner_pid,
@@ -6506,7 +6805,11 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status = format!("meshfox: failed to start run: {e}");
+                self.status_meta.error(
+                    "run",
+                    &mut self.status,
+                    format!("meshfox: failed to start run: {e}"),
+                );
             }
         }
     }
@@ -6535,7 +6838,11 @@ impl App {
             run.http_rx = None;
             run.finished = true;
             run.had_failure = true;
-            self.status = "meshfox: lost the worker's run stream".into();
+            self.status_meta.error(
+                "run",
+                &mut self.status,
+                "meshfox: lost the worker's run stream".into(),
+            );
             return;
         };
         // Which address (if any) this event's own live-output splice
@@ -6732,15 +7039,19 @@ impl App {
                 run.had_failure = true;
                 run.finished = true;
                 run.http_rx = None;
-                self.status = format!(
+                self.status_meta.error(
+                    "run",
+                    &mut self.status,
+                    format!(
                     "meshfox: {node_id:?}/{block:?} is locked by pid {owner_pid} ({owner_desc})"
+                ),
                 );
             }
             RunEvent::Killed { node_id, block } => {
                 run.killed = true;
                 run.finished = true;
                 run.http_rx = None;
-                self.status = "run killed".into();
+                self.status_meta.retry("run", &mut self.status);
                 // Local mode gets a `step_output` entry for free once a
                 // killed process's exit status actually resolves
                 // (`on_output_line`'s own `None` branch always inserts
@@ -6787,18 +7098,13 @@ impl App {
                 run.had_failure = true;
                 run.finished = true;
                 run.http_rx = None;
-                self.status = format!("meshfox: {message}");
+                self.status_meta
+                    .error("run", &mut self.status, format!("meshfox: {message}"));
             }
             RunEvent::Done { .. } => {
                 run.finished = true;
                 run.http_rx = None;
-                self.status = if run.killed {
-                    "run killed".into()
-                } else if run.had_failure {
-                    "run finished with a failure".into()
-                } else {
-                    "run finished".into()
-                };
+                self.status_meta.retry("run", &mut self.status);
                 if let Some(addr) = self.pending_autoruns.pop_front() {
                     if let Some(port) = self.worker_port {
                         Box::pin(self.start_run_via_worker(
@@ -7140,22 +7446,35 @@ impl App {
     /// lists, which takes a while. The form opens when the answer arrives
     /// (`on_slow_background_msg`).
     fn request_configure(&mut self) {
+        self.status_meta.retry("configure", &mut self.status);
         if self.var_form.is_some() || self.block_picker.is_some() {
             return;
         }
         if self.run.as_ref().is_some_and(|r| !r.finished) {
-            self.status = "a run is already in progress — press K to kill it first".into();
+            self.status_meta.progress(
+                "configure",
+                &mut self.status,
+                "a run is already in progress — press K to kill it first".into(),
+            );
             return;
         }
         let Some(port) = self.worker_port else {
-            self.status = "no worker for this canvas".into();
+            self.status_meta.error(
+                "configure",
+                &mut self.status,
+                "no worker for this canvas".into(),
+            );
             return;
         };
         if self.busy_checking.is_some() {
             return;
         }
         self.busy_checking = Some("listing variables (computing choices)");
-        self.status = "meshfox: listing variables (computing choices)…".into();
+        self.status_meta.progress(
+            "configure",
+            &mut self.status,
+            "meshfox: listing variables (computing choices)…".into(),
+        );
         let tx = self.background_tx.clone();
         tokio::spawn(async move {
             let result = crate::worker_client::get_configure_vars(port).await;
@@ -7196,7 +7515,10 @@ impl App {
                             .await;
                         }
                     }
-                    Err(e) => self.status = format!("meshfox: {e}"),
+                    Err(e) => {
+                        self.status_meta
+                            .error("run", &mut self.status, format!("meshfox: {e}"))
+                    }
                 }
                 self.render_current_document();
             }
@@ -7210,23 +7532,35 @@ impl App {
     /// this, never either half directly, so the branch lives in exactly
     /// one place.
     async fn start_run(&mut self, node_id: String, block_name: String, with_deps: bool) {
+        self.autorun_activity = None;
+        self.status_meta.retry("run", &mut self.status);
         let Some(port) = self.worker_port else {
-            self.status = "no worker for canvas".into();
+            self.status_meta
+                .error("run", &mut self.status, "no worker for canvas".into());
             return;
         };
         if self.no_exec {
-            self.status = NO_EXEC_STATUS.into();
+            self.status_meta
+                .error("run", &mut self.status, NO_EXEC_STATUS.into());
             return;
         }
         if self.busy_checking.is_some() {
-            self.status = "meshfox: still checking the previous request…".into();
+            self.status_meta.progress(
+                "run",
+                &mut self.status,
+                "meshfox: still checking the previous request…".into(),
+            );
             return;
         }
         // The up-front check can be slow (it runs the sources of computed
         // `select` lists): do it off the event loop so the screen keeps
         // updating, and carry on when the answer arrives.
         self.busy_checking = Some("checking variables (computing choices)");
-        self.status = "meshfox: checking variables (computing choices)…".into();
+        self.status_meta.progress(
+            "run",
+            &mut self.status,
+            "meshfox: checking variables (computing choices)…".into(),
+        );
         let path = self.path_to(&node_id);
         let tx = self.background_tx.clone();
         tokio::spawn(async move {
@@ -7417,22 +7751,20 @@ impl App {
     }
 
     fn service_notice(&mut self, message: String) {
-        self.status = message.clone();
-        self.status_expiry = Some((
-            std::time::Instant::now() + std::time::Duration::from_secs(5),
-            message,
-        ));
+        self.status_meta
+            .notice("service", &mut self.status, message);
     }
 
     pub fn status_deadline(&self) -> Option<std::time::Instant> {
-        self.status_expiry.as_ref().map(|(deadline, _)| *deadline)
+        self.status_meta.deadline()
     }
 
     pub fn expire_status(&mut self) {
-        if let Some((_, message)) = self.status_expiry.take() {
-            // A newer error or other status must survive this notice's timer.
-            if self.status == message {
-                self.status.clear();
+        let previous = self.status.clone();
+        self.status_meta.expire(&mut self.status);
+        if let Some(selection) = &mut self.text_selection {
+            if selection.notice.as_ref() == Some(&previous) && self.status.is_empty() {
+                selection.notice = None;
             }
         }
     }
@@ -7670,9 +8002,13 @@ impl App {
                 let Some(retry) = conflict.http_retry else {
                     return;
                 };
-                self.status = format!(
-                    "killed pid {} — restarting {:?}",
-                    conflict.owner_pid, conflict.block_name
+                self.status_meta.progress(
+                    "run",
+                    &mut self.status,
+                    format!(
+                        "killed pid {} — restarting {:?}",
+                        conflict.owner_pid, conflict.block_name
+                    ),
                 );
                 Box::pin(self.begin_http_run(
                     retry.node_id,
@@ -7686,9 +8022,13 @@ impl App {
                 .await;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.status = format!(
-                    "cancelled — {:?} is already running elsewhere",
-                    conflict.block_name
+                self.status_meta.notice(
+                    "run",
+                    &mut self.status,
+                    format!(
+                        "cancelled — {:?} is already running elsewhere",
+                        conflict.block_name
+                    ),
                 );
                 if let Some(run) = &mut self.run {
                     run.finished = true;
@@ -7714,10 +8054,15 @@ impl App {
     /// knows about at once, not scoped to the selected node), or reports
     /// there's nothing to show yet. See `ServicesViewState`.
     async fn open_services_view(&mut self) {
+        self.status_meta.retry("service", &mut self.status);
         if self.worker_port.is_some() {
             self.refresh_services().await;
             if self.service_list.is_empty() {
-                self.status = "no services running yet".into();
+                self.status_meta.notice(
+                    "service",
+                    &mut self.status,
+                    "no services running yet".into(),
+                );
                 return;
             }
             self.services_view = Some(ServicesViewState { selected: 0 });
@@ -7778,15 +8123,21 @@ impl App {
                 self.refresh_service_log(&key.0, &key.1).await;
             }
             KeyCode::Char('K') => {
+                self.status_meta.retry("service", &mut self.status);
                 let (node_id, block) = keys[selected].clone();
                 match crate::worker_client::stop_service(port, &node_id, &block).await {
                     Ok(()) => self.service_notice(format!("Service {block} stopped")),
-                    Err(e) => self.status = format!("failed to stop {block}: {e}"),
+                    Err(e) => self.status_meta.error(
+                        "service",
+                        &mut self.status,
+                        format!("failed to stop {block}: {e}"),
+                    ),
                 }
                 self.refresh_services().await;
                 self.refresh_service_log(&node_id, &block).await;
             }
             KeyCode::Char('r') => {
+                self.status_meta.retry("service", &mut self.status);
                 let (node_id, block) = keys[selected].clone();
                 match crate::worker_client::confirmation_blocks(
                     port,
@@ -7812,7 +8163,11 @@ impl App {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        self.status = format!("confirmation check failed: {error}");
+                        self.status_meta.error(
+                            "service",
+                            &mut self.status,
+                            format!("confirmation check failed: {error}"),
+                        );
                         return;
                     }
                 }
@@ -7820,7 +8175,11 @@ impl App {
                     Ok(pid) => {
                         self.service_notice(format!("Service {block} restarted (pid {pid})"))
                     }
-                    Err(e) => self.status = format!("failed to restart {block}: {e}"),
+                    Err(e) => self.status_meta.error(
+                        "service",
+                        &mut self.status,
+                        format!("failed to restart {block}: {e}"),
+                    ),
                 }
                 self.refresh_services().await;
                 self.refresh_service_log(&node_id, &block).await;
@@ -7838,8 +8197,13 @@ impl App {
     /// session it could ever know about is one this very process is
     /// already in the middle of running, which already has the terminal.
     async fn open_tty_sessions_view(&mut self) {
+        self.status_meta.retry("terminal", &mut self.status);
         let Some(port) = self.worker_port else {
-            self.status = "live terminal sessions need a worker — none reachable".into();
+            self.status_meta.error(
+                "terminal",
+                &mut self.status,
+                "live terminal sessions need a worker — none reachable".into(),
+            );
             return;
         };
         match crate::worker_client::list_active_runs(port).await {
@@ -7850,12 +8214,20 @@ impl App {
                     .collect();
             }
             Err(e) => {
-                self.status = format!("failed to list live terminals: {e}");
+                self.status_meta.error(
+                    "terminal",
+                    &mut self.status,
+                    format!("failed to list live terminals: {e}"),
+                );
                 return;
             }
         }
         if self.live_tty_sessions.is_empty() {
-            self.status = "no live terminal sessions".into();
+            self.status_meta.notice(
+                "terminal",
+                &mut self.status,
+                "no live terminal sessions".into(),
+            );
             return;
         }
         self.tty_sessions_view = Some(TtySessionsViewState { selected: 0 });
@@ -7903,8 +8275,16 @@ impl App {
             KeyCode::Char('K') => {
                 let session = self.live_tty_sessions[selected].clone();
                 match crate::worker_client::kill_run(port, &session.node_id, &session.block).await {
-                    Ok(()) => self.status = format!("killed {}", session.block),
-                    Err(e) => self.status = format!("failed to kill {}: {e}", session.block),
+                    Ok(()) => self.status_meta.notice(
+                        "terminal",
+                        &mut self.status,
+                        format!("killed {}", session.block),
+                    ),
+                    Err(e) => self.status_meta.error(
+                        "terminal",
+                        &mut self.status,
+                        format!("failed to kill {}: {e}", session.block),
+                    ),
                 }
                 match crate::worker_client::list_active_runs(port).await {
                     Ok(runs) => {
@@ -7929,18 +8309,25 @@ impl App {
     /// about (`GET /api/history`), newest first, with the current cursor
     /// preselected. Worker-only, like `t`: the log lives in the worker.
     async fn open_history_view(&mut self) {
+        self.status_meta.retry("history", &mut self.status);
         if self.read_only {
-            self.status = READ_ONLY_STATUS.into();
+            self.status_meta
+                .error("history", &mut self.status, READ_ONLY_STATUS.into());
             return;
         }
         let Some(port) = self.worker_port else {
-            self.status = "history needs a worker — none reachable".into();
+            self.status_meta.error(
+                "history",
+                &mut self.status,
+                "history needs a worker — none reachable".into(),
+            );
             return;
         };
         match crate::worker_client::history(port, Some(HISTORY_VIEW_LIMIT)).await {
             Ok(history) => {
                 if history.entries.is_empty() {
-                    self.status = "no history yet".into();
+                    self.status_meta
+                        .notice("history", &mut self.status, "no history yet".into());
                     return;
                 }
                 // Already newest first (`UndoLog::history_around`), which is
@@ -7971,7 +8358,11 @@ impl App {
                     ..Default::default()
                 });
             }
-            Err(e) => self.status = format!("failed to load history: {e}"),
+            Err(e) => self.status_meta.error(
+                "history",
+                &mut self.status,
+                format!("failed to load history: {e}"),
+            ),
         }
     }
 
@@ -8058,6 +8449,7 @@ impl App {
     /// block the same way: the Document's selected block, else the node's
     /// only block, else a picker. `stats` picks which view that opens.
     async fn open_block_view(&mut self, stats: bool) {
+        self.status_meta.retry("history", &mut self.status);
         if self.focus == Focus::Document {
             if let Some(addr) = self.selected_block.clone() {
                 if stats {
@@ -8071,9 +8463,13 @@ impl App {
             }
         }
         if self.worker_port.is_none() {
-            self.status = format!(
-                "{} needs a worker — none reachable",
-                if stats { "statistics" } else { "run history" }
+            self.status_meta.error(
+                "history",
+                &mut self.status,
+                format!(
+                    "{} needs a worker — none reachable",
+                    if stats { "statistics" } else { "run history" }
+                ),
             );
             return;
         }
@@ -8082,7 +8478,11 @@ impl App {
         };
         let node_id = row.node_id.clone();
         let Some(node) = self.display_canvas.node(&node_id) else {
-            self.status = format!("node {node_id:?} not found");
+            self.status_meta.error(
+                "history",
+                &mut self.status,
+                format!("node {node_id:?} not found"),
+            );
             return;
         };
         let blocks: Vec<_> = node
@@ -8095,13 +8495,15 @@ impl App {
             })
             .collect();
         match blocks.len() {
-            0 => {
-                self.status = if stats {
+            0 => self.status_meta.notice(
+                "history",
+                &mut self.status,
+                if stats {
                     "no block in this node to show statistics for".into()
                 } else {
                     "no block in this node keeps a run history".into()
-                }
-            }
+                },
+            ),
             1 => {
                 let name = blocks[0]
                     .name
@@ -8149,14 +8551,21 @@ impl App {
 
     /// Fetches `block`'s run history and opens the view on its newest run.
     async fn open_run_history_for(&mut self, node_id: String, block: String) {
+        self.status_meta.retry("history", &mut self.status);
         let Some(port) = self.worker_port else {
-            self.status = "run history needs a worker — none reachable".into();
+            self.status_meta.error(
+                "history",
+                &mut self.status,
+                "run history needs a worker — none reachable".into(),
+            );
             return;
         };
         match crate::worker_client::run_history(port, &node_id, &block).await {
-            Ok(entries) if entries.is_empty() => {
-                self.status = format!("no earlier runs of {block}")
-            }
+            Ok(entries) if entries.is_empty() => self.status_meta.notice(
+                "history",
+                &mut self.status,
+                format!("no earlier runs of {block}"),
+            ),
             Ok(entries) => {
                 let tty = self.display_canvas.node(&node_id).is_some_and(|n| {
                     n.runnable_blocks()
@@ -8172,7 +8581,11 @@ impl App {
                 });
                 self.load_run_history_output().await;
             }
-            Err(e) => self.status = format!("failed to load run history: {e}"),
+            Err(e) => self.status_meta.error(
+                "history",
+                &mut self.status,
+                format!("failed to load run history: {e}"),
+            ),
         }
     }
 
@@ -8261,9 +8674,13 @@ impl App {
     }
 
     async fn goto_history_step(&mut self, entry: crate::worker_client::HistoryEntryDto) {
+        self.status_meta.retry("history", &mut self.status);
         let Some(port) = self.worker_port else { return };
         match crate::worker_client::history_goto(port, entry.seq).await {
-            Ok(result) if !result.changed => self.status = "already at that step".into(),
+            Ok(result) if !result.changed => {
+                self.status_meta
+                    .notice("history", &mut self.status, "already at that step".into())
+            }
             Ok(_) => {
                 // Pull the rewritten canvas right away instead of waiting for
                 // the `/api/watch` push, so the tree is already current.
@@ -8271,9 +8688,17 @@ impl App {
                     let display = self.fetch_display_canvas().await;
                     self.on_external_change(content, display);
                 }
-                self.status = format!("jumped to #{} · {}", entry.seq, entry.summary);
+                self.status_meta.notice(
+                    "history",
+                    &mut self.status,
+                    format!("jumped to #{} · {}", entry.seq, entry.summary),
+                );
             }
-            Err(e) => self.status = format!("history jump failed: {e}"),
+            Err(e) => self.status_meta.error(
+                "history",
+                &mut self.status,
+                format!("history jump failed: {e}"),
+            ),
         }
     }
 
@@ -8335,6 +8760,7 @@ impl App {
     /// keypress that picks it, so a `404` here is a normal, unsurprising
     /// outcome, not a bug to alarm about.
     async fn attach_tty_session(&mut self, port: u16, node_id: String, block: String) {
+        self.status_meta.retry("terminal", &mut self.status);
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         match crate::worker_client::tty_attach(port, &node_id, &block, cols, rows).await {
             Ok(socket) => {
@@ -8350,7 +8776,11 @@ impl App {
                 });
             }
             Err(e) => {
-                self.status = format!("failed to attach to {block:?}: {e}");
+                self.status_meta.error(
+                    "terminal",
+                    &mut self.status,
+                    format!("failed to attach to {block:?}: {e}"),
+                );
             }
         }
     }
@@ -8366,11 +8796,13 @@ impl App {
     }
 
     async fn kill_running(&mut self) {
+        self.status_meta.retry("run", &mut self.status);
         if let Some(run) = &self.run {
             if run.http_rx.is_some() {
                 if let (Some(port), Some(addr)) = (self.worker_port, run.chain.last()) {
                     let (node_id, block) = (addr.node_id.clone(), addr.block_name.clone());
-                    self.status = "killing...".into();
+                    self.status_meta
+                        .progress("run", &mut self.status, "killing...".into());
                     let _ = crate::worker_client::kill_run(port, &node_id, &block).await;
                 }
             }
@@ -8390,12 +8822,18 @@ impl App {
     /// `<!-- meshfox:output ... -->` cache. See TODO.canvas.md: "Сброс
     /// сессии".
     async fn reset_session(&mut self) {
+        self.status_meta.retry("session", &mut self.status);
         self.session_vars.clear();
         self.pending_autoruns.clear();
-        self.status = "session reset".into();
+        self.status_meta
+            .notice("session", &mut self.status, "session reset".into());
         if let Some(port) = self.worker_port {
             if let Err(e) = crate::worker_client::reset_session(port).await {
-                self.status = format!("session reset here, but the worker didn't reset: {e}");
+                self.status_meta.error(
+                    "session",
+                    &mut self.status,
+                    format!("session reset here, but the worker didn't reset: {e}"),
+                );
             }
         }
     }
@@ -8444,7 +8882,11 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.reset_session_confirm = false;
-                self.status = "session reset cancelled".into();
+                self.status_meta.notice(
+                    "session",
+                    &mut self.status,
+                    "session reset cancelled".into(),
+                );
             }
             _ => {}
         }
@@ -8466,6 +8908,7 @@ impl App {
     /// focus jumps to the first offending field, so it's obvious what to
     /// fix.
     async fn submit_var_form(&mut self) {
+        self.status_meta.retry("configure", &mut self.status);
         if let Some(vf) = &mut self.var_form {
             normalize_date_inputs(&vf.decls, &mut vf.inputs);
         }
@@ -8485,7 +8928,8 @@ impl App {
             {
                 let vf = self.var_form.as_mut().unwrap();
                 vf.selected = i;
-                self.status = format!("meshfox: {e}");
+                self.status_meta
+                    .error("configure", &mut self.status, format!("meshfox: {e}"));
                 return;
             }
         }
@@ -8503,10 +8947,16 @@ impl App {
             let vf = self.var_form.as_mut().unwrap();
             vf.selected = i;
             let name = vf.decls[i].name.clone();
-            self.status = match self.choices_notes.get(&name) {
-                Some(note) => format!("{name}: {note}"),
-                None => format!("{name}: its choices come from {source}, which has no value yet"),
-            };
+            self.status_meta.notice(
+                "configure",
+                &mut self.status,
+                match self.choices_notes.get(&name) {
+                    Some(note) => format!("{name}: {note}"),
+                    None => {
+                        format!("{name}: its choices come from {source}, which has no value yet")
+                    }
+                },
+            );
             return;
         }
         let Some(vf) = self.var_form.take() else {
@@ -8550,7 +9000,11 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status = format!("meshfox: invalid arguments: {e}");
+                        self.status_meta.error(
+                            "configure",
+                            &mut self.status,
+                            format!("meshfox: invalid arguments: {e}"),
+                        );
                         self.var_form = Some(vf);
                         self.pending_http_run = Some(pending);
                     }
@@ -8608,10 +9062,18 @@ impl App {
             .collect();
         match crate::worker_client::post_configure_vars(port, vars, secrets, clear).await {
             Ok(saved) => {
-                self.status = format!("meshfox: saved {saved} declared variable(s) to the cache");
+                self.status_meta.notice(
+                    "configure",
+                    &mut self.status,
+                    format!("meshfox: saved {saved} declared variable(s) to the cache"),
+                );
             }
             Err(e) => {
-                self.status = format!("meshfox: failed to save configured variable(s): {e}");
+                self.status_meta.error(
+                    "configure",
+                    &mut self.status,
+                    format!("meshfox: failed to save configured variable(s): {e}"),
+                );
             }
         }
     }
@@ -8627,9 +9089,8 @@ impl App {
     ) {
         match result {
             Ok(statuses) if statuses.is_empty() => {
-                self.status =
-                    "meshfox: this canvas declares no configurable (non-session, non-from=) variable(s)"
-                        .into();
+                self.status_meta.notice("configure", &mut self.status, "meshfox: this canvas declares no configurable (non-session, non-from=) variable(s)"
+                        .into());
             }
             Ok(statuses) => {
                 self.status.clear();
@@ -8639,7 +9100,11 @@ impl App {
                 self.var_form = Some(form);
             }
             Err(e) => {
-                self.status = format!("meshfox: failed to list configurable variables: {e}");
+                self.status_meta.error(
+                    "configure",
+                    &mut self.status,
+                    format!("meshfox: failed to list configurable variables: {e}"),
+                );
             }
         }
     }
@@ -8647,8 +9112,13 @@ impl App {
     /// `request_configure`, waiting for the answer — for tests.
     #[cfg(test)]
     async fn trigger_configure(&mut self) {
+        self.status_meta.retry("configure", &mut self.status);
         let Some(port) = self.worker_port else {
-            self.status = "no worker for this canvas".into();
+            self.status_meta.error(
+                "configure",
+                &mut self.status,
+                "no worker for this canvas".into(),
+            );
             return;
         };
         let result = crate::worker_client::get_configure_vars(port).await;
@@ -8673,14 +9143,16 @@ impl App {
             return;
         };
         if vf.configuring {
-            self.status = "configure cancelled".into();
+            self.status_meta
+                .notice("configure", &mut self.status, "configure cancelled".into());
             return;
         }
         if let Some(run) = &mut self.run {
             run.finished = true;
             run.had_failure = true;
         }
-        self.status = "run cancelled".into();
+        self.status_meta
+            .notice("configure", &mut self.status, "run cancelled".into());
     }
 }
 
@@ -10404,6 +10876,117 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn form_autorun_result_keeps_its_target_after_late_dependency_updates() {
+        use crate::terminal_status::State;
+        use crate::worker_client::{ActiveRunDto, SubscribeEvent};
+        let mut app = app_with_blocks(
+            "autorun-target",
+            concat!(
+                "```sh name=animals-csv\necho animals\n```\n",
+                "```sh name=card deps=animals-csv\necho card\n```\n",
+            ),
+        )
+        .await;
+        let target = BlockAddr::new("root", "card");
+        let dependency = BlockAddr::new("root", "animals-csv");
+        let started = std::time::Instant::now();
+        let mut status = super::super::terminal_status::CanvasStatus::default();
+        status.update(&mut app);
+        app.autorun_activity = Some(super::super::terminal_status::AutorunActivity::new(
+            &app.display_canvas,
+            vec![target.clone()],
+            started,
+        ));
+        status.update(&mut app);
+        assert!(matches!(app.activity.state, State::Running(_)));
+
+        app.on_external_run_event(
+            dependency.clone(),
+            SubscribeEvent::Done { exit_code: Some(0) },
+        );
+        // A stale previous result for the target must not finish the new chain.
+        app.on_external_run_event(target.clone(), SubscribeEvent::Done { exit_code: Some(0) });
+        status.update(&mut app);
+        assert!(matches!(app.activity.state, State::Running(_)));
+        let runs = vec![ActiveRunDto {
+            history_id: Some(101),
+            node_id: "root".into(),
+            block: "animals-csv".into(),
+            kind: "plain".into(),
+            status: "exited".into(),
+            exit_code: Some(0),
+            uptime_ms: 816,
+        }];
+        app.on_background_msg(BackgroundMsg::AutorunFinished {
+            started,
+            target: target.clone(),
+            exit_code: Some(0),
+            runs,
+        });
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Completed("card".into()));
+        let elapsed = app.activity.elapsed;
+        // Dependency replays and the worker poll arrive in a different order.
+        app.step_output.get_mut(&dependency).unwrap().duration_ms = 816;
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Completed("card".into()));
+        assert_eq!(app.activity.elapsed, elapsed);
+
+        let newer = ActiveRunDto {
+            history_id: Some(102),
+            node_id: "root".into(),
+            block: "animals-csv".into(),
+            kind: "plain".into(),
+            status: "running".into(),
+            exit_code: None,
+            uptime_ms: 0,
+        };
+        app.on_background_msg(BackgroundMsg::WorkerState {
+            services: None,
+            runs: Some(vec![newer]),
+        });
+        assert!(
+            app.autorun_activity.is_none(),
+            "a later run must have its own activity"
+        );
+        status.update(&mut app);
+        assert!(matches!(app.activity.state, State::Running(_)));
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_form_autorun_reports_the_target_and_ignores_an_old_submission() {
+        use crate::terminal_status::State;
+        let mut app = app_with_blocks("autorun-failure", "```sh name=card\nfalse\n```\n").await;
+        let target = BlockAddr::new("root", "card");
+        let started = std::time::Instant::now();
+        app.autorun_activity = Some(super::super::terminal_status::AutorunActivity::new(
+            &app.display_canvas,
+            vec![target.clone()],
+            started,
+        ));
+        let mut status = super::super::terminal_status::CanvasStatus::default();
+        status.update(&mut app);
+        app.on_background_msg(BackgroundMsg::AutorunFinished {
+            started: started - std::time::Duration::from_secs(1),
+            target: target.clone(),
+            exit_code: Some(0),
+            runs: vec![],
+        });
+        status.update(&mut app);
+        assert!(matches!(app.activity.state, State::Running(_)));
+        app.on_background_msg(BackgroundMsg::AutorunFinished {
+            started,
+            target,
+            exit_code: Some(1),
+            runs: vec![],
+        });
+        status.update(&mut app);
+        assert_eq!(app.activity.state, State::Failure("card".into()));
+        let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }
 
     #[tokio::test]

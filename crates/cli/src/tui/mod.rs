@@ -27,6 +27,7 @@ mod selection;
 mod source_diff;
 mod source_editor;
 mod spatial;
+mod status_message;
 mod svg_raster;
 mod table;
 #[cfg(test)]
@@ -587,7 +588,11 @@ async fn main_loop(
             )
             .await;
             if let Err(e) = result {
-                app.status = format!("failed to open canvas: {e}");
+                app.status_meta.error(
+                    "open",
+                    &mut app.status,
+                    format!("failed to open canvas: {e}"),
+                );
             }
             app.refresh_services().await;
             app.refresh_block_runs().await;
@@ -595,9 +600,10 @@ async fn main_loop(
         }
 
         if let Some(pending) = app.pending_open_tty.take() {
-            app.status =
+            let message =
                 hand_terminal_over(terminal, input_paused, open_file::run_tty(pending.argv))
                     .await?;
+            app.status_meta.notice("open", &mut app.status, message);
             continue;
         }
 

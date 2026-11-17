@@ -2052,14 +2052,15 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::raw(format!(" · {notice}")));
         }
     }
-    if !app.status.is_empty()
-        && !matches!(app.activity.state, State::Running(_) | State::Waiting(_))
-        && !matches!(
-            app.status.as_str(),
-            "run finished" | "run finished with a failure" | "run killed"
-        )
-    {
-        spans.push(Span::raw(format!("  ·  {}", app.status)));
+    if !app.status.is_empty() {
+        if app.status_meta.is_error(&app.status) {
+            spans.push(Span::styled(
+                format!("  ·  ✗ {}", app.status),
+                Style::default().fg(super::theme::fail()),
+            ));
+        } else {
+            spans.push(Span::raw(format!("  ·  {}", app.status)));
+        }
     }
     if let Some((total, failed)) = app.constraint_stats {
         let (text, color) = if failed > 0 {
@@ -4874,9 +4875,16 @@ mod tests {
         let screen = render_to_screen(area, |f| render_footer(f, area, &app));
         assert!(screen.contains("✗ Failed: translate"), "{screen}");
         app.activity.state = State::Clear;
-        app.status = "meshfox: permission denied".into();
+        app.status_meta
+            .error("open", &mut app.status, "meshfox: permission denied".into());
         let screen = render_to_screen(area, |f| render_footer(f, area, &app));
-        assert!(screen.contains("permission denied"), "{screen}");
+        assert!(screen.contains("✗ meshfox: permission denied"), "{screen}");
+        app.activity.state = State::Running("render".into());
+        let screen = render_to_screen(area, |f| render_footer(f, area, &app));
+        assert!(
+            screen.contains("permission denied"),
+            "errors remain visible while another run is active: {screen}"
+        );
         std::fs::remove_dir_all(app.canvas_path.parent().unwrap()).unwrap();
     }
 
