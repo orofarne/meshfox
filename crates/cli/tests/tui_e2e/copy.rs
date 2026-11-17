@@ -283,6 +283,28 @@ fn keyboard_cursor_can_choose_and_replace_a_middle_selection_without_exiting() {
     );
 }
 
+/// The mode label and the image are painted by the same frame on a quiet
+/// machine, but under load the label can be on screen a frame before the
+/// image is: what must hold is that the image is *there* (not erased for good),
+/// so give it the usual wait instead of sampling the very first screen.
+fn wait_bgcolor(
+    session: &TuiSession,
+    row: u16,
+    col: u16,
+    expected: Option<vt100::Color>,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while session.bgcolor_at(row, col) != expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: {:?} != {expected:?}",
+            session.bgcolor_at(row, col)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 #[ignore = "pty-based e2e"]
 fn text_selection_preserves_images() {
@@ -311,22 +333,20 @@ fn text_selection_preserves_images() {
     let color = session.bgcolor_at(row, col);
     session.send_keys("\tv");
     session.wait_for("CURSOR", WAIT).unwrap();
-    assert_eq!(
-        session.bgcolor_at(row, col),
-        color,
-        "image vanished in cursor mode"
-    );
+    wait_bgcolor(&session, row, col, color, "image vanished in cursor mode");
     session.send_keys(" ");
     session.wait_for("SELECT", WAIT).unwrap();
-    assert_eq!(
-        session.bgcolor_at(row, col),
-        color,
-        "image vanished while selecting"
-    );
+    wait_bgcolor(&session, row, col, color, "image vanished while selecting");
     session.send_keys("\x1b");
     session.wait_absent("  ·  SELECT", WAIT).unwrap();
     session.wait_absent("  ·  CURSOR", WAIT).unwrap();
-    assert_eq!(session.bgcolor_at(row, col), color);
+    wait_bgcolor(
+        &session,
+        row,
+        col,
+        color,
+        "image vanished after leaving selection",
+    );
     session.send_keys("q");
     assert!(
         session.wait_for_exit(WAIT),
