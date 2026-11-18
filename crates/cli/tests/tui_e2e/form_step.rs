@@ -87,3 +87,34 @@ fn a_list_field_with_choices_is_ticked_in_a_checklist_popup() {
         .wait_for("regions-are-us,ap", timeout)
         .expect("the ticked items should reach the consumer in its format");
 }
+
+/// `r` on a node whose `autorun` block reads a variable a form answers: the
+/// run parks on the form, Send continues it — and the status bar must not
+/// report the form as a failure afterwards.
+#[test]
+#[ignore = "pty-based e2e — run via `cargo test --test tui_e2e -- --ignored`"]
+fn r_then_send_on_an_autorun_card_does_not_report_the_form_as_failed() {
+    let (canvas_path, dir) = fixtures::write_fixture(concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"CARD_ANIMAL\" session -->\n\n",
+        "```form name=\"card-form\" send=\"Show\"\n",
+        "field var=\"CARD_ANIMAL\" label=\"Animal\"\n```\n\n",
+        "```bash name=\"card\" env=\"$CARD_ANIMAL\" autorun\n",
+        "sleep 1; echo \"card-for-$CARD_ANIMAL\"\n```\n",
+    ));
+    let mut session = TuiSession::spawn(&canvas_path, dir, 40, 110);
+    let timeout = Duration::from_secs(10);
+    session.wait_for("Animal", timeout).unwrap();
+    session.send_keys("r");
+    session.wait_for("which block?", timeout).unwrap();
+    session.send_keys("\r");
+    session.wait_for("waiting for form", timeout).unwrap();
+    session.send_keys("Cat");
+    std::thread::sleep(Duration::from_millis(500));
+    eprintln!("--- typed\n{}", session.screen_text());
+    session.send_keys("\r\r");
+    std::thread::sleep(Duration::from_secs(6));
+    let screen = session.screen_text();
+    eprintln!("--- final\n{screen}");
+    assert!(!screen.contains("Failed:"), "{screen}");
+}

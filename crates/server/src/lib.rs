@@ -7703,6 +7703,15 @@ async fn run_block_impl_sized(
                     exit_code: 0,
                     duration_ms: step_started.elapsed().as_millis() as u64,
                 }));
+                // A form that is itself the requested target never reaches
+                // `attach` (it spawns no process), so its reservation would
+                // resolve as `-1` when this generator ends and passive
+                // watchers would report a sent form as failed.
+                if Some(addr) == chain.last() {
+                    if let Some(handle) = &target_reservation {
+                        handle.resolve_if_unreached(run_registry::RunOutcome::Exited { exit_code: 0 });
+                    }
+                }
                 // The session values the Send committed now apply to the
                 // rest of this chain.
                 for (name, value) in state.session_vars.lock().unwrap().iter() {
