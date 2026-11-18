@@ -164,7 +164,7 @@ for b, key, old_leaves in closed:
     for ol in old_leaves:
         f, _, ln = ol.rpartition(":")
         byfile.setdefault(f, []).append(ln)
-    head = [l for l in b[: next((i for i, l in enumerate(b) if l.startswith("### ")), len(b))]]
+    head = list(b[: next((i for i, l in enumerate(b) if l.startswith("### ")), len(b))])
     head[0] = "### " + title + (f" ({len(old_leaves)})" if old_leaves else "")
     head = [re.sub(r'tags="[^"]*"', "", l).replace("  -->", " -->") if l.startswith("<!-- meshfox:node") else l for l in head]
     while head and head[-1] == "":

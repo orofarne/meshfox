@@ -79,8 +79,14 @@ for clause in sys.argv[1].split(","):
         sys.exit(1)
 PY
 PY_MINOR='import sys; print("%d.%d" % sys.version_info[:2])'
-py_satisfies() { "$1" -c "$PY_SATISFIES" "$2"; }
-py_minor() { "$1" -c "$PY_MINOR" 2>/dev/null || true; }
+py_satisfies() {
+  local py="$1" spec="$2"
+  "$py" -c "$PY_SATISFIES" "$spec"
+}
+py_minor() {
+  local py="$1"
+  "$py" -c "$PY_MINOR" 2>/dev/null || true
+}
 
 requires=""
 if [[ "${MESHFOX_BLOCK_LANG:-text}" = toml ]]; then
