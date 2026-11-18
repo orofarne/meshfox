@@ -2804,7 +2804,12 @@ fn render_path_picker(f: &mut Frame, area: Rect, pp: &super::path_picker::PathPi
         Span::styled("/ filter: ", Style::default().fg(super::theme::muted())),
         Span::styled(
             if pp.focus == PickerFocus::Filter {
-                format!("{}_", pp.filter)
+                let at = pp
+                    .filter
+                    .char_indices()
+                    .nth(pp.filter_cursor)
+                    .map_or(pp.filter.len(), |(i, _)| i);
+                format!("{}_{}", &pp.filter[..at], &pp.filter[at..])
             } else if pp.filter.is_empty() {
                 "—".to_string()
             } else {

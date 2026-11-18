@@ -67,6 +67,8 @@ pub struct PathPickerState {
     /// Narrow files to `ext` (a hint: `e` switches it off).
     pub only_ext: bool,
     pub filter: String,
+    /// Caret position in `filter`, in chars (0..=len).
+    pub filter_cursor: usize,
     pub focus: PickerFocus,
     pub name: String,
     /// Index into [`PathPickerState::rows`].
@@ -114,6 +116,7 @@ impl PathPickerState {
             show_hidden: false,
             only_ext: true,
             filter: String::new(),
+            filter_cursor: 0,
             focus: PickerFocus::List,
             name: String::new(),
             selected: 0,
@@ -125,6 +128,7 @@ impl PathPickerState {
     pub fn set_listing(&mut self, listing: FsListing) {
         self.error = None;
         self.filter.clear();
+        self.filter_cursor = 0;
         if self.focus == PickerFocus::Filter {
             self.focus = PickerFocus::List;
         }
@@ -255,20 +259,50 @@ impl PathPickerState {
         }
     }
 
+    fn filter_byte(&self, chars: usize) -> usize {
+        self.filter
+            .char_indices()
+            .nth(chars)
+            .map_or(self.filter.len(), |(i, _)| i)
+    }
+
     fn on_filter_key(&mut self, key: KeyEvent) -> PickerAction {
+        let len = self.filter.chars().count();
+        self.filter_cursor = self.filter_cursor.min(len);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
                 self.filter.clear();
+                self.filter_cursor = 0;
                 self.focus = PickerFocus::List;
                 self.selected = 0;
             }
             KeyCode::Enter | KeyCode::Tab | KeyCode::Down => self.focus = PickerFocus::List,
+            KeyCode::Left => self.filter_cursor = self.filter_cursor.saturating_sub(1),
+            KeyCode::Right => self.filter_cursor = (self.filter_cursor + 1).min(len),
+            KeyCode::Home => self.filter_cursor = 0,
+            KeyCode::End => self.filter_cursor = len,
+            KeyCode::Char('a') if ctrl => self.filter_cursor = 0,
+            KeyCode::Char('e') if ctrl => self.filter_cursor = len,
             KeyCode::Backspace => {
-                self.filter.pop();
+                if self.filter_cursor > 0 {
+                    let at = self.filter_byte(self.filter_cursor - 1);
+                    self.filter.remove(at);
+                    self.filter_cursor -= 1;
+                }
                 self.selected = 0;
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.filter.push(c);
+            KeyCode::Delete => {
+                if self.filter_cursor < len {
+                    let at = self.filter_byte(self.filter_cursor);
+                    self.filter.remove(at);
+                }
+                self.selected = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                let at = self.filter_byte(self.filter_cursor);
+                self.filter.insert(at, c);
+                self.filter_cursor += 1;
                 self.selected = 0;
             }
             _ => {}
@@ -311,7 +345,10 @@ impl PathPickerState {
                     return PickerAction::Navigate(p);
                 }
             }
-            KeyCode::Char('/') => self.focus = PickerFocus::Filter,
+            KeyCode::Char('/') => {
+                self.focus = PickerFocus::Filter;
+                self.filter_cursor = self.filter.chars().count();
+            }
             KeyCode::Char('.') => {
                 self.show_hidden = !self.show_hidden;
                 if let Some(l) = &self.listing {
@@ -404,6 +441,24 @@ mod tests {
         assert_eq!(names(&p), ["..", "raw", "a.mkv", "b.MP4"]);
         p.on_key(key(KeyCode::Char('e')));
         assert_eq!(names(&p), ["..", "raw", "a.mkv", "b.MP4", "notes.txt"]);
+    }
+
+    #[test]
+    fn filter_caret_edits_in_the_middle() {
+        let mut p = picker(VarType::File, Some(FileMode::Open), &[]);
+        p.focus = PickerFocus::Filter;
+        for c in "abd".chars() {
+            p.on_key(key(KeyCode::Char(c)));
+        }
+        p.on_key(key(KeyCode::Left));
+        p.on_key(key(KeyCode::Char('c')));
+        assert_eq!(p.filter, "abcd");
+        p.on_key(key(KeyCode::Home));
+        p.on_key(key(KeyCode::Delete));
+        assert_eq!(p.filter, "bcd");
+        p.on_key(key(KeyCode::End));
+        p.on_key(key(KeyCode::Backspace));
+        assert_eq!(p.filter, "bc");
     }
 
     #[test]
