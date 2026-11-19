@@ -1563,6 +1563,11 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
         }
         app.reveal_selected_block = false;
     }
+    // Scrolling stops when the last row reaches the bottom of the pane; the
+    // handlers add to `doc_scroll` without knowing the document's height.
+    let max_scroll =
+        document_total_rows(app, inner.width, context).saturating_sub(inner.height.into());
+    app.doc_scroll = app.doc_scroll.min(max_scroll.min(u16::MAX as usize) as u16);
     let mut y = inner.y;
     let bottom = inner.y + inner.height;
     let mut skip = app.doc_scroll;
@@ -1782,6 +1787,28 @@ fn render_document(f: &mut Frame, area: Rect, app: &mut App) {
 /// right border (the dimmed border itself is the track), shown only when the document does
 /// not fit. `filled` says the visible rows ran out before the content did,
 /// which spares measuring the whole document when it plainly fits.
+/// Rows the whole document occupies at `width` — what the scrollbar and the
+/// scroll clamp both measure against.
+fn document_total_rows(
+    app: &App,
+    width: u16,
+    context: super::document_layout::LayoutContext,
+) -> usize {
+    app.doc_segments
+        .iter()
+        .map(|seg| match seg {
+            Segment::Image { path, prefix, .. } => {
+                let avail = width.saturating_sub(Line::from(prefix.clone()).width() as u16);
+                app.doc_images
+                    .get(path)
+                    .and_then(|p| p.as_ref())
+                    .map_or(1, |p| usize::from(p.rows_in(avail)))
+            }
+            _ => context.text(seg).map_or(1, |text| text.rows()),
+        })
+        .sum()
+}
+
 fn render_document_vscrollbar(
     f: &mut Frame,
     area: Rect,
@@ -1793,22 +1820,7 @@ fn render_document_vscrollbar(
     if !filled && app.doc_scroll == 0 {
         return;
     }
-    let total: usize = app
-        .doc_segments
-        .iter()
-        .map(|seg| match seg {
-            Segment::Image { path, prefix, .. } => {
-                let avail = inner
-                    .width
-                    .saturating_sub(Line::from(prefix.clone()).width() as u16);
-                app.doc_images
-                    .get(path)
-                    .and_then(|p| p.as_ref())
-                    .map_or(1, |p| usize::from(p.rows_in(avail)))
-            }
-            _ => context.text(seg).map_or(1, |text| text.rows()),
-        })
-        .sum();
+    let total = document_total_rows(app, inner.width, context);
     let view = usize::from(inner.height);
     if total <= view || view == 0 || area.width == 0 {
         return;
@@ -5005,7 +5017,7 @@ mod tests {
         app.picker = Picker::from_fontsize(FontSize::new(12, 7));
         app.picker.set_protocol_type(ProtocolType::Sixel);
         app.display_canvas = meshfox_core::Canvas::from_markdown(
-            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![plot](plot.png)\n\ntext below\n",
+            "# Root\n<!-- meshfox:node id=\"root\" -->\n\n![plot](plot.png)\n\ntext below\n\nl1\n\nl2\n\nl3\n\nl4\n",
         )
         .unwrap();
         let path = app.canvas_path.parent().unwrap().join("plot.png");
@@ -5383,6 +5395,9 @@ mod tests {
         let buffer = draw(&mut app);
         assert_eq!(thumb_rows(&buffer), vec![9, 10]);
         assert_eq!(buffer[(width - 1, height - 1)].symbol(), "┘");
+        // ...and the offset itself stops where the last row meets the pane's
+        // bottom, so scrolling can never reach an empty pane.
+        assert_eq!(app.doc_scroll, 30);
         let _ = std::fs::remove_dir_all(app.canvas_path.parent().unwrap());
     }
 
@@ -6012,7 +6027,7 @@ mod tests {
             std::env::temp_dir().join(format!("meshfox-document-heading-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("canvas.canvas.md");
-        std::fs::write(&path, "<!-- meshfox:canvas -->\n# A long node title\n<!-- meshfox:node id=\"root\" color=\"4\" tags=\"bag,improvement\" -->\n\nBody text here.\n").unwrap();
+        std::fs::write(&path, "<!-- meshfox:canvas -->\n# A long node title\n<!-- meshfox:node id=\"root\" color=\"4\" tags=\"bag,improvement\" -->\n\nBody text here.\n\nline 1\n\nline 2\n\nline 3\n\nline 4\n").unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(path, tx, None, None).await.unwrap();
         let area = Rect::new(0, 0, 24, 7);
