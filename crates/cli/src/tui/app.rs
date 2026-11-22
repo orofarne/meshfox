@@ -9293,14 +9293,22 @@ fn build_picker(configured: Option<&str>) -> io::Result<Picker> {
         }
     };
     let forced = select_image_protocol(override_value.as_deref(), configured)?;
-    super::image_render::set_braille(override_value.as_deref().or(configured) == Some("braille"));
+    let wanted = override_value.as_deref().or(configured);
+    super::image_render::set_braille(wanted == Some("braille"));
     if forced == Some(ProtocolType::Halfblocks) {
         return Ok(Picker::halfblocks());
     }
     let options = image_query_options(std::env::var("TERM_PROGRAM").ok().as_deref());
-    let picker =
-        Picker::from_query_stdio_with_options(options).unwrap_or_else(|_| Picker::halfblocks());
+    let queried = Picker::from_query_stdio_with_options(options);
+    let answered = queried.is_ok();
+    let picker = queried.unwrap_or_else(|_| Picker::halfblocks());
     let mut picker = apply_image_protocol(picker, forced);
+    // No graphics protocol (detection ended on the block fallback) and none
+    // asked for: Braille cells resolve more than half blocks do. (An
+    // unanswered query, as with no terminal at all, leaves the choice alone.)
+    if answered && forced.is_none() && picker.protocol_type() == ProtocolType::Halfblocks {
+        super::image_render::set_braille(true);
+    }
     if picker.protocol_type() == ProtocolType::Sixel
         && std::env::var("TERM_PROGRAM").is_ok_and(|t| t.contains("iTerm"))
     {

@@ -4078,8 +4078,8 @@ fragment; repeated visits reuse the encoded PNG.
 The TUI image protocol is configured by `[tui] image_protocol` in
 `~/.meshfox/config.toml` and `<canvas_root>/.meshfox/config.toml` (local wins).
 Supported values: `auto` (default), `iterm2`, `sixel`, `kitty`, `halfblocks`,
-`braille` (no graphics protocol: the picture is drawn as Unicode Braille cells,
-2×4 dots each).
+`braille` (the picture is drawn as Unicode Braille cells, 2×4 dots each; also
+what `auto` falls back to when the terminal supports no graphics protocol).
 `MESHFOX_IMAGE_PROTOCOL` overrides both files; `auto` explicitly restores
 capability detection. The client fetches the public setting from `/api/info`
 when no env override is present. Invalid protocol values are reported at TUI
