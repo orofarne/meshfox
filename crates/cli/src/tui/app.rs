@@ -9312,6 +9312,12 @@ fn build_picker(configured: Option<&str>) -> io::Result<Picker> {
             picker = physical_picker;
         }
     }
+    // Cell padding around an image (and any transparency in it) is drawn
+    // black by iTerm2 and Sixel unless filled with a real color: use the
+    // terminal's own background, when we know it.
+    if let Some((r, g, b)) = super::theme::surface_bg() {
+        picker.set_background_color(Some([r, g, b, 255]));
+    }
     Ok(picker)
 }
 
@@ -9502,6 +9508,30 @@ fn css_px_per_cell(picker: &Picker) -> (f32, f32) {
     )
 }
 
+/// Composites an image with transparency onto `surface`: terminals that
+/// can't show alpha (Sixel, and iTerm2 for padded inline images) draw
+/// transparent pixels black, which on a non-black terminal is a visible box.
+fn flatten_onto(image: image::DynamicImage, surface: (u8, u8, u8)) -> image::DynamicImage {
+    if !image.color().has_alpha() {
+        return image;
+    }
+    let mut rgba = image.into_rgba8();
+    for pixel in rgba.pixels_mut() {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 255 {
+            continue;
+        }
+        let blend = |c: u8, bg: u8| {
+            ((u32::from(c) * alpha + u32::from(bg) * (255 - alpha) + 127) / 255) as u8
+        };
+        pixel[0] = blend(pixel[0], surface.0);
+        pixel[1] = blend(pixel[1], surface.1);
+        pixel[2] = blend(pixel[2], surface.2);
+        pixel[3] = 255;
+    }
+    image::DynamicImage::ImageRgba8(rgba)
+}
+
 pub(super) fn prepared_image(
     picker: &Picker,
     image: image::DynamicImage,
@@ -9520,6 +9550,10 @@ pub(super) fn prepared_image(
         u32::from(budget.height) * cell_height,
         image::imageops::FilterType::Lanczos3,
     );
+    let pixels = match super::theme::surface_bg() {
+        Some(surface) => flatten_onto(pixels, surface),
+        None => pixels,
+    };
     let size = ratatui::layout::Size::new(
         pixels.width().div_ceil(cell_width) as u16,
         pixels.height().div_ceil(cell_height) as u16,
@@ -11811,6 +11845,21 @@ mod tests {
         assert_eq!(child.picker.font_size().width, picker.font_size().width);
         assert_eq!(child.picker.font_size().height, picker.font_size().height);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flatten_onto_blends_transparency_into_the_surface_color() {
+        let mut img = image::RgbaImage::new(3, 1);
+        img.put_pixel(0, 0, image::Rgba([255, 255, 255, 0]));
+        img.put_pixel(1, 0, image::Rgba([255, 255, 255, 255]));
+        img.put_pixel(2, 0, image::Rgba([255, 255, 255, 128]));
+        let out = flatten_onto(image::DynamicImage::ImageRgba8(img), (40, 40, 40)).to_rgba8();
+        assert_eq!(out.get_pixel(0, 0).0, [40, 40, 40, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
+        assert_eq!(out.get_pixel(2, 0).0, [148, 148, 148, 255]);
+        // An opaque image is returned as is.
+        let opaque = image::DynamicImage::new_rgb8(2, 2);
+        assert!(!flatten_onto(opaque, (1, 2, 3)).color().has_alpha());
     }
 
     #[test]
