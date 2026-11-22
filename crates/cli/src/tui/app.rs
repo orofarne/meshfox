@@ -11894,6 +11894,43 @@ mod tests {
         );
     }
 
+    const ALPHA_PNG: &[u8] = include_bytes!("../../../../examples/images-data/alpha.png");
+    const ALPHA_WEBP: &[u8] = include_bytes!("../../../../examples/images-data/alpha.webp");
+
+    #[test]
+    fn the_alpha_example_images_decode_with_their_transparency_in_both_formats() {
+        let png = image::load_from_memory(ALPHA_PNG).unwrap();
+        let webp = image::load_from_memory(ALPHA_WEBP).unwrap();
+        assert!(png.color().has_alpha() && webp.color().has_alpha());
+        // The WebP is lossless: same pixels as the PNG, alpha included.
+        assert_eq!(png.to_rgba8(), webp.to_rgba8());
+        let px = png.to_rgba8();
+        assert_eq!(px.get_pixel(0, 0)[3], 0, "outside the badge is transparent");
+        assert_eq!(px.get_pixel(40, 64)[3], 223, "the capsule is nearly opaque");
+        let disc = px.get_pixel(192, 64)[3];
+        // The 50% disc over the faded capsule: translucent, not opaque.
+        assert!((100..200).contains(&disc), "got {disc}");
+    }
+
+    #[test]
+    fn alpha_images_flatten_onto_the_surface_and_load_through_the_image_path() {
+        let surface = (250, 241, 199);
+        for bytes in [ALPHA_PNG, ALPHA_WEBP] {
+            let flat = flatten_onto(image::load_from_memory(bytes).unwrap(), surface).to_rgba8();
+            assert_eq!(flat.get_pixel(0, 0).0, [250, 241, 199, 255]);
+            assert!(flat.pixels().all(|p| p[3] == 255));
+            // The translucent disc ends up between the ink and the surface.
+            let disc = flat.get_pixel(192, 64).0;
+            assert!(disc[0] < 250 && disc[0] > 30, "{disc:?}");
+
+            let mut picker = Picker::halfblocks();
+            let path = std::path::Path::new("alpha-image");
+            assert!(
+                load_image_protocol(&mut picker, path, Some(bytes), None, None, None).is_some()
+            );
+        }
+    }
+
     #[test]
     fn flatten_onto_blends_transparency_into_the_surface_color() {
         let mut img = image::RgbaImage::new(3, 1);

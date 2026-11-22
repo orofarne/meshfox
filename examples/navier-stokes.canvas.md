@@ -102,20 +102,40 @@ boundary layers.
 ## A Reynolds number
 <!-- meshfox:node id="reynolds" -->
 
-$\mathrm{Re} = \rho U L / \mu$. For air at sea level (ρ ≈ 1.225 kg/m³,
-μ ≈ 1.81·10⁻⁵ Pa·s) flowing at $U$ = 70 m/s over a $L$ = 1.5 m wing chord:
+The Reynolds number compares the inertia of a flow with its viscous forces:
 
-```bash name="reynolds" cache
-awk 'BEGIN { rho = 1.225; mu = 1.81e-5; U = 70; L = 1.5;
-             printf "Re = %.2e\n", rho * U * L / mu }'
-```
-<!-- meshfox:output name="reynolds" hash="5814ac67" -->
-```text
-exit code: 0 · 14ms
+$$
+\mathrm{Re} = \frac{\rho U L}{\mu}
+$$
 
-Re = 7.11e+06
+Take air at sea level ($\rho \approx 1.225\,\mathrm{kg/m^3}$,
+$\mu \approx 1.81\cdot 10^{-5}\,\mathrm{Pa\cdot s}$) flowing at
+$U = 70\,\mathrm{m/s}$ over a wing chord $L = 1.5\,\mathrm{m}$. The block
+below is a computed view: it runs in the sandbox, prints Markdown — formula
+included — and shows the result in place of itself, never writing it into
+this file.
+
+```starlark render name="reynolds" output="markdown"
+rho = 1.225   # kg/m^3
+mu = 1.81e-5  # Pa*s
+U = 70.0      # m/s
+L = 1.5       # m
+
+re = rho * U * L / mu
+# Scientific notation by hand: re = mantissa * 10^exponent, 1 <= mantissa < 10.
+exponent = 0
+mantissa = re
+for _ in range(300):
+    if mantissa < 10:
+        break
+    mantissa = mantissa / 10
+    exponent += 1
+mantissa = int(mantissa * 100 + 0.5) / 100.0
+
+print("$$\n\\mathrm{Re} = \\frac{%s \\cdot %s \\cdot %s}{%s} \\approx %s \\times 10^{%d}\n$$" % (
+    rho, U, L, "1.81 \\cdot 10^{-5}", mantissa, exponent,
+))
 ```
-<!-- /meshfox:output -->
 
 ## Attribution
 <!-- meshfox:node id="attribution" -->

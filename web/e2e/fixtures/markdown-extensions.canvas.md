@@ -52,6 +52,8 @@ $$
 
 Broken TeX: $\badcommand{x}$ stays visible.
 
+Images with an alpha channel: ![alpha png](alpha.png) and ![alpha webp](alpha.webp)
+
 ```starlark render name="colors" output="markdown"
 print(md.background_color(md.color("StarlarkColor", "#e06c75"), "#fff3b0"))
 ```

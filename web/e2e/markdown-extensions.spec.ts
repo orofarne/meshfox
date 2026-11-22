@@ -135,3 +135,28 @@ test("LaTeX math renders through KaTeX, inline and display, and bad TeX stays vi
   // `throwOnError: false`: the unknown command is shown (in the error color), not dropped.
   await expect(body.locator(".katex", { hasText: "\\badcommand" })).toHaveCount(1);
 });
+
+test("PNG and WebP images keep their alpha channel when drawn by the browser", async ({ page }) => {
+  const images = page.locator('.react-flow__node[data-id="root"] .mesh-node-body img[alt^="alpha"]');
+  await expect(images).toHaveCount(2);
+  const probes = await images.evaluateAll((els) =>
+    Promise.all(
+      (els as HTMLImageElement[]).map(async (el) => {
+        await el.decode();
+        const canvas = document.createElement("canvas");
+        canvas.width = el.naturalWidth;
+        canvas.height = el.naturalHeight;
+        const ctx = canvas.getContext("2d")!;
+        ctx.drawImage(el, 0, 0);
+        const alpha = (x: number, y: number) => ctx.getImageData(x, y, 1, 1).data[3];
+        return { alt: el.alt, width: el.naturalWidth, corner: alpha(0, 0), capsule: alpha(40, 64) };
+      }),
+    ),
+  );
+  expect(probes.map((p) => p.alt)).toEqual(["alpha png", "alpha webp"]);
+  for (const probe of probes) {
+    expect(probe.width).toBe(256);
+    expect(probe.corner).toBe(0); // outside the badge: fully transparent
+    expect(probe.capsule).toBeGreaterThan(200); // the capsule: nearly opaque
+  }
+});

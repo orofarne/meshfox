@@ -444,6 +444,21 @@ and keeps its attribution in the canvas itself.
 
 [examples/navier-stokes.canvas.md](./examples/navier-stokes.canvas.md)
 
+## Images with transparency (PNG, WebP)
+<!-- meshfox:node id="images-with-transparency-png-webp" -->
+
+[examples/transparent-images.canvas.md](./examples/transparent-images.canvas.md)
+— a PNG or WebP with an alpha channel is drawn over what is behind it, so one
+file suits a light and a dark theme; `{bg=…}` after the image pins a backdrop
+instead (MARKDOWN.md's "Image size and background"). The TUI flattens such an
+image onto the terminal's own background color, because iTerm2 and Sixel show
+transparent pixels black.
+
+### Example
+<!-- meshfox:node id="example-transparent-images" type="file" -->
+
+[examples/transparent-images.canvas.md](./examples/transparent-images.canvas.md)
+
 ## Browsing a huge table (CSV, Parquet, ...)
 <!-- meshfox:node id="browsing-a-huge-table-csv-parquet" -->
 

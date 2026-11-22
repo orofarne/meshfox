@@ -371,7 +371,7 @@ mod tests {
             display += 1;
             rest = &after[end + 3..];
         }
-        assert_eq!(display, 3);
+        assert_eq!(display, 4);
         for tex in [
             r"\mathrm{Re} = \rho U L / \mu",
             r"\tau_{ij}",
