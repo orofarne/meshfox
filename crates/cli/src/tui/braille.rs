@@ -18,10 +18,18 @@ const DOT: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
 /// no dots, just its own color as the background.
 const FLAT: f32 = 14.0;
 
-/// A picture is line art when at least this share of it is page.
-const LINE_ART_PAGE_PERCENT: usize = 55;
-/// Exponent lifting mid-tones of line art toward full ink (< 1 lifts).
-const LINE_ART_GAMMA: f32 = 0.5;
+/// Line art detection: colors covering at least `COLOR_SHARE_PERMILLE`‰ of the
+/// picture are "flat" ones (anti-aliasing shades are each only a sliver, a
+/// photograph has a wide tonal range); they must cover `FLAT_COVERAGE_PERCENT`%,
+/// and `STRONG_PERCENT`% of what isn't page must stand out strongly.
+const COLOR_SHARE_PERMILLE: usize = 5;
+const FLAT_COVERAGE_PERCENT: usize = 75;
+const STRONG_PERCENT: usize = 50;
+/// In line art a sample is ink when it differs from the page by at least this
+/// share of the strongest difference in the picture ...
+const INK_SHARE: f32 = 0.3;
+/// ... and a picture whose strongest difference is under this (of 255) is blank.
+const MIN_CONTRAST: f32 = 15.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
@@ -170,6 +178,135 @@ fn dots_of(samples: &[Rgb; 8], page: Rgb) -> u8 {
     mask
 }
 
+/// Whether the picture is line art: a few flat colors cover most of it (the
+/// page and the ink; a smooth tonal range doesn't) and, of what isn't page,
+/// most stands out strongly (strokes, not the faint shading of an object).
+/// Judged on the source pixels, sampled with a stride — a thumbnail would blur
+/// thin strokes into mid-tones.
+fn is_line_art(image: &DynamicImage) -> bool {
+    let source = image.to_rgba8();
+    let total = source.pixels().len();
+    let stride = (total / 250_000).max(1);
+    let mut buckets: std::collections::HashMap<(u8, u8, u8), (usize, Rgb)> = Default::default();
+    let mut sampled = 0usize;
+    let mut colors: Vec<Rgb> = Vec::new();
+    for p in source.pixels().step_by(stride).filter(|p| p[3] >= 128) {
+        let c = [f32::from(p[0]), f32::from(p[1]), f32::from(p[2])];
+        let entry = buckets
+            .entry((p[0] >> 4, p[1] >> 4, p[2] >> 4))
+            .or_insert((0, [0.0; 3]));
+        entry.0 += 1;
+        for i in 0..3 {
+            entry.1[i] += c[i];
+        }
+        colors.push(c);
+        sampled += 1;
+    }
+    if sampled == 0 {
+        return false;
+    }
+    let flat: usize = buckets
+        .values()
+        .filter(|(n, _)| n * 1000 >= sampled * COLOR_SHARE_PERMILLE)
+        .map(|(n, _)| *n)
+        .sum();
+    if flat * 100 < sampled * FLAT_COVERAGE_PERCENT {
+        return false;
+    }
+    let Some((n, sum)) = buckets.values().max_by_key(|(n, _)| *n) else {
+        return false;
+    };
+    let page = sum.map(|v| v / *n as f32);
+    let strongest = colors
+        .iter()
+        .map(|c| distance(*c, page))
+        .fold(0.0, f32::max);
+    if strongest < MIN_CONTRAST {
+        return false;
+    }
+    let (mut off_page, mut strong) = (0usize, 0usize);
+    for c in &colors {
+        let d = distance(*c, page);
+        if d > 20.0 {
+            off_page += 1;
+            if d >= strongest * 0.5 {
+                strong += 1;
+            }
+        }
+    }
+    off_page > 0 && strong * 100 >= off_page * STRONG_PERCENT
+}
+
+/// Line art: a sample is a dot when it stands out from the page by
+/// `INK_SHARE` of the strongest difference; the dots take the color of the
+/// cell's strongest sample, a fully inked cell is a solid block, the rest of
+/// the cell is the page. Lights every plausible ink sample, because a real
+/// terminal draws Braille dots small and dim.
+fn line_art_grid(
+    samples: &image::RgbaImage,
+    cols: u16,
+    rows: u16,
+    backdrop: Rgb,
+    page: Rgb,
+) -> CellGrid {
+    let composed: Vec<Rgb> = samples.pixels().map(|p| over(p.0, backdrop)).collect();
+    let strength: Vec<f32> = composed.iter().map(|c| distance(*c, page)).collect();
+    let strongest = strength.iter().copied().fold(0.0, f32::max);
+    let blank = strongest < MIN_CONTRAST;
+    let threshold = strongest * INK_SHARE;
+    let bg = to_color(page);
+    let width = samples.width() as usize;
+    let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
+    for cy in 0..usize::from(rows) {
+        for cx in 0..usize::from(cols) {
+            let (mut mask, mut inkiest) = (0u8, (0.0f32, page));
+            for (dx, column) in DOT.iter().enumerate() {
+                for (dy, bit) in column.iter().enumerate() {
+                    let at = (cy * 4 + dy) * width + cx * 2 + dx;
+                    if !blank && strength[at] >= threshold {
+                        mask |= bit;
+                        if strength[at] > inkiest.0 {
+                            inkiest = (strength[at], composed[at]);
+                        }
+                    }
+                }
+            }
+            // The downscale blurred the strokes; bring the cell's strongest
+            // sample back to the full strength of the picture's ink, same hue.
+            let k = if inkiest.0 > 0.0 {
+                strongest / inkiest.0
+            } else {
+                1.0
+            };
+            let ink = to_color(
+                [0, 1, 2].map(|i| (page[i] + (inkiest.1[i] - page[i]) * k).clamp(0.0, 255.0)),
+            );
+            cells.push(match mask {
+                0 => Cell {
+                    symbol: ' ',
+                    fg: Color::Reset,
+                    bg,
+                },
+                0xFF => Cell {
+                    symbol: '█',
+                    fg: ink,
+                    bg,
+                },
+                _ => Cell {
+                    symbol: char::from_u32(0x2800 + u32::from(mask)).unwrap_or(' '),
+                    fg: ink,
+                    bg,
+                },
+            });
+        }
+    }
+    CellGrid {
+        width: cols,
+        height: rows,
+        cells,
+    }
+}
+
 /// Turns `image` into `cols`×`rows` Braille cells. Each cell is split into
 /// two color classes, dots in the minority class's color over the other
 /// class's color; a cell with nothing to split is just its color. `surface`
@@ -203,31 +340,9 @@ pub fn to_grid(
     // shot on white has white.
     let page = commonest_color(samples.pixels().map(|p| over(p.0, backdrop)));
 
-    // Line art (formulas, diagrams): mostly page with thin ink. Blurred by
-    // the downscale, strokes come out as mid-tones; lift them toward full ink
-    // so they read as ink and not as gray smudges. Photographs are left alone.
-    let composed: Vec<Rgb> = samples.pixels().map(|p| over(p.0, backdrop)).collect();
-    let near_page = composed
-        .iter()
-        .filter(|c| distance(**c, page) < 20.0)
-        .count();
-    let strongest = composed
-        .iter()
-        .map(|c| distance(*c, page))
-        .fold(0.0f32, f32::max);
-    let line_art = near_page * 100 >= composed.len() * LINE_ART_PAGE_PERCENT && strongest > FLAT;
-    let lift = |c: Rgb| -> Rgb {
-        let d = distance(c, page);
-        if !line_art || d <= 0.0 {
-            return c;
-        }
-        let t = (d / strongest).min(1.0);
-        // Faint tones (a shaded surface) stay as they are; strokes are lifted.
-        let weight = ((t - 0.15) / 0.2).clamp(0.0, 1.0);
-        let t = t + (t.powf(LINE_ART_GAMMA) - t) * weight;
-        let k = t * strongest / d;
-        [0, 1, 2].map(|i| page[i] + (c[i] - page[i]) * k)
-    };
+    if is_line_art(image) {
+        return line_art_grid(&samples, cols, rows, backdrop, page);
+    }
 
     let mut cells = Vec::with_capacity(usize::from(cols) * usize::from(rows));
     for cy in 0..u32::from(rows) {
@@ -242,7 +357,7 @@ pub fn to_grid(
                     order[index] = (dx, dy);
                     let pixel = samples.get_pixel(cx * 2 + dx as u32, cy * 4 + dy as u32).0;
                     seen |= pixel[3] != 0;
-                    colors[index] = lift(over(pixel, backdrop));
+                    colors[index] = over(pixel, backdrop);
                 }
             }
             let spread = (0..3)
@@ -404,6 +519,56 @@ mod tests {
         let Color::Rgb(r, ..) = cell.fg else { panic!() };
         assert!(r > 200, "ink washed out: {:?}", cell.fg);
         assert_eq!(cell.bg, Color::Rgb(39, 40, 34));
+    }
+
+    fn formula(tex: &str) -> DynamicImage {
+        let svg = crate::tui::math::to_svg(tex, true)
+            .unwrap()
+            .replace("currentColor", "#f2ede6");
+        crate::tui::svg_raster::rasterize(
+            &svg,
+            Some(meshfox_core::image_attrs::Background::Rgb(39, 40, 34)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn formulas_are_line_art_and_photographs_are_not() {
+        assert!(is_line_art(&formula(r"\frac{a}{b} + \sqrt{x}")));
+        // A smooth tonal range, like a photograph.
+        let photo = RgbaImage::from_fn(64, 64, |x, y| {
+            Rgba([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8, 255])
+        });
+        assert!(!is_line_art(&DynamicImage::ImageRgba8(photo)));
+    }
+
+    #[test]
+    fn a_formula_lights_its_strokes_in_the_text_color_on_the_terminal_background() {
+        let img = formula(r"\mathrm{Re} = \frac{\rho U L}{\mu}");
+        let cols = 40;
+        let rows =
+            ((f32::from(cols) * img.height() as f32 / img.width() as f32) / 2.0).ceil() as u16;
+        let grid = to_grid(&img, cols, rows, Some((39, 40, 34)));
+        let mut lit = 0;
+        for y in 0..grid.height {
+            for x in 0..grid.width {
+                let cell = grid.cell(x, y).unwrap();
+                assert_eq!(cell.bg, Color::Rgb(39, 40, 34));
+                if cell.symbol != ' ' {
+                    lit += 1;
+                    let Color::Rgb(r, ..) = cell.fg else { panic!() };
+                    assert!(r > 200, "ink too dim: {:?}", cell.fg);
+                }
+            }
+        }
+        assert!(lit > 10, "the formula must leave marks, got {lit}");
+    }
+
+    #[test]
+    #[ignore]
+    fn is_line_art_of_a_file() {
+        let path = std::env::var("BRAILLE_PHOTO").unwrap();
+        println!("line art: {}", is_line_art(&image::open(path).unwrap()));
     }
 
     #[test]
