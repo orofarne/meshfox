@@ -184,7 +184,7 @@ $$
 | | web | static/PDF | TUI |
 |---|---|---|---|
 | Inline `$...$` | KaTeX | not yet | Unicode approximation in the line of text (Greek, operators, simple scripts; `^{iπ}` stays visible when a script has no Unicode form) |
-| Display `$$...$$` | KaTeX (block) | not yet | typeset to SVG by RaTeX, shown as an image like any other SVG (needs an image-capable terminal) |
+| Display `$$...$$` | KaTeX (block) | not yet | typeset to SVG by RaTeX, shown as an image like any other SVG (needs an image-capable terminal). Drawn in the terminal's own text color on its own background color, which the TUI asks the terminal for at startup (OSC 10/11; not under tmux/screen, where it falls back to the dark `darkfox` colors with a transparent background) |
 | Broken TeX | the unknown command is shown in red | — | inline: shown as written; display: shown as `$$ source $$` |
 
 Display math is a `$$` block on its own lines on the web (`remark-math`); the

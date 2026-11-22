@@ -34,6 +34,7 @@ mod svg_raster;
 mod table;
 #[cfg(test)]
 mod table_layout_tests;
+mod terminal_colors;
 mod terminal_status;
 pub(crate) mod theme;
 mod tree;
@@ -74,6 +75,8 @@ pub async fn run(canvas_path: PathBuf, initial_node: Option<String>) -> io::Resu
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Before `App::new`: its `Picker` query and this one both read stdin.
+    terminal_colors::query();
     svg_raster::warm_up_fonts();
     let backend = PositionedBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;

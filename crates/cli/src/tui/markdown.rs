@@ -1358,11 +1358,18 @@ impl<'a> Renderer<'a> {
                     self.push_text(&super::math::inline_text(&t), Style::default());
                 } else if let Some(url) = super::math::svg_data_url(&t) {
                     self.flush_paragraph();
+                    // Flattened onto the surface color (when known): formulas
+                    // are drawn in the theme's text color, which only reads on it.
+                    let attrs = meshfox_core::image_attrs::ImageAttrs {
+                        bg: super::theme::surface_bg()
+                            .map(|(r, g, b)| meshfox_core::image_attrs::Background::Rgb(r, g, b)),
+                        ..Default::default()
+                    };
                     self.push_segment(Segment::Image {
                         prefix: Vec::new(),
                         path: std::path::PathBuf::from(url),
                         alt: t.trim().to_string(),
-                        attrs: Default::default(),
+                        attrs,
                     });
                 } else {
                     self.flush_paragraph();

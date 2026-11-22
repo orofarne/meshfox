@@ -152,6 +152,18 @@ pub fn init(canvas_root: &std::path::Path) -> Option<String> {
     }
 }
 
+/// The color the document is drawn on, when it is known for certain: the
+/// theme's own `bg`, or the terminal's default background it reported. An
+/// image with no transparency (Sixel; some terminals drop alpha for inline
+/// images) is flattened onto this so it blends in. `None` when unknown.
+pub fn surface_bg() -> Option<(u8, u8, u8)> {
+    current()
+        .ui
+        .bg
+        .approx_rgb()
+        .or_else(super::terminal_colors::bg)
+}
+
 /// The colors SVG output is themed with (`var(--mf-fg)` etc., see
 /// `meshfox_core::svg`). SVG needs literal colors, so ANSI ones are
 /// approximated; a `default` falls back to `darkfox`'s value.
@@ -159,15 +171,19 @@ pub fn svg() -> meshfox_core::svg::Theme {
     let t = current();
     // `default` (the terminal's own color) has no literal value; SVG falls
     // back to the dark theme's.
-    let hex = |c: ThemeColor, fallback: &str| match c.approx_rgb() {
-        Some((r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
-        None => fallback.to_string(),
-    };
+    // A `default` color is the terminal's own: use what the terminal told
+    // us at startup (`terminal_colors`), else the dark fallback.
+    let hex =
+        |c: ThemeColor, asked: Option<(u8, u8, u8)>, fallback: &str| match c.approx_rgb().or(asked)
+        {
+            Some((r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+            None => fallback.to_string(),
+        };
     meshfox_core::svg::Theme {
-        fg: hex(t.ui.fg, "#f2ede6"),
-        bg: hex(t.ui.bg, "#131316"),
-        accent: hex(t.ui.accent, "#ff6e15"),
-        border: hex(t.ui.svg_border, "#7a4620"),
+        fg: hex(t.ui.fg, super::terminal_colors::fg(), "#f2ede6"),
+        bg: hex(t.ui.bg, super::terminal_colors::bg(), "#131316"),
+        accent: hex(t.ui.accent, None, "#ff6e15"),
+        border: hex(t.ui.svg_border, None, "#7a4620"),
     }
 }
 
