@@ -258,8 +258,8 @@ fn tui_image_protocol_from_table(table: &toml::Table) -> Result<Option<String>, 
         .as_str()
         .ok_or("tui.image_protocol must be a string")?;
     match value {
-        "auto" | "iterm2" | "sixel" | "kitty" | "halfblocks" => Ok(Some(value.to_owned())),
-        _ => Err(format!("invalid tui.image_protocol={value:?}; expected auto, iterm2, sixel, kitty, or halfblocks")),
+        "auto" | "iterm2" | "sixel" | "kitty" | "halfblocks" | "braille" => Ok(Some(value.to_owned())),
+        _ => Err(format!("invalid tui.image_protocol={value:?}; expected auto, iterm2, sixel, kitty, halfblocks, or braille")),
     }
 }
 

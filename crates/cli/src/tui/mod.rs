@@ -12,6 +12,7 @@
 mod ansi;
 mod app;
 mod backend;
+mod braille;
 mod clipboard;
 mod date_picker;
 mod document_layout;

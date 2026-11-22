@@ -9293,6 +9293,7 @@ fn build_picker(configured: Option<&str>) -> io::Result<Picker> {
         }
     };
     let forced = select_image_protocol(override_value.as_deref(), configured)?;
+    super::image_render::set_braille(override_value.as_deref().or(configured) == Some("braille"));
     if forced == Some(ProtocolType::Halfblocks) {
         return Ok(Picker::halfblocks());
     }
@@ -9335,9 +9336,12 @@ fn parse_image_protocol(value: Option<&str>) -> io::Result<Option<ProtocolType>>
         Some("iterm2") => Ok(Some(ProtocolType::Iterm2)),
         Some("kitty") => Ok(Some(ProtocolType::Kitty)),
         Some("halfblocks") => Ok(Some(ProtocolType::Halfblocks)),
+        // Not a graphics protocol: cells of Braille dots, on the halfblocks
+        // picker (see `build_picker`, which switches the drawing mode on).
+        Some("braille") => Ok(Some(ProtocolType::Halfblocks)),
         Some(value) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("invalid MESHFOX_IMAGE_PROTOCOL={value:?}; expected auto, sixel, iterm2, kitty, or halfblocks"),
+            format!("invalid MESHFOX_IMAGE_PROTOCOL={value:?}; expected auto, sixel, iterm2, kitty, halfblocks, or braille"),
         )),
     }
 }
@@ -9586,6 +9590,11 @@ pub(super) fn prepared_image(
         ),
         None => pixels,
     };
+    if super::image_render::braille_enabled() {
+        let grid =
+            super::braille::to_grid(&pixels, size.width, size.height, super::theme::surface_bg());
+        return Some(DocumentImage::cells(grid));
+    }
     match picker.protocol_type() {
         ProtocolType::Iterm2 | ProtocolType::Sixel => {
             // Obtain tmux framing without encoding the full image or individual rows.

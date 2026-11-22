@@ -1342,6 +1342,10 @@ pub(super) fn render_document_image_at(
     buffer: &mut ratatui::buffer::Buffer,
 ) {
     use ratatui::widgets::Widget;
+    if let Some(grid) = image.cell_grid() {
+        grid.render(skip, skip_col, area, buffer);
+        return;
+    }
     let fragment = if defer {
         image.cached_fragment_at(skip, area.height, skip_col, area.width)
     } else {

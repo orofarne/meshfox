@@ -2,7 +2,19 @@
 use image::DynamicImage;
 use ratatui::layout::Size;
 use ratatui_image::{protocol::Protocol, sliced::SlicedProtocol};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
+
+static BRAILLE: AtomicBool = AtomicBool::new(false);
+
+/// Draw pictures as Braille cells (`image_protocol = "braille"`).
+pub(super) fn set_braille(on: bool) {
+    BRAILLE.store(on, Ordering::Relaxed);
+}
+
+pub(super) fn braille_enabled() -> bool {
+    BRAILLE.load(Ordering::Relaxed)
+}
 
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 64;
@@ -76,6 +88,8 @@ pub(super) struct DocumentImage {
     /// library's sliced widget can only skip rows, never columns.
     window_source: Option<WindowSource>,
     fragment: Option<FragmentImage>,
+    /// A picture drawn as ready-made cells (Braille) instead of a protocol.
+    cells: Option<super::braille::CellGrid>,
 }
 
 const SLICED_WINDOWS: usize = 4;
@@ -108,6 +122,7 @@ impl DocumentImage {
             size,
             sliced: None,
             window_source: None,
+            cells: None,
             fragment: Some(FragmentImage {
                 pixels,
                 cell_width,
@@ -136,7 +151,24 @@ impl DocumentImage {
                 windows: RefCell::new(VecDeque::new()),
             }),
             fragment: None,
+            cells: None,
         }
+    }
+
+    /// A picture already turned into cells (see `braille`).
+    pub fn cells(grid: super::braille::CellGrid) -> Self {
+        Self {
+            size: Size::new(grid.width, grid.height),
+            sliced: None,
+            window_source: None,
+            fragment: None,
+            cells: Some(grid),
+        }
+    }
+
+    /// The ready-made cells, if this picture is drawn that way.
+    pub fn cell_grid(&self) -> Option<&super::braille::CellGrid> {
+        self.cells.as_ref()
     }
 
     /// The `width`-column window of a sliced image starting at `skip_col`, or
