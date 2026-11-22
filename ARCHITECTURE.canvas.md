@@ -8,6 +8,12 @@ Rust workspace + a small browser frontend:
 
 ```
 crates/
+  model/    pure document model shared with the browser (wasm): parsing
+            helpers, fences, tree, SVG theming; no I/O
+  math/     LaTeX -> SVG (RaTeX) and the `$$` joining; used by the TUI and
+            the static/PDF export
+  export/   canvas -> static-site data (`meshfox static`, `meshfox pdf`):
+            Markdown to HTML, assets, previews
   core/     canvas model, .canvas.md parsing/rendering (crate::mdcanvas),
             tree derivation, Markdown fence scanning, output-block
             rewriting, executors (bash, ...), auto-layout

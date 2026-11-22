@@ -3,11 +3,11 @@
 //! embedded the Typst engine and hand-rolled Markdown->Typst rendering
 //! plus hand-drawn vector graphics for a spatial overview page, and got
 //! layout fidelity wrong in exactly the way `meshfox static`'s own design
-//! notes already warn against (see `crates/core/src/staticgen.rs`'s module
+//! notes already warn against (see `crates/export/src/lib.rs`'s module
 //! doc comment): a browser already lays out flex/flow content, tables, code
 //! wrapping, and page breaks correctly, so there's no reason to re-derive
 //! any of that by hand. `meshfox pdf` instead builds on the same,
-//! already-tested `meshfox_core::staticgen` data `meshfox static` uses, and
+//! already-tested `meshfox_export` data `meshfox static` uses, and
 //! gets a real Chrome/Chromium (`browser`) to print it.
 //!
 //! Two HTML pages are rendered (`render`) and printed independently
@@ -43,8 +43,8 @@ mod browser;
 mod merge;
 pub(crate) mod render;
 
-use meshfox_core::staticgen;
 use meshfox_core::Canvas;
+use meshfox_export as staticgen;
 use std::path::Path;
 
 /// Restricts `generate` to just one of the two page kinds

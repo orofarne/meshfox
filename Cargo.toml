@@ -4,6 +4,7 @@ members = [
     "crates/model",
     "crates/math",
     "crates/core",
+    "crates/export",
     "crates/wasm",
     "crates/server",
     "crates/cli",

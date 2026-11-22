@@ -76,7 +76,7 @@ tui-editor-themes.html
 ## PDF export (experimental)
 <!-- meshfox:node id="pdf-export-experimental" -->
 
-Renders a canvas straight to a PDF file, via a real (headless) Chrome/Chromium rather than a hand-rolled layout engine — a system install is used if one can be found (`CHROME` env var, common binary names on `PATH`, well-known install locations); otherwise a pinned Chromium build is downloaded once and cached for next time. Builds on the same `meshfox_core::staticgen` data `static` uses (see above), so it gets the same real, browser-computed layout instead of guessing at Markdown-body heights in Rust.
+Renders a canvas straight to a PDF file, via a real (headless) Chrome/Chromium rather than a hand-rolled layout engine — a system install is used if one can be found (`CHROME` env var, common binary names on `PATH`, well-known install locations); otherwise a pinned Chromium build is downloaded once and cached for next time. Builds on the same `meshfox_export` data `static` uses (see above), so it gets the same real, browser-computed layout instead of guessing at Markdown-body heights in Rust.
 
 A `file` node with `display="table"` prints the first 100 rows of its table as a plain grid, like `meshfox static` does — which needs the `duckdb` CLI, and `meshfox pdf` fails (naming the node and why) when a table can't be read, rather than printing a page with a hole in it.
 

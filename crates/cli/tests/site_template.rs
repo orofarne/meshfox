@@ -10,7 +10,7 @@
 //! fine — but every level of nesting ate into the next one's available
 //! width and drew its border right on top of the level above, so the page
 //! visually came out with the wrong widths and overlapping borders. A pure
-//! data-level test (`meshfox_core::staticgen`'s own unit tests) can't catch
+//! data-level test (`meshfox_export`'s own unit tests) can't catch
 //! this at all, since the bug was entirely in how the template arranges
 //! elements — so this parses the actual rendered HTML and asserts on its
 //! DOM structure instead.

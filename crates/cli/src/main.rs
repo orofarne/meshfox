@@ -6844,7 +6844,7 @@ fn xml_escape(s: &str) -> String {
 async fn fetch_code_previews(
     port: u16,
     canvas: &Canvas,
-) -> HashMap<String, meshfox_core::staticgen::CodePreview> {
+) -> HashMap<String, meshfox_export::CodePreview> {
     let mut previews = HashMap::new();
     for node in &canvas.nodes {
         if node.node_type != NodeType::File || node.display != Some(FileDisplay::Code) {
@@ -6854,7 +6854,7 @@ async fn fetch_code_previews(
         {
             previews.insert(
                 node.id.clone(),
-                meshfox_core::staticgen::CodePreview { content, truncated },
+                meshfox_export::CodePreview { content, truncated },
             );
         }
     }
@@ -6870,8 +6870,8 @@ async fn fetch_code_previews(
 async fn fetch_node_previews(
     port: u16,
     canvas: &Canvas,
-) -> Result<meshfox_core::staticgen::NodePreviews, Vec<String>> {
-    let mut previews = meshfox_core::staticgen::NodePreviews {
+) -> Result<meshfox_export::NodePreviews, Vec<String>> {
+    let mut previews = meshfox_export::NodePreviews {
         code: fetch_code_previews(port, canvas).await,
         tables: HashMap::new(),
     };
@@ -6909,8 +6909,8 @@ const TABLE_IMPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(60
 async fn fetch_table_preview(
     port: u16,
     node_id: &str,
-) -> Result<meshfox_core::staticgen::TablePreview, String> {
-    use meshfox_core::staticgen::{TablePreview, TablePreviewColumn, TABLE_PREVIEW_ROWS};
+) -> Result<meshfox_export::TablePreview, String> {
+    use meshfox_export::{TablePreview, TablePreviewColumn, TABLE_PREVIEW_ROWS};
     let started = std::time::Instant::now();
     let mut announced = false;
     let meta = loop {
@@ -7051,7 +7051,7 @@ fn static_cmd(
         canvas_path.to_path_buf(),
         out_dir.to_path_buf(),
         String::new(),
-        meshfox_core::staticgen::PageKind::Canvas,
+        meshfox_export::PageKind::Canvas,
         template_dir,
         &tera,
         &config,
@@ -7116,7 +7116,7 @@ fn render_canvas_site<'a>(
     root_canvas_path: PathBuf,
     top_out_dir: PathBuf,
     current_slot: String,
-    kind: meshfox_core::staticgen::PageKind,
+    kind: meshfox_export::PageKind,
     template_dir: &'a Path,
     tera: &'a tera::Tera,
     config: &'a TemplateConfig,
@@ -7141,7 +7141,7 @@ fn render_canvas_site<'a>(
         // A document (plain Markdown file) has no canvas structure for a
         // worker to serve: it is read directly, and its images too.
         let (site, assets, canvas_links, port) = match kind {
-            meshfox_core::staticgen::PageKind::Canvas => {
+            meshfox_export::PageKind::Canvas => {
                 let port = coordinator::get_or_spawn(&canvas_path)
                     .await
                     .unwrap_or_else(|e| {
@@ -7177,7 +7177,7 @@ fn render_canvas_site<'a>(
                     });
                 let access = meshfox_core::FileAccess::for_canvas_path(&canvas, &canvas_path);
                 let (site, assets, canvas_links) =
-                    meshfox_core::staticgen::build_for_static_export_with_access(
+                    meshfox_export::build_for_static_export_with_access(
                         &canvas,
                         canvas_dir,
                         &root_canvas_path,
@@ -7196,12 +7196,12 @@ fn render_canvas_site<'a>(
                     });
                 (site, assets, canvas_links, Some(port))
             }
-            meshfox_core::staticgen::PageKind::Document => {
+            meshfox_export::PageKind::Document => {
                 let access = meshfox_core::FileAccess::for_canvas_path(
                     &meshfox_core::Canvas::default(),
                     &root_canvas_path,
                 );
-                let (site, assets) = meshfox_core::staticgen::build_document_for_static_export(
+                let (site, assets) = meshfox_export::build_document_for_static_export(
                     &canvas_path,
                     &root_canvas_path,
                     &current_slot,

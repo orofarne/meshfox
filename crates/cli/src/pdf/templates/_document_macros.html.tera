@@ -1,7 +1,7 @@
 {# Recursive node renderer for `document.html.tera`'s flow-order body: every
    node (positioned or not — `pdf::render` never even passes position data
    here) is a plain block, headings sized by real tree depth, capped at 6
-   like `crates/core/src/staticgen.rs`'s own depth convention. No folding —
+   like `crates/export/src/lib.rs`'s own depth convention. No folding —
    a PDF reader can't click to expand a `<details>`, so nothing is ever
    collapsed here unlike `site-template/_macros.html.tera`'s live-site
    macro this is a print-only sibling of.

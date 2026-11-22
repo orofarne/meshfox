@@ -1,7 +1,7 @@
 //! End-to-end test for `meshfox static`: invokes the built binary against a
 //! small, self-contained canvas fixture and a minimal fixture template, and
 //! checks the output directory it produces — the parts unit tests inside
-//! `meshfox_core::staticgen` can't reach (CLI arg parsing, walking the
+//! `meshfox_export` can't reach (CLI arg parsing, walking the
 //! template directory, Tera rendering, asset copying, the `--out`/`--force`
 //! clobber guard).
 
@@ -163,7 +163,7 @@ fn template_toml_supplies_links_base_url_and_icons_but_is_never_copied_to_out() 
 
     let canvas_path = unique_dir("canvas-config").join("doc.canvas.md");
     // A plain Markdown link in the root's own body — the kind
-    // `links_base_url` actually prefixes (see meshfox_core::staticgen's own
+    // `links_base_url` actually prefixes (see meshfox_export's own
     // doc comment); a literal `<a>` written directly in a template's own
     // HTML never goes through that resolution at all, so it wouldn't
     // exercise this.
@@ -289,7 +289,7 @@ fn refuses_to_clobber_a_non_empty_out_dir_without_force() {
 
 // TODO.canvas.md: "Опция sitemap.xml (+ даты обновления из git)" —
 // `--sitemap`'s own end-to-end behavior (unit coverage lives in
-// `meshfox_core::staticgen` for everything upstream of the CLI; `sitemap.xml`
+// `meshfox_export` for everything upstream of the CLI; `sitemap.xml`
 // itself is generated entirely in `crates/cli/src/main.rs`, so it only has
 // a CLI-level test to exercise it at all).
 #[test]

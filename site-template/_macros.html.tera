@@ -12,7 +12,7 @@
    the browser's own free disclosure widget, no JS anywhere. `open` mirrors
    `n.folded` at render time only (a static page has no build step to write
    a reader's later clicks back into, unlike the web UI's own localStorage —
-   see `crates/core/src/staticgen.rs`'s `resolve_default_fold`). `<details>`
+   see `crates/export/src/lib.rs`'s `resolve_default_fold`). `<details>`
    already hides everything but its own `<summary>` when closed, which is
    what hides this node's own tags/body for free; `.node-children` sits
    *outside* the `<details>` (same sibling rule as above) so folding it
@@ -34,7 +34,7 @@
    nudge right — same document-outline convention `web/src/autolayout.ts`
    calls `ROOT_CHILD_INDENT`, as opposed to the full branch-right step
    (`H_GAP`) every deeper level gets. `n.depth` (real tree depth; see
-   `crates/core/src/staticgen.rs`'s `NodeView.depth` doc comment) is what
+   `crates/export/src/lib.rs`'s `NodeView.depth` doc comment) is what
    lets that CSS tell "root or its direct children" (depth <=1) apart from
    "real rightward branching" (depth >=2) for the `.shallow`/`.deep` width
    tiers too.

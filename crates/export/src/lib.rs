@@ -79,7 +79,7 @@
 //!     the two can differ, e.g. this repo's own canvases publish as plain
 //!     Markdown on GitHub, not alongside the static site built from them.
 
-use crate::canvas::{ArrowEnd, Canvas, FileDisplay, Node, NodeType};
+use meshfox_core::canvas::{ArrowEnd, Canvas, FileDisplay, Node, NodeType};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -123,7 +123,7 @@ pub struct NodeView {
     /// `NodeType::as_str`. In practice `"include"` never appears in a
     /// `SiteData` built from an already `include::resolve`d canvas (an
     /// include node becomes a `group` or `text` node once resolved — see
-    /// `crate::include`'s module docs) — this module doesn't resolve
+    /// `meshfox_core::include`'s module docs) — this module doesn't resolve
     /// includes itself, so it's left as a possible value for a caller that
     /// passes a raw, unresolved canvas.
     pub node_type: &'static str,
@@ -145,14 +145,14 @@ pub struct NodeView {
     pub spatial_children: bool,
     /// The node's own explicit `color`, or a fallback derived from its
     /// tags against the document's `meshfox:tag-color` defaults — whatever
-    /// `node.effective_color` already resolved to (`crate::tag_colors`).
+    /// `node.effective_color` already resolved to (`meshfox_core::tag_colors`).
     /// `None` when neither applies, or the caller never annotated it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     pub tags: Vec<String>,
     /// `node.text` rendered to HTML (GFM-flavored Markdown, meshfox's own
     /// fence attributes stripped down to a bare language token first — see
-    /// `crate::fence::strip_fence_attrs`). Always empty for a `group` node,
+    /// `meshfox_core::fence::strip_fence_attrs`). Always empty for a `group` node,
     /// which never has a body.
     pub html_body: String,
     /// `file`/`link` node target (path or URL); `None` for every other type.
@@ -215,7 +215,7 @@ pub struct EdgeView {
     pub label_at: Option<u16>,
     pub source_side: Option<&'static str>,
     pub target_side: Option<&'static str>,
-    pub via: Vec<crate::canvas::RoutePoint>,
+    pub via: Vec<meshfox_core::canvas::RoutePoint>,
     pub style: &'static str,
     pub arrow_start: bool,
     pub arrow_end: bool,
@@ -262,7 +262,7 @@ pub fn build(
 /// `display="table"` file-node's rows are taken from `previews` (keyed by node
 /// id) instead of read off local disk — see `NodePreviews`/
 /// `RenderCtx::previews`. Pass `None` for exactly `build`'s own behavior
-/// (local disk, `crate::file_read::preview`, and a plain link for a table,
+/// (local disk, `meshfox_core::file_read::preview`, and a plain link for a table,
 /// which has no local reader); pass `Some(..)` once every such node has
 /// already been fetched through a worker (`meshfox static`/`meshfox pdf`) —
 /// a node with no entry renders the same fallback link
@@ -342,11 +342,14 @@ pub fn build_for_static_export(
     recursive: bool,
 ) -> Result<(SiteData, Vec<Asset>, Vec<CanvasLinkTarget>), Vec<CopyFilesTargetError>> {
     let access = if root_canvas_path.parent() == Some(canvas_dir) {
-        crate::FileAccess::for_canvas_path(canvas, root_canvas_path)
+        meshfox_core::FileAccess::for_canvas_path(canvas, root_canvas_path)
     } else {
         // This legacy API has no current document filename. Configuration
         // grants still apply; never borrow another document's answer cache.
-        crate::FileAccess::from_values(&canvas_dir.join(".static-export"), Default::default())
+        meshfox_core::FileAccess::from_values(
+            &canvas_dir.join(".static-export"),
+            Default::default(),
+        )
     };
     build_for_static_export_with_access(
         canvas,
@@ -372,7 +375,7 @@ pub fn build_for_static_export_with_access(
     previews: Option<&NodePreviews>,
     copy_files: bool,
     recursive: bool,
-    access: &crate::FileAccess,
+    access: &meshfox_core::FileAccess,
 ) -> Result<(SiteData, Vec<Asset>, Vec<CanvasLinkTarget>), Vec<CopyFilesTargetError>> {
     let canvas_dir = canvas_dir
         .canonicalize()
@@ -387,7 +390,7 @@ pub fn build_for_static_export_with_access(
         .find(|n| n.parent.is_none())
         .expect("a parsed canvas always has a root");
     let (folded_ids, foldable_ids) = resolve_default_fold(canvas, &root_node.id);
-    let tag_colors = crate::tag_colors::declared_tag_colors(canvas).unwrap_or_default();
+    let tag_colors = meshfox_core::tag_colors::declared_tag_colors(canvas).unwrap_or_default();
     let ctx = RenderCtx {
         access,
         canvas_dir: &canvas_dir,
@@ -440,7 +443,7 @@ pub fn build_document_for_static_export(
     root_canvas_path: &Path,
     current_slot: &str,
     links_base_url: Option<&str>,
-    access: &crate::FileAccess,
+    access: &meshfox_core::FileAccess,
 ) -> Result<(SiteData, Vec<Asset>), Vec<CopyFilesTargetError>> {
     let source = std::fs::read_to_string(markdown_path).map_err(|e| {
         vec![CopyFilesTargetError {
@@ -552,7 +555,7 @@ fn build_node_view(
     // comment and this module's own doc comment's "Local-file references"
     // section — a `file`-node's own `target` (the `display="code"` branch
     // below) never has this problem: a `file` node can't itself live
-    // inside an `include`-dumped body (`crate::include::resolve` only ever
+    // inside an `include`-dumped body (`meshfox_core::include::resolve` only ever
     // produces plain `Text` nodes, never new addressable structure), so
     // `node.asset_base` is always `None` there and `cwd` reduces to
     // `ctx.canvas_dir` — nothing to thread through for `render_file_code`.
@@ -628,7 +631,7 @@ fn build_node_view(
         let first_link_override = (node.node_type == NodeType::File && ctx.copy_files)
             .then_some(target.as_deref())
             .flatten();
-        let blocks = crate::fence::scan_render_blocks(&node.text);
+        let blocks = meshfox_core::fence::scan_render_blocks(&node.text);
         let mut html_body = String::new();
         let mut cursor = 0;
         for (block, result) in blocks.iter().zip(&node.render_results) {
@@ -653,9 +656,9 @@ fn build_node_view(
             html_body.push_str("</summary>");
             let code = format!(
                 "{}starlark\n{}\n{}\n",
-                "`".repeat(crate::output::safe_fence_len(&block.code)),
+                "`".repeat(meshfox_core::output::safe_fence_len(&block.code)),
                 block.code,
-                "`".repeat(crate::output::safe_fence_len(&block.code))
+                "`".repeat(meshfox_core::output::safe_fence_len(&block.code))
             );
             html_body.push_str(&render_markdown(
                 &code,
@@ -750,7 +753,7 @@ fn build_node_view(
         position,
         authored_position,
         spatial_children,
-        color: crate::tag_colors::effective_color(node, ctx.tag_colors).map(css_color),
+        color: meshfox_core::tag_colors::effective_color(node, ctx.tag_colors).map(css_color),
         tags: node.tags.clone(),
         html_body,
         target,
@@ -816,7 +819,7 @@ fn resolve_default_fold(
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
 ) {
-    let has_unfold_option = crate::options::declared_options(canvas)
+    let has_unfold_option = meshfox_core::options::declared_options(canvas)
         .map(|opts| opts.iter().any(|o| o == "unfold"))
         .unwrap_or(false);
     // Ids that are somebody's structural `parent` — mirrors
@@ -914,7 +917,7 @@ fn build_edges(canvas: &Canvas) -> Vec<EdgeView> {
 /// resolve from, and how to treat whatever's left un-copied. See module
 /// docs.
 struct RenderCtx<'a> {
-    access: &'a crate::FileAccess,
+    access: &'a meshfox_core::FileAccess,
     canvas_dir: &'a Path,
     /// The *original* canvas the whole export started from (its file, not
     /// just its directory) — fixed across a whole recursive export, unlike
@@ -934,7 +937,7 @@ struct RenderCtx<'a> {
     folded_ids: &'a std::collections::HashSet<String>,
     foldable_ids: &'a std::collections::HashSet<String>,
     /// This document's own `meshfox:tag-color` defaults (see
-    /// `crate::tag_colors`) — computed once in `build`, consulted per node
+    /// `meshfox_core::tag_colors`) — computed once in `build`, consulted per node
     /// by `build_node_view` via `tag_colors::effective_color`. A malformed
     /// declaration just resolves to empty here (no node falls back to a
     /// tag-derived color, same as if none were declared) — `meshfox
@@ -1033,7 +1036,7 @@ pub enum PageKind {
 /// the caller (`build_with_code_previews`) instead of read from local disk
 /// during `build` itself — field-for-field what the worker's own
 /// `GET /api/nodes/:id/file-content` returns, and what
-/// `crate::file_read::FilePreview` holds for the local-disk case `render_file_code`
+/// `meshfox_core::file_read::FilePreview` holds for the local-disk case `render_file_code`
 /// otherwise falls back to.
 #[derive(Debug, Clone)]
 pub struct CodePreview {
@@ -1080,7 +1083,7 @@ pub struct NodePreviews {
 }
 
 /// GFM-flavored Markdown -> HTML, with meshfox's own fence attributes
-/// stripped first (see `crate::fence::strip_fence_attrs`) so a runnable
+/// stripped first (see `meshfox_core::fence::strip_fence_attrs`) so a runnable
 /// block's `name=`/`cache`/`deps=` don't leak into the rendered
 /// `class="language-..."`, and every image/link URL rewritten per `ctx`
 /// (see `resolve_image_url`/`resolve_link_url`). Every link additionally
@@ -1114,7 +1117,7 @@ fn render_markdown(
     // goes through the ordinary `resolve_link_url` below, unaffected.
     let mut first_link_override = first_link_override.map(str::to_string);
     use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
-    let stripped = crate::fence::strip_fence_attrs(text);
+    let stripped = meshfox_core::fence::strip_fence_attrs(text);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_FOOTNOTES
@@ -1135,7 +1138,7 @@ fn render_markdown(
     // legitimate `Event::Html` for spliced `<img>` attrs and `<sub>`/
     // `<sup>` (`subsup_events`) — filtering the final `events` list
     // instead would strip those too.
-    let raw: Vec<Event> = crate::color_spans::events(
+    let raw: Vec<Event> = meshfox_core::color_spans::events(
         &stripped,
         Parser::new_ext(&stripped, options)
             .into_offset_iter()
@@ -1173,9 +1176,9 @@ fn render_markdown(
                         break;
                     }
                 }
-                let mut attrs = crate::image_attrs::ImageAttrs::default();
+                let mut attrs = meshfox_core::image_attrs::ImageAttrs::default();
                 if let Some(Event::Text(t)) = raw.get(i) {
-                    if let Some((parsed, consumed)) = crate::image_attrs::parse(t) {
+                    if let Some((parsed, consumed)) = meshfox_core::image_attrs::parse(t) {
                         attrs = parsed;
                         let rest = t[consumed..].to_string();
                         i += 1;
@@ -1268,8 +1271,8 @@ fn replace_button_fences(text: &str, canvas: &Canvas, owner: &Node) -> String {
     }
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    for fence in crate::fence::scan_raw_fences(text) {
-        let (lang, attrs) = crate::fence::parse_info_string(&fence.info);
+    for fence in meshfox_core::fence::scan_raw_fences(text) {
+        let (lang, attrs) = meshfox_core::fence::parse_info_string(&fence.info);
         if fence.delim_char != '`' || lang != "button" {
             continue;
         }
@@ -1277,9 +1280,10 @@ fn replace_button_fences(text: &str, canvas: &Canvas, owner: &Node) -> String {
         cursor = fence.span.end;
 
         let mut targets: Vec<&Node> = Vec::new();
-        for r in crate::fence::parse_deps_list(attrs.get("deps").map(String::as_str).unwrap_or(""))
-        {
-            let addr = crate::deps::resolve_ref(&owner.id, &r);
+        for r in meshfox_core::fence::parse_deps_list(
+            attrs.get("deps").map(String::as_str).unwrap_or(""),
+        ) {
+            let addr = meshfox_core::deps::resolve_ref(&owner.id, &r);
             if addr.node_id == owner.id {
                 continue;
             }
@@ -1325,7 +1329,7 @@ fn escape_markdown_inline(s: &str) -> String {
     out
 }
 
-/// Splits `text` on `crate::subsup`'s `~sub~`/`^sup^` syntax and turns
+/// Splits `text` on `meshfox_core::subsup`'s `~sub~`/`^sup^` syntax and turns
 /// each marked run into a raw `<sub>`/`<sup>` HTML event (content
 /// HTML-escaped — these bypass `pulldown-cmark`'s own escaping, since
 /// they're never real Markdown text nodes) alongside ordinary `Text`
@@ -1333,7 +1337,7 @@ fn escape_markdown_inline(s: &str) -> String {
 /// general several events out — hence `extend` at each call site rather
 /// than a plain `map`.
 fn subsup_events(text: &str) -> Vec<pulldown_cmark::Event<'static>> {
-    use crate::subsup::{scan, Piece, Script};
+    use meshfox_core::subsup::{scan, Piece, Script};
     use pulldown_cmark::Event;
     scan(text)
         .into_iter()
@@ -1370,11 +1374,14 @@ fn escape_html_text(s: &str) -> String {
 /// `/>` — the one spot `pulldown-cmark`'s own HTML writer always ends an
 /// image tag with, self-closing slash included, regardless of which of
 /// `alt`/`title` it did or didn't have to write first.
-fn splice_img_attrs(img_html: &str, attrs: &crate::image_attrs::ImageAttrs) -> String {
+fn splice_img_attrs(img_html: &str, attrs: &meshfox_core::image_attrs::ImageAttrs) -> String {
     match img_html.rfind("/>") {
         Some(idx) => {
             let prefix = img_html[..idx].trim_end();
-            format!("{prefix}{} />", crate::image_attrs::html_attrs(attrs))
+            format!(
+                "{prefix}{} />",
+                meshfox_core::image_attrs::html_attrs(attrs)
+            )
         }
         None => img_html.to_string(),
     }
@@ -1426,13 +1433,13 @@ fn add_target_blank(html: &str) -> String {
 fn resolve_canvas_relative(
     url: &str,
     canvas_dir: &Path,
-    access: &crate::FileAccess,
+    access: &meshfox_core::FileAccess,
 ) -> Option<PathBuf> {
     let clean = url.split(['?', '#']).next().unwrap_or(url);
     if clean.is_empty() {
         return None;
     }
-    let clean = crate::image_attrs::decode_image_path(clean);
+    let clean = meshfox_core::image_attrs::decode_image_path(clean);
     let resolved = access.confine(canvas_dir, &clean).ok()?;
     resolved.is_file().then_some(resolved)
 }
@@ -1642,7 +1649,7 @@ fn root_relative_link(url: &str, base_dir: &Path, ctx: &RenderCtx) -> String {
 /// target apart from an ordinary file. Not a guarantee the target actually
 /// parses as one.
 fn is_canvas_file(path: &Path) -> bool {
-    crate::mdcanvas::is_canvas(path)
+    meshfox_core::mdcanvas::is_canvas(path)
 }
 
 /// `resolved`'s position in the `--out` tree relative to the *root*
@@ -1883,7 +1890,7 @@ fn resolve_file_target_for_copy(
 /// own doc comment) — the worker-routed path, content already fetched
 /// through that same `GET /api/nodes/:id/file-content` route ahead of time.
 /// `None` (or no entry for this node) falls back to reading the target once
-/// at build time instead, via `crate::file_read::preview` — same
+/// at build time instead, via `meshfox_core::file_read::preview` — same
 /// confinement/binary-sniff/size-cap as that route. Falls back to a plain
 /// link (same as the web UI falls back to an error message) when the target
 /// is missing, unreadable, outside `canvas_dir`, or looks binary.
@@ -2080,7 +2087,7 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mdcanvas::parse;
+    use meshfox_core::mdcanvas::parse;
     use std::fs;
 
     fn canvas(md: &str) -> Canvas {
@@ -2113,10 +2120,10 @@ mod tests {
     #[test]
     fn computed_starlark_export_has_collapsible_source_and_a_real_table() {
         let mut c = canvas("# Root\n```starlark render name=\"counts\"\nprint(md.table(headers=[\"Tag\", \"Count\"], rows=[[md.link(\"todo\", \"https://example.com\"), 2]]))\n```\n");
-        crate::starlark_render::annotate(
+        meshfox_core::starlark_render::annotate(
             &mut c,
             None,
-            &crate::FileAccess::none(),
+            &meshfox_core::FileAccess::none(),
             &Default::default(),
         );
         let site = build_site(&c);
@@ -2371,7 +2378,7 @@ mod tests {
 
     // TODO.canvas.md: "Формальные граматики для meshfox:*" subtree ->
     // "Атрибуты картинок в markdown" — `{width=..}`/`{height=..}` right
-    // after an image (`crate::image_attrs`), spliced into the rendered
+    // after an image (`meshfox_core::image_attrs`), spliced into the rendered
     // `<img>` tag.
     #[test]
     fn image_size_attrs_become_html_width_height() {
@@ -3385,7 +3392,7 @@ mod tests {
         );
         let root_path = dir.join("doc.canvas.md");
         let access =
-            crate::FileAccess::from_values(&dir.join(".static-export"), Default::default());
+            meshfox_core::FileAccess::from_values(&dir.join(".static-export"), Default::default());
 
         let (site, _assets) = build_document_for_static_export(
             &dir.join("SPEC.md"),
@@ -3516,7 +3523,7 @@ mod tests {
     }
 
     // A canvas link is confined to *its own linking node's* directory, same
-    // boundary an image/asset reference already has (`crate::file_read::
+    // boundary an image/asset reference already has (`meshfox_core::file_read::
     // confine`, via `resolve_canvas_relative`) — a `../other.canvas.md` that
     // would have to climb out of the linking canvas's own directory doesn't
     // resolve there either, `--recursive` or not, so it's left as a plain,

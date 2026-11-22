@@ -193,7 +193,7 @@ write the block form when the document is read in both. A lone `$` is text
 in the TUI (`costs $5 and $6`), but `remark-math` may pair two of them —
 escape a literal dollar as `\$` to be safe.
 
-Code: `crates/math` (RaTeX typesetting and `$$` joining, shared), `crates/cli/src/tui/markdown.rs` (TUI), `crates/core/src/staticgen.rs` (static/PDF), `web/src/mathPlugins.ts` (web).
+Code: `crates/math` (RaTeX typesetting and `$$` joining, shared), `crates/cli/src/tui/markdown.rs` (TUI), `crates/export/src/lib.rs` (static/PDF), `web/src/mathPlugins.ts` (web).
 
 ### GFM alert blockquotes (`> [!NOTE]`/...)
 

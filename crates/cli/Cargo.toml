@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 meshfox-core = { path = "../core" }
+meshfox-export = { path = "../export" }
 meshfox-math = { path = "../math" }
 meshfox-server = { path = "../server" }
 clap = { version = "4", features = ["derive"] }

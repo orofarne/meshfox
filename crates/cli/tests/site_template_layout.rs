@@ -193,7 +193,7 @@ const GAP_FIXTURE_CANVAS: &str = concat!(
     "# Root\n",
     "<!-- meshfox:node id=\"root\" -->\n",
     // Every node in this fixture is folded shut by default (see
-    // `crates/core/src/staticgen.rs`'s `resolve_default_fold`) — this
+    // `crates/export/src/lib.rs`'s `resolve_default_fold`) — this
     // test is about the *expanded* layout, so it opts the whole document
     // out via the `unfold` option, same as a reader clicking every node
     // open would get.

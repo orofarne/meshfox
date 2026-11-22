@@ -3524,6 +3524,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "meshfox-core",
+ "meshfox-export",
  "meshfox-math",
  "meshfox-server",
  "open",
@@ -3562,9 +3563,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
- "meshfox-math",
  "meshfox-model",
- "pulldown-cmark",
  "rusqlite",
  "secret-service",
  "security-framework",
@@ -3575,6 +3574,17 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "toml",
+]
+
+[[package]]
+name = "meshfox-export"
+version = "0.1.0"
+dependencies = [
+ "meshfox-core",
+ "meshfox-math",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

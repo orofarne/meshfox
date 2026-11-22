@@ -4,7 +4,7 @@
 //! run/open endpoints, `staticgen`'s static-export asset copying, and
 //! `constraint`'s `.content()`/`.json()`/... (see `crate::constraint`).
 //! Previously duplicated (with small behavioral drift) between
-//! `crates/server` and `crates/core::staticgen`; this is the one copy both
+//! `crates/server` and `crates/export`; this is the one copy both
 //! — and the constraint sandbox — build on now.
 
 use std::fs;

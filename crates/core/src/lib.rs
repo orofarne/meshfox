@@ -63,7 +63,6 @@ pub mod shared_env;
 pub mod slug;
 pub use meshfox_model::script_vars;
 pub use meshfox_model::starlark_render;
-pub mod staticgen;
 pub use meshfox_model::subsup;
 pub use meshfox_model::suggest;
 pub use meshfox_model::svg;
@@ -116,7 +115,6 @@ pub use output::{
     write_output, ExecOutput,
 };
 pub use shared_env::{load as load_shared_env, SharedEnv, SharedOrigin, SharedVar};
-pub use staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
 pub use tag_colors::{
     annotate_effective_colors, declared_tag_colors, effective_color, TagColorError,
 };

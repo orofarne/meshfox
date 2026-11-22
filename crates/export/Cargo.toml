@@ -1,0 +1,15 @@
+[package]
+name = "meshfox-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canvas to static-site data (meshfox static, meshfox pdf): Markdown to HTML, assets, previews"
+
+[dependencies]
+meshfox-core = { path = "../core" }
+meshfox-math = { path = "../math" }
+serde = { version = "1", features = ["derive"] }
+pulldown-cmark = "0.13.4"
+
+[dev-dependencies]
+serde_json = "1"

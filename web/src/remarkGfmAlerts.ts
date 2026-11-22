@@ -1,5 +1,5 @@
 // Client-side counterpart to `Options::ENABLE_GFM` on the Rust side
-// (`crates/core/src/staticgen.rs`, the TUI's `markdown.rs`) — GitHub's
+// (`crates/export/src/lib.rs`, the TUI's `markdown.rs`) — GitHub's
 // alert blockquote syntax, `> [!NOTE]`/`> [!TIP]`/`> [!IMPORTANT]`/
 // `> [!WARNING]`/`> [!CAUTION]` (see SPEC.md and TODO.canvas.md's
 // `admonition-callouts` task). `remark-gfm` itself doesn't parse this —

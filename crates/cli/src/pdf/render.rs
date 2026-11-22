@@ -26,7 +26,7 @@
 //! (`include_str!`) — unlike `meshfox static`, `pdf` isn't meant to be
 //! user-templatable, so there's no runtime template directory to load.
 
-use meshfox_core::staticgen::{Asset, EdgeView, NodeView, Position, SiteData};
+use meshfox_export::{Asset, EdgeView, NodeView, Position, SiteData};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
