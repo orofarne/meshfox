@@ -119,8 +119,20 @@ pub fn heading(idx: usize) -> Color {
     })
 }
 
-/// Activates the theme named by `[tui] theme` in `config.toml` (default
-/// `darkfox`). On a missing or broken theme, keeps `darkfox` and returns
+/// Overrides `[tui] theme` for one run, the way `MESHFOX_IMAGE_PROTOCOL`
+/// overrides `[tui] image_protocol`.
+const THEME_ENV: &str = "MESHFOX_TUI_THEME";
+
+/// The theme to load: the environment's (when set and not blank) over the
+/// configuration's.
+fn theme_name(env: Option<String>, configured: Option<String>) -> Option<String> {
+    env.map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or(configured)
+}
+
+/// Activates the theme named by `MESHFOX_TUI_THEME`, else `[tui] theme` in
+/// `config.toml` (default `darkfox`). On a missing or broken theme, keeps `darkfox` and returns
 /// the reason, for the caller to show.
 pub fn init(canvas_root: &std::path::Path) -> Option<String> {
     // Tests build many `App`s in parallel and must not pick up the theme
@@ -130,12 +142,13 @@ pub fn init(canvas_root: &std::path::Path) -> Option<String> {
         let _ = canvas_root;
         return None;
     }
-    let name = meshfox_core::config::load(canvas_root)
+    let configured = meshfox_core::config::load(canvas_root)
         .get("tui")
         .and_then(|v| v.as_table())
         .and_then(|t| t.get("theme"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let name = theme_name(std::env::var(THEME_ENV).ok(), configured);
     let Some(name) = name else {
         set(Theme::darkfox());
         return None;
@@ -218,6 +231,23 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Style;
+
+    #[test]
+    fn the_environment_theme_wins_over_the_configured_one() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            theme_name(some("lightfox"), some("monokai")),
+            some("lightfox")
+        );
+        assert_eq!(
+            theme_name(some("  gruvbox-dark \n"), None),
+            some("gruvbox-dark")
+        );
+        // Unset or blank: the configuration decides.
+        assert_eq!(theme_name(None, some("monokai")), some("monokai"));
+        assert_eq!(theme_name(some("  "), some("monokai")), some("monokai"));
+        assert_eq!(theme_name(some(""), None), None);
+    }
 
     #[test]
     fn fills_only_cells_that_kept_the_terminal_defaults() {
