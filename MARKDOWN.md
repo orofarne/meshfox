@@ -169,6 +169,32 @@ or around it) stays real strikethrough on both sides.
 Shared scanner: `crates/core/src/subsup.rs` (Rust) /
 `web/src/remarkSubSup.ts` (web, plus its own reclaim pass).
 
+### Math (`$...$` / `$$...$$`)
+
+LaTeX, KaTeX-compatible syntax (including `\ce{}` chemistry):
+
+```markdown
+Inline: $E = mc^2$.
+
+$$
+\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt\pi}{2}
+$$
+```
+
+| | web | static/PDF | TUI |
+|---|---|---|---|
+| Inline `$...$` | KaTeX | not yet | Unicode approximation in the line of text (Greek, operators, simple scripts; `^{iπ}` stays visible when a script has no Unicode form) |
+| Display `$$...$$` | KaTeX (block) | not yet | typeset to SVG by RaTeX, shown as an image like any other SVG (needs an image-capable terminal) |
+| Broken TeX | the unknown command is shown in red | — | inline: shown as written; display: shown as `$$ source $$` |
+
+Display math is a `$$` block on its own lines on the web (`remark-math`); the
+TUI's parser (`pulldown-cmark`) also treats a one-line `$$x$$` as display, so
+write the block form when the document is read in both. A lone `$` is text
+in the TUI (`costs $5 and $6`), but `remark-math` may pair two of them —
+escape a literal dollar as `\$` to be safe.
+
+Code: `crates/cli/src/tui/math.rs` (TUI), `web/src/mathPlugins.ts` (web).
+
 ### GFM alert blockquotes (`> [!NOTE]`/...)
 
 GitHub's alert syntax — a blockquote whose first line is exactly one of

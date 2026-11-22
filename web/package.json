@@ -49,15 +49,19 @@
     "@xterm/xterm": "^6.0.0",
     "@xyflow/react": "^12.11.2",
     "anser": "^2.3.5",
+    "katex": "^0.19.1",
     "monaco-editor": "^0.53.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
     "shiki": "^4.4.3"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.0",
+    "@types/katex": "^0.16.8",
     "@types/node": "^26.1.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
@@ -68,5 +72,8 @@
   "allowScripts": {
     "fsevents@2.3.2": true,
     "fsevents@2.3.3": true
+  },
+  "overrides": {
+    "katex": "$katex"
   }
 }

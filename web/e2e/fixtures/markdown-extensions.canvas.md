@@ -44,6 +44,14 @@ documentation rather than a real runnable block:
 | --- |
 | [ColorCell]{color="#e06c75" background-color="#fff3b0"} |
 
+Math: inline $E = mc^2$ in a sentence, and a display formula:
+
+$$
+\int_0^1 x^2\,dx = \frac{1}{3}
+$$
+
+Broken TeX: $\badcommand{x}$ stays visible.
+
 ```starlark render name="colors" output="markdown"
 print(md.background_color(md.color("StarlarkColor", "#e06c75"), "#fff3b0"))
 ```

@@ -8,6 +8,8 @@ Only **direct** dependencies are listed by name below; the full transitive tree 
 
 It grew by one more once `crates/cli`'s `main` gained an explicit `rustls::crypto::ring::default_provider().install_default()` call — `rustls` (already reachable transitively via `headless_chrome`/`self_update`'s own `ureq` backend, and via `meshfox_server`'s `reqwest` feature flags) was promoted to a real, direct `crates/cli` dependency so that call has something to name; picking the `ring` backend there (rather than the default `aws-lc-rs`) keeps only one crypto backend compiled into the binary, matching `reqwest`'s own `rustls-no-provider` feature choice in `meshfox_server`. `Apache-2.0 OR ISC OR MIT` — permissive, no new copyleft exception. `crates/server` now names the same `rustls`/`ring` dependency directly as well: Source-mode saves of a canvas-valued include can make a loopback `reqwest` request when the server is embedded as a library, without the CLI's `main` having installed a provider. This adds no package to the existing transitive tree.
 
+**LaTeX math** (`$…$`/`$$…$$`). Web: `remark-math` + `rehype-katex` + `katex` (all MIT; `katex` is pinned `^0.19.1` through an `overrides` entry in `web/package.json`, since `katex` 0.11–0.18 carries an advisory (GHSA-238p-pmpm-9mq7) and `rehype-katex` 7 asks for `^0.16`). The KaTeX font files that `katex`'s CSS references ship inside the browser bundle under SIL OFL-1.1 (font-file-level attribution, same as `@fontsource/fira-code`). TUI: `ratex-parser`/`ratex-layout`/`ratex-svg`/`ratex-types` (RaTeX, pure Rust, MIT) typeset a formula to SVG, which then goes through the existing `resvg` path; with its `embed-fonts` feature `ratex-svg` pulls `ratex-katex-fonts`, which embeds the same KaTeX fonts (OFL-1.1, notice in the crate's `fonts/OFL.txt`) into the binary — the glyph outlines end up inside generated SVG. Transitive additions are `MIT`/`Apache-2.0`/`MIT OR Apache-2.0` (`ab_glyph`, `owned_ttf_parser`, `phf*`, `fancy-regex`, `regex-lite`, `memmap2`, `sys-locale`, `system-fonts`, `ratex-font*`, `ratex-lexer`, `ratex-unicode-font`); no new copyleft exception.
+
 On Linux only, `crates/core` has one more direct dependency, `secret-service` (`cfg(target_os = "linux")`, the freedesktop Secret Service client behind `secret_store = "keychain"` there; `default-features = false` with the `rt-async-io-crypto-rust` feature, so pure-Rust crypto and the async-io `zbus` runtime — no libdbus/OpenSSL to link and no tokio runtime for its blocking API to collide with). It pulls 39 crates that do not reach the macOS binary at all (`zbus` and its `zvariant`/`zbus_names`/`endi` family, `async-io`/`async-lock`/`async-process`/`blocking`/`polling` and friends, `enumflags2`, `hkdf`, `num*`, `winnow`/`toml_edit`) — 16 `MIT OR Apache-2.0`, 14 `Apache-2.0 OR MIT`, 9 `MIT`; no copyleft, so no new exception. The 627 figure above stays the macOS count.
 
 It grew by one more once `service` blocks (see SPEC.md's "Service blocks (experimental)") gained per-process CPU/memory/uptime sampling for the webui's service panel and the TUI's own service view — `sysinfo` (MIT), used from `crates/server`'s new `services` module (shared by both, since the TUI links this crate as a library rather than talking to it over HTTP).
@@ -71,6 +73,10 @@ Direct dependencies across `crates/core`, `crates/server`, `crates/cli` (`cargo 
 | pulldown-cmark | MIT |
 | ratatui | MIT |
 | ratatui-image | MIT |
+| ratex-layout | MIT |
+| ratex-parser | MIT |
+| ratex-svg | MIT |
+| ratex-types | MIT |
 | regex | MIT OR Apache-2.0 |
 | reqwest | MIT OR Apache-2.0 |
 | resvg | Apache-2.0 OR MIT |
@@ -178,11 +184,14 @@ Direct `dependencies` from `web/package.json` — these ship inside the built br
 | @xterm/xterm | MIT |
 | @xyflow/react | MIT |
 | anser | MIT |
+| katex | MIT |
 | monaco-editor | MIT |
 | react | MIT |
 | react-dom | MIT |
 | react-markdown | MIT |
+| rehype-katex | MIT |
 | remark-gfm | MIT |
+| remark-math | MIT |
 | shiki | MIT |
 
 Direct `devDependencies` — build/test tooling only, never shipped:
@@ -190,6 +199,7 @@ Direct `devDependencies` — build/test tooling only, never shipped:
 | Package | License |
 |---|---|
 | @playwright/test | Apache-2.0 |
+| @types/katex | MIT |
 | @types/node | MIT |
 | @types/react | MIT |
 | @types/react-dom | MIT |

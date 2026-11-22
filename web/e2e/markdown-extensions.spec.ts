@@ -124,3 +124,14 @@ test("Starlark color builders paint computed Markdown output", async ({ page }) 
   await expect(text.locator('span')).toHaveCSS('color', 'rgb(224, 108, 117)');
   await expect(text.first()).toHaveCSS('background-color', 'rgb(255, 243, 176)');
 });
+
+test("LaTeX math renders through KaTeX, inline and display, and bad TeX stays visible", async ({ page }) => {
+  const body = page.locator('.react-flow__node[data-id="root"] .mesh-node-body');
+  await expect(body.locator(".katex")).toHaveCount(3); // inline, display, and the broken formula
+  await expect(body.locator(".katex-display .katex")).toHaveCount(1);
+  await expect(body.locator("p .katex", { hasText: "mc" }).first()).toBeVisible();
+  // Rendered MathML carries the original TeX for screen readers/copying.
+  await expect(body.locator('annotation[encoding="application/x-tex"]').first()).toHaveText("E = mc^2");
+  // `throwOnError: false`: the unknown command is shown (in the error color), not dropped.
+  await expect(body.locator(".katex", { hasText: "\\badcommand" })).toHaveCount(1);
+});

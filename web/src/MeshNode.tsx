@@ -10,6 +10,7 @@ import type { NodeSize } from "./contentFit";
 import remarkImageAttrs from "./remarkImageAttrs";
 import remarkSubSup from "./remarkSubSup";
 import remarkGfmAlerts from "./remarkGfmAlerts";
+import { mathRemarkPlugin, mathRehypePlugins } from "./mathPlugins";
 import { highlightToHtml } from "./shiki";
 import { FileTablePreview } from "./TablePreview";
 import { ChoiceSelect } from "./ChoiceSelect";
@@ -2358,7 +2359,8 @@ function MarkdownOutput({
         </pre>
       )}
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+        remarkPlugins={[remarkGfm, mathRemarkPlugin, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+        rehypePlugins={mathRehypePlugins}
         components={components}
         urlTransform={allowDataImageUrls}
       >
@@ -2696,7 +2698,8 @@ export function NodeBodyPreview({ text }: { text: string }) {
           return (
             <ReactMarkdown
               key={`markdown-${i}`}
-              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+              remarkPlugins={[remarkGfm, mathRemarkPlugin, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+        rehypePlugins={mathRehypePlugins}
               components={markdownComponents}
               urlTransform={allowDataImageUrls}
             >
@@ -2837,7 +2840,8 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
           return (
             <ReactMarkdown
               key={`markdown-${markdownIdx++}`}
-              remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+              remarkPlugins={[remarkGfm, mathRemarkPlugin, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+        rehypePlugins={mathRehypePlugins}
               components={components}
               urlTransform={allowDataImageUrls}
             >
@@ -2882,7 +2886,8 @@ function MeshNodeBody({ data, nodeId }: { data: MeshNodeData; nodeId: string }) 
 function FileLinkCaption({ caption }: { caption: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+      remarkPlugins={[remarkGfm, mathRemarkPlugin, remarkImageAttrs, remarkColorSpans, remarkSubSup, remarkGfmAlerts]}
+        rehypePlugins={mathRehypePlugins}
       components={markdownComponents}
       urlTransform={allowDataImageUrls}
     >

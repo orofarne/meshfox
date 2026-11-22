@@ -20,6 +20,7 @@ mod image_metrics;
 mod image_render;
 mod image_scroll;
 mod markdown;
+mod math;
 mod open_file;
 mod palette;
 mod path_picker;

@@ -231,6 +231,12 @@ Rust formatting: `cargo fmt --check` fails (and prints the diff) if any crate is
 cargo fmt --all -- --check
 ```
 
+License inventory: `LICENSE.canvas.md` tracks every third-party dependency and its license check, so it must stay a valid canvas (`meshfox validate` checks the whole document structure). Part of `full-check`:
+
+```sh name="license-canvas"
+cargo run -q -p meshfox-cli -- validate LICENSE.canvas.md
+```
+
 ## Release build
 <!-- meshfox:node id="release-build" -->
 
@@ -254,9 +260,9 @@ echo "binary: target/release/meshfox"
 ## Full check
 <!-- meshfox:node id="full-check" -->
 
-Run unit tests (macOS host and the Linux VM), the WebAssembly model's checks, typecheck, Rust formatting (`cargo fmt --check`), and e2e tests (including the in-browser build's and the TUI's pty suite):
+Run unit tests (macOS host and the Linux VM), the WebAssembly model's checks, typecheck, Rust formatting (`cargo fmt --check`), validation of the license canvas, and e2e tests (including the in-browser build's and the TUI's pty suite):
 
-```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,linting/rustfmt!,e2e-tests/run!,e2e-tests/wasm-editor!,editor-tests/neovim-tests!,editor-tests/vscode-e2e!,tui-end-to-end-tests/tui-e2e-run!,release-build/release-build!"
+```bash name="full-check" deps="unit-tests/run!,unit-tests/wasm!,linux-tests/run!,linting/typecheck!,linting/rustfmt!,linting/license-canvas!,e2e-tests/run!,e2e-tests/wasm-editor!,editor-tests/neovim-tests!,editor-tests/vscode-e2e!,tui-end-to-end-tests/tui-e2e-run!,release-build/release-build!"
 echo "done"
 ```
 

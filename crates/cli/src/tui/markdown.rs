@@ -549,7 +549,8 @@ pub fn render_with_computed(
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_GFM
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH;
     // `into_offset_iter` (not the plain `Parser` iterator `event` alone
     // would give) so `start` can resolve a code fence's click target by
     // where it actually sits in `md`, the same reasoning as above.
@@ -1332,6 +1333,42 @@ impl<'a> Renderer<'a> {
                 self.push_text(&t, Style::default());
                 self.inline_stack.pop();
             }
+            // `$…$`: stays in the line of text (a terminal image can't), as
+            // a Unicode approximation. Inside a table cell the same text goes
+            // into the cell.
+            Event::InlineMath(t) => {
+                let text = super::math::inline_text(&t);
+                let style = Style::default().add_modifier(Modifier::ITALIC);
+                if self.table.is_some() {
+                    let span = Span::styled(text, self.inline_style().patch(style));
+                    if let Some(table) = &mut self.table {
+                        table.current_cell.push(span);
+                    }
+                } else {
+                    self.push_text(&text, style);
+                }
+            }
+            // `$$…$$`: typeset to an SVG and shown like any `data:` image;
+            // TeX that doesn't parse stays visible as a code-styled line.
+            Event::DisplayMath(t) => {
+                if self.table.is_some() || self.code_lang.is_some() {
+                    self.push_text(&super::math::inline_text(&t), Style::default());
+                } else if let Some(url) = super::math::svg_data_url(&t) {
+                    self.flush_paragraph();
+                    self.push_segment(Segment::Image {
+                        prefix: Vec::new(),
+                        path: std::path::PathBuf::from(url),
+                        alt: t.trim().to_string(),
+                        attrs: Default::default(),
+                    });
+                } else {
+                    self.flush_paragraph();
+                    self.push_segment(Segment::Text(vec![Line::from(Span::styled(
+                        format!("$$ {} $$", t.trim()),
+                        Style::default().fg(super::theme::muted()),
+                    ))]));
+                }
+            }
             Event::SoftBreak if self.table.is_some() => {
                 if let Some(table) = &mut self.table {
                     table.current_cell.push(Span::raw(" "));
@@ -1379,7 +1416,6 @@ impl<'a> Renderer<'a> {
             // now toggles `in_output_region` around whatever's between
             // them (see `wrap_in_output_border`).
             Event::Html(text) | Event::InlineHtml(text) => self.handle_output_marker(&text),
-            _ => {}
         }
     }
 
@@ -2356,7 +2392,8 @@ pub fn links(md: &str) -> Vec<(String, String)> {
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_GFM
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH;
     let mut found = Vec::new();
     // The open link's destination and the text collected so far.
     let mut open: Option<(String, String)> = None;
@@ -3051,6 +3088,66 @@ mod tests {
             .starts_with("data:image/svg+xml;base64,"));
         assert_eq!(width, Some(50));
         assert_eq!(bg, meshfox_core::image_attrs::Background::parse("#fff"));
+    }
+
+    fn math_segments(md: &str) -> Vec<Segment> {
+        let hl = Highlighter::new();
+        render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "r",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .0
+    }
+
+    #[test]
+    fn display_math_is_an_svg_image_between_the_paragraphs() {
+        let segments = math_segments("before\n\n$$\\frac{a}{b}$$\n\nafter\n");
+        let kinds: Vec<&str> = segments
+            .iter()
+            .filter(|s| !matches!(s, Segment::Text(l) if l.iter().all(|l| line_text(l).trim().is_empty())))
+            .map(|s| match s {
+                Segment::Text(_) => "text",
+                Segment::Image { .. } => "image",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "image", "text"]);
+        let path = segments
+            .iter()
+            .find_map(|s| match s {
+                Segment::Image { path, .. } => Some(path),
+                _ => None,
+            })
+            .unwrap();
+        assert!(path
+            .to_string_lossy()
+            .starts_with("data:image/svg+xml;base64,"));
+    }
+
+    #[test]
+    fn inline_math_stays_in_the_line_as_unicode() {
+        let text = segment_text(&math_segments("Energy $E = mc^2$ and $\\alpha_1$.\n"));
+        assert!(text.contains("Energy E = mc² and α₁."), "{text}");
+    }
+
+    #[test]
+    fn display_math_that_does_not_parse_stays_visible_as_source() {
+        let segments = math_segments("$$\\foo{bad}$$\n");
+        let text = segment_text(&segments);
+        assert!(text.contains("$$ \\foo{bad} $$"), "{text:?}");
+        assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
+    }
+
+    #[test]
+    fn dollar_amounts_are_not_math() {
+        let text = segment_text(&math_segments("costs $5 and $6 today\n"));
+        assert!(text.contains("costs $5 and $6 today"), "{text}");
     }
 
     #[test]
