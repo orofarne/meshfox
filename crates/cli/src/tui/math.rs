@@ -52,6 +52,84 @@ pub fn svg_data_url(tex: &str) -> Option<String> {
     ))
 }
 
+/// Longest `$$` block (in lines) that is joined onto one line.
+const MAX_DISPLAY_LINES: usize = 200;
+
+fn is_fence_line(line: &str) -> bool {
+    let t = line.trim_start_matches(' ');
+    line.len() - t.len() <= 3 && (t.starts_with("```") || t.starts_with("~~~"))
+}
+
+/// Makes a block-form display formula
+///
+/// ```text
+/// $$
+/// a
+/// + b
+/// $$
+/// ```
+///
+/// survive `pulldown-cmark`, which finds math *inside* a paragraph: a formula
+/// line starting with `+`, `-`, `*`, `1.`, `>` or a following `=` would be read
+/// as a list item / quote / setext heading first and cut the formula apart
+/// (`remark-math`, on the web, parses `$$` as a block, so it has no such
+/// problem). The newlines inside the block become spaces, which keeps every
+/// byte offset of the document unchanged (span lookups depend on them) and
+/// turns the block into the one-line `$$ … $$` form the parser handles.
+///
+/// Left alone: `$$` inside a code fence, a block with a blank line or a `%`
+/// comment in it (a joined `%` would swallow the rest of the formula), one
+/// that isn't closed within `MAX_DISPLAY_LINES`, and anything not starting on
+/// a line of its own `$$`.
+pub fn join_display_math(md: &str) -> std::borrow::Cow<'_, str> {
+    if !md.contains("$$") {
+        return std::borrow::Cow::Borrowed(md);
+    }
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut pos = 0;
+    for line in md.split_inclusive('\n') {
+        lines.push((pos, line));
+        pos += line.len();
+    }
+    fn body(l: &str) -> &str {
+        l.trim_end_matches(['\n', '\r'])
+    }
+    let mut out: Option<String> = None;
+    let mut in_fence = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = body(lines[i].1);
+        if is_fence_line(line) {
+            in_fence = !in_fence;
+        } else if !in_fence && line.trim() == "$$" {
+            let end = (i + 1..lines.len().min(i + 1 + MAX_DISPLAY_LINES)).find(|&j| {
+                let t = body(lines[j].1).trim();
+                t == "$$" || t.is_empty()
+            });
+            if let Some(j) = end.filter(|&j| body(lines[j].1).trim() == "$$") {
+                let inner = &lines[i + 1..j];
+                if !inner.iter().any(|(_, l)| l.contains('%')) {
+                    let buf = out.get_or_insert_with(|| md.to_string());
+                    // Newline terminating each line from the opener to the
+                    // one before the closer (a `\r` before it stays).
+                    for &(start, l) in &lines[i..j] {
+                        let nl = start + l.len() - 1;
+                        if l.ends_with('\n') {
+                            buf.replace_range(nl..=nl, " ");
+                        }
+                    }
+                    i = j;
+                }
+            }
+        }
+        i += 1;
+    }
+    match out {
+        Some(s) => std::borrow::Cow::Owned(s),
+        None => std::borrow::Cow::Borrowed(md),
+    }
+}
+
 const SYMBOLS: &[(&str, &str)] = &[
     ("alpha", "α"),
     ("beta", "β"),
@@ -301,6 +379,21 @@ mod tests {
         ] {
             assert!(to_svg(tex, false).is_some(), "{tex}");
         }
+    }
+
+    #[test]
+    fn join_display_math_keeps_the_byte_length_and_skips_unsafe_blocks() {
+        let md = "a\n\n$$\nx\n+ y\n$$\n\n```\n$$\nq\n$$\n```\n\n$$\nr % c\ns\n$$\n\n$$\nunclosed\n\nend\n";
+        let out = join_display_math(md);
+        assert_eq!(out.len(), md.len());
+        assert!(out.contains("$$ x + y $$"), "{out}");
+        assert!(out.contains("```\n$$\nq\n$$\n```"), "{out}");
+        assert!(out.contains("$$\nr % c\ns\n$$"), "{out}");
+        assert!(out.contains("$$\nunclosed\n\nend"), "{out}");
+        assert!(matches!(
+            join_display_math("no math\n"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

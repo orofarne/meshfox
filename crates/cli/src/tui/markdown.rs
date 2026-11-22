@@ -554,6 +554,9 @@ pub fn render_with_computed(
     // `into_offset_iter` (not the plain `Parser` iterator `event` alone
     // would give) so `start` can resolve a code fence's click target by
     // where it actually sits in `md`, the same reasoning as above.
+    // Same byte length as `md`, so every offset above/below still lines up.
+    let protected = super::math::join_display_math(md);
+    let md = protected.as_ref();
     for (event, range) in meshfox_core::color_spans::events(
         md,
         Parser::new_ext(md, options).into_offset_iter().collect(),
@@ -3142,6 +3145,22 @@ mod tests {
         let text = segment_text(&segments);
         assert!(text.contains("$$ \\foo{bad} $$"), "{text:?}");
         assert!(!segments.iter().any(|s| matches!(s, Segment::Image { .. })));
+    }
+
+    #[test]
+    fn multiline_display_math_with_list_like_lines_stays_one_formula() {
+        let md = "Energy\n\n$$\n\\frac{a}{b}\n+ \\frac{c}{d}\n- x\n= y\n$$\n\nafter\n";
+        let segments = math_segments(md);
+        assert_eq!(
+            segments
+                .iter()
+                .filter(|s| matches!(s, Segment::Image { .. }))
+                .count(),
+            1
+        );
+        let text = segment_text(&segments);
+        assert!(!text.contains('•') && !text.contains("frac"), "{text}");
+        assert!(text.contains("after"));
     }
 
     #[test]
