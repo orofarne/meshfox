@@ -9508,6 +9508,26 @@ fn css_px_per_cell(picker: &Picker) -> (f32, f32) {
     )
 }
 
+/// Extends `image` to `width`×`height` (top-left anchored), the new area
+/// filled with `surface`. An image already that size is returned as is.
+fn pad_to(
+    image: image::DynamicImage,
+    width: u32,
+    height: u32,
+    surface: (u8, u8, u8),
+) -> image::DynamicImage {
+    if image.width() >= width && image.height() >= height {
+        return image;
+    }
+    let mut canvas = image::RgbaImage::from_pixel(
+        width.max(image.width()),
+        height.max(image.height()),
+        image::Rgba([surface.0, surface.1, surface.2, 255]),
+    );
+    image::imageops::overlay(&mut canvas, &image.to_rgba8(), 0, 0);
+    image::DynamicImage::ImageRgba8(canvas)
+}
+
 /// Composites an image with transparency onto `surface`: terminals that
 /// can't show alpha (Sixel, and iTerm2 for padded inline images) draw
 /// transparent pixels black, which on a non-black terminal is a visible box.
@@ -9550,14 +9570,22 @@ pub(super) fn prepared_image(
         u32::from(budget.height) * cell_height,
         image::imageops::FilterType::Lanczos3,
     );
-    let pixels = match super::theme::surface_bg() {
-        Some(surface) => flatten_onto(pixels, surface),
-        None => pixels,
-    };
     let size = ratatui::layout::Size::new(
         pixels.width().div_ceil(cell_width) as u16,
         pixels.height().div_ceil(cell_height) as u16,
     );
+    // Fragments are cut from these pixels exactly, so a picture that ends
+    // mid-cell leaves the rest of its last cell row/column to the terminal,
+    // which shows it black. Extend it to whole cells in the surface color.
+    let pixels = match super::theme::surface_bg() {
+        Some(surface) => pad_to(
+            flatten_onto(pixels, surface),
+            u32::from(size.width) * cell_width,
+            u32::from(size.height) * cell_height,
+            surface,
+        ),
+        None => pixels,
+    };
     match picker.protocol_type() {
         ProtocolType::Iterm2 | ProtocolType::Sixel => {
             // Obtain tmux framing without encoding the full image or individual rows.
@@ -11845,6 +11873,25 @@ mod tests {
         assert_eq!(child.picker.font_size().width, picker.font_size().width);
         assert_eq!(child.picker.font_size().height, picker.font_size().height);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pad_to_extends_to_whole_cells_in_the_surface_color() {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            3,
+            2,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let out = pad_to(img, 4, 5, (9, 8, 7)).to_rgba8();
+        assert_eq!(out.dimensions(), (4, 5));
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(out.get_pixel(3, 0).0, [9, 8, 7, 255]);
+        assert_eq!(out.get_pixel(0, 4).0, [9, 8, 7, 255]);
+        let same = image::DynamicImage::new_rgba8(4, 5);
+        assert_eq!(
+            pad_to(same, 4, 5, (1, 2, 3)).to_rgba8().get_pixel(0, 0).0,
+            [0, 0, 0, 0]
+        );
     }
 
     #[test]
