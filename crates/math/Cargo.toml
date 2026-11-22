@@ -1,0 +1,13 @@
+[package]
+name = "meshfox-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LaTeX math to SVG (RaTeX) and the Markdown helpers around it"
+
+[dependencies]
+base64 = "0.22"
+ratex-svg = { version = "0.1.16", features = ["embed-fonts"] }
+ratex-parser = "0.1.16"
+ratex-layout = "0.1.16"
+ratex-types = "0.1.16"

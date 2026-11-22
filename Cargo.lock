@@ -3524,16 +3524,13 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "meshfox-core",
+ "meshfox-math",
  "meshfox-server",
  "open",
  "portable-pty",
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
- "ratex-layout",
- "ratex-parser",
- "ratex-svg",
- "ratex-types",
  "reqwest",
  "resvg",
  "rmcp",
@@ -3565,6 +3562,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "meshfox-math",
  "meshfox-model",
  "pulldown-cmark",
  "rusqlite",
@@ -3577,6 +3575,17 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "toml",
+]
+
+[[package]]
+name = "meshfox-math"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-svg",
+ "ratex-types",
 ]
 
 [[package]]

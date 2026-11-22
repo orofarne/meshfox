@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 meshfox-core = { path = "../core" }
+meshfox-math = { path = "../math" }
 meshfox-server = { path = "../server" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -47,10 +48,6 @@ base64 = "0.22"
 # LaTeX math -> self-contained SVG (pure Rust, KaTeX-compatible, no JS engine);
 # `embed-fonts` bundles the KaTeX glyphs so the SVG needs no web fonts, and the
 # result goes through the same `resvg` path as any other SVG image.
-ratex-svg = { version = "0.1.16", features = ["embed-fonts"] }
-ratex-parser = "0.1.16"
-ratex-layout = "0.1.16"
-ratex-types = "0.1.16"
 resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts", "raster-images"] }
 edtui = "0.11.6"
 open = "5"

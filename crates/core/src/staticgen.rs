@@ -1119,7 +1119,11 @@ fn render_markdown(
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_GFM;
+        | Options::ENABLE_GFM
+        | Options::ENABLE_MATH;
+    // `$$` blocks that a list marker or `=` would break apart are joined first
+    // (same rule as the TUI's renderer).
+    let stripped = meshfox_math::join_display_math(&stripped);
     // Raw HTML (`Event::Html`/`Event::InlineHtml`) straight from a node's
     // own Markdown text — `<script>` and friends — is dropped here, not
     // sanitized: web UI's `ReactMarkdown` renders without `rehype-raw`,
@@ -1217,6 +1221,28 @@ fn render_markdown(
             }
             Event::Text(t) if !in_code => {
                 events.extend(subsup_events(&t));
+                i += 1;
+            }
+            // A formula becomes an inline SVG (glyphs embedded: no JS, no
+            // web fonts, same in a browser, offline and in the PDF). One RaTeX
+            // cannot typeset keeps pulldown-cmark's own output, the escaped
+            // TeX source in a `math` span.
+            Event::InlineMath(t) => {
+                events.push(match meshfox_math::html_svg(&t, false) {
+                    Some(svg) => {
+                        Event::Html(format!("<span class=\"math-inline\">{svg}</span>").into())
+                    }
+                    None => Event::InlineMath(t),
+                });
+                i += 1;
+            }
+            Event::DisplayMath(t) => {
+                events.push(match meshfox_math::html_svg(&t, true) {
+                    Some(svg) => {
+                        Event::Html(format!("<div class=\"math-display\">{svg}</div>").into())
+                    }
+                    None => Event::DisplayMath(t),
+                });
                 i += 1;
             }
             event => {
@@ -2059,6 +2085,21 @@ mod tests {
 
     fn canvas(md: &str) -> Canvas {
         parse(md).unwrap()
+    }
+
+    #[test]
+    fn formulas_become_inline_svg_and_bad_tex_stays_source() {
+        let c = canvas("# Root\nEnergy $E = mc^2$ is small.\n\n$$\n- \\frac{a}{b} = c\n$$\n\nBad: $\\foo{x}$ and costs $5 and $6.\n");
+        let site = build_site(&c);
+        let html = &site.root.html_body;
+        assert!(html.contains("<span class=\"math-inline\"><svg"), "{html}");
+        assert!(html.contains("<div class=\"math-display\"><svg"), "{html}");
+        assert!(!html.contains("\\frac"), "{html}");
+        // RaTeX cannot typeset an unknown command: the escaped source stays.
+        assert!(html.contains("\\foo{x}"), "{html}");
+        // Dollar amounts are not math.
+        assert!(html.contains("costs $5 and $6"), "{html}");
+        assert_eq!(html.matches("<svg").count(), 2, "{html}");
     }
 
     #[test]

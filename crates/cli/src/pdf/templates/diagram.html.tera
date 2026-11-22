@@ -82,6 +82,11 @@ html, body { background: #ffffff; }
 .file-table-grid .row-num, .file-table-grid .null { color: #999; }
 .file-table-grid .null { font-style: italic; }
 .edge-overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+/* LaTeX formulas: inline SVG (see meshfox-math), coloured by the text. */
+.math-inline svg { vertical-align: middle; }
+.math-display { text-align: center; margin: 1em 0; }
+.math-display svg { max-width: 100%; height: auto; }
 </style>
 </head>
 <body>
