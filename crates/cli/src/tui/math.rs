@@ -279,6 +279,30 @@ mod tests {
         assert!(img.is_some());
     }
 
+    /// Every `$$` block and every `$…$` span of the shipped example typesets
+    /// (the example is the canonical "does real-world math work" document).
+    #[test]
+    fn the_navier_stokes_example_typesets_completely() {
+        let doc = include_str!("../../../../examples/navier-stokes.canvas.md");
+        let mut display = 0;
+        let mut rest = doc;
+        while let Some(i) = rest.find("\n$$\n") {
+            let after = &rest[i + 4..];
+            let end = after.find("\n$$").expect("closed display block");
+            assert!(to_svg(&after[..end], true).is_some(), "{}", &after[..end]);
+            display += 1;
+            rest = &after[end + 3..];
+        }
+        assert_eq!(display, 3);
+        for tex in [
+            r"\mathrm{Re} = \rho U L / \mu",
+            r"\tau_{ij}",
+            r"q_x, q_y, q_z",
+        ] {
+            assert!(to_svg(tex, false).is_some(), "{tex}");
+        }
+    }
+
     #[test]
     fn inline_text_uses_unicode_where_it_can() {
         assert_eq!(inline_text(r"E = mc^2"), "E = mc²");

@@ -4117,3 +4117,9 @@ button > .mesh-node-running-spinner {
   align-items: center;
   gap: 4px;
 }
+
+/* Long display formulas scroll inside their node instead of being clipped. */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
