@@ -427,6 +427,23 @@ An SVG follows the light/dark theme through `currentColor` and
 
 [examples/svg.canvas.md](./examples/svg.canvas.md)
 
+## Writing math formulas (LaTeX)
+<!-- meshfox:node id="writing-math-formulas-latex" -->
+
+[examples/navier-stokes.canvas.md](./examples/navier-stokes.canvas.md) — `$…$`
+(inline) and `$$…$$` (display) hold LaTeX, KaTeX-compatible. The web UI
+typesets them with KaTeX; the TUI typesets a display formula to an SVG (RaTeX,
+pure Rust) and shows it as an image drawn in the terminal's own colors, while
+an inline formula stays in the line as a Unicode approximation. Write display
+math as a block with `$$` on its own lines so both agree (MARKDOWN.md's
+"Math"). The example adapts a NASA Glenn page on the Navier–Stokes equations
+and keeps its attribution in the canvas itself.
+
+### Example
+<!-- meshfox:node id="example-navier-stokes" type="file" -->
+
+[examples/navier-stokes.canvas.md](./examples/navier-stokes.canvas.md)
+
 ## Browsing a huge table (CSV, Parquet, ...)
 <!-- meshfox:node id="browsing-a-huge-table-csv-parquet" -->
 
