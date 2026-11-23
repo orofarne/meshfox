@@ -90,10 +90,16 @@ fn running_a_service_block_streams_a_started_line_and_shows_live_glyphs_then_qui
         .wait_for("service(s) running", Duration::from_secs(5))
         .expect("the footer should show the service aggregate line");
 
+    // `q` with a live service that doesn't `autostop` asks what to do with
+    // it; `s` stops it and quits.
     session.send_keys("q");
+    session
+        .wait_for("services still running", Duration::from_secs(5))
+        .expect("q should ask what to do with the running service");
+    session.send_keys("s");
     assert!(
-        session.wait_for_exit(Duration::from_secs(5)),
-        "meshfox tui should still exit on q with a service running"
+        session.wait_for_exit(Duration::from_secs(10)),
+        "meshfox tui should exit after choosing to stop the running service"
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
