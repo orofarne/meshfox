@@ -584,6 +584,8 @@ fn render_screen(f: &mut Frame, app: &mut App) {
             .block(Block::default().borders(Borders::ALL).title(" confirm run ")), rect);
     } else if app.reset_session_confirm {
         render_reset_session_confirm(f, area);
+    } else if let Some(qp) = &app.quit_prompt {
+        render_quit_prompt(f, area, qp);
     } else if let Some(conflict) = &app.service_conflict {
         render_service_conflict(f, area, conflict);
     } else if let Some(sv) = &app.services_view {
@@ -3039,6 +3041,40 @@ fn render_reset_session_confirm(f: &mut Frame, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "y/enter confirm · n/esc cancel",
+            Style::default().fg(super::theme::muted()),
+        ))),
+        rows[1],
+    );
+}
+
+/// The quit prompt — see `App::quit_prompt`.
+fn render_quit_prompt(f: &mut Frame, area: Rect, qp: &super::app::QuitPrompt) {
+    let height = (qp.services.len().min(8) as u16) + 7;
+    let rect = centered_rect(60, height, area);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(super::theme::accent()))
+        .title(" services still running ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut text = String::from("These services keep running after the TUI exits:\n");
+    for name in qp.services.iter().take(8) {
+        text.push_str(&format!("  • {name}\n"));
+    }
+    if qp.services.len() > 8 {
+        text.push_str(&format!("  … and {} more\n", qp.services.len() - 8));
+    }
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "s stop them and quit · k keep running and quit · n/esc cancel",
             Style::default().fg(super::theme::muted()),
         ))),
         rows[1],

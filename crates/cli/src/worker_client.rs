@@ -2769,6 +2769,8 @@ pub struct ServiceDto {
     pub cpu_percent: Option<f32>,
     #[serde(default)]
     pub mem_bytes: Option<u64>,
+    #[serde(default)]
+    pub autostop: bool,
 }
 
 pub async fn list_services(port: u16) -> Result<Vec<ServiceDto>, String> {

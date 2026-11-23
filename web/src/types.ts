@@ -199,6 +199,8 @@ export interface ServiceStatusDto {
    * or a permissions boundary). */
   cpuPercent?: number;
   memBytes?: number;
+  /** The fence's `autostop` flag: the worker stops this service itself when it goes idle. */
+  autostop?: boolean;
 }
 
 /** Where a `VarStatus`'s resolved value came from, when it was inherited

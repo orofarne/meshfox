@@ -592,6 +592,7 @@ mod tests {
             uptime_ms: 0,
             cpu_percent: None,
             mem_bytes: None,
+            autostop: false,
         });
         let mut status = CanvasStatus::default();
         assert_eq!(status.observe(Snapshot::from_app(&app)), State::Ready(1));

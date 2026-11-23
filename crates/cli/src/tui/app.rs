@@ -518,6 +518,13 @@ pub struct ServicesViewState {
     pub selected: usize,
 }
 
+/// The quit prompt: `q` found live services without `autostop` in the
+/// worker, which would otherwise keep running after the TUI exits.
+pub struct QuitPrompt {
+    /// `block` names of those services, for display.
+    pub services: Vec<String>,
+}
+
 pub struct RunConfirmation {
     pub blocks: Vec<String>,
     restart: bool,
@@ -894,6 +901,9 @@ pub struct App {
     /// being purely in-memory. Same "one thing at a time" precedence as
     /// `var_form`/`block_picker`/`source_editor`.
     pub reset_session_confirm: bool,
+    /// Set while the quit prompt asks what to do with still-running
+    /// services — see `request_quit` / `on_quit_prompt_key`.
+    pub quit_prompt: Option<QuitPrompt>,
     /// `(running, crashed)` across `service_list` — recomputed by
     /// `refresh_services`, not on every render (unlike `constraint_stats`,
     /// which only changes on a document reload) since a service's own
@@ -1551,6 +1561,7 @@ impl App {
             link_preview_image_requested: HashSet::new(),
             link_preview_image: HashMap::new(),
             reset_session_confirm: false,
+            quit_prompt: None,
             service_stats: None,
             service_conflict: None,
             services_view: None,
@@ -1919,6 +1930,10 @@ impl App {
             self.on_reset_session_confirm_key(key).await;
             return;
         }
+        if self.quit_prompt.is_some() {
+            self.on_quit_prompt_key(key).await;
+            return;
+        }
         if self.service_conflict.is_some() {
             self.on_service_conflict_key(key).await;
             return;
@@ -2044,7 +2059,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') => self.quit(),
+            KeyCode::Char('q') => self.request_quit().await,
             KeyCode::Esc => {
                 if self.fullscreen.is_some() {
                     self.fullscreen = None;
@@ -3958,6 +3973,7 @@ impl App {
             && self.block_picker.is_none()
             && self.run_confirmation.is_none()
             && !self.reset_session_confirm
+            && self.quit_prompt.is_none()
             && self.service_conflict.is_none()
             && self.services_view.is_none()
             && self.tty_sessions_view.is_none()
@@ -8803,6 +8819,78 @@ impl App {
     /// `spawn_signal_terminal_restore`.
     fn quit(&mut self) {
         self.should_quit = true;
+    }
+
+    /// `q`: quits at once, unless the worker has live services that don't
+    /// `autostop` — those outlive the TUI, so ask what to do with them.
+    async fn request_quit(&mut self) {
+        if self.worker_port.is_some() {
+            self.refresh_services().await;
+        }
+        let services = self.persistent_live_services();
+        if services.is_empty() {
+            self.quit();
+        } else {
+            self.quit_prompt = Some(QuitPrompt {
+                services: services.into_iter().map(|(_, block)| block).collect(),
+            });
+        }
+    }
+
+    /// `(node_id, block)` of every live service without `autostop`, from the
+    /// last refreshed `service_list`.
+    fn persistent_live_services(&self) -> Vec<(String, String)> {
+        self.service_list
+            .iter()
+            .filter(|d| {
+                !d.autostop
+                    && matches!(
+                        d.status.as_str(),
+                        "running" | "starting" | "restarting" | "stopping" | "stop_failed"
+                    )
+            })
+            .map(|d| (d.node_id.clone(), d.block.clone()))
+            .collect()
+    }
+
+    /// While `quit_prompt` is up: `s` stops those services and quits, `k`
+    /// quits leaving them running, `n`/Esc/`q` goes back. A failed stop
+    /// keeps the TUI open and says why.
+    async fn on_quit_prompt_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('k') => {
+                self.quit_prompt = None;
+                self.quit();
+            }
+            KeyCode::Char('s') => {
+                self.quit_prompt = None;
+                let Some(port) = self.worker_port else {
+                    self.quit();
+                    return;
+                };
+                let mut failed = Vec::new();
+                for (node_id, block) in self.persistent_live_services() {
+                    if let Err(e) = crate::worker_client::stop_service(port, &node_id, &block).await
+                    {
+                        failed.push(format!("{block}: {e}"));
+                    }
+                }
+                if failed.is_empty() {
+                    self.quit();
+                } else {
+                    self.refresh_services().await;
+                    self.status_meta.error(
+                        "service",
+                        &mut self.status,
+                        format!("failed to stop {}", failed.join("; ")),
+                    );
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
+                self.quit_prompt = None;
+            }
+            _ => {}
+        }
     }
 
     async fn kill_running(&mut self) {
@@ -13801,6 +13889,58 @@ mod tests {
         assert_eq!(app.selected, app.rows.len() - 1);
         app.on_key(key(KeyCode::PageUp)).await;
         assert_eq!(app.selected, app.rows.len() - 11);
+    }
+
+    #[tokio::test]
+    async fn quit_asks_only_about_live_services_without_autostop() {
+        let dir =
+            std::env::temp_dir().join(format!("meshfox-tui-quit-prompt-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let svc = |block: &str, status: &str, autostop: bool| crate::worker_client::ServiceDto {
+            node_id: "root".into(),
+            block: block.into(),
+            status: status.into(),
+            exit_code: None,
+            pid: 1,
+            uptime_ms: 0,
+            cpu_percent: None,
+            mem_bytes: None,
+            autostop,
+        };
+
+        // Autostop and already-finished services don't ask.
+        app.service_list = vec![svc("a", "running", true), svc("b", "stopped", false)];
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(app.should_quit);
+
+        // A live ordinary service asks; `n` cancels, `k` keeps it and quits.
+        app.should_quit = false;
+        app.service_list = vec![svc("db", "running", false)];
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.quit_prompt.as_ref().unwrap().services,
+            vec!["db".to_string()]
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .await;
+        assert!(app.quit_prompt.is_none() && !app.should_quit);
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .await;
+        assert!(app.should_quit);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

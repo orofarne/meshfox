@@ -9657,6 +9657,9 @@ struct ServiceDto {
     cpu_percent: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mem_bytes: Option<u64>,
+    /// The fence's `autostop` flag — read-only information for interfaces
+    /// deciding whether to ask what to do with this service on exit.
+    autostop: bool,
 }
 
 fn service_dto(node_id: &str, block: &str, handle: &services::ServiceHandle) -> ServiceDto {
@@ -9679,6 +9682,7 @@ fn service_dto(node_id: &str, block: &str, handle: &services::ServiceHandle) -> 
         uptime_ms: handle.started_at.elapsed().as_millis() as u64,
         cpu_percent: sample.as_ref().map(|s| s.cpu_percent),
         mem_bytes: sample.as_ref().map(|s| s.mem_bytes),
+        autostop: handle.autostop(),
     }
 }
 

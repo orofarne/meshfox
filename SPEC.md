@@ -1826,9 +1826,14 @@ alive or not.
   dot next to its title: white when idle, a smoothly pulsing green while
   running, red if crashed. `s` opens the services list; inside it, `s`
   stops the selected service and `r` restarts it. The footer shows a running/crashed
-  count. Quitting the TUI (`q`/Esc) stops every service it owns first —
-  unlike the web UI, there's no separate long-lived server behind a TUI
-  session for a service to keep being tracked by once it ends.
+  count. Quitting the TUI (`q`) asks what to do when the worker has live
+  services without `autostop`: `s` stops them and quits, `k` quits leaving them
+  running, `n`/Esc cancels (a failed stop keeps the TUI open). With none, `q`
+  quits at once. The web UI's activity strip has the same choice behind its
+  Exit button (stop and close / keep running and close / cancel), and the
+  browser's own leave-page warning appears while such services run; closing
+  the tab by other means still leaves them running. This is interface-only:
+  the worker's lifecycle is unchanged (`GET /api/services` reports `autostop`).
 - **`meshfox run`** — starting a service no longer means the command
   exits once its chain finishes: it stays attached, streaming each
   service's own output to the console (prefixed by block name), until

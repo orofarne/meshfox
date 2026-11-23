@@ -68,6 +68,7 @@ import {
 } from "./api";
 import type { CanvasDoc, CanvasNode, ExtraEdgeDto, ServiceStatusDto, VarStatus } from "./types";
 import { ServicePanel } from "./ServicePanel";
+import { ExitServicesDialog, persistentServices } from "./ExitServicesDialog";
 import { TtySessionsPanel } from "./TtySessionsPanel";
 import { HistoryPanel } from "./HistoryPanel";
 import { ServiceLockConflictDialog } from "./ServiceLockConflictDialog";
@@ -471,6 +472,22 @@ export default function App() {
   // (unscoped — every service, same global panel as the activity strip's
   // checks indicator).
   const [servicePanelOpen, setServicePanelOpen] = useState(false);
+  // Exit dialog (`ExitServicesDialog`) and its page-leave guard.
+  const [exitDialogOpen, setExitDialogOpen] = useState(false);
+  const [exitNote, setExitNote] = useState(false);
+  const leavingRef = useRef(false);
+  const persistentLive = persistentServices(services);
+  const hasPersistentLive = persistentLive.length > 0;
+  useEffect(() => {
+    if (!hasPersistentLive) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (leavingRef.current) return;
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [hasPersistentLive]);
   // Which service to pre-select when the panel opens — `null` for
   // "whichever" (the activity strip's case). Set alongside
   // `servicePanelOpen` itself, never read while it's `false`.
@@ -4454,6 +4471,10 @@ export default function App() {
         ttyCount={liveTtySessions.length}
         onTerminals={() => setTtySessionsPanelOpen(true)}
         onServices={() => { setServicePanelFocusNodeId(null); setServicePanelOpen(true); }}
+        onExit={() => {
+          if (hasPersistentLive) setExitDialogOpen(true);
+          else { leavingRef.current = true; window.close(); setExitNote(true); }
+        }}
         services={{ total: services.length, running: services.filter(s => s.status === "running").length,
           failed: services.filter(s => s.status === "crashed" || s.status === "stop_failed").length }}
         onLocate={address => { revealAndFocus(address.nodeId); setActivityFocus(address.nodeId); }}
@@ -4546,6 +4567,25 @@ export default function App() {
           }}
           onCancel={() => setResetSessionConfirmOpen(false)}
         />
+      )}
+      {exitDialogOpen && (
+        <ExitServicesDialog
+          services={persistentLive}
+          onStop={(nodeId, block) => stopService(nodeId, block)}
+          onCancel={() => setExitDialogOpen(false)}
+          onClose={() => {
+            leavingRef.current = true;
+            setExitDialogOpen(false);
+            fetchServices().then(setServices).catch(() => {});
+            window.close();
+            setExitNote(true);
+          }}
+        />
+      )}
+      {exitNote && (
+        <div role="status" className="vars-modal-backdrop" onClick={() => { setExitNote(false); leavingRef.current = false; }}>
+          <div className="vars-modal"><p>You can close this tab now.</p></div>
+        </div>
       )}
       {servicePanelOpen && (
         <ServicePanel

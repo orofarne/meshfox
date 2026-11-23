@@ -9,13 +9,15 @@ function duration(ms: number): string {
   const seconds = Math.floor(Math.max(0, ms) / 1000);
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
-export function ActivityBar({ activities, services, onLocate, onStop, onConsole, consoleOpen, checks, ttyCount, onTerminals, onServices, executionEnabled, checkingVars = false }: {
+export function ActivityBar({ activities, services, onLocate, onStop, onConsole, consoleOpen, checks, ttyCount, onTerminals, onServices, onExit, executionEnabled, checkingVars = false }: {
   activities: RunActivity[];
   services: { total: number; running: number; failed: number };
   checks: { total: number; failed: number } | null;
   ttyCount: number;
   onTerminals: () => void;
   onServices: () => void;
+  /** Leave the page, asking first what to do with running services. */
+  onExit?: () => void;
   executionEnabled: boolean;
   /** A run was requested and its variables/arguments are still being
    * resolved (a computed `select` list may have to run its source first). */
@@ -84,6 +86,8 @@ export function ActivityBar({ activities, services, onLocate, onStop, onConsole,
         title={services.failed ? `${services.failed} of ${services.total} services failed — open services` : "Open services"}>
         <span aria-hidden="true">⚙</span> <span className="activity-control-label">Services</span> {services.running}/{services.total}
       </button>}
+      {services.total > 0 && onExit && <button type="button" aria-label="Exit" onClick={onExit}
+        title="Exit — choose what to do with running services"><span aria-hidden="true">⏻</span> <span className="activity-control-label">Exit</span></button>}
       {executionEnabled && <button type="button" className="activity-console" aria-label="Console" onClick={onConsole} aria-expanded={consoleOpen}
         title={consoleOpen ? "Collapse the console" : "Open the console"}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
