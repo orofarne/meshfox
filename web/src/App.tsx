@@ -4583,8 +4583,13 @@ export default function App() {
         />
       )}
       {exitNote && (
-        <div role="status" className="vars-modal-backdrop" onClick={() => { setExitNote(false); leavingRef.current = false; }}>
-          <div className="vars-modal"><p>You can close this tab now.</p></div>
+        <div className="vars-modal-backdrop">
+          <div className="vars-modal" role="status">
+            <p>You can close this tab now.</p>
+            <div className="vars-modal-actions">
+              <button type="button" onClick={() => { setExitNote(false); leavingRef.current = false; }}>ok</button>
+            </div>
+          </div>
         </div>
       )}
       {servicePanelOpen && (
