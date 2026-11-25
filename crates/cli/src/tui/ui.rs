@@ -3210,7 +3210,7 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "j/k select · K stop · r restart · q/esc close",
+            "j/k select · h/l · PgUp/PgDn scroll log · K stop · r restart · q/esc close",
             Style::default().fg(super::theme::muted()),
         ))),
         hint_area,
@@ -3222,6 +3222,8 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     state.select(Some(selected));
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, list_area, &mut state);
+    sv.list_rect.set(list_area);
+    sv.offset.set(state.offset());
 
     // The selected service's own retained output — `app.service_log`'s
     // last poll (see that field's own doc comment — an async fetch has no
@@ -3230,9 +3232,25 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
     // manual scrollback yet, same "good enough for now" scope as everything
     // else marked **experimental** here.
     if let Some(row) = rows.get(selected) {
+        // Clamp the vertical scroll first: the title below shows it.
+        let vmax = app
+            .service_log
+            .len()
+            .saturating_sub(log_area.height as usize);
+        sv.log_vmax.set(vmax);
+        sv.log_vscroll.set(sv.log_vscroll.get().min(vmax));
+        sv.log_rect.set(log_area);
         f.render_widget(
             Line::from(Span::styled(
-                format!("── {} log ──", row.block_name),
+                if sv.log_vscroll.get() > 0 {
+                    format!(
+                        "── {} log ── ↑{} · End follows",
+                        row.block_name,
+                        sv.log_vscroll.get()
+                    )
+                } else {
+                    format!("── {} log ──", row.block_name)
+                },
                 Style::default().fg(super::theme::muted()),
             )),
             log_title_area,
@@ -3240,7 +3258,9 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
         let log: Vec<(meshfox_server::stream_exec::OutputStream, String)> = app.service_log.clone();
         {
             let take = log_area.height as usize;
-            let start = log.len().saturating_sub(take);
+            let vscroll = sv.log_vscroll.get();
+            let end = log.len() - vscroll;
+            let start = end.saturating_sub(take);
             let mut ansi = super::ansi::Ansi::default();
             let lines: Vec<Line> = log
                 .iter()
@@ -3254,8 +3274,16 @@ fn render_services_view(f: &mut Frame, area: Rect, app: &App, sv: &ServicesViewS
                     ansi.line(text, style)
                 })
                 .collect();
+            let visible = &lines[start..end];
+            let widest = visible.iter().map(Line::width).max().unwrap_or(0);
+            let hmax = widest
+                .saturating_sub(log_area.width as usize)
+                .min(u16::MAX as usize) as u16;
+            let hscroll = sv.log_hscroll.get().min(hmax);
+            sv.log_hmax.set(hmax);
+            sv.log_hscroll.set(hscroll);
             f.render_widget(
-                Paragraph::new(Text::from(lines[start..].to_vec())),
+                Paragraph::new(Text::from(visible.to_vec())).scroll((0, hscroll)),
                 log_area,
             );
         }

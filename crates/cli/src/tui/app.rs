@@ -514,8 +514,41 @@ pub struct HttpRunRetry {
 /// The `s` services list view — see `App::services_view`,
 /// `App::on_services_view_key`, `ui::render_services_view`.
 /// **Experimental**, see SPEC.md's "Service blocks (experimental)".
+#[derive(Default)]
 pub struct ServicesViewState {
     pub selected: usize,
+    /// Where `ui::render_services_view` last drew the list rows, and its
+    /// scroll offset — so a click can be mapped to the row actually under
+    /// it (same pattern as `HistoryViewState::list_rect`).
+    pub list_rect: std::cell::Cell<Rect>,
+    pub offset: std::cell::Cell<usize>,
+    /// Horizontal scroll of the log below the list (columns). The log's
+    /// lines never wrap, so a long line is only reachable this way;
+    /// `ui::render_services_view` clamps it to `log_hmax`, the widest
+    /// visible line minus the log's width, each frame.
+    pub log_hscroll: std::cell::Cell<u16>,
+    pub log_hmax: std::cell::Cell<u16>,
+    /// Vertical scroll of the log: how many lines above the tail the
+    /// bottom of the view sits (0 = following the tail). Clamped each frame
+    /// to `log_vmax` (lines beyond one screenful); `log_rect` is where the
+    /// log was drawn, so the wheel can tell the log from the list.
+    pub log_vscroll: std::cell::Cell<usize>,
+    pub log_vmax: std::cell::Cell<usize>,
+    pub log_rect: std::cell::Cell<Rect>,
+}
+
+impl ServicesViewState {
+    /// Scrolls the log by `delta` lines (positive = towards older output),
+    /// clamped to what the last frame could show.
+    pub fn scroll_log(&self, delta: isize) {
+        let next = (self.log_vscroll.get() as isize + delta).clamp(0, self.log_vmax.get() as isize);
+        self.log_vscroll.set(next as usize);
+    }
+
+    fn reset_log_scroll(&self) {
+        self.log_hscroll.set(0);
+        self.log_vscroll.set(0);
+    }
 }
 
 /// The quit prompt: `q` found live services without `autostop` in the
@@ -3440,6 +3473,50 @@ impl App {
         if self.run_confirmation.is_some() {
             return;
         }
+        if self.services_view.is_some()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            self.on_services_view_click(mouse).await;
+            return;
+        }
+        if self.keyboard_only_modal_open() {
+            // Nothing clickable, but the wheel scrolls/moves whatever the
+            // modal itself scrolls, same as its own Up/Down keys.
+            let code = match mouse.kind {
+                MouseEventKind::ScrollUp => KeyCode::Up,
+                MouseEventKind::ScrollDown => KeyCode::Down,
+                MouseEventKind::ScrollLeft => KeyCode::Left,
+                MouseEventKind::ScrollRight => KeyCode::Right,
+                _ => return,
+            };
+            if matches!(code, KeyCode::Left | KeyCode::Right) && self.services_view.is_none() {
+                return;
+            }
+            if let Some(view) = &self.services_view {
+                if matches!(code, KeyCode::Up | KeyCode::Down)
+                    && view
+                        .log_rect
+                        .get()
+                        .contains((mouse.column, mouse.row).into())
+                {
+                    view.scroll_log(if code == KeyCode::Up { 3 } else { -3 });
+                    return;
+                }
+            }
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            if self.palette.is_some() {
+                self.on_palette_key(key).await;
+            } else if self.show_help {
+                self.on_help_key(key);
+            } else if self.services_view.is_some() {
+                self.on_services_view_key(key).await;
+            } else if self.tty_sessions_view.is_some() {
+                self.on_tty_sessions_view_key(key).await;
+            } else if self.stats_view.is_some() {
+                self.on_stats_view_key(key);
+            }
+            return;
+        }
         if let Some(se) = &mut self.source_editor {
             se.on_mouse(mouse);
             return;
@@ -3956,6 +4033,22 @@ impl App {
             None => meshfox_core::fsbrowse::list(path, kind, hidden, &self.canvas_path)
                 .map_err(|e| e.to_string()),
         }
+    }
+
+    /// A screen-covering modal that has no mouse handling of its own (it
+    /// claims the keymap in `on_key`, but there is nothing clickable in
+    /// it). Its mouse events must be swallowed, otherwise they fall through
+    /// to the tree/document/output panes drawn underneath it.
+    fn keyboard_only_modal_open(&self) -> bool {
+        self.palette.is_some()
+            || self.show_help
+            || self.search.open
+            || self.reset_session_confirm
+            || self.quit_prompt.is_some()
+            || self.service_conflict.is_some()
+            || self.services_view.is_some()
+            || self.tty_sessions_view.is_some()
+            || self.stats_view.is_some()
     }
 
     /// Whether `Ctrl-p` may open the palette right now: not over another
@@ -8004,6 +8097,15 @@ impl App {
     pub async fn refresh_service_log(&mut self, node_id: &str, block: &str) {
         let Some(port) = self.worker_port else { return };
         if let Ok(log) = crate::worker_client::get_service_log(port, node_id, block).await {
+            // Scrolled back into history: keep the same lines on screen as
+            // new ones arrive, instead of letting the view drift.
+            if let Some(view) = &self.services_view {
+                let grown = log.len().saturating_sub(self.service_log.len());
+                if view.log_vscroll.get() > 0 && grown > 0 {
+                    view.log_vscroll.set(view.log_vscroll.get() + grown);
+                    view.log_vmax.set(view.log_vmax.get() + grown);
+                }
+            }
             self.service_log = log;
         }
     }
@@ -8091,10 +8193,30 @@ impl App {
                 );
                 return;
             }
-            self.services_view = Some(ServicesViewState { selected: 0 });
+            self.services_view = Some(ServicesViewState::default());
             let key = self.sorted_service_keys()[0].clone();
             self.refresh_service_log(&key.0, &key.1).await;
         }
+    }
+
+    /// A click on a row of the services list selects it (and loads its log,
+    /// as `j`/`k` do); a click anywhere else in the view is ignored.
+    async fn on_services_view_click(&mut self, mouse: MouseEvent) {
+        let keys = self.sorted_service_keys();
+        let Some(view) = &mut self.services_view else {
+            return;
+        };
+        let rect = view.list_rect.get();
+        if !rect.contains((mouse.column, mouse.row).into()) {
+            return;
+        }
+        let idx = view.offset.get() + (mouse.row - rect.y) as usize;
+        let Some(key) = keys.get(idx).cloned() else {
+            return;
+        };
+        view.selected = idx;
+        view.reset_log_scroll();
+        self.refresh_service_log(&key.0, &key.1).await;
     }
 
     /// A stable, sorted key order for `service_list` — the services view
@@ -8116,6 +8238,29 @@ impl App {
     /// running — use `K` first), `q`/Esc closes the view. **Experimental**,
     /// see SPEC.md's "Service blocks (experimental)".
     async fn on_services_view_key(&mut self, key: KeyEvent) {
+        if let Some(view) = &self.services_view {
+            let step = match key.code {
+                KeyCode::Left | KeyCode::Char('h') => Some(-5i32),
+                KeyCode::Right | KeyCode::Char('l') => Some(5),
+                _ => None,
+            };
+            if let Some(step) = step {
+                let next = (i32::from(view.log_hscroll.get()) + step)
+                    .clamp(0, i32::from(view.log_hmax.get()));
+                view.log_hscroll.set(next as u16);
+                return;
+            }
+        }
+        if let Some(view) = &self.services_view {
+            let page = view.log_rect.get().height.saturating_sub(1).max(1) as isize;
+            match key.code {
+                KeyCode::PageUp => return view.scroll_log(page),
+                KeyCode::PageDown => return view.scroll_log(-page),
+                KeyCode::Home => return view.scroll_log(isize::MAX / 2),
+                KeyCode::End => return view.scroll_log(isize::MIN / 2),
+                _ => {}
+            }
+        }
         let keys = self.sorted_service_keys();
         if keys.is_empty() {
             self.services_view = None;
@@ -8136,6 +8281,7 @@ impl App {
                 let new_selected = selected.saturating_sub(1);
                 if let Some(view) = &mut self.services_view {
                     view.selected = new_selected;
+                    view.reset_log_scroll();
                 }
                 let key = keys[new_selected].clone();
                 self.refresh_service_log(&key.0, &key.1).await;
@@ -8144,6 +8290,7 @@ impl App {
                 let new_selected = (selected + 1).min(keys.len() - 1);
                 if let Some(view) = &mut self.services_view {
                     view.selected = new_selected;
+                    view.reset_log_scroll();
                 }
                 let key = keys[new_selected].clone();
                 self.refresh_service_log(&key.0, &key.1).await;
@@ -13861,6 +14008,210 @@ mod tests {
         // (no worker here, so nothing to move) and closes the view.
         app.on_mouse(click(9, 20)).await;
         assert!(app.history_view.is_none());
+    }
+
+    #[tokio::test]
+    async fn clicks_do_not_fall_through_keyboard_only_modals() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-modal-click-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n## A\n<!-- meshfox:node id=\"a\" parent=\"root\" -->\n\n## B\n<!-- meshfox:node id=\"b\" parent=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let click = |row: u16, col: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let open: [fn(&mut App); 3] = [
+            |a| a.services_view = Some(ServicesViewState::default()),
+            |a| a.show_help = true,
+            |a| a.reset_session_confirm = true,
+        ];
+        for open_modal in open {
+            open_modal(&mut app);
+            assert!(app.keyboard_only_modal_open());
+            let (selected, focus) = (app.selected, app.focus);
+            for row in 0..24 {
+                for col in (0..80).step_by(4) {
+                    app.on_mouse(click(row, col)).await;
+                }
+            }
+            assert_eq!((app.selected, app.focus), (selected, focus));
+            app.services_view = None;
+            app.show_help = false;
+            app.reset_session_confirm = false;
+        }
+    }
+
+    #[tokio::test]
+    async fn click_selects_a_row_of_the_services_list() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-svc-click-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.service_list = ["a", "b", "c"]
+            .iter()
+            .map(|b| crate::worker_client::ServiceDto {
+                node_id: "root".into(),
+                block: (*b).into(),
+                status: "stopped".into(),
+                exit_code: None,
+                pid: 0,
+                uptime_ms: 0,
+                cpu_percent: None,
+                mem_bytes: None,
+                autostop: false,
+            })
+            .collect();
+        let view = ServicesViewState::default();
+        // As if drawn at (10, 5), 40x5, scrolled by one row.
+        view.list_rect.set(Rect::new(10, 5, 40, 5));
+        view.offset.set(1);
+        app.services_view = Some(view);
+        let click = |row: u16, col: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(click(6, 20)).await; // second visible row -> index 2
+        assert_eq!(app.services_view.as_ref().unwrap().selected, 2);
+        app.on_mouse(click(9, 20)).await; // below the last service
+        app.on_mouse(click(6, 5)).await; // left of the list
+        assert_eq!(app.services_view.as_ref().unwrap().selected, 2);
+        assert!(app.services_view.is_some());
+    }
+
+    #[tokio::test]
+    async fn horizontal_wheel_and_keys_scroll_the_services_log() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-svc-hscroll-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        let view = ServicesViewState::default();
+        view.log_hmax.set(12); // as if the widest log line overflows by 12 columns
+        app.services_view = Some(view);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        let hscroll = |app: &App| app.services_view.as_ref().unwrap().log_hscroll.get();
+        app.on_mouse(wheel(MouseEventKind::ScrollRight)).await;
+        assert_eq!(hscroll(&app), 5);
+        app.on_mouse(wheel(MouseEventKind::ScrollRight)).await;
+        app.on_mouse(wheel(MouseEventKind::ScrollRight)).await;
+        assert_eq!(hscroll(&app), 12, "clamped to the widest line");
+        app.on_mouse(wheel(MouseEventKind::ScrollLeft)).await;
+        assert_eq!(hscroll(&app), 7);
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await;
+        assert_eq!(hscroll(&app), 0);
+    }
+
+    #[tokio::test]
+    async fn wheel_over_the_services_log_scrolls_it_and_over_the_list_selects() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-svc-vscroll-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.service_list = vec![crate::worker_client::ServiceDto {
+            node_id: "root".into(),
+            block: "a".into(),
+            status: "stopped".into(),
+            exit_code: None,
+            pid: 0,
+            uptime_ms: 0,
+            cpu_percent: None,
+            mem_bytes: None,
+            autostop: false,
+        }];
+        let view = ServicesViewState::default();
+        view.log_rect.set(Rect::new(0, 10, 40, 8));
+        view.log_vmax.set(20);
+        app.services_view = Some(view);
+        let wheel = |kind, row| MouseEvent {
+            kind,
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let vscroll = |app: &App| app.services_view.as_ref().unwrap().log_vscroll.get();
+        app.on_mouse(wheel(MouseEventKind::ScrollUp, 12)).await;
+        assert_eq!(vscroll(&app), 3);
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 12)).await;
+        app.on_mouse(wheel(MouseEventKind::ScrollDown, 12)).await;
+        assert_eq!(vscroll(&app), 0, "never below the tail");
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .await;
+        assert_eq!(vscroll(&app), 7);
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+            .await;
+        assert_eq!(vscroll(&app), 20, "clamped to the oldest line");
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .await;
+        assert_eq!(vscroll(&app), 0);
+        // Over the list (outside the log) the wheel does not scroll the log.
+        app.on_mouse(wheel(MouseEventKind::ScrollUp, 2)).await;
+        assert_eq!(vscroll(&app), 0);
+    }
+
+    #[tokio::test]
+    async fn wheel_scrolls_help_modal_not_panes_below() {
+        let dir = std::env::temp_dir().join(format!("meshfox-tui-modal-wheel-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("canvas.md");
+        std::fs::write(
+            &path,
+            "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n",
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(path, tx, None, None).await.unwrap();
+        app.show_help = true;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        let selected = app.selected;
+        app.on_mouse(wheel(MouseEventKind::ScrollDown)).await;
+        app.on_mouse(wheel(MouseEventKind::ScrollDown)).await;
+        assert_eq!(app.help_scroll, 2);
+        app.on_mouse(wheel(MouseEventKind::ScrollUp)).await;
+        assert_eq!(app.help_scroll, 1);
+        assert_eq!(app.selected, selected);
+        // Horizontal wheel and the like are swallowed.
+        app.on_mouse(wheel(MouseEventKind::ScrollRight)).await;
+        assert_eq!(app.help_scroll, 1);
     }
 
     #[tokio::test]
