@@ -4565,6 +4565,8 @@ fn var_decl_from_status(status: &worker_client::VarStatus) -> VarDecl {
         session: false,
         default_var: None,
         choices_var: status.choices_pending.as_ref().map(|p| p.var.clone()),
+        suggest: status.suggest.clone(),
+        suggest_var: None,
         file_mode: (status.var_type == "file").then(|| match status.mode.as_deref() {
             Some("save") => meshfox_core::FileMode::Save,
             _ => meshfox_core::FileMode::Open,
@@ -8760,6 +8762,8 @@ mod set_override_tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }

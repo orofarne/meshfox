@@ -1,6 +1,7 @@
 import { FieldBox, ListField } from "./ListField";
 import { useState, type FormEvent } from "react";
 import { ChoiceSelect } from "./ChoiceSelect";
+import { SuggestInput } from "./SuggestInput";
 import { describePending } from "./choiceFilter";
 import { DateField } from "./DateField";
 import { dateValueProblem, isValidDateValue } from "./dateValues";
@@ -203,6 +204,16 @@ export function VarsForm({
           label={v.prompt}
           autoFocus={i === 0}
           required
+        />
+      );
+    }
+    if (v.type === "string" && !v.secret) {
+      return (
+        <SuggestInput
+          value={values[v.name]}
+          onChange={(value) => set(v.name, value)}
+          suggest={v.suggest}
+          autoFocus={i === 0}
         />
       );
     }

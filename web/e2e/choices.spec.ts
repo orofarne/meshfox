@@ -59,6 +59,31 @@ test("a select filters its choices as you type and takes the same keys as the TU
   await expect(block(page, "fonts", "use-font").locator(".mesh-code-output")).toContainText("font is Noto Serif");
 });
 
+test("a string offers its suggestions as you type but accepts any text", async ({ page }) => {
+  await block(page, "hosts", "connect").locator("button", { hasText: "run" }).click();
+  const modal = page.locator(".vars-modal");
+  await expect(modal).toBeVisible();
+
+  const host = modal.getByRole("combobox", { name: "Host?", exact: true });
+  const stage = modal.getByRole("combobox", { name: "Stage?", exact: true });
+  const optionValues = (input: Locator) =>
+    input.evaluate((el) =>
+      Array.from(document.getElementById((el as HTMLInputElement).getAttribute("list") ?? "")?.querySelectorAll("option") ?? []).map(
+        (o) => (o as HTMLOptionElement).value,
+      ),
+    );
+  // `suggest_var=` through a `from=` variable, and a literal `suggest=`.
+  expect(await optionValues(host)).toEqual(["web-1.example", "web-2.example", "db-1.example"]);
+  expect(await optionValues(stage)).toEqual(["dev", "staging", "prod"]);
+
+  // A value that is not a suggestion is just as good (unlike a select).
+  await host.fill("my-own-host");
+  await stage.fill("prod");
+  await modal.locator("button", { hasText: "run" }).click();
+  await expect(modal).toHaveCount(0);
+  await expect(block(page, "hosts", "connect").locator(".mesh-code-output")).toContainText("connecting to my-own-host (prod)");
+});
+
 test("a select whose choices could not be computed says why instead of listing nothing", async ({ page }) => {
   await block(page, "broken", "use-broken").locator("button", { hasText: "run" }).click();
   const modal = page.locator(".vars-modal");

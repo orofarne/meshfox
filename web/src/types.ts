@@ -214,6 +214,9 @@ export interface VarStatus {
   type: "string" | "int" | "bool" | "select" | "dir" | "file" | "date" | "datetime" | "list";
   prompt: string;
   choices?: string[];
+  /** `type="string"` only: `suggest=`/`suggest_var=` completion candidates —
+   * offered while typing, never validated against. */
+  suggest?: string[];
   /** `type="file"` only: `open` (the file must exist) or `save` (an output
    * path; only its directory must exist). */
   mode?: "open" | "save";

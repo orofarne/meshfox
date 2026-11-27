@@ -1925,18 +1925,15 @@ impl<'a> Renderer<'a> {
                         // undeclared/unknown var — `None` here — defaults
                         // to showing one anyway, same as a plain text field
                         // would, rather than silently showing none).
-                        let var_type = self
-                            .decls
-                            .iter()
-                            .find(|d| d.name == field.var)
-                            .map(|d| d.var_type);
+                        let field_decl = self.decls.iter().find(|d| d.name == field.var);
+                        let var_type = field_decl.map(|d| d.var_type);
                         let cursor = focused
                             && !matches!(
                                 var_type,
                                 Some(meshfox_core::vars::VarType::Bool)
                                     | Some(meshfox_core::vars::VarType::Select)
                             );
-                        let browse_text = var_type.and_then(super::date_picker::marker_for);
+                        let browse_text = field_decl.and_then(super::date_picker::marker_for_decl);
                         let mut shown = if value.is_empty() {
                             " ".to_string()
                         } else {
@@ -3406,6 +3403,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }];

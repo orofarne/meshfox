@@ -1762,6 +1762,9 @@ pub struct VarStatus {
     pub prompt: String,
     #[serde(default)]
     pub choices: Vec<String>,
+    /// `suggest=`/`suggest_var=` of a `string` field: completion candidates.
+    #[serde(default)]
+    pub suggest: Vec<String>,
     /// `"open"`/`"save"` for a `type="file"` field.
     #[serde(default)]
     pub mode: Option<String>,

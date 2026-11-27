@@ -2426,7 +2426,7 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         // A `dir`/`file` field ends in a right-aligned, clickable
         // "[Browse… ^o]" (`App::on_modal_mouse` hit-tests the same
         // `BROWSE_MARKER`-wide strip at the row's right edge).
-        let marker = super::date_picker::marker_for(decl.var_type);
+        let marker = super::date_picker::marker_for_decl(decl);
         let marker_chars = marker.map_or(0, |m| m.chars().count());
         let browse_width = if marker.is_some() {
             marker_chars + 2
@@ -2510,6 +2510,9 @@ fn render_var_form(f: &mut Frame, area: Rect, vf: &super::app::VarFormState) {
         Some(VarType::Select) => "Enter/Space choices",
         Some(VarType::List) if super::app::is_choice_list(&vf.decls[vf.selected]) => {
             "Enter/Space choices · or type items, comma-separated"
+        }
+        Some(VarType::String) if super::app::has_suggestions(&vf.decls[vf.selected]) => {
+            "←/→ cursor · Ctrl-O suggestions"
         }
         Some(VarType::Bool) => "←/→ toggle",
         Some(VarType::File | VarType::Dir) => "←/→ cursor · Home/End · Ctrl-O browse",

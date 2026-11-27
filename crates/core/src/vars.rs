@@ -164,6 +164,17 @@ pub struct VarDecl {
     /// Mutually exclusive with a literal `choices=` and with `from=`;
     /// requires `type="select"`, same as a literal `choices=` does.
     pub choices_var: Option<String>,
+    /// `suggest="a,b,c"` -- completion candidates for a `type="string"`
+    /// variable. Unlike `choices` they are only offered: any text is still
+    /// a valid answer, so nothing validates a value against them.
+    pub suggest: Vec<String>,
+    /// `suggest_var="OTHER_NAME"` -- `suggest` taken from another declared
+    /// variable's resolved value (split like `choices_var`). Display-only,
+    /// so unlike `choices_var` an unresolved source never defers this
+    /// variable: it just has no suggestions yet. Mutually exclusive with a
+    /// literal `suggest=`, with `from=` and with `content=`; requires
+    /// `type="string"`.
+    pub suggest_var: Option<String>,
     /// `mode="open"|"save"` — only `Some` for `type="file"` (`open` when
     /// the attribute is omitted).
     pub file_mode: Option<FileMode>,
@@ -247,9 +258,13 @@ pub enum VarsError {
     ChoicesConflict(String),
     #[error("meshfox:var {0:?} has choices_var= but type={1:?} (expected select)")]
     ChoicesVarRequiresSelect(String, String),
+    #[error("meshfox:var {0:?} combines suggest= with suggest_var=, only one may be given")]
+    SuggestConflict(String),
+    #[error("meshfox:var {0:?} has suggest= or suggest_var= but type={1:?} (expected string)")]
+    SuggestRequiresString(String, String),
     #[error("meshfox:var {0:?} references undeclared variable {1:?} via {2}=")]
     UndeclaredVarRef(String, String, &'static str),
-    #[error("cycle in default_var=/choices_var= references: {}", .0.join(" -> "))]
+    #[error("cycle in default_var=/choices_var=/suggest_var= references: {}", .0.join(" -> "))]
     VarRefCycle(Vec<String>),
     #[error("node {0:?} form {1:?} has a `field var=\"{2}\"`, but {2:?} is from=-computed — a form field can't target a computed variable, that would let a submitted value impersonate one its source block never produced")]
     FormFieldTargetsComputedVar(String, String, String),
@@ -314,6 +329,8 @@ const VAR_ATTRS: &[&str] = &[
     "type",
     "choices",
     "choices_var",
+    "suggest",
+    "suggest_var",
     "secret",
     "required",
     "session",
@@ -345,6 +362,20 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
     }
     if choices_var.is_some() && var_type != VarType::Select {
         return Err(VarsError::ChoicesVarRequiresSelect(
+            name,
+            var_type.as_str().to_string(),
+        ));
+    }
+    let suggest: Vec<String> = attrs
+        .get("suggest")
+        .map(|v| split_choices(v))
+        .unwrap_or_default();
+    let suggest_var = attrs.get("suggest_var").cloned();
+    if !suggest.is_empty() && suggest_var.is_some() {
+        return Err(VarsError::SuggestConflict(name));
+    }
+    if (attrs.contains_key("suggest") || suggest_var.is_some()) && var_type != VarType::String {
+        return Err(VarsError::SuggestRequiresString(
             name,
             var_type.as_str().to_string(),
         ));
@@ -433,6 +464,12 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         if choices_var.is_some() {
             return Err(VarsError::FromConflict(name, "choices_var"));
         }
+        if !suggest.is_empty() {
+            return Err(VarsError::FromConflict(name, "suggest"));
+        }
+        if suggest_var.is_some() {
+            return Err(VarsError::FromConflict(name, "suggest_var"));
+        }
     }
     let content = match attrs.get("content") {
         None => None,
@@ -455,6 +492,8 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
             (session, "session"),
             (choices_var.is_some(), "choices_var"),
             (!choices.is_empty(), "choices"),
+            (!suggest.is_empty(), "suggest"),
+            (suggest_var.is_some(), "suggest_var"),
             (var_type != VarType::String, "type"),
         ]
         .into_iter()
@@ -477,6 +516,8 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         session,
         default_var,
         choices_var,
+        suggest,
+        suggest_var,
         file_mode,
         ext,
     })
@@ -582,6 +623,8 @@ fn validate_list_value(decl: &VarDecl, value: &str) -> Result<(), String> {
         of: None,
         choices: Vec::new(),
         choices_var: None,
+        suggest: Vec::new(),
+        suggest_var: None,
         default: None,
         default_var: None,
         ..decl.clone()
@@ -1186,6 +1229,7 @@ pub fn validate_var_refs(canvas: &Canvas) -> Result<(), VarsError> {
         for (reference, attr) in [
             (&decl.default_var, "default_var"),
             (&decl.choices_var, "choices_var"),
+            (&decl.suggest_var, "suggest_var"),
         ] {
             if let Some(name) = reference {
                 if !declared.contains(name.as_str()) {
@@ -1243,7 +1287,10 @@ fn find_var_ref_cycle(
         return Some(cycle);
     }
     stack.push(decl.name.clone());
-    for reference in [&decl.default_var, &decl.choices_var].into_iter().flatten() {
+    for reference in [&decl.default_var, &decl.choices_var, &decl.suggest_var]
+        .into_iter()
+        .flatten()
+    {
         if let Some(referenced) = by_name.get(reference.as_str()) {
             if let Some(cycle) = find_var_ref_cycle(referenced, by_name, visited, stack) {
                 return Some(cycle);
@@ -1270,6 +1317,25 @@ pub fn close_over_var_refs<'a>(
     decls: &[VarDecl],
     seed: impl IntoIterator<Item = &'a str>,
 ) -> HashSet<String> {
+    close_over(decls, seed, false)
+}
+
+/// `close_over_var_refs` that also follows `suggest_var=`. For what a
+/// *displayed* field needs (a form, `configure`): a suggestion source is
+/// never needed to run a block, so the run-time closure must not pull it in
+/// (that would execute its `from=` block on every run just to offer a hint).
+pub fn close_over_display_refs<'a>(
+    decls: &[VarDecl],
+    seed: impl IntoIterator<Item = &'a str>,
+) -> HashSet<String> {
+    close_over(decls, seed, true)
+}
+
+fn close_over<'a>(
+    decls: &[VarDecl],
+    seed: impl IntoIterator<Item = &'a str>,
+    with_suggestions: bool,
+) -> HashSet<String> {
     let by_name: HashMap<&str, &VarDecl> = decls.iter().map(|d| (d.name.as_str(), d)).collect();
     let mut closure: HashSet<String> = HashSet::new();
     let mut frontier: Vec<String> = seed.into_iter().map(String::from).collect();
@@ -1278,7 +1344,12 @@ pub fn close_over_var_refs<'a>(
             continue;
         }
         if let Some(decl) = by_name.get(name.as_str()) {
-            for reference in [&decl.default_var, &decl.choices_var].into_iter().flatten() {
+            let suggestion = with_suggestions.then_some(&decl.suggest_var);
+            for reference in [&decl.default_var, &decl.choices_var]
+                .into_iter()
+                .chain(suggestion)
+                .flatten()
+            {
                 if !closure.contains(reference) {
                     frontier.push(reference.clone());
                 }
@@ -1655,6 +1726,11 @@ pub fn resolve_with_shared(
         let mut missing_decl = decl.clone();
         missing_decl.default = effective_default;
         missing_decl.choices = effective_choices;
+        // Display-only: an unresolved source leaves the list empty instead
+        // of deferring the variable, since nothing depends on it.
+        if let Some(list) = decl.suggest_var.as_ref().and_then(|n| values.get(n)) {
+            missing_decl.suggest = split_choices(list);
+        }
         missing.push(missing_decl);
     }
     // A `dir` value is written the way a human wrote it (`@tmp/x`, `~/d`,
@@ -1745,7 +1821,10 @@ fn visit_for_topo_order<'a>(
         return;
     }
     stack.insert(decl.name.clone());
-    for reference in [&decl.default_var, &decl.choices_var].into_iter().flatten() {
+    for reference in [&decl.default_var, &decl.choices_var, &decl.suggest_var]
+        .into_iter()
+        .flatten()
+    {
         if let Some(referenced) = by_name.get(reference.as_str()) {
             visit_for_topo_order(referenced, by_name, order, visited, stack);
         }
@@ -2466,6 +2545,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -2665,6 +2746,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -2685,6 +2768,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -3468,6 +3553,8 @@ mod tests {
             session: true,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -3618,6 +3705,8 @@ mod tests {
             session: false,
             default_var: Some(default_var.to_string()),
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -3638,9 +3727,93 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: Some(choices_var.to_string()),
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
+    }
+
+    #[test]
+    fn suggest_and_suggest_var_parse_on_a_string() {
+        let md = "<!-- meshfox:var name=\"A\" suggest=\"x, y ,,z\" -->\n<!-- meshfox:var name=\"B\" suggest_var=\"A\" -->\n";
+        let decls = scan_var_decls(md).unwrap();
+        assert_eq!(decls[0].suggest, ["x", "y", "z"]);
+        assert_eq!(decls[1].suggest_var.as_deref(), Some("A"));
+        // A suggestion is not a constraint: any text is still a valid answer.
+        assert!(validate_value(&decls[0], "anything else").is_ok());
+    }
+
+    #[test]
+    fn suggest_is_rejected_where_it_means_nothing() {
+        for (md, want) in [
+            (
+                "<!-- meshfox:var name=\"X\" suggest=\"a\" suggest_var=\"Y\" -->\n",
+                VarsError::SuggestConflict("X".into()),
+            ),
+            (
+                "<!-- meshfox:var name=\"X\" type=\"int\" suggest=\"1\" -->\n",
+                VarsError::SuggestRequiresString("X".into(), "int".into()),
+            ),
+            (
+                "<!-- meshfox:var name=\"X\" type=\"select\" choices=\"a\" suggest_var=\"Y\" -->\n",
+                VarsError::SuggestRequiresString("X".into(), "select".into()),
+            ),
+            (
+                "<!-- meshfox:var name=\"X\" from=\"a\" suggest=\"b\" -->\n",
+                VarsError::FromConflict("X".into(), "suggest"),
+            ),
+            (
+                "<!-- meshfox:var name=\"X\" from=\"a\" suggest_var=\"Y\" -->\n",
+                VarsError::FromConflict("X".into(), "suggest_var"),
+            ),
+        ] {
+            assert_eq!(scan_var_decls(md).unwrap_err(), want, "{md}");
+        }
+    }
+
+    fn suggest_var_decl(name: &str, suggest_var: &str) -> VarDecl {
+        let mut d = decl(name, None, false);
+        d.suggest_var = Some(suggest_var.to_string());
+        d
+    }
+
+    #[test]
+    fn resolve_substitutes_a_resolved_suggest_var_into_missing() {
+        let decls = vec![
+            decl("HOSTS", Some("a.example, b.example"), false),
+            suggest_var_decl("HOST", "HOSTS"),
+        ];
+        let cache = VarCache::in_memory();
+        let resolved = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
+        let host = resolved.missing.iter().find(|d| d.name == "HOST").unwrap();
+        assert_eq!(host.suggest, ["a.example", "b.example"]);
+    }
+
+    #[test]
+    fn resolve_does_not_defer_a_decl_whose_suggest_var_is_unresolved() {
+        // Unlike `choices_var`, nothing depends on a suggestion: the field is
+        // still asked for, just without candidates.
+        let decls = vec![
+            decl("HOSTS", None, false),
+            suggest_var_decl("HOST", "HOSTS"),
+        ];
+        let cache = VarCache::in_memory();
+        let resolved = resolve(&decls, &HashMap::new(), &cache, &HashMap::new());
+        let host = resolved.missing.iter().find(|d| d.name == "HOST").unwrap();
+        assert!(host.suggest.is_empty());
+    }
+
+    #[test]
+    fn only_the_display_closure_follows_suggest_var() {
+        let decls = vec![
+            decl("HOSTS", None, false),
+            suggest_var_decl("HOST", "HOSTS"),
+        ];
+        // A block needing HOST must not drag in (and run) its suggestion
+        // source; a form showing HOST does need it.
+        assert!(!close_over_var_refs(&decls, ["HOST"]).contains("HOSTS"));
+        assert!(close_over_display_refs(&decls, ["HOST"]).contains("HOSTS"));
     }
 
     #[test]

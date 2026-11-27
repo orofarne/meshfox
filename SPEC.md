@@ -2495,6 +2495,16 @@ Attributes:
   Requires `type="select"`, same as a literal `choices=` does. Mutually
   exclusive with a literal `choices` and with `from=`, same reasoning as
   `default_var`.
+- `suggest` / `suggest_var` — completion candidates for a `type="string"`
+  variable: `suggest="a,b,c"` (comma-separated, like `choices`) or
+  `suggest_var="OTHER_NAME"` (the referenced variable's resolved value, split
+  the same way). Unlike `choices` they are only *offered*: any text stays a
+  valid answer and nothing validates a value against them. Because the
+  variable itself carries them, every place that asks for it shows them — the
+  pre-run form, `configure`, an inline `form` field, the TUI and the terminal
+  prompt. Mutually exclusive with each other, with `from=` and with
+  `content=`; `type` must be `string` (a `meshfox validate` error otherwise).
+  See "Suggestions (`suggest=`/`suggest_var=`)" below.
 - `secret` — flag (`secret` or `secret=true`). A secret variable is
   never read from or written to the on-disk cache (see below) and never
   pre-filled anywhere — the only way to supply one without an
@@ -2539,8 +2549,8 @@ Attributes:
   the named block and reading back what it wrote to its own
   `MESHFOX_VARS_OUT` file — see "Computed variables (`from=`)" below.
   Mutually exclusive with `default`/`default_var`, `required`, `secret`,
-  `session`, and `choices_var` (a `meshfox validate` error to combine any
-  of them with `from`) — none of those mean anything for a value that's
+  `session`, `choices_var`, `suggest` and `suggest_var` (a `meshfox validate`
+  error to combine any of them with `from`) — none of those mean anything for a value that's
   never cached, defaulted, or prompted for. `type`/`choices` still apply,
   validated against whatever the source block actually produced.
 
@@ -2571,8 +2581,8 @@ variable is declared in, like `from=` and `deps=`:
   environment, the cache and shared config are all ignored, `configure` and
   the pre-run form never offer it, and a `form` field can't target it.
 - Combining `content=` with `from`, `default`, `default_var`, `required`,
-  `secret`, `session`, `choices`, `choices_var` or a `type` other than
-  `string` is an error. A `?` condition is not allowed either.
+  `secret`, `session`, `choices`, `choices_var`, `suggest`, `suggest_var` or a
+  `type` other than `string` is an error. A `?` condition is not allowed either.
 - A reference to a fence that doesn't exist fails the run, naming the
   variable and the node (`meshfox validate` reports it too).
 - The value travels in the process environment, which the OS limits (about
@@ -2582,8 +2592,8 @@ variable is declared in, like `from=` and `deps=`:
 - `content` — `content="node-id/block-name"`: the value is that fence's
   text, see "Fence text as a value (`content=`)" below. Mutually exclusive
   with every other source of a value (`from`, `default`, `default_var`,
-  `required`, `secret`, `session`, `choices`, `choices_var`, non-`string`
-  `type`).
+  `required`, `secret`, `session`, `choices`, `choices_var`, `suggest`,
+  `suggest_var`, non-`string` `type`).
 
 ### Named environment builtins
 
@@ -3047,6 +3057,36 @@ suggested default) end up actually coming from running a script:
   (`default`/`choices`) and with `from=` — see each attribute's own
   entry above. `meshfox validate` catches a `default_var`/`choices_var`
   naming a variable nothing declares, and a reference cycle.
+
+### Suggestions (`suggest=`/`suggest_var=`)
+
+A `string` variable can offer completion candidates without restricting the
+answer: `suggest="staging,prod"`, or `suggest_var="HOSTS"` to take them from
+another variable (typically a `from=`-computed one, e.g. a block that lists
+hosts). The status of the field (`GET /api/vars`, `/api/vars/configure`,
+`/api/form/fields`) carries them as `suggest`.
+
+- **Offered, never enforced.** Any text is a valid answer, a value that is not
+  in the list is stored and run like any other, and nothing checks an
+  existing value against the list. A `secret` string is never offered
+  suggestions in a form.
+- **Never blocks.** Unlike `choices_var`, an unresolved `suggest_var` source
+  does not defer the variable and there is no `choicesPending`: the field is
+  simply shown without candidates (a source that failed, or that `--no-exec`
+  forbids running, is not reported).
+- **Display-only references.** A form that shows the variable computes the
+  `suggest_var` source like it does for `choices_var` (running its `from=`
+  block with an empty environment), but running a block that merely uses the
+  variable does not: the source is not part of that block's dependencies.
+  `meshfox validate` still checks that the name is declared and that there is
+  no reference cycle through `default_var`/`choices_var`/`suggest_var`.
+- **Front ends.** The browser uses a native `<datalist>` on the text input
+  (typing narrows, picking fills). In the TUI `Ctrl-O` on the field, or a click
+  on the `[Suggest… ^o]` marker at the right edge of a field that has
+  suggestions (a click in the text itself still edits it), opens the same
+  filterable list as a `select` (the field stays editable text). The
+  terminal prompt prints `suggestions: a, b, c` above the question; typing is
+  the only way to answer.
 
 ### Choosing from a `select`, and choices that could not be computed
 
@@ -3783,8 +3823,8 @@ unrecognized key, for forward/backward compatibility across format versions
     edge-attr      ::= 'from' | 'label' | 'labelAt' | 'color' | 'style' | 'arrowStart'
                      | 'arrowEnd' | 'tags' | 'sourceSide' | 'targetSide' | 'via'
     var-attr       ::= 'name' | 'type' | 'prompt' | 'default' | 'default_var'
-                     | 'choices' | 'choices_var' | 'secret' | 'required'
-                     | 'session' | 'from' | 'content'
+                     | 'choices' | 'choices_var' | 'suggest' | 'suggest_var'
+                     | 'secret' | 'required' | 'session' | 'from' | 'content'
     option-attr    ::= 'name'
     tag-color-attr ::= 'tag' | 'color'
     output-attr    ::= 'name'

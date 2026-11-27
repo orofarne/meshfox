@@ -165,6 +165,10 @@ fn print_select(decl: &VarDecl, shown: &[usize], current: Option<&str>) -> io::R
 }
 
 fn print_prompt(decl: &VarDecl, current: Option<&str>) -> io::Result<()> {
+    // Suggestions are only a hint: any text typed below is still the answer.
+    if decl.var_type == VarType::String && !decl.suggest.is_empty() {
+        println!("  suggestions: {}", decl.suggest.join(", "));
+    }
     if decl.var_type == VarType::List {
         if !decl.choices.is_empty() {
             for (i, choice) in decl.choices.iter().enumerate() {
@@ -292,6 +296,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -392,6 +398,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: Some("FONT_LIST".into()),
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         };

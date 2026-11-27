@@ -7,7 +7,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use meshfox_core::datevars;
-use meshfox_core::VarType;
+use meshfox_core::{VarDecl, VarType};
 use time::{Date, Duration, Month, PrimitiveDateTime, Time, UtcOffset};
 
 pub use super::path_picker::PickerTarget;
@@ -22,6 +22,16 @@ pub fn marker_for(var_type: VarType) -> Option<&'static str> {
         VarType::Date | VarType::DateTime => Some(PICK_MARKER),
         _ => None,
     }
+}
+
+/// The clickable marker of a `string` that offers `suggest=` candidates.
+pub const SUGGEST_MARKER: &str = "[Suggest… ^o]";
+
+/// `marker_for`, but for a declaration: a `string` with suggestions also gets
+/// a marker (a click in its text edits it, so the list opens from here).
+pub fn marker_for_decl(decl: &VarDecl) -> Option<&'static str> {
+    marker_for(decl.var_type)
+        .or_else(|| super::app::has_suggestions(decl).then_some(SUGGEST_MARKER))
 }
 
 /// Whether `Ctrl-O` / the marker opens a picker for this type.

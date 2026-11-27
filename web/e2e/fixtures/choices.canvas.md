@@ -51,3 +51,23 @@ echo "font is $BROKEN_FONT"
 ```form name="pick-broken" send="Pick"
 field var="BROKEN_FONT"
 ```
+
+
+## Hosts
+<!-- meshfox:node id="hosts" -->
+
+A `string` with `suggest_var=` (computed list) and one with a literal
+`suggest=`: the control is a text input that offers candidates while typing,
+and any other text is still a valid answer.
+
+<!-- meshfox:var name="HOST_LIST" from="hosts/list-hosts" -->
+<!-- meshfox:var name="HOST" prompt="Host?" suggest_var="HOST_LIST" required session -->
+<!-- meshfox:var name="STAGE" prompt="Stage?" suggest="dev,staging,prod" required session -->
+
+```bash name="list-hosts"
+echo "HOST_LIST=web-1.example,web-2.example,db-1.example" >> "$MESHFOX_VARS_OUT"
+```
+
+```bash name="connect" env="$HOST,$STAGE"
+echo "connecting to $HOST ($STAGE)"
+```

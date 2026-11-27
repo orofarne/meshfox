@@ -1189,6 +1189,13 @@ pub(super) fn is_choice_list(decl: &VarDecl) -> bool {
     decl.var_type == VarType::List && !decl.choices.is_empty()
 }
 
+/// A non-secret `string` with `suggest=`/`suggest_var=` candidates: Ctrl-O
+/// lists them in the select popup. Picking one fills the field; typing
+/// anything else stays valid, so (unlike `select`) the field is still typed.
+pub(super) fn has_suggestions(decl: &VarDecl) -> bool {
+    decl.var_type == VarType::String && !decl.secret && !decl.suggest.is_empty()
+}
+
 /// Rewrites what a person typed into each `date`/`datetime` field into the
 /// canonical value (`2026-10-25 14:30` → `2026-10-25T14:30:00+03:00`, with
 /// the local offset when none was typed). A value that can't be understood
@@ -1231,6 +1238,8 @@ fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
         session: false,
         default_var: None,
         choices_var: None,
+        suggest: status.suggest.clone(),
+        suggest_var: None,
         file_mode: (var_type == VarType::File).then(|| match status.mode.as_deref() {
             Some("save") => meshfox_core::FileMode::Save,
             _ => meshfox_core::FileMode::Open,
@@ -2267,10 +2276,16 @@ impl App {
             return false;
         };
         let multi = decl.var_type == VarType::List && !decl.choices.is_empty();
-        if decl.var_type != VarType::Select && !multi {
+        let suggesting = has_suggestions(decl);
+        if decl.var_type != VarType::Select && !multi && !suggesting {
             return false;
         }
-        if decl.choices.is_empty() {
+        let options = if suggesting {
+            &decl.suggest
+        } else {
+            &decl.choices
+        };
+        if options.is_empty() {
             self.status_meta.notice(
                 "form-submit",
                 &mut self.status,
@@ -2297,17 +2312,17 @@ impl App {
         self.select_picker = Some(SelectPickerState {
             target,
             query: String::new(),
-            filtered: (0..decl.choices.len()).collect(),
-            choices: decl.choices.clone(),
+            filtered: (0..options.len()).collect(),
+            choices: options.clone(),
             selected: if multi {
                 0
             } else {
-                decl.choices.iter().position(|c| c == input).unwrap_or(0)
+                options.iter().position(|c| c == input).unwrap_or(0)
             },
             rows: Rect::default(),
             offset: 0,
             multi,
-            checked: decl.choices.iter().map(|c| ticked.contains(c)).collect(),
+            checked: options.iter().map(|c| ticked.contains(c)).collect(),
         });
         true
     }
@@ -2467,8 +2482,10 @@ impl App {
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let target = self.var_form.as_ref().and_then(|vf| {
                     let d = &vf.decls[vf.selected];
-                    (super::date_picker::has_picker(d.var_type) || is_choice_list(d))
-                        .then_some(super::path_picker::PickerTarget::VarForm(vf.selected))
+                    (super::date_picker::has_picker(d.var_type)
+                        || is_choice_list(d)
+                        || has_suggestions(d))
+                    .then_some(super::path_picker::PickerTarget::VarForm(vf.selected))
                 });
                 if let Some(target) = target {
                     self.open_picker(target).await;
@@ -2836,7 +2853,8 @@ impl App {
                     let i = form.selected;
                     (i < form.decls.len()
                         && (super::date_picker::has_picker(form.decls[i].var_type)
-                            || is_choice_list(&form.decls[i])))
+                            || is_choice_list(&form.decls[i])
+                            || has_suggestions(&form.decls[i])))
                     .then_some(super::path_picker::PickerTarget::InlineForm(i))
                 });
                 if let Some(target) = target {
@@ -3980,7 +3998,7 @@ impl App {
                 self.ensure_inline_form_open(&node_id, &block_name);
                 let usable = self.active_inline_form.as_mut().is_some_and(|form| {
                     let ok = field_index < form.decls.len()
-                        && super::date_picker::has_picker(form.decls[field_index].var_type);
+                        && super::date_picker::marker_for_decl(&form.decls[field_index]).is_some();
                     if ok {
                         form.selected = field_index;
                         form.editing = true;
@@ -4519,7 +4537,7 @@ impl App {
         };
         match var_type {
             Some(VarType::Date | VarType::DateTime) => self.open_date_picker(target),
-            Some(VarType::List) => {
+            Some(VarType::List | VarType::String) => {
                 self.open_select_picker(target);
             }
             Some(_) => self.open_path_picker(target).await,
@@ -4787,7 +4805,7 @@ impl App {
                 if vf.decls[idx].var_type == VarType::Select || is_choice_list(&vf.decls[idx]) {
                     select = Some(idx);
                 }
-                let marker = super::date_picker::marker_for(vf.decls[idx].var_type)
+                let marker = super::date_picker::marker_for_decl(&vf.decls[idx])
                     .map_or(0, |m| m.chars().count() as u16);
                 if marker > 0
                     && point_in(*value, mouse.column, mouse.row)
@@ -13116,6 +13134,92 @@ mod tests {
         );
     }
 
+    // A `string` with `suggest=` stays typed text; Ctrl-O lists the candidates
+    // and picking one fills the field. A plain string has no list to open.
+    #[tokio::test]
+    async fn string_suggestions_open_with_ctrl_o_and_fill_the_field_on_enter() {
+        let mut app = app_with_blocks(
+            "string-suggest",
+            concat!(
+                "<!-- meshfox:var name=\"HOST\" suggest=\"alpha,beta,gamma\" session -->\n",
+                "<!-- meshfox:var name=\"PLAIN\" session -->\n\n",
+                "```form name=pick\nfield var=\"HOST\"\nfield var=\"PLAIN\"\n```\n",
+            ),
+        )
+        .await;
+        app.set_focus(Focus::Document);
+        app.try_enter_inline_form();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        // Typing is still how the field is answered.
+        app.on_inline_form_key(key(KeyCode::Char('z'))).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "z");
+        assert!(app.select_picker.is_none());
+
+        app.on_inline_form_key(ctrl_o).await;
+        assert_eq!(
+            app.select_picker.as_ref().unwrap().choices,
+            ["alpha", "beta", "gamma"]
+        );
+        app.on_key(key(KeyCode::Down)).await;
+        app.on_key(key(KeyCode::Enter)).await;
+        assert!(app.select_picker.is_none());
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "beta");
+
+        // Esc closes the list and leaves what was typed alone.
+        app.on_inline_form_key(ctrl_o).await;
+        app.on_key(key(KeyCode::Esc)).await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "beta");
+
+        // A string without suggestions has nothing to open.
+        app.on_inline_form_key(key(KeyCode::Down)).await;
+        app.on_inline_form_key(ctrl_o).await;
+        assert!(app.select_picker.is_none());
+    }
+
+    // A click in a string's text edits it, so a field with suggestions ends in
+    // a `[Suggest… ^o]` marker (like `[Browse… ^o]`); clicking that opens the list.
+    #[tokio::test]
+    async fn the_suggest_marker_opens_the_list_on_click_and_only_where_there_are_suggestions() {
+        let mut app = app_with_blocks(
+            "string-suggest-marker",
+            concat!(
+                "<!-- meshfox:var name=\"HOST\" suggest=\"alpha,beta\" session -->\n",
+                "<!-- meshfox:var name=\"PLAIN\" session -->\n\n",
+                "```form name=pick\nfield var=\"HOST\"\nfield var=\"PLAIN\"\n```\n",
+            ),
+        )
+        .await;
+        app.set_focus(Focus::Document);
+        let text = document_text(&app);
+        assert_eq!(text.matches("[Suggest… ^o]").count(), 1, "{text}");
+
+        app.activate_click_target(ClickTarget::FormBrowse {
+            node_id: "root".into(),
+            block_name: "pick".into(),
+            field_index: 1,
+        })
+        .await;
+        assert!(app.select_picker.is_none(), "PLAIN has nothing to suggest");
+
+        app.activate_click_target(ClickTarget::FormBrowse {
+            node_id: "root".into(),
+            block_name: "pick".into(),
+            field_index: 0,
+        })
+        .await;
+        assert_eq!(
+            app.select_picker.as_ref().unwrap().choices,
+            ["alpha", "beta"]
+        );
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.active_inline_form.as_ref().unwrap().inputs[0], "beta");
+    }
+
     #[tokio::test]
     async fn select_form_opens_choices_and_commits_only_on_confirmation() {
         let mut app = app_with_blocks("select-dropdown", concat!(
@@ -13396,6 +13500,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         };
@@ -13437,6 +13543,8 @@ mod tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         };

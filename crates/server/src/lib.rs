@@ -3146,6 +3146,10 @@ struct VarStatus {
     prompt: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     choices: Vec<String>,
+    /// `suggest=`/`suggest_var=` of a `type="string"` variable: completion
+    /// candidates only, any text stays a valid answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    suggest: Vec<String>,
     /// `"open"`/`"save"` for a `type="file"` variable, absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
@@ -3596,7 +3600,7 @@ async fn get_vars_with_plan(
 
     let cache = state.vars_cache.lock().unwrap();
     let closure =
-        meshfox_core::close_over_var_refs(&decls, relevant.iter().map(|d| d.name.as_str()));
+        meshfox_core::close_over_display_refs(&decls, relevant.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
         .iter()
         .filter(|d| {
@@ -3683,7 +3687,7 @@ async fn materialize_choices_and_defaults(
     // which variable a failed step left without a value.
     let mut needs: Vec<(String, Vec<meshfox_core::BlockAddr>)> = Vec::new();
     for d in for_decls {
-        for name in meshfox_core::close_over_var_refs(decls, [d.name.as_str()]) {
+        for name in meshfox_core::close_over_display_refs(decls, [d.name.as_str()]) {
             let Some(from) = decls
                 .iter()
                 .find(|x| x.name == name)
@@ -3841,6 +3845,13 @@ fn var_status(
     {
         d.default = Some(value.clone());
     }
+    if let Some(value) = d
+        .suggest_var
+        .as_ref()
+        .and_then(|name| resolved.values.get(name))
+    {
+        d.suggest = meshfox_core::vars::split_choices(value);
+    }
     let choices_pending =
         meshfox_core::pending_choices_source(&d).map(|var| meshfox_core::ChoicesPending {
             var: var.to_string(),
@@ -3860,6 +3871,7 @@ fn var_status(
         var_type: d.var_type.as_str().into(),
         prompt: d.prompt,
         choices: d.choices,
+        suggest: d.suggest,
         mode: d.file_mode.map(|m| m.as_str().into()),
         ext: d.ext,
         secret: d.secret,
@@ -3941,7 +3953,7 @@ async fn get_configure_vars(
 
     let cache = state.vars_cache.lock().unwrap();
     let closure =
-        meshfox_core::close_over_var_refs(&decls, configurable.iter().map(|d| d.name.as_str()));
+        meshfox_core::close_over_display_refs(&decls, configurable.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
         .iter()
         .filter(|d| closure.contains(d.name.as_str()))
@@ -8796,7 +8808,7 @@ async fn get_form_fields(
     )
     .await;
     let closure =
-        meshfox_core::close_over_var_refs(&decls, field_decls.iter().map(|d| d.name.as_str()));
+        meshfox_core::close_over_display_refs(&decls, field_decls.iter().map(|d| d.name.as_str()));
     let decls_for_resolve: Vec<_> = decls
         .iter()
         .filter(|d| closure.contains(d.name.as_str()))
@@ -19394,6 +19406,8 @@ mod var_status_tests {
             session: false,
             default_var: None,
             choices_var: None,
+            suggest: Vec::new(),
+            suggest_var: None,
             file_mode: None,
             ext: Vec::new(),
         }
@@ -19880,6 +19894,42 @@ mod vars_endpoint_tests {
             statuses[0]["choices"],
             serde_json::json!(["us-east-1", "eu-west-1"])
         );
+
+        let _ = std::fs::remove_file(&canvas_path);
+        let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));
+    }
+
+    const DYNAMIC_SUGGEST_CANVAS: &str = concat!(
+        "<!-- meshfox:canvas -->\n# Root\n<!-- meshfox:node id=\"root\" -->\n\n",
+        "<!-- meshfox:var name=\"HOSTS\" from=\"root/list-hosts\" -->\n",
+        "<!-- meshfox:var name=\"HOST\" suggest_var=\"HOSTS\" -->\n\n",
+        "```bash name=\"list-hosts\"\necho \"HOSTS=a.example,b.example\" >> \"$MESHFOX_VARS_OUT\"\n```\n\n",
+        "```bash name=\"connect\" env=\"$HOST\"\necho \"$HOST\"\n```\n",
+    );
+
+    // `suggest_var=` reaches a `from=`-computed variable the same way
+    // `choices_var=` does, on both forms; it only ever offers candidates, so
+    // the field stays a plain unresolved string.
+    #[tokio::test]
+    async fn get_vars_and_configure_materialize_suggest_var_through_a_from_computed_variable() {
+        let canvas_path = write_test_canvas(DYNAMIC_SUGGEST_CANVAS);
+        let addr = spawn_test_server(canvas_path.clone()).await;
+
+        for path in ["/api/vars?block=connect", "/api/vars/configure"] {
+            let (status, body) = get(addr, path).await;
+            assert_eq!(status, 200, "{path}");
+            let statuses: Vec<serde_json::Value> =
+                serde_json::from_str(&body).expect("valid VarStatus JSON");
+            assert_eq!(statuses.len(), 1, "{path}: {body}");
+            assert_eq!(statuses[0]["name"], "HOST");
+            assert_eq!(statuses[0]["type"], "string");
+            assert_eq!(
+                statuses[0]["suggest"],
+                serde_json::json!(["a.example", "b.example"]),
+                "{path}"
+            );
+            assert!(statuses[0].get("choices").is_none(), "{path}");
+        }
 
         let _ = std::fs::remove_file(&canvas_path);
         let _ = std::fs::remove_file(meshfox_core::varcache::cache_path(&canvas_path));

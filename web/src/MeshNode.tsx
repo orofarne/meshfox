@@ -14,6 +14,7 @@ import { mathRemarkPlugin, mathRehypePlugins } from "./mathPlugins";
 import { highlightToHtml } from "./shiki";
 import { FileTablePreview } from "./TablePreview";
 import { ChoiceSelect } from "./ChoiceSelect";
+import { SuggestInput } from "./SuggestInput";
 import { DateField } from "./DateField";
 import { dateValueProblem, isValidDateValue } from "./dateValues";
 import { PathField } from "./PathPicker";
@@ -2172,6 +2173,9 @@ function FormBlock({ seg, data, nodeId }: { seg: CodeSegment; data: MeshNodeData
           autoFocus={i === 0}
         />
       );
+    }
+    if (f.type === "string" && !f.secret) {
+      return <SuggestInput value={value} onChange={(next) => set(f.name, next)} suggest={f.suggest} autoFocus={i === 0} />;
     }
     return (
       <input

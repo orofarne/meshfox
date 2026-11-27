@@ -248,6 +248,33 @@ echo "REGIONS_LIST=us-east-1,eu-west-1,ap-southeast-1" >> "$MESHFOX_VARS_OUT"
 echo "using $REGION_DYNAMIC"
 ```
 
+## Suggestions
+<!-- meshfox:node id="suggestions" -->
+
+A `string` can offer completion candidates without restricting the answer:
+`suggest="dev,staging,prod"` for a fixed list, or `suggest_var="KNOWN_HOSTS"`
+to take them from another variable — here a `from=`-computed one, so the list
+comes from running `list-hosts`. Unlike a `select`, any text is still a valid
+answer; the candidates are only offered (a filterable list in the TUI via
+`Ctrl-O`, a native suggestion list in the web UI, a `suggestions:` line in the
+terminal prompt).
+
+If the source cannot be computed the field is simply shown without candidates:
+nothing waits for it, and running `connect` never runs `list-hosts` (only a
+form that shows the field does).
+
+<!-- meshfox:var name="KNOWN_HOSTS" from="suggestions/list-hosts" -->
+<!-- meshfox:var name="HOST" prompt="Host?" suggest_var="KNOWN_HOSTS" required session -->
+<!-- meshfox:var name="STAGE" prompt="Stage?" suggest="dev,staging,prod" default="dev" required session -->
+
+```bash name="list-hosts"
+echo "KNOWN_HOSTS=web-1.example,web-2.example,db-1.example" >> "$MESHFOX_VARS_OUT"
+```
+
+```bash name="connect" env="$HOST,$STAGE"
+echo "connecting to $HOST ($STAGE)"
+```
+
 ## Combined
 <!-- meshfox:node id="combined" x=32 y=5766 w=440 h=610 -->
 
