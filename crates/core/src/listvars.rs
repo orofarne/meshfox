@@ -109,58 +109,53 @@ fn split_shell_words(text: &str) -> Result<Vec<String>, String> {
     let mut in_word = false;
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            if in_word {
+                out.push(std::mem::take(&mut cur));
+                in_word = false;
+            }
+            continue;
+        }
+        in_word = true;
         match c {
-            c if c.is_whitespace() => {
-                if in_word {
-                    out.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
-            '\'' => {
-                in_word = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(c) => cur.push(c),
-                        None => return Err("has an unterminated ' quote".into()),
-                    }
-                }
-            }
-            '"' => {
-                in_word = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(c) if c == '"' || c == '\\' => cur.push(c),
-                            Some(c) => {
-                                cur.push('\\');
-                                cur.push(c);
-                            }
-                            None => return Err("has an unterminated \" quote".into()),
-                        },
-                        Some(c) => cur.push(c),
-                        None => return Err("has an unterminated \" quote".into()),
-                    }
-                }
-            }
-            '\\' => {
-                in_word = true;
-                match chars.next() {
-                    Some(c) => cur.push(c),
-                    None => cur.push('\\'),
-                }
-            }
-            c => {
-                in_word = true;
-                cur.push(c);
-            }
+            '\'' => read_single_quoted(&mut chars, &mut cur)?,
+            '"' => read_double_quoted(&mut chars, &mut cur)?,
+            '\\' => cur.push(chars.next().unwrap_or('\\')),
+            c => cur.push(c),
         }
     }
     if in_word {
         out.push(cur);
     }
     Ok(out)
+}
+
+fn read_single_quoted(chars: &mut std::str::Chars, cur: &mut String) -> Result<(), String> {
+    for c in chars.by_ref() {
+        if c == '\'' {
+            return Ok(());
+        }
+        cur.push(c);
+    }
+    Err("has an unterminated ' quote".into())
+}
+
+fn read_double_quoted(chars: &mut std::str::Chars, cur: &mut String) -> Result<(), String> {
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Ok(()),
+            '\\' => match chars.next() {
+                Some(e @ ('"' | '\\')) => cur.push(e),
+                Some(e) => {
+                    cur.push('\\');
+                    cur.push(e);
+                }
+                None => break,
+            },
+            c => cur.push(c),
+        }
+    }
+    Err("has an unterminated \" quote".into())
 }
 
 /// A one-dimensional PostgreSQL array literal, `{a,"b c"}`.

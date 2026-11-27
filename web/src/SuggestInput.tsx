@@ -13,7 +13,7 @@ interface SuggestInputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, 
  * browser's own `<datalist>`: typing narrows the offered list, picking one
  * fills the field, and typing something else is just as valid.
  */
-export function SuggestInput({ value, onChange, suggest, ...rest }: SuggestInputProps) {
+export function SuggestInput({ value, onChange, suggest, ...rest }: Readonly<SuggestInputProps>) {
   const listId = useId();
   const has = !!suggest && suggest.length > 0;
   return (

@@ -78,6 +78,39 @@ function initialValue(v: VarStatus): string {
   return "";
 }
 
+interface PlainFieldProps {
+  readonly v: VarStatus;
+  readonly value: string;
+  readonly onChange: (value: string) => void;
+  readonly autoFocus: boolean;
+  readonly configure?: boolean;
+}
+
+/** The text/number/password input for the types that need nothing special. */
+function PlainField({ v, value, onChange, autoFocus, configure }: PlainFieldProps) {
+  const secretHere = configure && v.secret;
+  let type = "text";
+  if (v.type === "int") type = "number";
+  else if (v.secret) type = "password";
+  let placeholder: string | undefined;
+  if (secretHere) placeholder = v.stored || v.inheritedFrom ? "•••••• (unchanged)" : "";
+  return (
+    <input
+      type={type}
+      step={v.type === "int" ? 1 : undefined}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      autoFocus={autoFocus}
+      // Only `int` genuinely can't be empty (it has to parse as a whole
+      // number — see `isValidValue`/`INT_PATTERN`). A `string` field is
+      // allowed to be blank on purpose (e.g. "no fixed value" style
+      // defaults) — `meshfox_core::vars::validate_value` already accepts "".
+      required={v.type === "int" && !secretHere}
+      placeholder={placeholder}
+    />
+  );
+}
+
 /**
  * Blocking modal shown when `handleRun` finds one or more declared
  * `meshfox:var`s unresolved (see SPEC.md's "Variables") — the browser's
@@ -218,19 +251,12 @@ export function VarsForm({
       );
     }
     return (
-      <input
-        type={v.type === "int" ? "number" : v.secret ? "password" : "text"}
-        step={v.type === "int" ? 1 : undefined}
+      <PlainField
+        v={v}
         value={values[v.name]}
-        onChange={(e) => set(v.name, e.target.value)}
+        onChange={(value) => set(v.name, value)}
         autoFocus={i === 0}
-        // Only `int` genuinely can't be empty (it has to parse as a
-        // whole number — see `isValidValue`/`INT_PATTERN`). A
-        // `string` field is allowed to be blank on purpose (e.g. "no
-        // fixed value" style defaults) — `meshfox_core::vars::
-        // validate_value` already accepts "" for it.
-        required={v.type === "int" && !(configure && v.secret)}
-        placeholder={configure && v.secret ? (v.stored || v.inheritedFrom ? "•••••• (unchanged)" : "") : undefined}
+        configure={configure}
       />
     );
   };
