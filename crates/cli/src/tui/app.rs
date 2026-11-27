@@ -1240,6 +1240,7 @@ fn var_decl_from_status(status: &crate::worker_client::VarStatus) -> VarDecl {
         choices_var: None,
         suggest: status.suggest.clone(),
         suggest_var: None,
+        casts: Default::default(),
         file_mode: (var_type == VarType::File).then(|| match status.mode.as_deref() {
             Some("save") => meshfox_core::FileMode::Save,
             _ => meshfox_core::FileMode::Open,
@@ -6067,7 +6068,16 @@ impl App {
         // spliced in from an `include` too, same as `trigger_run`'s own
         // `declared_vars` call. Best-effort: a `vars.rs` error (e.g. a
         // duplicate declaration) just means no implicit deps are shown.
-        let decls = meshfox_core::declared_vars(&self.display_canvas).unwrap_or_default();
+        let mut decls = meshfox_core::declared_vars(&self.display_canvas).unwrap_or_default();
+        // What only the worker knows (`suggest_var=` candidates) lives on the
+        // open inline form's own decls; the renderer reads it from here.
+        if let Some(form) = &self.active_inline_form {
+            for open in &form.decls {
+                if let Some(decl) = decls.iter_mut().find(|d| d.name == open.name) {
+                    decl.suggest = open.suggest.clone();
+                }
+            }
+        }
 
         // Current display value for every `form`-field-targeted variable —
         // what's already been submitted this session, with whichever
@@ -6552,6 +6562,7 @@ impl App {
                             let resolved = statuses.iter().find(|s| s.var.name == decl.name);
                             if let Some(status) = resolved {
                                 decl.choices = status.var.choices.clone();
+                                decl.suggest = status.var.suggest.clone();
                                 decl.choices_var =
                                     status.var.choices_pending.as_ref().map(|p| p.var.clone());
                                 match &status.var.choices_pending {
@@ -13178,6 +13189,40 @@ mod tests {
         assert!(app.select_picker.is_none());
     }
 
+    // `suggest_var` is only known to the worker, so the inline form has to take
+    // the candidates from its `/api/form/fields` answer, like it does choices.
+    #[tokio::test]
+    async fn an_inline_form_takes_suggest_var_candidates_from_the_workers_answer() {
+        let mut app = app_with_blocks(
+            "string-suggest-var",
+            concat!(
+                "<!-- meshfox:var name=\"NAMES\" type=\"list\" default=\"[]\" -->\n",
+                "<!-- meshfox:var name=\"DRUG\" suggest_var=\"NAMES\" session -->\n\n",
+                "```form name=pick\nfield var=\"DRUG\"\n```\n",
+            ),
+        )
+        .await;
+        app.set_focus(Focus::Document);
+        app.try_enter_inline_form();
+        assert!(!has_suggestions(
+            &app.active_inline_form.as_ref().unwrap().decls[0]
+        ));
+        let field: crate::worker_client::FormFieldStatus =
+            serde_json::from_value(serde_json::json!({
+                "name": "DRUG", "type": "string", "prompt": "Drug", "resolved": false,
+                "suggest": ["Nobivac", "Fiprist"],
+            }))
+            .unwrap();
+        app.on_background_msg(BackgroundMsg::FormFields {
+            node_id: app.active_inline_form.as_ref().unwrap().node_id.clone(),
+            block: "pick".into(),
+            result: Ok(vec![field]),
+        });
+        let decl = &app.active_inline_form.as_ref().unwrap().decls[0];
+        assert_eq!(decl.suggest, ["Nobivac", "Fiprist"]);
+        assert!(has_suggestions(decl));
+    }
+
     // A click in a string's text edits it, so a field with suggestions ends in
     // a `[Suggest… ^o]` marker (like `[Browse… ^o]`); clicking that opens the list.
     #[tokio::test]
@@ -13502,6 +13547,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         };
@@ -13545,6 +13591,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         };

@@ -23,6 +23,7 @@ pub use meshfox_model::canvas;
 pub mod canvas_call;
 pub mod canvas_index;
 pub mod capabilities;
+pub mod cast;
 pub use meshfox_model::color_spans;
 pub use meshfox_model::comment;
 pub mod config;

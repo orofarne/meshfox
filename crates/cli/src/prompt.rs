@@ -298,6 +298,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -400,6 +401,7 @@ mod tests {
             choices_var: Some("FONT_LIST".into()),
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         };

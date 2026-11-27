@@ -38,6 +38,17 @@ impl ListFormat {
         })
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            ListFormat::Json => "json",
+            ListFormat::Lines => "lines",
+            ListFormat::Space => "space",
+            ListFormat::Comma => "comma",
+            ListFormat::Tab => "tab",
+            ListFormat::Pg => "pg",
+        }
+    }
+
     pub fn render(self, items: &[String]) -> String {
         match self {
             ListFormat::Json => to_json(items),
@@ -55,6 +66,154 @@ impl ListFormat {
             }
         }
     }
+}
+
+impl ListFormat {
+    /// The inverse of [`ListFormat::render`]: reads a list a consumer wants
+    /// out of text written in this format. Empty elements are dropped for
+    /// the separator formats (`lines`, `comma`, `tab`, `space`), which have
+    /// no way to say "an empty string" unambiguously; `json` and `pg` keep
+    /// them because they quote.
+    pub fn parse_items(self, text: &str) -> Result<Vec<String>, String> {
+        match self {
+            ListFormat::Json => parse_list(text),
+            ListFormat::Lines => Ok(text
+                .lines()
+                .map(|l| l.trim_end_matches('\r'))
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect()),
+            ListFormat::Comma => Ok(text
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()),
+            ListFormat::Tab => Ok(text
+                .split('\t')
+                .map(|s| s.trim_matches(|c| c == '\n' || c == '\r'))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()),
+            ListFormat::Space => split_shell_words(text),
+            ListFormat::Pg => parse_pg(text),
+        }
+    }
+}
+
+/// POSIX-ish word splitting: whitespace separates, `'..'` is literal,
+/// `".."` honours `\"` and `\\`, a bare backslash escapes the next char.
+fn split_shell_words(text: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => cur.push(c),
+                        None => return Err("has an unterminated ' quote".into()),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(c) if c == '"' || c == '\\' => cur.push(c),
+                            Some(c) => {
+                                cur.push('\\');
+                                cur.push(c);
+                            }
+                            None => return Err("has an unterminated \" quote".into()),
+                        },
+                        Some(c) => cur.push(c),
+                        None => return Err("has an unterminated \" quote".into()),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                match chars.next() {
+                    Some(c) => cur.push(c),
+                    None => cur.push('\\'),
+                }
+            }
+            c => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// A one-dimensional PostgreSQL array literal, `{a,"b c"}`.
+fn parse_pg(text: &str) -> Result<Vec<String>, String> {
+    let text = text.trim();
+    let inner = text
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix('}'))
+        .ok_or_else(|| "expects a PostgreSQL array literal, e.g. {a,\"b c\"}".to_string())?;
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut item = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some('\\') => match chars.next() {
+                        Some(c) => item.push(c),
+                        None => return Err("has a dangling backslash in a PostgreSQL array".into()),
+                    },
+                    Some(c) => item.push(c),
+                    None => return Err("has an unterminated quote in a PostgreSQL array".into()),
+                }
+            }
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                item.push(c);
+                chars.next();
+            }
+            item = item.trim().to_string();
+        }
+        out.push(item);
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            Some(c) => return Err(format!("has an unexpected {c:?} in a PostgreSQL array")),
+        }
+    }
+    Ok(out)
 }
 
 /// The canonical stored form: a compact JSON array of strings.
@@ -154,6 +313,59 @@ mod tests {
 
     fn items(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn every_format_parses_back_what_it_renders() {
+        let list = items(&["a", "b c", "it's", "x,y", "", "say \"hi\""]);
+        // json and pg are the lossless ones; the separator formats cannot
+        // carry an empty element, and comma/lines/tab cannot carry their
+        // own separator.
+        for f in [ListFormat::Json, ListFormat::Pg, ListFormat::Space] {
+            let back = f.parse_items(&f.render(&list)).unwrap();
+            let expected: Vec<String> = if f == ListFormat::Space {
+                list.iter().filter(|s| !s.is_empty()).cloned().collect()
+            } else {
+                list.clone()
+            };
+            // `Space` quotes the empty element ('') so it round-trips too.
+            if f == ListFormat::Space {
+                assert_eq!(back.len(), list.len(), "{f:?}");
+            } else {
+                assert_eq!(back, expected, "{f:?}");
+            }
+        }
+        let plain = items(&["a", "b c", "d"]);
+        for f in [ListFormat::Lines, ListFormat::Comma, ListFormat::Tab] {
+            assert_eq!(f.parse_items(&f.render(&plain)).unwrap(), plain, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn parsing_is_forgiving_about_whitespace_and_empties() {
+        assert_eq!(
+            ListFormat::Comma.parse_items(" a , ,b,").unwrap(),
+            items(&["a", "b"])
+        );
+        assert_eq!(
+            ListFormat::Lines.parse_items("a\r\n\nb\n").unwrap(),
+            items(&["a", "b"])
+        );
+        assert_eq!(
+            ListFormat::Space.parse_items("  a   'b c' d\\ e ").unwrap(),
+            items(&["a", "b c", "d e"])
+        );
+        assert_eq!(
+            ListFormat::Pg.parse_items("{}").unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ListFormat::Pg.parse_items("{a, \"b,c\" ,d}").unwrap(),
+            items(&["a", "b,c", "d"])
+        );
+        assert!(ListFormat::Pg.parse_items("a,b").is_err());
+        assert!(ListFormat::Space.parse_items("'open").is_err());
+        assert!(ListFormat::Json.parse_items("not json").is_err());
     }
 
     #[test]

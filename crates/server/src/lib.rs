@@ -3385,12 +3385,18 @@ async fn prepare_arguments_local(
         argument_choice_sources(&state, &canvas, node, &block_name, &request.args).await;
     let mut argument_values = canvas.artifact_values.clone();
     argument_values.extend(choice_sources.clone());
+    let choice_types: HashMap<String, meshfox_core::VarType> = meshfox_core::declared_vars(&canvas)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| (d.name, d.var_type))
+        .collect();
     let mut prepared = meshfox_core::args::prepare_node_arguments(
         node,
         &block_name,
         &request.args,
         &argument_values,
         &choice_sources,
+        &choice_types,
     )
     .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     for field in &mut prepared.fields {
@@ -3642,7 +3648,7 @@ async fn get_vars_with_plan(
                 .get(d.name.as_str())
                 .map(|m| (*m).clone())
                 .unwrap_or(d);
-            let mut status = var_status(materialized, &resolved, cache.secret_store_kind());
+            let mut status = var_status(materialized, &resolved, &decls, cache.secret_store_kind());
             status.explain_pending(&source_failures);
             status
         })
@@ -3827,31 +3833,12 @@ async fn run_from_source_for_status(
 fn var_status(
     mut d: meshfox_core::VarDecl,
     resolved: &meshfox_core::ResolvedVars,
+    decls: &[meshfox_core::VarDecl],
     store: meshfox_core::secret_store::SecretStoreKind,
 ) -> VarStatus {
     // Resolved fields bypass reference substitution in vars::resolve: their
     // existing answer needs no choices/default. A displayed form still does.
-    if let Some(value) = d
-        .choices_var
-        .as_ref()
-        .and_then(|name| resolved.values.get(name))
-    {
-        d.choices = meshfox_core::vars::split_choices(value);
-    }
-    if let Some(value) = d
-        .default_var
-        .as_ref()
-        .and_then(|name| resolved.values.get(name))
-    {
-        d.default = Some(value.clone());
-    }
-    if let Some(value) = d
-        .suggest_var
-        .as_ref()
-        .and_then(|name| resolved.values.get(name))
-    {
-        d.suggest = meshfox_core::vars::split_choices(value);
-    }
+    meshfox_core::vars::substitute_refs(&mut d, &resolved.values, decls);
     let choices_pending =
         meshfox_core::pending_choices_source(&d).map(|var| meshfox_core::ChoicesPending {
             var: var.to_string(),
@@ -3981,7 +3968,7 @@ async fn get_configure_vars(
                 .unwrap_or(d);
             let secret = materialized.secret;
             let name = materialized.name.clone();
-            let mut status = var_status(materialized, &resolved, cache.secret_store_kind());
+            let mut status = var_status(materialized, &resolved, &decls, cache.secret_store_kind());
             status.explain_pending(&source_failures);
             if secret {
                 // Existence only; the value never leaves the cache.
@@ -8837,7 +8824,7 @@ async fn get_form_fields(
                 .get(d.name.as_str())
                 .map(|m| (*m).clone())
                 .unwrap_or(d);
-            let mut var = var_status(materialized, &resolved, cache.secret_store_kind());
+            let mut var = var_status(materialized, &resolved, &decls, cache.secret_store_kind());
             var.explain_pending(&source_failures);
             FormFieldStatus { label, var }
         })
@@ -19408,6 +19395,7 @@ mod var_status_tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -19425,6 +19413,7 @@ mod var_status_tests {
         let status = var_status(
             d,
             &resolved,
+            &[],
             meshfox_core::secret_store::SecretStoreKind::Plaintext,
         );
         assert!(!status.resolved);
@@ -19445,6 +19434,7 @@ mod var_status_tests {
         let status = var_status(
             d,
             &resolved,
+            &[],
             meshfox_core::secret_store::SecretStoreKind::Plaintext,
         );
         assert!(status.resolved);
@@ -19463,6 +19453,7 @@ mod var_status_tests {
         let status = var_status(
             d,
             &resolved,
+            &[],
             meshfox_core::secret_store::SecretStoreKind::Plaintext,
         );
         assert!(status.resolved);
@@ -19481,6 +19472,7 @@ mod var_status_tests {
         let status = var_status(
             d,
             &resolved,
+            &[],
             meshfox_core::secret_store::SecretStoreKind::Plaintext,
         );
         assert!(!status.resolved);

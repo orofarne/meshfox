@@ -2490,7 +2490,9 @@ Attributes:
   (`meshfox validate` error).
 - `choices_var` — `choices_var="OTHER_NAME"`, same idea as `default_var`
   but for `choices` (the referenced variable's resolved value is split the
-  same comma-separated way a literal `choices=` already is) — e.g. a
+  same comma-separated way a literal `choices=` already is; a `list` source
+  gives its elements; `choices_var="NAME|lines"` picks another format — see
+  "Casting between variables") — e.g. a
   `select`'s options populated by actually running `aws list-regions`.
   Requires `type="select"`, same as a literal `choices=` does. Mutually
   exclusive with a literal `choices` and with `from=`, same reasoning as
@@ -3057,6 +3059,39 @@ suggested default) end up actually coming from running a script:
   (`default`/`choices`) and with `from=` — see each attribute's own
   entry above. `meshfox validate` catches a `default_var`/`choices_var`
   naming a variable nothing declares, and a reference cycle.
+
+### Casting between variables (`NAME|format`)
+
+A reference (`default_var=`, `choices_var=`, `suggest_var=`, `env=`) may point
+at a variable whose type is not the shape the reading position needs. The
+**consumer** decides the shape; the variable only declares what it holds. One
+shared rule set (`meshfox_core::cast`) does every conversion:
+
+| source → consumer | what happens | default |
+|---|---|---|
+| `list` → a list (`choices_var`, `suggest_var`) | its elements; no pipe | — |
+| `list` → text (`default_var` of a string, `env=`) | rendered | `json` |
+| string → a list (`choices_var`, `suggest_var`, `default_var` of a `list`) | parsed | `comma` |
+| anything else | the value as is | — |
+
+A pipe refines the default and reuses the `type="list"` format names —
+`json`, `lines`, `space`, `comma`, `tab`, `pg` — in **both** directions:
+rendering for `list` → text, parsing for string → list. Parsing is the inverse
+of rendering (`space` reads shell words, `pg` a one-dimensional PostgreSQL
+array literal); the separator formats drop empty elements.
+
+```markdown
+<!-- meshfox:var name="BRANCHES" from="list-branches" -->    <!-- prints: main 'feature x' -->
+<!-- meshfox:var name="BRANCH" type="select" choices_var="BRANCHES|space" -->
+<!-- meshfox:var name="TAGS" type="list" default="a,b" -->
+<!-- meshfox:var name="TAG_LINE" default_var="TAGS|comma" -->      <!-- "a,b" -->
+```
+
+`meshfox validate` checks this statically from the declared types: an unknown
+format name is an error, and so is a pipe that has nothing to convert (a list
+read as a list, or a plain value read as plain text). A value that does not
+parse in the requested format yields no elements rather than failing the form.
+A spread (`name=*$LIST`) is a list-only position and is unchanged.
 
 ### Suggestions (`suggest=`/`suggest_var=`)
 

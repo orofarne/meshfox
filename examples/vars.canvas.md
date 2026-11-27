@@ -275,6 +275,30 @@ echo "KNOWN_HOSTS=web-1.example,web-2.example,db-1.example" >> "$MESHFOX_VARS_OU
 echo "connecting to $HOST ($STAGE)"
 ```
 
+## Casting
+<!-- meshfox:node id="casting" -->
+
+The place that *reads* a variable decides the shape it needs, so a list and a
+plain string can feed each other. A `list` used for `choices_var`/`suggest_var`
+gives its elements; a string is split on commas unless a pipe names another
+format — the same names `env="LIST|format"` uses (`json`, `lines`, `space`,
+`comma`, `tab`, `pg`), here parsing instead of rendering. A `list` read as a
+string is rendered as JSON, or in the format the pipe names.
+
+<!-- A computed variable is one line (`NAME=value`), so shell words, not lines. -->
+<!-- meshfox:var name="BRANCHES" from="casting/list-branches" -->
+<!-- meshfox:var name="BRANCH" type="select" prompt="Branch?" choices_var="BRANCHES|space" -->
+<!-- meshfox:var name="ENVS" type="list" default="dev,staging,prod" -->
+<!-- meshfox:var name="ENV" prompt="Env?" suggest_var="ENVS" default_var="ENVS|comma" -->
+
+```bash name="list-branches"
+echo "BRANCHES=main release/1.0 'feature x'" >> "$MESHFOX_VARS_OUT"
+```
+
+```bash name="deploy" env="$BRANCH,$ENV"
+echo "deploying $BRANCH to $ENV"
+```
+
 ## Combined
 <!-- meshfox:node id="combined" x=32 y=5766 w=440 h=610 -->
 

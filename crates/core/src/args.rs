@@ -12,6 +12,8 @@ pub struct ArgDecl {
     /// value of the declared variable `NAME` (comma-separated), looked up
     /// when the launch form is prepared. Until then any value is accepted.
     pub choices_var: Option<String>,
+    /// The `|format` pipe of `choices_var="NAME|format"`.
+    pub choices_cast: Option<crate::listvars::ListFormat>,
     pub default: Option<String>,
     pub prompt: String,
     pub required: bool,
@@ -97,6 +99,7 @@ fn declaration(rest: &str) -> Result<ArgDecl, String> {
         var_type: decl.var_type,
         choices: decl.choices,
         choices_var: decl.choices_var,
+        choices_cast: decl.casts.choices,
         default: decl.default,
         prompt: decl.prompt,
         required: decl.required,
@@ -448,7 +451,11 @@ pub fn canonical_value(arg: &ArgDecl, value: &str) -> Result<String, String> {
         attrs.insert("choices".into(), arg.choices.join(","));
     }
     if let Some(choices_var) = &arg.choices_var {
-        attrs.insert("choices_var".into(), choices_var.clone());
+        let pipe = arg
+            .choices_cast
+            .map(|f| format!("|{}", f.name()))
+            .unwrap_or_default();
+        attrs.insert("choices_var".into(), format!("{choices_var}{pipe}"));
     }
     let declaration = vars::build_var_decl(attrs).map_err(|e| e.to_string())?;
     vars::validate_value(&declaration, value)?;
@@ -737,6 +744,7 @@ pub fn prepare_arguments(
     answers: &std::collections::BTreeMap<String, String>,
     values: &std::collections::HashMap<String, String>,
     choice_sources: &std::collections::HashMap<String, String>,
+    choice_types: &std::collections::HashMap<String, vars::VarType>,
 ) -> Result<ArgumentPreparation, String> {
     prepare_in(
         node_id,
@@ -746,6 +754,7 @@ pub fn prepare_arguments(
         answers,
         values,
         choice_sources,
+        choice_types,
     )
 }
 
@@ -757,6 +766,7 @@ pub fn prepare_node_arguments(
     answers: &std::collections::BTreeMap<String, String>,
     values: &std::collections::HashMap<String, String>,
     choice_sources: &std::collections::HashMap<String, String>,
+    choice_types: &std::collections::HashMap<String, vars::VarType>,
 ) -> Result<ArgumentPreparation, String> {
     prepare_in(
         &node.id,
@@ -766,6 +776,7 @@ pub fn prepare_node_arguments(
         answers,
         values,
         choice_sources,
+        choice_types,
     )
 }
 
@@ -777,6 +788,7 @@ fn prepare_in(
     answers: &std::collections::BTreeMap<String, String>,
     values: &std::collections::HashMap<String, String>,
     choice_sources: &std::collections::HashMap<String, String>,
+    choice_types: &std::collections::HashMap<String, vars::VarType>,
 ) -> Result<ArgumentPreparation, String> {
     let mut app = Application::parse(address)?;
     for (name, value) in answers {
@@ -833,7 +845,11 @@ fn prepare_in(
         if let Some(source) = &arg.choices_var {
             match choice_sources.get(source) {
                 Some(list) => {
-                    arg.choices = vars::split_choices(list);
+                    let ty = choice_types
+                        .get(source)
+                        .copied()
+                        .unwrap_or(vars::VarType::String);
+                    arg.choices = crate::cast::to_list(list, ty, arg.choices_cast);
                     arg.choices_var = None;
                 }
                 None => {
@@ -941,6 +957,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert!(prepared.block.is_none());
@@ -955,6 +972,7 @@ mod tests {
             &answers,
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(prepared.block.as_deref(), Some("extract[lang=en,n=2]"));
@@ -965,7 +983,8 @@ mod tests {
                 address,
                 &Default::default(),
                 &Default::default(),
-                &Default::default()
+                &Default::default(),
+                &Default::default(),
             )
             .is_err());
         }
@@ -980,6 +999,7 @@ mod tests {
             md,
             "search[q=$MISSING]",
             &answers,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         )
@@ -1000,6 +1020,7 @@ mod tests {
             &Default::default(),
             &values,
             &Default::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(prepared.block.as_deref(), Some("search[q=hy]"));
@@ -1010,8 +1031,16 @@ mod tests {
         let md = "<!-- meshfox:arg name=\"file\" type=\"select\" choices_var=\"FILES\" -->\n```bash name=\"import\"\necho ok\n```";
         let none = std::collections::HashMap::new();
         // Source not resolved yet: no choices, flagged pending, not bound.
-        let prepared =
-            prepare_arguments("root", md, "import", &Default::default(), &none, &none).unwrap();
+        let prepared = prepare_arguments(
+            "root",
+            md,
+            "import",
+            &Default::default(),
+            &none,
+            &none,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             prepared.fields[0]
                 .choices_pending
@@ -1024,12 +1053,30 @@ mod tests {
         // Source resolved: choices substituted and the answer is checked.
         let sources = std::collections::HashMap::from([("FILES".into(), "a.csv,b.csv".into())]);
         let answers = std::collections::BTreeMap::from([("file".into(), "b.csv".into())]);
-        let prepared = prepare_arguments("root", md, "import", &answers, &none, &sources).unwrap();
+        let prepared = prepare_arguments(
+            "root",
+            md,
+            "import",
+            &answers,
+            &none,
+            &sources,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(prepared.fields[0].choices, ["a.csv", "b.csv"]);
         assert_eq!(prepared.fields[0].choices_pending, None);
         assert_eq!(prepared.block.as_deref(), Some("import[file=b.csv]"));
         let answers = std::collections::BTreeMap::from([("file".into(), "c.csv".into())]);
-        assert!(prepare_arguments("root", md, "import", &answers, &none, &sources).is_err());
+        assert!(prepare_arguments(
+            "root",
+            md,
+            "import",
+            &answers,
+            &none,
+            &sources,
+            &Default::default()
+        )
+        .is_err());
     }
 
     #[test]

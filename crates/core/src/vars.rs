@@ -175,6 +175,10 @@ pub struct VarDecl {
     /// literal `suggest=`, with `from=` and with `content=`; requires
     /// `type="string"`.
     pub suggest_var: Option<String>,
+    /// The `|format` pipes of `default_var=`/`choices_var=`/`suggest_var=`
+    /// (`choices_var="BRANCHES|lines"`); the attributes above hold only the
+    /// variable name. See [`crate::cast`].
+    pub casts: crate::cast::RefCasts,
     /// `mode="open"|"save"` — only `Some` for `type="file"` (`open` when
     /// the attribute is omitted).
     pub file_mode: Option<FileMode>,
@@ -264,6 +268,10 @@ pub enum VarsError {
     SuggestRequiresString(String, String),
     #[error("meshfox:var {0:?} references undeclared variable {1:?} via {2}=")]
     UndeclaredVarRef(String, String, &'static str),
+    #[error("meshfox:var {0:?}: unknown format |{2} in {1}= (expected one of {})", crate::listvars::ListFormat::NAMES.join(", "))]
+    UnknownRefFormat(String, &'static str, String),
+    #[error("meshfox:var {0:?}: |{2} on {1}= does nothing: {3}")]
+    RefPipeMeaningless(String, &'static str, String, &'static str),
     #[error("cycle in default_var=/choices_var=/suggest_var= references: {}", .0.join(" -> "))]
     VarRefCycle(Vec<String>),
     #[error("node {0:?} form {1:?} has a `field var=\"{2}\"`, but {2:?} is from=-computed — a form field can't target a computed variable, that would let a submitted value impersonate one its source block never produced")]
@@ -280,6 +288,38 @@ pub fn split_choices(s: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// The declared type of the variable `name` (a plain string when it is not
+/// declared) -- what a cast needs to know about the *source* of a reference.
+pub fn source_type(decls: &[VarDecl], name: &str) -> VarType {
+    decls
+        .iter()
+        .find(|d| d.name == name)
+        .map_or(VarType::String, |d| d.var_type)
+}
+
+/// Substitutes the values of `default_var=`/`choices_var=`/`suggest_var=`
+/// into an already-built declaration, casting from each source's declared
+/// type (see [`crate::cast`]). A source with no value leaves the field as is.
+pub fn substitute_refs(decl: &mut VarDecl, values: &HashMap<String, String>, decls: &[VarDecl]) {
+    if let Some(v) = decl.default_var.as_ref().and_then(|n| values.get(n)) {
+        let source = decl.default_var.as_deref().unwrap_or_default();
+        decl.default = Some(crate::cast::to_target(
+            v,
+            source_type(decls, source),
+            decl.var_type,
+            decl.casts.default,
+        ));
+    }
+    if let Some(v) = decl.choices_var.as_ref().and_then(|n| values.get(n)) {
+        let source = decl.choices_var.as_deref().unwrap_or_default();
+        decl.choices = crate::cast::to_list(v, source_type(decls, source), decl.casts.choices);
+    }
+    if let Some(v) = decl.suggest_var.as_ref().and_then(|n| values.get(n)) {
+        let source = decl.suggest_var.as_deref().unwrap_or_default();
+        decl.suggest = crate::cast::to_list(v, source_type(decls, source), decl.casts.suggest);
+    }
 }
 
 /// A `select` that is still waiting for its choices: they come from the
@@ -356,7 +396,23 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         .get("choices")
         .map(|v| split_choices(v))
         .unwrap_or_default();
-    let choices_var = attrs.get("choices_var").cloned();
+    let mut casts = crate::cast::RefCasts::default();
+    let mut ref_attr = |key: &'static str| -> Result<Option<String>, VarsError> {
+        let Some(raw) = attrs.get(key) else {
+            return Ok(None);
+        };
+        let (target, format) = crate::cast::split_ref(raw)
+            .map_err(|bad| VarsError::UnknownRefFormat(name.clone(), key, bad))?;
+        match key {
+            "default_var" => casts.default = format,
+            "choices_var" => casts.choices = format,
+            _ => casts.suggest = format,
+        }
+        Ok(Some(target))
+    };
+    let choices_var = ref_attr("choices_var")?;
+    let suggest_var = ref_attr("suggest_var")?;
+    let default_var = ref_attr("default_var")?;
     if !choices.is_empty() && choices_var.is_some() {
         return Err(VarsError::ChoicesConflict(name));
     }
@@ -370,7 +426,6 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         .get("suggest")
         .map(|v| split_choices(v))
         .unwrap_or_default();
-    let suggest_var = attrs.get("suggest_var").cloned();
     if !suggest.is_empty() && suggest_var.is_some() {
         return Err(VarsError::SuggestConflict(name));
     }
@@ -430,7 +485,6 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
     let session = attrs.get("session").map(|v| v != "false").unwrap_or(false);
     let prompt = attrs.get("prompt").cloned().unwrap_or_else(|| name.clone());
     let default = attrs.get("default").cloned();
-    let default_var = attrs.get("default_var").cloned();
     if default.is_some() && default_var.is_some() {
         return Err(VarsError::DefaultConflict(name));
     }
@@ -518,6 +572,7 @@ pub(crate) fn build_var_decl(attrs: HashMap<String, String>) -> Result<VarDecl, 
         choices_var,
         suggest,
         suggest_var,
+        casts,
         file_mode,
         ext,
     })
@@ -625,6 +680,7 @@ fn validate_list_value(decl: &VarDecl, value: &str) -> Result<(), String> {
         choices_var: None,
         suggest: Vec::new(),
         suggest_var: None,
+        casts: Default::default(),
         default: None,
         default_var: None,
         ..decl.clone()
@@ -1241,6 +1297,40 @@ pub fn validate_var_refs(canvas: &Canvas) -> Result<(), VarsError> {
                 }
             }
         }
+        // A pipe only means something when the reference crosses the
+        // list/string boundary; elsewhere it is a mistake worth reporting.
+        for (reference, attr, format, target) in [
+            (
+                &decl.default_var,
+                "default_var",
+                decl.casts.default,
+                decl.var_type,
+            ),
+            (
+                &decl.choices_var,
+                "choices_var",
+                decl.casts.choices,
+                VarType::List,
+            ),
+            (
+                &decl.suggest_var,
+                "suggest_var",
+                decl.casts.suggest,
+                VarType::List,
+            ),
+        ] {
+            let (Some(name), Some(format)) = (reference, format) else {
+                continue;
+            };
+            if let Some(why) = crate::cast::meaningless_pipe(source_type(&decls, name), target) {
+                return Err(VarsError::RefPipeMeaningless(
+                    decl.name.clone(),
+                    attr,
+                    format.name().to_string(),
+                    why,
+                ));
+            }
+        }
     }
 
     // A block argument's `choices_var` must name a declared variable too.
@@ -1662,7 +1752,7 @@ pub fn resolve_with_shared(
         }
         if let Some(v) = already_resolved {
             secret_errors.remove(&decl.name);
-            if let Err(message) = validate_supplied(decl, &v, &values) {
+            if let Err(message) = validate_supplied(decl, &v, &values, decls) {
                 invalid.push(InvalidVar {
                     name: decl.name.clone(),
                     source,
@@ -1683,14 +1773,21 @@ pub fn resolve_with_shared(
         // decl) or to build the prompt's own fields (`missing`).
         let effective_default = match &decl.default_var {
             Some(ref_name) => match values.get(ref_name) {
-                Some(v) => Some(v.clone()),
+                Some(v) => Some(crate::cast::to_target(
+                    v,
+                    source_type(decls, ref_name),
+                    decl.var_type,
+                    decl.casts.default,
+                )),
                 None => continue, // referenced var not resolvable yet -- defer
             },
             None => decl.default.clone(),
         };
         let effective_choices = match &decl.choices_var {
             Some(ref_name) => match values.get(ref_name) {
-                Some(v) => split_choices(v),
+                Some(v) => {
+                    crate::cast::to_list(v, source_type(decls, ref_name), decl.casts.choices)
+                }
                 None => continue, // referenced var not resolvable yet -- defer
             },
             None => decl.choices.clone(),
@@ -1729,7 +1826,9 @@ pub fn resolve_with_shared(
         // Display-only: an unresolved source leaves the list empty instead
         // of deferring the variable, since nothing depends on it.
         if let Some(list) = decl.suggest_var.as_ref().and_then(|n| values.get(n)) {
-            missing_decl.suggest = split_choices(list);
+            let source = decl.suggest_var.as_deref().unwrap_or_default();
+            missing_decl.suggest =
+                crate::cast::to_list(list, source_type(decls, source), decl.casts.suggest);
         }
         missing.push(missing_decl);
     }
@@ -1767,12 +1866,14 @@ fn validate_supplied(
     decl: &VarDecl,
     value: &str,
     resolved: &HashMap<String, String>,
+    decls: &[VarDecl],
 ) -> Result<(), String> {
     let result = match &decl.choices_var {
         Some(reference) => match resolved.get(reference) {
             Some(list) => {
                 let mut with_choices = decl.clone();
-                with_choices.choices = split_choices(list);
+                with_choices.choices =
+                    crate::cast::to_list(list, source_type(decls, reference), decl.casts.choices);
                 validate_value(&with_choices, value)
             }
             None => return Ok(()),
@@ -1925,16 +2026,13 @@ pub fn resolve_block_env_with_shared(
 /// A `list` variable's value as one block asked for it (`env="IDS|space"`);
 /// anything that is not a list, or has no (valid) format, is passed through.
 fn render_env_value(er: &crate::fence::EnvRef, value: &str) -> String {
-    let Some(format) = er
+    match er
         .format
         .as_deref()
         .and_then(crate::listvars::ListFormat::parse)
-    else {
-        return value.to_string();
-    };
-    match crate::listvars::parse_list(value) {
-        Ok(items) => format.render(&items),
-        Err(_) => value.to_string(),
+    {
+        Some(format) => crate::cast::to_text(value, VarType::List, Some(format)),
+        None => value.to_string(),
     }
 }
 
@@ -2547,6 +2645,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -2748,6 +2847,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -2770,6 +2870,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -3555,6 +3656,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -3707,6 +3809,7 @@ mod tests {
             choices_var: None,
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -3729,6 +3832,7 @@ mod tests {
             choices_var: Some(choices_var.to_string()),
             suggest: Vec::new(),
             suggest_var: None,
+            casts: Default::default(),
             file_mode: None,
             ext: Vec::new(),
         }
@@ -4125,5 +4229,109 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(r.values.get("TOKEN").map(String::as_str), Some("fallback"));
+    }
+
+    // --- casts between list and string references ---
+
+    const CAST_CANVAS: &str = concat!(
+        "# R\n\n<!-- meshfox:var name=\"LST\" type=\"list\" default=\"[\\\"a\\\",\\\"b\\\"]\" -->\n",
+        "<!-- meshfox:var name=\"TXT\" default=\"x\\ny z\" -->\n",
+    );
+
+    fn cast_decls(extra: &str) -> Vec<VarDecl> {
+        declared_vars(&canvas(&format!("{CAST_CANVAS}{extra}"))).unwrap()
+    }
+
+    #[test]
+    fn a_reference_pipe_is_split_off_the_variable_name() {
+        let decls = cast_decls(
+            "<!-- meshfox:var name=\"C\" type=\"select\" choices_var=\"TXT|lines\" -->\n",
+        );
+        let c = decls.iter().find(|d| d.name == "C").unwrap();
+        assert_eq!(c.choices_var.as_deref(), Some("TXT"));
+        assert_eq!(c.casts.choices, Some(crate::listvars::ListFormat::Lines));
+        let err = declared_vars(&canvas(
+            "# R\n\n<!-- meshfox:var name=\"C\" suggest_var=\"X|bogus\" -->\n",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, VarsError::UnknownRefFormat(_, "suggest_var", _)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn substitution_casts_by_consumer_and_source_type() {
+        let decls = cast_decls(concat!(
+            "<!-- meshfox:var name=\"C\" type=\"select\" choices_var=\"TXT|lines\" -->\n",
+            "<!-- meshfox:var name=\"S\" suggest_var=\"LST\" -->\n",
+            "<!-- meshfox:var name=\"D\" default_var=\"LST|comma\" -->\n",
+            "<!-- meshfox:var name=\"E\" default_var=\"LST\" -->\n",
+            "<!-- meshfox:var name=\"L\" type=\"list\" default_var=\"TXT|lines\" -->\n",
+        ));
+        let values: HashMap<String, String> = [("LST", "[\"a\",\"b\"]"), ("TXT", "x\ny z")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let get = |n: &str| {
+            let mut d = decls.iter().find(|d| d.name == n).unwrap().clone();
+            substitute_refs(&mut d, &values, &decls);
+            d
+        };
+        assert_eq!(get("C").choices, ["x", "y z"]);
+        assert_eq!(get("S").suggest, ["a", "b"]);
+        assert_eq!(get("D").default.as_deref(), Some("a,b"));
+        assert_eq!(get("E").default.as_deref(), Some("[\"a\",\"b\"]"));
+        assert_eq!(get("L").default.as_deref(), Some("[\"x\",\"y z\"]"));
+    }
+
+    #[test]
+    fn validate_rejects_a_pipe_that_has_nothing_to_convert() {
+        for (extra, attr) in [
+            (
+                "<!-- meshfox:var name=\"C\" type=\"select\" choices_var=\"LST|lines\" -->\n",
+                "choices_var",
+            ),
+            (
+                "<!-- meshfox:var name=\"S\" suggest_var=\"LST|lines\" -->\n",
+                "suggest_var",
+            ),
+            (
+                "<!-- meshfox:var name=\"D\" default_var=\"TXT|comma\" -->\n",
+                "default_var",
+            ),
+        ] {
+            let c = canvas(&format!("{CAST_CANVAS}{extra}"));
+            let err = validate_var_refs(&c).unwrap_err();
+            assert!(
+                matches!(&err, VarsError::RefPipeMeaningless(_, a, _, _) if *a == attr),
+                "{attr}: {err}"
+            );
+        }
+        let ok = canvas(&format!(
+            "{CAST_CANVAS}<!-- meshfox:var name=\"D\" default_var=\"LST|comma\" -->\n"
+        ));
+        validate_var_refs(&ok).unwrap();
+    }
+
+    #[test]
+    fn resolve_casts_a_default_var_and_a_supplied_choice() {
+        let decls = cast_decls(concat!(
+            "<!-- meshfox:var name=\"C\" type=\"select\" choices_var=\"TXT|lines\" -->\n",
+        ));
+        let overrides: HashMap<String, String> = [
+            ("C".to_string(), "y z".to_string()),
+            ("TXT".to_string(), "x\ny z".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let r = resolve(&decls, &overrides, &VarCache::default(), &HashMap::new());
+        assert_eq!(
+            r.values.get("C").map(String::as_str),
+            Some("y z"),
+            "{:?}",
+            r.invalid
+        );
+        assert!(r.invalid.is_empty(), "{:?}", r.invalid);
     }
 }
