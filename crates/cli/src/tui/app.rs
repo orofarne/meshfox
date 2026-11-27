@@ -3958,6 +3958,7 @@ impl App {
                 self.start_run(node_id, block_name, true).await;
             }
             ClickTarget::JumpToNode { node_id } => self.jump_to_node(&node_id),
+            ClickTarget::Link { url } => self.open_link_list_at(&url),
             ClickTarget::FormField {
                 node_id,
                 block_name,
@@ -5520,6 +5521,29 @@ impl App {
     /// Hands a link from the list to the OS. Only web and mail links leave
     /// the TUI; a relative or `file` destination is not something to start
     /// an application for.
+    /// A click on a link in the text: the same list `o` shows, with that
+    /// link already selected, so `Enter` follows it.
+    fn open_link_list_at(&mut self, url: &str) {
+        let Some(node) = self
+            .rows
+            .get(self.selected)
+            .and_then(|row| self.display_canvas.node(&row.node_id))
+        else {
+            return;
+        };
+        let links = super::markdown::links(&node.text);
+        let selected = links.iter().position(|(_, dest)| dest == url).unwrap_or(0);
+        if links.is_empty() {
+            return;
+        }
+        self.link_picker = Some(LinkPickerState {
+            links,
+            selected,
+            rows: Rect::default(),
+            offset: 0,
+        });
+    }
+
     async fn open_link_url(&mut self, url: String) {
         self.status_meta.retry("open", &mut self.status);
         let lower = url.to_ascii_lowercase();
@@ -13221,6 +13245,24 @@ mod tests {
         let decl = &app.active_inline_form.as_ref().unwrap().decls[0];
         assert_eq!(decl.suggest, ["Nobivac", "Fiprist"]);
         assert!(has_suggestions(decl));
+    }
+
+    // A click on link text opens the node's link list with that link chosen;
+    // it never leaves the TUI by itself.
+    #[tokio::test]
+    async fn clicking_a_link_opens_the_link_list_on_that_link() {
+        let mut app = app_with_blocks(
+            "link-click",
+            "See [first](https://one.example) and [second](https://two.example).\n",
+        )
+        .await;
+        app.activate_click_target(ClickTarget::Link {
+            url: "https://two.example".into(),
+        })
+        .await;
+        let picker = app.link_picker.as_ref().expect("link list is open");
+        assert_eq!(picker.links.len(), 2);
+        assert_eq!(picker.links[picker.selected].1, "https://two.example");
     }
 
     // A click in a string's text edits it, so a field with suggestions ends in

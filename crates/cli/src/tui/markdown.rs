@@ -107,6 +107,10 @@ pub enum ClickTarget {
         block_name: String,
         field_index: usize,
     },
+    /// A Markdown link in running text — opens the node's link list on this
+    /// destination (the same list `o` shows), so following a link is still a
+    /// deliberate step that shows where it goes.
+    Link { url: String },
 }
 
 /// One clickable span inside a rendered `Segment::Text`, in the segment's
@@ -632,6 +636,12 @@ struct Renderer<'a> {
     click_regions: Vec<ClickRegion>,
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
+    /// The destination of the link being read, if inside one.
+    link_dest: Option<String>,
+    /// `(line in the paragraph being built, col_start, col_end, url)` for
+    /// each piece of link text, turned into click regions once the paragraph
+    /// has a segment index (`flush_paragraph`).
+    pending_links: Vec<(usize, u16, u16, String)>,
     inline_stack: Vec<Inline>,
     list_stack: Vec<Option<u64>>, // Some(n) = ordered, next number; None = bullet
     quote_depth: usize,
@@ -778,6 +788,8 @@ impl<'a> Renderer<'a> {
             click_regions: Vec::new(),
             lines: Vec::new(),
             current: Vec::new(),
+            link_dest: None,
+            pending_links: Vec::new(),
             inline_stack: Vec::new(),
             list_stack: Vec::new(),
             quote_depth: 0,
@@ -875,6 +887,21 @@ impl<'a> Renderer<'a> {
 
     fn push_text(&mut self, text: &str, extra: Style) {
         let style = self.inline_style();
+        if let (Some(url), None) = (&self.link_dest, &self.table) {
+            let indent = if self.quote_depth > 0 || !self.list_stack.is_empty() {
+                Span::raw(self.indent()).width()
+            } else {
+                0
+            };
+            let start = indent + self.current.iter().map(Span::width).sum::<usize>();
+            let end = start + Span::raw(text).width();
+            self.pending_links.push((
+                self.lines.len(),
+                start.min(u16::MAX as usize) as u16,
+                end.min(u16::MAX as usize) as u16,
+                url.clone(),
+            ));
+        }
         self.current
             .push(Span::styled(text.to_string(), style.patch(extra)));
     }
@@ -891,9 +918,27 @@ impl<'a> Renderer<'a> {
 
     fn flush_paragraph(&mut self) {
         self.flush_line();
+        let links = std::mem::take(&mut self.pending_links);
         if !self.lines.is_empty() {
             let lines = std::mem::take(&mut self.lines);
+            let before = self.segments.len();
             self.push_segment(Segment::Text(lines));
+            // Inside an output frame the lines gain a border prefix, which
+            // would shift every column; links there stay keyboard-only (`o`).
+            if self.output_region.is_none() && self.segments.len() > before {
+                let segment_index = self.segments.len() - 1;
+                for (line_index, col_start, col_end, url) in links {
+                    if col_end > col_start {
+                        self.click_regions.push(ClickRegion {
+                            segment_index,
+                            line_index,
+                            col_start,
+                            col_end,
+                            target: ClickTarget::Link { url },
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -1558,7 +1603,10 @@ impl<'a> Renderer<'a> {
             Tag::Emphasis => self.inline_stack.push(Inline::Emphasis),
             Tag::Strong => self.inline_stack.push(Inline::Strong),
             Tag::Strikethrough => self.inline_stack.push(Inline::Strikethrough),
-            Tag::Link { .. } => self.inline_stack.push(Inline::Link),
+            Tag::Link { dest_url, .. } => {
+                self.link_dest = Some(dest_url.to_string()).filter(|u| !u.is_empty());
+                self.inline_stack.push(Inline::Link);
+            }
             Tag::Image {
                 dest_url, title, ..
             } => {
@@ -2351,6 +2399,7 @@ impl<'a> Renderer<'a> {
                 self.inline_stack.retain(|m| *m != Inline::Strikethrough);
             }
             TagEnd::Link => {
+                self.link_dest = None;
                 self.inline_stack.retain(|m| *m != Inline::Link);
             }
             TagEnd::TableCell => {
@@ -4023,6 +4072,50 @@ mod tests {
             .filter(|c| matches!(c.target, ClickTarget::JumpToNode { .. }))
             .count();
         assert_eq!(jumps, 2);
+    }
+
+    #[test]
+    fn link_text_gets_a_click_region_over_exactly_its_columns() {
+        let hl = Highlighter::new();
+        let md = "Install [Android Studio](https://developer.android.com/studio). Then more.\n\n- see [docs](https://example.org/d)\n";
+        let (segments, clicks) = render(
+            md,
+            Path::new("/nonexistent-base-dir"),
+            &hl,
+            "n",
+            &[],
+            &std::collections::HashMap::new(),
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let links: Vec<_> = clicks
+            .iter()
+            .filter_map(|c| match &c.target {
+                ClickTarget::Link { url } => Some((c, url.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links.len(), 2, "one region per link");
+        let line_text = |c: &ClickRegion| -> String {
+            match &segments[c.segment_index] {
+                Segment::Text(lines) => lines[c.line_index].to_string(),
+                _ => panic!("a link is always in a text segment"),
+            }
+        };
+        for (c, url) in links {
+            let text = line_text(c);
+            let covered: String = text
+                .chars()
+                .skip(c.col_start as usize)
+                .take((c.col_end - c.col_start) as usize)
+                .collect();
+            let expected = if url.contains("android") {
+                "Android Studio"
+            } else {
+                "docs"
+            };
+            assert_eq!(covered, expected, "{text:?}");
+        }
     }
 
     #[test]

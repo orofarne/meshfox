@@ -3670,6 +3670,8 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
     ];
     if app.selected_is_open_target() {
         items.push("o               open this file node's target in the OS's default application");
+    } else {
+        items.push("o / click       list this node's links (click one in the text) · enter opens");
     }
     if app.selected_is_table() && app.worker_port.is_some() {
         items.push("enter           (a display=\"table\" node) open the table full screen —");
