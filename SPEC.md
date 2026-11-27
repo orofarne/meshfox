@@ -3081,11 +3081,14 @@ of rendering (`space` reads shell words, `pg` a one-dimensional PostgreSQL
 array literal); the separator formats drop empty elements.
 
 ```markdown
-<!-- meshfox:var name="BRANCHES" from="list-branches" -->    <!-- prints: main 'feature x' -->
+<!-- meshfox:var name="BRANCHES" from="list-branches" -->
 <!-- meshfox:var name="BRANCH" type="select" choices_var="BRANCHES|space" -->
 <!-- meshfox:var name="TAGS" type="list" default="a,b" -->
-<!-- meshfox:var name="TAG_LINE" default_var="TAGS|comma" -->      <!-- "a,b" -->
+<!-- meshfox:var name="TAG_LINE" default_var="TAGS|comma" -->
 ```
+
+Here `list-branches` prints `BRANCHES=main 'feature x'`, so `BRANCH` offers
+`main` and `feature x`, and `TAG_LINE` is `a,b`.
 
 `meshfox validate` checks this statically from the declared types: an unknown
 format name is an error, and so is a pipe that has nothing to convert (a list
