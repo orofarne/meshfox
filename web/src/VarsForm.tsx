@@ -1,5 +1,5 @@
 import { FieldBox, ListField } from "./ListField";
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ChoiceSelect } from "./ChoiceSelect";
 import { SuggestInput } from "./SuggestInput";
 import { describePending } from "./choiceFilter";
@@ -89,6 +89,10 @@ interface PlainFieldProps {
 /** The text/number/password input for the types that need nothing special. */
 function PlainField({ v, value, onChange, autoFocus, configure }: PlainFieldProps) {
   const secretHere = configure && v.secret;
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (autoFocus) ref.current?.focus();
+  }, [autoFocus]);
   let type = "text";
   if (v.type === "int") type = "number";
   else if (v.secret) type = "password";
@@ -96,11 +100,11 @@ function PlainField({ v, value, onChange, autoFocus, configure }: PlainFieldProp
   if (secretHere) placeholder = v.stored || v.inheritedFrom ? "•••••• (unchanged)" : "";
   return (
     <input
+      ref={ref}
       type={type}
       step={v.type === "int" ? 1 : undefined}
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      autoFocus={autoFocus}
       // Only `int` genuinely can't be empty (it has to parse as a whole
       // number — see `isValidValue`/`INT_PATTERN`). A `string` field is
       // allowed to be blank on purpose (e.g. "no fixed value" style

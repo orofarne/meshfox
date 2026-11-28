@@ -168,39 +168,18 @@ fn parse_pg(text: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut chars = inner.chars().peekable();
     loop {
-        while chars.peek().is_some_and(|c| c.is_whitespace()) {
-            chars.next();
-        }
+        skip_whitespace(&mut chars);
         if chars.peek().is_none() {
             break;
         }
-        let mut item = String::new();
-        if chars.peek() == Some(&'"') {
+        let item = if chars.peek() == Some(&'"') {
             chars.next();
-            loop {
-                match chars.next() {
-                    Some('"') => break,
-                    Some('\\') => match chars.next() {
-                        Some(c) => item.push(c),
-                        None => return Err("has a dangling backslash in a PostgreSQL array".into()),
-                    },
-                    Some(c) => item.push(c),
-                    None => return Err("has an unterminated quote in a PostgreSQL array".into()),
-                }
-            }
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
+            let item = read_pg_quoted(&mut chars)?;
+            skip_whitespace(&mut chars);
+            item
         } else {
-            while let Some(&c) = chars.peek() {
-                if c == ',' {
-                    break;
-                }
-                item.push(c);
-                chars.next();
-            }
-            item = item.trim().to_string();
-        }
+            read_pg_bare(&mut chars)
+        };
         out.push(item);
         match chars.next() {
             Some(',') => continue,
@@ -209,6 +188,40 @@ fn parse_pg(text: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+fn skip_whitespace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
+}
+
+/// The body of a `"…"` array element (the opening quote already consumed).
+fn read_pg_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<String, String> {
+    let mut item = String::new();
+    loop {
+        match chars.next() {
+            Some('"') => return Ok(item),
+            Some('\\') => match chars.next() {
+                Some(c) => item.push(c),
+                None => return Err("has a dangling backslash in a PostgreSQL array".into()),
+            },
+            Some(c) => item.push(c),
+            None => return Err("has an unterminated quote in a PostgreSQL array".into()),
+        }
+    }
+}
+
+fn read_pg_bare(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut item = String::new();
+    while let Some(&c) = chars.peek() {
+        if c == ',' {
+            break;
+        }
+        item.push(c);
+        chars.next();
+    }
+    item.trim().to_string()
 }
 
 /// The canonical stored form: a compact JSON array of strings.
